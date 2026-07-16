@@ -41,14 +41,15 @@
 
 ## 安装与首次配置
 
-1. 将整个 `astrbot_plugin_comfy_anima` 目录放入 AstrBot 插件目录。
-2. 在管理面板重载插件。
-3. 设置 `comfyui_url`。
-4. 在“绘图思考模型”中选择一个已配置的聊天模型。
-5. 已安装 ComfyUI-Lora-Manager 时保持 `enable_lora_manager=true`；插件会自动访问 `comfyui_url/api/lm/loras`，同时保留 `object_info` 回退。
-6. 建议保持 `strict_lora_validation=true`，这样后台组合在出图时、管理员命令在保存时都会核对 ComfyUI 实际可加载名称。
-7. 需要通过 QQ 下载 Civitai LoRA 时开启 `enable_lora_download`，按网络环境设置 `lora_download_timeout`，并保持 `lora_download_allowed_hosts` 仅包含受信任的 Civitai 官方域名。
-8. 先执行 `/anima ping`，再用 `/画图no 1girl, white hair, portrait` 测试。
+1. 在 ComfyUI 中导入 [插件安装工作流](docs/workflows/导入Comfy工作流用下载插件用.json)，按提示安装缺失的自定义节点；如有缺失的模型或 LoRA，也请一并准备。
+2. 将整个 `astrbot_plugin_comfy_anima` 目录放入 AstrBot 插件目录。
+3. 在管理面板重载插件。
+4. 设置 `comfyui_url`。
+5. 在“绘图思考模型”中选择一个已配置的聊天模型。
+6. 已安装 ComfyUI-Lora-Manager 时保持 `enable_lora_manager=true`；插件会自动访问 `comfyui_url/api/lm/loras`，同时保留 `object_info` 回退。
+7. 建议保持 `strict_lora_validation=true`，这样后台组合在出图时、管理员命令在保存时都会核对 ComfyUI 实际可加载名称。
+8. 需要通过 QQ 下载 Civitai LoRA 时开启 `enable_lora_download`，按网络环境设置 `lora_download_timeout`，并保持 `lora_download_allowed_hosts` 仅包含受信任的 Civitai 官方域名。
+9. 先执行 `/anima ping`，再用 `/画图no 1girl, white hair, portrait` 测试。
 
 `auto_draw_system_prompt` 留空时使用插件附带的 `prompts/director_reference.txt`。后台填写的自定义 System Prompt 会立即用于普通对话注入，并作为人设/风格偏好叠加到自然语言分镜；插件的实时 LoRA、输出协议和换装安全约束不会再被自定义内容覆盖。自定义内容仍必须要求需要绘图时输出合法的 `<pic prompt="英文 tags">`，没有标签就不会自动触发图片。
 
