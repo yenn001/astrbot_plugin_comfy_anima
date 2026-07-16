@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#25211d">
+    <title>Comfy Anima 工坊控制台</title>
+    <script src="/assets/theme.js"></script>
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到主要内容</a>
+    <div class="paper-glow" aria-hidden="true"></div>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div class="brand-mark small" aria-hidden="true">CA</div>
+          <div>
+            <strong>Comfy Anima</strong>
+            <span>Illustration Workshop</span>
+          </div>
+        </div>
+
+        <div class="side-ticket" aria-hidden="true">
+          <span>ANIMA</span><b>WORKSHOP / 01</b>
+        </div>
+
+        <nav id="nav" aria-label="功能导航">
+          <button class="nav-item active" data-panel="overview" aria-current="page"><span>01</span>运行概览</button>
+          <button class="nav-item" data-panel="settings"><span>02</span>插件设置</button>
+          <button class="nav-item" data-panel="loras"><span>03</span>LoRA 管理</button>
+          <button class="nav-item" data-panel="presets"><span>04</span>风格与角色串</button>
+          <button class="nav-item" data-panel="models"><span>05</span>UNET 模型</button>
+          <button class="nav-item" data-panel="tasks"><span>06</span>任务中心</button>
+          <button class="nav-item" data-panel="console"><span>07</span>运行控制台</button>
+        </nav>
+
+        <div class="sidebar-orbit" aria-hidden="true">
+          <svg viewBox="0 0 120 120" role="presentation">
+            <circle cx="60" cy="60" r="47"></circle>
+            <path d="M60 7v16M60 97v16M7 60h16M97 60h16"></path>
+            <path class="spark" d="M60 43l4.5 12.5L77 60l-12.5 4.5L60 77l-4.5-12.5L43 60l12.5-4.5z"></path>
+          </svg>
+        </div>
+
+        <div class="sidebar-foot">
+          <span id="version-label">正在连接…</span>
+          <button id="logout-button" class="ghost compact">退出登录</button>
+        </div>
+      </aside>
+
+      <main id="workspace" class="main-area" tabindex="-1">
+        <header class="topbar">
+          <div class="title-lockup">
+            <p class="eyebrow">ANIMA WORKFLOW OPERATIONS</p>
+            <h1 id="page-title">运行概览</h1>
+            <svg class="title-wave" viewBox="0 0 280 14" preserveAspectRatio="none" aria-hidden="true">
+              <path d="M2 8c19-10 37 10 56 0s37 10 56 0 37 10 56 0 37 10 56 0 35 8 52-1"></path>
+            </svg>
+          </div>
+          <div class="top-actions">
+            <label class="theme-picker" for="theme-select">
+              <span>界面主题</span>
+              <select id="theme-select" aria-label="选择 WebUI 主题">
+                <option value="workshop">纸感工坊</option>
+                <option value="editorial">铅灰编辑部</option>
+                <option value="night">墨夜控制室</option>
+              </select>
+            </label>
+            <span id="service-state" class="status-pill" role="status">连接中</span>
+            <button id="reload-data" class="secondary">刷新当前页</button>
+          </div>
+        </header>
+
+        <div class="type-marquee" aria-hidden="true">
+          <div>DRAW · DIRECT · ARCHIVE · COMPOSE · ANIMA · DRAW · DIRECT · ARCHIVE · COMPOSE · ANIMA</div>
+        </div>
+
+        <section id="panel-overview" class="panel active" aria-labelledby="page-title">
+          <div class="metric-grid">
+            <article class="metric-card accent">
+              <span class="card-number">01 / VERSION</span>
+              <strong id="metric-version">—</strong>
+              <small>服务器实际运行版本</small>
+            </article>
+            <article class="metric-card">
+              <span class="card-number">02 / JOBS</span>
+              <strong id="metric-jobs">—</strong>
+              <small>当前绘图任务数量</small>
+            </article>
+            <article class="metric-card dark-card">
+              <span class="card-number">03 / STYLE</span>
+              <strong id="metric-style">—</strong>
+              <small>未显式指定时使用</small>
+            </article>
+            <article class="metric-card sand-card">
+              <span class="card-number">04 / UNET</span>
+              <strong id="metric-unet">—</strong>
+              <small>节点 429 的模型覆盖值</small>
+            </article>
+          </div>
+
+          <div class="content-grid two editorial-grid">
+            <article class="card connection-card">
+              <div class="card-head">
+                <div><p class="eyebrow">CONNECTION</p><h2>服务连接</h2></div>
+                <span class="ticket-tag">LIVE</span>
+              </div>
+              <dl class="detail-list">
+                <div><dt>ComfyUI</dt><dd id="detail-comfy">—</dd></div>
+                <div><dt>LoRA Manager</dt><dd id="detail-lora-manager">—</dd></div>
+                <div><dt>工作流</dt><dd id="detail-workflow">—</dd></div>
+                <div><dt>默认分辨率</dt><dd id="detail-resolution">—</dd></div>
+              </dl>
+            </article>
+
+            <article class="card safety-card dark-card">
+              <div class="card-head">
+                <div><p class="eyebrow">SAFETY GATE</p><h2>LoRA 安全门禁</h2></div>
+                <span class="spark-icon" aria-hidden="true">✦</span>
+              </div>
+              <p class="body-copy">
+                每一次 LoRA 查询、组合、下载和绘图注入都会先强制刷新 LoRA Manager，
+                并与 ComfyUI 当前可加载清单交叉校验。
+              </p>
+              <div class="callout success">刷新失败即停止操作，不使用跨操作旧缓存。</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="panel-settings" class="panel" aria-labelledby="page-title">
+          <article class="card profile-station">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">ENVIRONMENT PROFILES</p>
+                <h2>全局配置档案</h2>
+              </div>
+              <span id="profile-active-badge" class="ticket-tag">未读取</span>
+            </div>
+            <p class="body-copy compact-copy">保存不同局域网环境的 ComfyUI、LoRA Manager、工作流、UNET 与默认分辨率，一键来回切换。敏感凭据不会写入档案。</p>
+            <div class="profile-controls">
+              <label>
+                <span>已保存档案</span>
+                <select id="config-profile-select"><option value="">正在读取…</option></select>
+              </label>
+              <label>
+                <span>新档案名称</span>
+                <input id="config-profile-name" maxlength="64" placeholder="例如：192.168.1.50 / 家用 Comfy">
+              </label>
+              <div class="profile-buttons" aria-label="配置档案操作">
+                <button id="profile-save" class="primary" type="button">保存当前配置</button>
+                <button id="profile-activate" class="secondary" type="button">切换到所选</button>
+                <button id="profile-delete" class="danger" type="button">删除所选</button>
+              </div>
+            </div>
+            <p id="profile-status" class="muted live-line" role="status"></p>
+          </article>
+
+          <form id="settings-form" class="stack large-gap">
+            <article class="card numbered-card" data-number="01">
+              <div class="card-head"><div><p class="eyebrow">CORE</p><h2>绘图与工作流</h2></div></div>
+              <div class="form-grid">
+                <label class="span-2"><span>ComfyUI 地址</span><input name="comfyui_url" required></label>
+                <label><span>默认宽度</span><input name="default_width" type="number" min="256" max="4096"></label>
+                <label><span>默认高度</span><input name="default_height" type="number" min="256" max="4096"></label>
+                <label><span>并发任务</span><input name="max_concurrent_jobs" type="number" min="1" max="16"></label>
+                <label><span>用户冷却（秒）</span><input name="user_cooldown" type="number" min="0"></label>
+                <label class="toggle"><input name="enable_upscale" type="checkbox"><span>启用最终放大</span></label>
+                <label class="toggle"><input name="send_generation_notice" type="checkbox"><span>发送生成进度提示</span></label>
+              </div>
+            </article>
+
+            <article class="card numbered-card dark-card" data-number="02">
+              <div class="card-head"><div><p class="eyebrow">PROMPT DIRECTOR</p><h2>LLM 绘图导演</h2></div></div>
+              <div class="form-grid">
+                <div class="span-2 provider-field">
+                  <label for="provider-select"><span>思考模型 Provider</span></label>
+                  <div class="provider-picker">
+                    <select id="provider-select" name="prompt_llm_provider_id"><option value="">跟随当前会话模型</option></select>
+                    <button id="provider-refresh" class="secondary inverse" type="button">读取 AstrBot 模型</button>
+                  </div>
+                  <input id="provider-manual" placeholder="手动填写 Provider ID" hidden>
+                  <small id="provider-note" class="muted">正在读取 AstrBot 已保存模型…</small>
+                </div>
+                <label><span>Temperature</span><input name="prompt_llm_temperature" type="number" min="0" max="2" step="0.05"></label>
+                <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
+                <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
+                <label class="toggle"><input name="enable_natural_draw" type="checkbox"><span>启用自然语言绘图</span></label>
+                <label class="toggle"><input name="enable_llm_pic_trigger" type="checkbox"><span>解析 &lt;pic prompt&gt;</span></label>
+                <label class="span-4"><span>System Prompt</span><textarea name="auto_draw_system_prompt" rows="9" placeholder="留空使用插件内置导演提示词"></textarea></label>
+              </div>
+            </article>
+
+            <article class="card numbered-card" data-number="03">
+              <div class="card-head"><div><p class="eyebrow">LORA POLICY</p><h2>LoRA 与默认风格</h2></div></div>
+              <div class="form-grid">
+                <label class="span-2"><span>LoRA Manager 地址</span><input name="lora_manager_url" placeholder="留空跟随 ComfyUI"></label>
+                <label><span>默认风格名称</span><input name="default_style_preset"></label>
+                <label><span>单次 LoRA 总上限</span><input name="max_total_dynamic_loras" type="number" min="1" max="64"></label>
+                <label><span>单个组合 LoRA 上限</span><input name="max_preset_loras" type="number" min="1" max="64"></label>
+                <label><span>LLM 额外 LoRA 上限</span><input name="max_dynamic_loras" type="number" min="0" max="32"></label>
+                <label class="toggle"><input name="enable_lora_tool" type="checkbox"><span>启用 LoRA 工具</span></label>
+                <label class="toggle"><input name="enable_lora_download" type="checkbox"><span>允许管理员下载 LoRA</span></label>
+                <label class="toggle"><input name="strict_lora_validation" type="checkbox"><span>严格校验 LoRA 文件</span></label>
+                <label class="span-4"><span>LoRA 自定义别名（每行一条）</span><textarea name="lora_alias_rules" rows="5" placeholder="black deniav1-2=达妮娅,denia,鸣潮达妮娅"></textarea><small class="muted">格式：精确文件名=别名1,别名2。仅补充逻辑索引，不移动实际文件。</small></label>
+              </div>
+            </article>
+
+            <article class="card numbered-card sand-card" data-number="04">
+              <div class="card-head"><div><p class="eyebrow">ACCESS</p><h2>权限与风控</h2></div></div>
+              <div class="form-grid">
+                <label><span>默认违禁级别</span><select name="default_block_level"><option value="none">none</option><option value="lite">lite</option><option value="full">full</option></select></label>
+                <label class="span-3"><span>群白名单（逗号或换行）</span><textarea name="group_whitelist" rows="3"></textarea></label>
+                <label class="toggle"><input name="global_lock" type="checkbox"><span>全局锁定，仅管理员可用</span></label>
+                <label class="toggle"><input name="whitelist_only" type="checkbox"><span>仅白名单群生效</span></label>
+                <label class="toggle"><input name="admin_ignore_cooldown" type="checkbox"><span>管理员无视冷却</span></label>
+                <label class="toggle"><input name="admin_ignore_whitelist" type="checkbox"><span>管理员无视白名单</span></label>
+                <label class="toggle"><input name="admin_ignore_blocklist" type="checkbox"><span>管理员无视违禁词</span></label>
+              </div>
+            </article>
+
+            <article class="card numbered-card" data-number="05">
+              <div class="card-head">
+                <div><p class="eyebrow">WEB UI</p><h2>端口面板</h2></div>
+                <span class="ticket-tag">保存后自动重载</span>
+              </div>
+              <div class="form-grid">
+                <label><span>监听地址</span><input name="web_ui_host" placeholder="0.0.0.0"></label>
+                <label><span>端口</span><input name="web_ui_port" type="number" min="1024" max="65535"></label>
+                <label><span>用户名</span><input name="web_ui_username" autocomplete="off"></label>
+                <label><span>会话时长（秒）</span><input name="web_ui_session_ttl" type="number" min="300" max="86400"></label>
+                <label class="span-2"><span>新密码</span><input name="web_ui_password" type="password" autocomplete="new-password" placeholder="留空保持当前密码；最少 8 位"></label>
+                <label class="toggle"><input name="enable_web_ui" type="checkbox"><span>启用端口 Web UI</span></label>
+              </div>
+            </article>
+
+            <div class="sticky-actions">
+              <span id="settings-note" class="muted" role="status"></span>
+              <button class="primary" type="submit">保存全局设置并重载</button>
+            </div>
+          </form>
+        </section>
+
+        <section id="panel-loras" class="panel" aria-labelledby="page-title">
+          <div class="lora-tool-grid">
+            <article class="card lora-search-card">
+              <div class="card-head">
+                <div><p class="eyebrow">LIVE CATALOG</p><h2>搜索最新 LoRA</h2></div>
+                <button id="lora-refresh" class="secondary" type="button">强制刷新 Manager</button>
+              </div>
+              <form id="lora-search-form" class="inline-form">
+                <label class="sr-only" for="lora-query">搜索 LoRA</label>
+                <input id="lora-query" placeholder="名称、角色、作品、画师、触发词…">
+                <button class="primary" type="submit">搜索最新清单</button>
+              </form>
+              <p id="lora-summary" class="muted live-line" role="status"></p>
+            </article>
+
+            <article class="card lora-download-card dark-card">
+              <div class="card-head"><div><p class="eyebrow">CIVITAI</p><h2>从 URL 下载</h2></div><span aria-hidden="true" class="spark-icon">✧</span></div>
+              <form id="lora-download-form" class="stack">
+                <label class="sr-only" for="lora-download-url">Civitai 模型网址</label>
+                <input id="lora-download-url" type="url" placeholder="https://civitai.com/models/…" required>
+                <button class="secondary inverse" type="submit">下载 → 获取元数据 → 刷新</button>
+              </form>
+              <p id="download-status" class="muted live-line" role="status"></p>
+            </article>
+          </div>
+
+          <article class="archive-studio dark-card">
+            <div class="archive-studio-head">
+              <div>
+                <p class="eyebrow">AI LIBRARY INDEXER</p>
+                <h2>为 LoRA 建立可搜索档案</h2>
+                <p>先读取最新库指纹；有变化时，把 Civitai 标题、模型说明、全部触发词与别名交给已选择的思考模型，建立带证据和待确认状态的角色 / 画师风格 / 混合索引。</p>
+              </div>
+              <div id="lora-change-badge" class="change-seal idle" role="status"><span>LIBRARY</span><strong>待检测</strong></div>
+            </div>
+            <div class="archive-settings-row">
+              <label class="toggle inverse-toggle"><input id="archive-auto-toggle" type="checkbox"><span>检测到变化后自动归档变化项</span></label>
+              <label class="toggle inverse-toggle"><input id="archive-fetch-first" type="checkbox" checked><span>归档前先从 Civitai 获取所选元数据</span></label>
+            </div>
+            <div class="archive-actions">
+              <button id="metadata-all" class="secondary inverse" type="button">获取全库元数据</button>
+              <button id="archive-changed" class="primary" type="button">AI 建档变化项</button>
+              <button id="archive-selected" class="secondary inverse" type="button">AI 建档所选</button>
+              <button id="archive-all" class="ghost inverse" type="button">AI 建档全部</button>
+            </div>
+            <p id="lora-archive-run-status" class="live-line" role="status">尚未运行 AI 建档。</p>
+            <div id="lora-archive-result" class="archive-result" hidden></div>
+          </article>
+
+          <article id="lora-archive-card" class="card" hidden>
+            <div class="card-head">
+              <div><p class="eyebrow">SEMANTIC INDEX</p><h2>LoRA AI 建档摘要</h2></div>
+              <span class="ticket-tag">不移动实际文件</span>
+            </div>
+            <div id="lora-archive-metrics" class="archive-metrics"></div>
+            <div class="digestion-progress-block">
+              <div class="digestion-progress-copy">
+                <div>
+                  <span class="mono-label">AI 建档可搜索进度</span>
+                  <strong id="digestion-progress-text">0 / 0</strong>
+                </div>
+                <span id="digestion-progress-percent" class="ticket-tag">0%</span>
+              </div>
+              <progress id="digestion-progress-track" class="digestion-progress-track" aria-label="AI 建档可搜索进度" max="100" value="0">0%</progress>
+              <div class="digestion-status-notes">
+                <span>可搜索 <b id="digestion-count-archived">0</b></span>
+                <span>待确认 <b id="digestion-count-review">0</b></span>
+                <span>资料就绪 <b id="digestion-count-metadata">0</b></span>
+                <span>失败 / 未建档 <b id="digestion-count-unarchived">0</b></span>
+              </div>
+            </div>
+            <div class="archive-work-row"><span class="muted mono-label">作品归档</span><div id="lora-work-list" class="chip-list"></div></div>
+          </article>
+
+          <article class="card catalog-card">
+            <div class="catalog-toolbar">
+              <div>
+                <p class="eyebrow">CATALOG FILTER</p>
+                <div id="lora-category-filters" class="filter-tabs" role="group" aria-label="LoRA 分类筛选">
+                  <button class="filter-tab active" data-category="all" type="button" aria-pressed="true">全部 <span id="filter-count-all">0</span></button>
+                  <button class="filter-tab" data-category="character" type="button" aria-pressed="false">角色 <span id="filter-count-character">0</span></button>
+                  <button class="filter-tab" data-category="artist_style" type="button" aria-pressed="false">画师 / 风格 <span id="filter-count-artist-style">0</span></button>
+                  <button class="filter-tab" data-category="speed_sampling" type="button" aria-pressed="false">加速 / 采样 <span id="filter-count-speed-sampling">0</span></button>
+                  <button class="filter-tab" data-category="quality_enhancement" type="button" aria-pressed="false">画质增强 <span id="filter-count-quality-enhancement">0</span></button>
+                  <button class="filter-tab" data-category="detail_restoration" type="button" aria-pressed="false">细节修复 <span id="filter-count-detail-restoration">0</span></button>
+                  <button class="filter-tab" data-category="composition_pose" type="button" aria-pressed="false">构图 / 姿势 <span id="filter-count-composition-pose">0</span></button>
+                  <button class="filter-tab" data-category="lighting_color" type="button" aria-pressed="false">光影 / 色彩 <span id="filter-count-lighting-color">0</span></button>
+                  <button class="filter-tab" data-category="background_environment" type="button" aria-pressed="false">背景 / 环境 <span id="filter-count-background-environment">0</span></button>
+                  <button class="filter-tab" data-category="clothing_concept" type="button" aria-pressed="false">服装 / 概念 <span id="filter-count-clothing-concept">0</span></button>
+                  <button class="filter-tab" data-category="mixed" type="button" aria-pressed="false">混合 <span id="filter-count-mixed">0</span></button>
+                  <button class="filter-tab" data-category="unclassified" type="button" aria-pressed="false">未分类 <span id="filter-count-unclassified">0</span></button>
+                </div>
+                <p class="eyebrow archive-state-label">AI INDEX STATUS</p>
+                <div id="lora-archive-state-filters" class="filter-tabs archive-state-tabs" role="group" aria-label="LoRA AI 建档状态筛选">
+                  <button class="filter-tab active" data-archive-state="all" type="button" aria-pressed="true">全部状态 <span id="archive-filter-count-all">0</span></button>
+                  <button class="filter-tab" data-archive-state="searchable" type="button" aria-pressed="false">可搜索 <span id="archive-filter-count-searchable">0</span></button>
+                  <button class="filter-tab" data-archive-state="analyzing" type="button" aria-pressed="false">建档中 <span id="archive-filter-count-analyzing">0</span></button>
+                  <button class="filter-tab" data-archive-state="review_needed" type="button" aria-pressed="false">待确认 <span id="archive-filter-count-review-needed">0</span></button>
+                  <button class="filter-tab" data-archive-state="stale" type="button" aria-pressed="false">资料变化 <span id="archive-filter-count-stale">0</span></button>
+                  <button class="filter-tab" data-archive-state="metadata_ready" type="button" aria-pressed="false">资料就绪 <span id="archive-filter-count-metadata-ready">0</span></button>
+                  <button class="filter-tab" data-archive-state="failed" type="button" aria-pressed="false">失败 <span id="archive-filter-count-failed">0</span></button>
+                  <button class="filter-tab" data-archive-state="unarchived" type="button" aria-pressed="false">未建档 <span id="archive-filter-count-unarchived">0</span></button>
+                </div>
+              </div>
+              <div class="selection-tools">
+                <span id="lora-selection-count" class="ticket-tag">已选 0</span>
+                <button id="lora-select-visible" class="ghost" type="button">全选当前筛选</button>
+                <button id="lora-clear-selection" class="ghost" type="button">清空全部选择</button>
+                <button id="metadata-selected" class="secondary" type="button">获取所选元数据</button>
+                <button id="archive-selected-inline" class="primary" type="button">AI 建档所选</button>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table class="lora-table">
+                <thead>
+                  <tr>
+                    <th class="check-column"><label class="sr-only" for="lora-select-all">选择当前筛选全部 LoRA</label><input id="lora-select-all" type="checkbox"></th>
+                    <th>文件名</th><th>AI 建档</th><th>角色 / 作品</th><th>Civitai 信息</th><th>别名 / 触发词</th><th>动作</th>
+                  </tr>
+                </thead>
+                <tbody id="lora-table"></tbody>
+              </table>
+            </div>
+            <div id="lora-empty" class="empty-state">输入关键词或直接搜索全部最新 LoRA。</div>
+          </article>
+          <dialog id="lora-detail-dialog" class="lora-detail-dialog">
+            <div class="lora-detail-shell">
+              <header class="lora-detail-head">
+                <div><p class="eyebrow">LIVE LORA DOSSIER</p><h2 id="lora-detail-title">LoRA 资料档案</h2><code id="lora-detail-name"></code></div>
+                <button id="lora-detail-close" class="ghost" type="button" aria-label="关闭 LoRA 详情">关闭</button>
+              </header>
+              <p id="lora-detail-status" class="live-line" role="status">等待读取实时资料。</p>
+              <div id="lora-detail-content" class="lora-detail-grid"></div>
+              <form id="lora-semantic-form" class="lora-review-form stack">
+                <input name="name" type="hidden">
+                <div class="card-head"><div><p class="eyebrow">HUMAN REVIEW</p><h3>人工语义审核</h3></div><span class="ticket-tag">MANUAL WINS</span></div>
+                <div class="form-grid compact-grid">
+                  <label><span>分类</span><select name="category"><option value="character">角色</option><option value="artist_style">画师 / 风格</option><option value="speed_sampling">加速 / 采样</option><option value="quality_enhancement">画质增强</option><option value="detail_restoration">细节修复</option><option value="composition_pose">构图 / 姿势</option><option value="lighting_color">光影 / 色彩</option><option value="background_environment">背景 / 环境</option><option value="clothing_concept">服装 / 概念</option><option value="mixed">混合</option><option value="unclassified">未分类 / 待确认</option></select></label>
+                  <label><span>角色名（逗号或换行）</span><textarea name="character_names" rows="3"></textarea></label>
+                  <label><span>作品名（逗号或换行）</span><textarea name="source_works" rows="3"></textarea></label>
+                  <label><span>画师 / 风格名（逗号或换行）</span><textarea name="artist_style_names" rows="3"></textarea></label>
+                </div>
+                <label><span>自然语言别名、译名、简称</span><textarea name="aliases" rows="4"></textarea></label>
+                <div class="inline-actions"><button id="lora-semantic-save" class="primary" type="submit">保存人工审核</button><button id="lora-detail-reanalyze" class="secondary" type="button">重新 AI 建档</button></div>
+              </form>
+            </div>
+          </dialog>
+        </section>
+
+        <section id="panel-presets" class="panel" aria-labelledby="page-title">
+          <div class="content-grid preset-layout">
+            <article class="card numbered-card" data-number="A">
+              <div class="card-head"><div><p class="eyebrow">PRESET EDITOR</p><h2>保存组合</h2></div></div>
+              <form id="preset-form" class="stack">
+                <div class="form-grid compact-grid">
+                  <label><span>名称</span><input name="name" placeholder="风格001 / 达妮娅" required></label>
+                  <label><span>分类</span><select name="category"><option value="artist_style">画师/风格</option><option value="character">角色</option><option value="mixed">混合</option><option value="auto">自动判断</option></select></label>
+                </div>
+                <label><span>LoRA 串（每行 name=weight）</span><textarea name="loras" rows="9" placeholder="anima-highres-aesthetic-boost=0.5&#10;black deniav1-2=1.0" required></textarea></label>
+                <label><span>触发词</span><textarea name="trigger_words" rows="3"></textarea></label>
+                <label><span>说明</span><textarea name="description" rows="3"></textarea></label>
+                <label class="toggle"><input name="enabled" type="checkbox" checked><span>启用此组合</span></label>
+                <button class="primary" type="submit">强制刷新并保存</button>
+              </form>
+            </article>
+            <article class="card table-card numbered-card" data-number="B">
+              <div class="card-head">
+                <div><p class="eyebrow">SAVED PRESETS</p><h2>已保存组合</h2></div>
+                <button id="preset-refresh" class="secondary" type="button">刷新校验</button>
+              </div>
+              <div class="table-wrap">
+                <table><thead><tr><th>名称</th><th>分类</th><th>LoRA</th><th>状态</th><th>动作</th></tr></thead><tbody id="preset-table"></tbody></table>
+              </div>
+              <div id="preset-empty" class="empty-state">尚未读取组合。</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="panel-models" class="panel" aria-labelledby="page-title">
+          <article class="model-lead dark-card">
+            <div>
+              <p class="eyebrow">UNET LOADER · NODE 429</p>
+              <h2>实时模型列表</h2>
+              <p>每次切换前都会重新读取 ComfyUI 的 UNETLoader 清单。</p>
+            </div>
+            <button id="model-refresh" class="secondary inverse" type="button">读取最新模型</button>
+          </article>
+          <div id="model-grid" class="model-grid"></div>
+          <div id="model-empty" class="empty-state card">点击“读取最新模型”开始。</div>
+        </section>
+
+        <section id="panel-tasks" class="panel" aria-labelledby="page-title">
+          <div class="task-metric-grid" aria-label="任务统计">
+            <article class="task-metric active-task-metric"><span>ACTIVE</span><strong id="task-count-active">0</strong><small>排队 / 运行中</small></article>
+            <article class="task-metric"><span>SUCCEEDED</span><strong id="task-count-succeeded">0</strong><small>最近成功</small></article>
+            <article class="task-metric warning-task-metric"><span>NEEDS ATTENTION</span><strong id="task-count-warning">0</strong><small>部分完成 / 中断</small></article>
+            <article class="task-metric failed-task-metric"><span>FAILED</span><strong id="task-count-failed">0</strong><small>失败 / 超时</small></article>
+          </div>
+
+          <article class="task-workbench dark-card">
+            <div class="task-workbench-head">
+              <div>
+                <p class="eyebrow">PERSISTENT JOB LEDGER</p>
+                <h2>任务中心</h2>
+                <p>LoRA 元数据、AI 建档与后续后台工作会留下可恢复的阶段时间线。刷新页面或插件重载后，已完成记录仍可查看；异常退出的运行任务会标记为“已中断”。</p>
+              </div>
+              <button id="task-refresh" class="secondary inverse" type="button">刷新任务</button>
+            </div>
+            <div class="task-toolbar">
+              <label><span>任务类型</span><select id="task-type-filter"><option value="">全部类型</option><option value="lora_semantic_analysis">LoRA 语义建档</option><option value="lora_archive">旧版 LoRA 建档</option><option value="lora_metadata">LoRA 元数据</option><option value="lora_download">LoRA 下载</option></select></label>
+              <label><span>运行状态</span><select id="task-status-filter"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="succeeded">成功</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="timed_out">超时</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option></select></label>
+              <p id="task-list-status" class="task-list-status" role="status">等待读取持久任务记录…</p>
+            </div>
+          </article>
+
+          <div class="task-center-grid">
+            <article class="card task-list-card">
+              <div class="card-head"><div><p class="eyebrow">RECENT RUNS</p><h2>最近任务</h2></div><span id="task-visible-count" class="ticket-tag">0 项</span></div>
+              <div id="task-list" class="task-list" role="list"></div>
+              <div id="task-list-empty" class="empty-state">暂无符合筛选条件的任务。</div>
+            </article>
+
+            <article class="card task-detail-card">
+              <div id="task-detail-empty" class="task-detail-empty">
+                <span class="task-detail-star" aria-hidden="true">✦</span>
+                <h2>选择一项任务</h2>
+                <p>查看当前阶段、处理进度、耗时，以及逐步成功、失败或无响应记录。</p>
+              </div>
+              <div id="task-detail" hidden>
+                <div class="task-detail-head">
+                  <div><p class="eyebrow">RUN DETAIL</p><h2 id="task-detail-title">任务详情</h2><code id="task-detail-id"></code></div>
+                  <div class="task-detail-actions"><span id="task-detail-status" class="task-status-badge">—</span><button id="task-cancel" class="console-clear-button compact" type="button" hidden>取消任务</button></div>
+                </div>
+                <div id="task-detail-metrics" class="task-detail-metrics"></div>
+                <div class="task-progress-block"><div><span id="task-progress-label">等待进度</span><strong id="task-progress-value">0%</strong></div><progress id="task-progress-track" max="100" value="0">0%</progress></div>
+                <div class="task-timeline-head">
+                  <div><p class="eyebrow">EVENT TIMELINE</p><h3>阶段时间线</h3></div>
+                  <div class="task-timeline-controls">
+                    <label><span class="sr-only">时间线排序</span><select id="task-event-order"><option value="desc" selected>最新在上</option><option value="asc">最早在上</option></select></label>
+                    <label><span class="sr-only">每页事件数量</span><select id="task-event-page-size"><option value="10">10 条 / 页</option><option value="20" selected>20 条 / 页</option><option value="50">50 条 / 页</option><option value="100">100 条 / 页</option><option value="200">200 条 / 页</option></select></label>
+                    <button id="task-event-prev" class="ghost compact" type="button">上一页</button>
+                    <span id="task-event-page" class="ticket-tag">1 / 1</span>
+                    <button id="task-event-next" class="ghost compact" type="button">下一页</button>
+                    <span id="task-event-cursor" class="ticket-tag">SEQ 0</span>
+                  </div>
+                </div>
+                <ol id="task-event-list" class="task-event-list"></ol>
+                <div id="task-event-empty" class="empty-state compact-empty">尚无阶段事件，任务可能仍在排队。</div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="panel-console" class="panel" aria-labelledby="page-title">
+          <div class="console-metric-grid" aria-label="日志统计">
+            <article class="console-metric paper-stat">
+              <span>PERSISTED / ALL</span>
+              <strong id="console-count-total">0</strong>
+              <small id="console-capacity-label">最多保留 1000 条</small>
+            </article>
+            <article class="console-metric info-stat">
+              <span>INFO</span>
+              <strong id="console-count-info">0</strong>
+              <small>正常运行记录</small>
+            </article>
+            <article class="console-metric warning-stat">
+              <span>WARNING</span>
+              <strong id="console-count-warning">0</strong>
+              <small>需要留意</small>
+            </article>
+            <article class="console-metric error-stat">
+              <span>ERROR / CRITICAL</span>
+              <strong id="console-count-error">0</strong>
+              <small>错误与异常</small>
+            </article>
+          </div>
+
+          <article class="console-workbench dark-card">
+            <div class="console-heading">
+              <div>
+                <p class="eyebrow">PLUGIN LOG PRESS</p>
+                <h2>Comfy Anima 专属控制台</h2>
+                <p>捕获并持久保存本插件日志，页面刷新与插件重载后可恢复最近记录；常见密钥、密码、Cookie 与会话字段会在写入前脱敏。</p>
+              </div>
+              <div id="console-live-seal" class="console-live-seal live" role="status">
+                <span class="console-live-dot" aria-hidden="true"></span>
+                <strong>LIVE</strong>
+                <small id="console-live-label">自动刷新</small>
+              </div>
+            </div>
+
+            <div class="console-toolbar">
+              <label class="console-search-field">
+                <span>搜索日志</span>
+                <input id="console-query" type="search" placeholder="错误、LoRA、文件名、来源…" autocomplete="off">
+              </label>
+              <label>
+                <span>级别</span>
+                <select id="console-level-filter">
+                  <option value="all">全部级别</option>
+                  <option value="DEBUG">DEBUG</option>
+                  <option value="INFO">INFO</option>
+                  <option value="WARNING">WARNING</option>
+                  <option value="ERROR">ERROR / CRITICAL</option>
+                </select>
+              </label>
+              <label>
+                <span>模块</span>
+                <select id="console-category-filter">
+                  <option value="all">全部模块</option>
+                  <option value="generation">绘图 / ComfyUI</option>
+                  <option value="lora">LoRA</option>
+                  <option value="llm">LLM / Provider</option>
+                  <option value="web">WebUI</option>
+                  <option value="plugin">插件运行</option>
+                </select>
+              </label>
+              <label class="toggle inverse-toggle console-follow-toggle">
+                <input id="console-follow" type="checkbox" checked>
+                <span>跟随最新</span>
+              </label>
+            </div>
+
+            <div class="console-actions">
+              <div>
+                <span id="console-visible-count" class="ticket-tag">显示 0 条</span>
+                <span id="console-status" class="console-status" role="status">等待读取插件日志…</span>
+              </div>
+              <div class="console-action-buttons">
+                <button id="console-pause" class="secondary inverse" type="button">暂停刷新</button>
+                <button id="console-copy" class="ghost inverse" type="button">复制可见日志</button>
+                <button id="console-clear" class="console-clear-button" type="button">清空持久视图</button>
+              </div>
+            </div>
+
+            <div id="console-viewport" class="console-viewport" tabindex="0" aria-label="插件实时日志">
+              <ol id="console-list" class="console-list"></ol>
+              <div id="console-empty" class="console-empty">当前筛选下没有日志。</div>
+            </div>
+
+            <div class="console-footnote">
+              <span>SQLITE LEDGER · 插件重载后恢复最近记录</span>
+              <span>清空只删除插件专属持久视图，不删除 AstrBot 文件日志或任务事件</span>
+            </div>
+          </article>
+        </section>
+
+        <footer class="workshop-footer">
+          <span>COMFY ANIMA / ASTRBOT</span>
+          <svg viewBox="0 0 90 18" aria-hidden="true"><path d="M1 10c8-8 14 8 22 0s14 8 22 0 14 8 22 0 14 7 22-1"></path></svg>
+          <span>LOCAL ILLUSTRATION WORKSHOP</span>
+        </footer>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

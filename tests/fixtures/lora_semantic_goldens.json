@@ -1,0 +1,460 @@
+{
+  "fixture_version": 1,
+  "cases": [
+    {
+      "id": "denia_wuwa",
+      "detail": {
+        "asset_id": "asset-denia-001",
+        "name": "characters/denia_wuwa.safetensors",
+        "file_name": "denia_wuwa.safetensors",
+        "folder": "characters",
+        "model_name": "Denia - Wuthering Waves Character",
+        "version_name": "Anima release",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "model_description": "Character model for Denia from Wuthering Waves.",
+        "version_description": "Use the supplied character trigger with the outfit tags you need.",
+        "trigger_words": ["denia_wuwa", "denia", "black coat"],
+        "tags": ["character", "wuthering waves", "wuwa"],
+        "category": "character",
+        "aliases": ["Denia"],
+        "character_name": "Denia",
+        "source_work": "Wuthering Waves",
+        "file_status": {"sha256": "a1111111", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "character", "source": "observed", "confidence": 1.0}],
+        "character_names": [
+          {"value": "Denia", "source": "observed", "confidence": 1.0},
+          {"value": "达妮娅", "source": "manual", "confidence": 1.0}
+        ],
+        "source_works": [
+          {"value": "Wuthering Waves", "source": "observed", "confidence": 1.0},
+          {"value": "鸣潮", "source": "manual", "confidence": 1.0}
+        ],
+        "artist_style_names": [],
+        "aliases": [
+          {"value": "Denia", "source": "observed", "confidence": 1.0},
+          {"value": "达妮娅", "source": "manual", "confidence": 1.0},
+          {"value": "wuwa", "source": "manual", "confidence": 1.0},
+          {"value": "鸣潮达妮娅", "source": "manual", "confidence": 1.0}
+        ]
+      }
+    },
+    {
+      "id": "remielle_zzz",
+      "detail": {
+        "asset_id": "asset-remielle-001",
+        "name": "characters/remielle_zzz.safetensors",
+        "file_name": "remielle_zzz.safetensors",
+        "folder": "characters",
+        "model_name": "Remielle - Zenless Zone Zero Character",
+        "version_name": "Anima release",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "model_description": "Character model for Remielle from Zenless Zone Zero.",
+        "version_description": "The primary trigger identifies the character.",
+        "trigger_words": ["remielle_zzz", "remielle"],
+        "tags": ["character", "zenless zone zero", "zzz"],
+        "category": "character",
+        "aliases": ["Remielle"],
+        "character_name": "Remielle",
+        "source_work": "Zenless Zone Zero",
+        "file_status": {"sha256": "b2222222", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "character", "source": "observed", "confidence": 1.0}],
+        "character_names": [
+          {"value": "Remielle", "source": "observed", "confidence": 1.0},
+          {"value": "拉米尔", "source": "manual", "confidence": 1.0}
+        ],
+        "source_works": [
+          {"value": "Zenless Zone Zero", "source": "observed", "confidence": 1.0},
+          {"value": "绝区零", "source": "manual", "confidence": 1.0}
+        ],
+        "artist_style_names": [],
+        "aliases": [
+          {"value": "Remielle", "source": "observed", "confidence": 1.0},
+          {"value": "拉米尔", "source": "manual", "confidence": 1.0},
+          {"value": "zzz", "source": "manual", "confidence": 1.0},
+          {"value": "绝区零拉米尔", "source": "manual", "confidence": 1.0}
+        ]
+      }
+    },
+    {
+      "id": "sunna_zzz",
+      "detail": {
+        "asset_id": "asset-sunna-001",
+        "name": "characters/sunna_zzz.safetensors",
+        "file_name": "sunna_zzz.safetensors",
+        "folder": "characters",
+        "model_name": "Sunna - Zenless Zone Zero Character",
+        "version_name": "Anima release",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "model_description": "Character model for Sunna from Zenless Zone Zero.",
+        "version_description": "The primary trigger identifies the character.",
+        "trigger_words": ["sunna_zzz", "sunna"],
+        "tags": ["character", "zenless zone zero", "zzz"],
+        "category": "character",
+        "aliases": ["Sunna"],
+        "character_name": "Sunna",
+        "source_work": "Zenless Zone Zero",
+        "file_status": {"sha256": "c3333333", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "character", "source": "observed", "confidence": 1.0}],
+        "character_names": [{"value": "Sunna", "source": "observed", "confidence": 1.0}],
+        "source_works": [
+          {"value": "Zenless Zone Zero", "source": "observed", "confidence": 1.0},
+          {"value": "绝区零", "source": "manual", "confidence": 1.0}
+        ],
+        "artist_style_names": [],
+        "aliases": [
+          {"value": "Sunna", "source": "observed", "confidence": 1.0},
+          {"value": "zzz", "source": "manual", "confidence": 1.0}
+        ]
+      }
+    },
+    {
+      "id": "cure_arcana_shadow",
+      "detail": {
+        "asset_id": "asset-arcana-001",
+        "name": "characters/cure_arcana_shadow.safetensors",
+        "file_name": "cure_arcana_shadow.safetensors",
+        "folder": "characters",
+        "model_name": "Cure Arcana Shadow - Pretty Cure",
+        "version_name": "Anima release",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "model_description": "Character model for Cure Arcana Shadow from Pretty Cure.",
+        "version_description": "Use the full character trigger for the strongest identity.",
+        "trigger_words": ["cure arcana shadow", "arcana shadow"],
+        "tags": ["character", "pretty cure", "precure"],
+        "category": "character",
+        "aliases": ["Cure Arcana Shadow"],
+        "character_name": "Cure Arcana Shadow",
+        "source_work": "Pretty Cure",
+        "file_status": {"sha256": "d4444444", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "character", "source": "observed", "confidence": 1.0}],
+        "character_names": [{"value": "Cure Arcana Shadow", "source": "observed", "confidence": 1.0}],
+        "source_works": [
+          {"value": "Pretty Cure", "source": "observed", "confidence": 1.0},
+          {"value": "光之美少女", "source": "manual", "confidence": 1.0}
+        ],
+        "artist_style_names": [],
+        "aliases": [
+          {"value": "Cure Arcana Shadow", "source": "observed", "confidence": 1.0},
+          {"value": "Arcana Shadow", "source": "derived", "confidence": 0.9},
+          {"value": "precure", "source": "manual", "confidence": 1.0}
+        ]
+      }
+    },
+    {
+      "id": "photo_background_style",
+      "detail": {
+        "asset_id": "asset-photo-bg-001",
+        "name": "styles/anima_photo_background_v3.safetensors",
+        "file_name": "anima_photo_background_v3.safetensors",
+        "folder": "styles",
+        "model_name": "Anima Photo Background V3",
+        "version_name": "V3",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "model_description": "A style LoRA for photographic backgrounds and environmental detail.",
+        "version_description": "Designed as a background treatment rather than a character identity.",
+        "trigger_words": ["photo background", "photographic environment"],
+        "tags": ["style", "background", "photography"],
+        "category": "artist_style",
+        "aliases": ["photo background"],
+        "file_status": {"sha256": "e5555555", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "artist_style", "source": "observed", "confidence": 1.0}],
+        "character_names": [],
+        "source_works": [],
+        "artist_style_names": [
+          {"value": "Photo Background", "source": "observed", "confidence": 1.0},
+          {"value": "写真背景", "source": "manual", "confidence": 1.0}
+        ],
+        "aliases": [
+          {"value": "photo background", "source": "observed", "confidence": 1.0},
+          {"value": "写真背景", "source": "manual", "confidence": 1.0}
+        ]
+      }
+    },
+    {
+      "id": "speed_sampling_helper",
+      "detail": {
+        "asset_id": "asset-speed-001",
+        "name": "functional/anima_fast_sampling.safetensors",
+        "file_name": "anima_fast_sampling.safetensors",
+        "folder": "functional",
+        "model_name": "Anima Fast Sampling Helper",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "model_description": "A functional LoRA for faster sampling with fewer steps.",
+        "trigger_words": ["fast sampling"],
+        "tags": ["sampling helper", "few step", "acceleration"],
+        "category": "speed_sampling",
+        "file_status": {"sha256": "1111aaaa", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "speed_sampling", "source": "observed", "confidence": 1.0}],
+        "character_names": [], "source_works": [], "artist_style_names": [],
+        "aliases": [{"value": "采样加速", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "quality_enhancer",
+      "detail": {
+        "asset_id": "asset-quality-001",
+        "name": "functional/anima_highres_quality_boost.safetensors",
+        "file_name": "anima_highres_quality_boost.safetensors",
+        "folder": "functional",
+        "model_name": "Anima High Resolution Quality Boost",
+        "base_model": "Anima", "model_type": "LORA", "sub_type": "LoRA",
+        "model_description": "A functional quality enhancement LoRA for high-resolution output.",
+        "trigger_words": ["highres quality"],
+        "tags": ["quality enhancement", "aesthetic boost"],
+        "category": "quality_enhancement",
+        "file_status": {"sha256": "2222bbbb", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "quality_enhancement", "source": "observed", "confidence": 1.0}],
+        "character_names": [], "source_works": [], "artist_style_names": [],
+        "aliases": [{"value": "画质增强", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "detail_restorer",
+      "detail": {
+        "asset_id": "asset-detail-001",
+        "name": "functional/skin_detail_restorer.safetensors",
+        "file_name": "skin_detail_restorer.safetensors",
+        "folder": "functional",
+        "model_name": "Skin Detail Restorer",
+        "base_model": "Anima", "model_type": "LORA", "sub_type": "LoRA",
+        "model_description": "A functional LoRA for detail restoration and skin detail.",
+        "trigger_words": ["skin detail"],
+        "tags": ["detail restoration", "detail repair"],
+        "category": "detail_restoration",
+        "file_status": {"sha256": "3333cccc", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "detail_restoration", "source": "observed", "confidence": 1.0}],
+        "character_names": [], "source_works": [], "artist_style_names": [],
+        "aliases": [{"value": "细节修复", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "composition_pose_helper",
+      "detail": {
+        "asset_id": "asset-pose-001",
+        "name": "functional/dynamic_pose_composition.safetensors",
+        "file_name": "dynamic_pose_composition.safetensors",
+        "folder": "functional",
+        "model_name": "Dynamic Pose Composition Helper",
+        "base_model": "Anima", "model_type": "LORA", "sub_type": "LoRA",
+        "model_description": "A functional LoRA for composition and dynamic poses.",
+        "trigger_words": ["dynamic pose"],
+        "tags": ["composition", "pose helper"],
+        "category": "composition_pose",
+        "file_status": {"sha256": "4444dddd", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "composition_pose", "source": "observed", "confidence": 1.0}],
+        "character_names": [], "source_works": [], "artist_style_names": [],
+        "aliases": [{"value": "构图姿势", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "lighting_color_helper",
+      "detail": {
+        "asset_id": "asset-light-001",
+        "name": "functional/cinematic_lighting_color.safetensors",
+        "file_name": "cinematic_lighting_color.safetensors",
+        "folder": "functional",
+        "model_name": "Cinematic Lighting and Color",
+        "base_model": "Anima", "model_type": "LORA", "sub_type": "LoRA",
+        "model_description": "A functional LoRA for lighting and color grading.",
+        "trigger_words": ["cinematic lighting"],
+        "tags": ["lighting", "color grading"],
+        "category": "lighting_color",
+        "file_status": {"sha256": "5555eeee", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "lighting_color", "source": "observed", "confidence": 1.0}],
+        "character_names": [], "source_works": [], "artist_style_names": [],
+        "aliases": [{"value": "光影色彩", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "clothing_concept_helper",
+      "detail": {
+        "asset_id": "asset-outfit-001",
+        "name": "functional/outfit_concept_pack.safetensors",
+        "file_name": "outfit_concept_pack.safetensors",
+        "folder": "functional",
+        "model_name": "Outfit Concept Pack",
+        "base_model": "Anima", "model_type": "LORA", "sub_type": "LoRA",
+        "model_description": "A functional LoRA for clothing and outfit concepts.",
+        "trigger_words": ["outfit concept"],
+        "tags": ["clothing", "costume", "concept pack"],
+        "category": "clothing_concept",
+        "file_status": {"sha256": "6666ffff", "loadable": true, "from_civitai": true},
+        "metadata_health": {"status": "complete", "available_sources": ["manager_list", "manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "clothing_concept", "source": "observed", "confidence": 1.0}],
+        "character_names": [], "source_works": [], "artist_style_names": [],
+        "aliases": [{"value": "服装概念", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "sparse_unknown",
+      "detail": {
+        "asset_id": "asset-sparse-001",
+        "name": "uncategorized/mystery_epoch24.safetensors",
+        "file_name": "mystery_epoch24.safetensors",
+        "folder": "uncategorized",
+        "model_name": "Mystery Epoch 24",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "trigger_words": ["mystery_token"],
+        "tags": [],
+        "category": "unknown",
+        "file_status": {"sha256": "f6666666", "loadable": true, "from_civitai": false},
+        "metadata_health": {"status": "partial", "available_sources": ["manager_list"], "missing_sources": ["manager_metadata", "model_description"]}
+      },
+      "semantic": {
+        "analysis_status": "review_needed",
+        "category": [{"value": "unclassified", "source": "llm_inferred", "confidence": 0.35}],
+        "character_names": [],
+        "source_works": [],
+        "artist_style_names": [],
+        "aliases": []
+      }
+    },
+    {
+      "id": "ambiguous_variant_a",
+      "detail": {
+        "asset_id": "asset-amb-a-001",
+        "name": "characters/variant_a.safetensors",
+        "file_name": "variant_a.safetensors",
+        "folder": "characters",
+        "model_name": "Character Variant A",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "trigger_words": ["variant_a_token"],
+        "tags": ["character"],
+        "category": "character",
+        "file_status": {"sha256": "a7777777", "loadable": true, "from_civitai": false},
+        "metadata_health": {"status": "partial", "available_sources": ["manager_list"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "character", "source": "manual", "confidence": 1.0}],
+        "character_names": [{"value": "共享测试角色", "source": "manual", "confidence": 1.0}],
+        "source_works": [],
+        "artist_style_names": [],
+        "aliases": [{"value": "共享测试别名", "source": "manual", "confidence": 1.0}]
+      }
+    },
+    {
+      "id": "ambiguous_variant_b",
+      "detail": {
+        "asset_id": "asset-amb-b-001",
+        "name": "characters/variant_b.safetensors",
+        "file_name": "variant_b.safetensors",
+        "folder": "characters",
+        "model_name": "Character Variant B",
+        "base_model": "Anima",
+        "model_type": "LORA",
+        "sub_type": "LoRA",
+        "trigger_words": ["variant_b_token"],
+        "tags": ["character"],
+        "category": "character",
+        "file_status": {"sha256": "b8888888", "loadable": true, "from_civitai": false},
+        "metadata_health": {"status": "partial", "available_sources": ["manager_list"]}
+      },
+      "semantic": {
+        "analysis_status": "searchable",
+        "category": [{"value": "character", "source": "manual", "confidence": 1.0}],
+        "character_names": [{"value": "共享测试角色", "source": "manual", "confidence": 1.0}],
+        "source_works": [],
+        "artist_style_names": [],
+        "aliases": [{"value": "共享测试别名", "source": "manual", "confidence": 1.0}]
+      }
+    }
+  ],
+  "unique_queries": [
+    {"query": "Denia", "expected_id": "denia_wuwa"},
+    {"query": "达妮娅", "expected_id": "denia_wuwa"},
+    {"query": "鸣潮达妮娅", "expected_id": "denia_wuwa"},
+    {"query": "wuwa", "expected_id": "denia_wuwa"},
+    {"query": "Remielle", "expected_id": "remielle_zzz"},
+    {"query": "拉米尔", "expected_id": "remielle_zzz"},
+    {"query": "绝区零拉米尔", "expected_id": "remielle_zzz"},
+    {"query": "Sunna", "expected_id": "sunna_zzz"},
+    {"query": "Cure Arcana Shadow", "expected_id": "cure_arcana_shadow"},
+    {"query": "Arcana Shadow", "expected_id": "cure_arcana_shadow"},
+    {"query": "光之美少女", "expected_id": "cure_arcana_shadow"},
+    {"query": "precure", "expected_id": "cure_arcana_shadow"},
+    {"query": "写真背景", "expected_id": "photo_background_style"},
+    {"query": "photo background", "expected_id": "photo_background_style"},
+    {"query": "采样加速", "expected_id": "speed_sampling_helper"},
+    {"query": "画质增强", "expected_id": "quality_enhancer"},
+    {"query": "细节修复", "expected_id": "detail_restorer"},
+    {"query": "构图姿势", "expected_id": "composition_pose_helper"},
+    {"query": "光影色彩", "expected_id": "lighting_color_helper"},
+    {"query": "服装概念", "expected_id": "clothing_concept_helper"},
+    {"query": "mystery_epoch24", "expected_id": "sparse_unknown"}
+  ],
+  "ambiguous_queries": [
+    {"query": "zzz", "expected_ids": ["remielle_zzz", "sunna_zzz"]},
+    {"query": "绝区零", "expected_ids": ["remielle_zzz", "sunna_zzz"]},
+    {"query": "共享测试别名", "expected_ids": ["ambiguous_variant_a", "ambiguous_variant_b"]}
+  ],
+  "removed_semantic": {
+    "name": "retired/old_character.safetensors",
+    "sha256": "c9999999",
+    "analysis_status": "searchable",
+    "category": [{"value": "character", "source": "manual", "confidence": 1.0}],
+    "character_names": [{"value": "旧测试角色", "source": "manual", "confidence": 1.0}],
+    "source_works": [],
+    "artist_style_names": [],
+    "aliases": [{"value": "不可加载旧角色", "source": "manual", "confidence": 1.0}]
+  }
+}

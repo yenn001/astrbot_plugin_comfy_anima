@@ -1,0 +1,856 @@
+"""使用轻量 AstrBot 桩验证主模块可导入及基础辅助逻辑。"""
+
+import importlib
+import sys
+import tempfile
+import types
+import unittest
+from dataclasses import replace
+from pathlib import Path
+
+from ..models import LoraSelection
+
+
+class _DecoratorGroup:
+    """模拟 AstrBot 指令组装饰器返回值。"""
+
+    def command(self, *_args, **_kwargs):
+        return lambda function: function
+
+
+class _FilterStub:
+    """模拟主模块定义阶段使用的 filter API。"""
+
+    class PermissionType:
+        ADMIN = "admin"
+
+    class PlatformAdapterType:
+        AIOCQHTTP = "aiocqhttp"
+
+    class EventMessageType:
+        ALL = "all"
+
+    @staticmethod
+    def command_group(*_args, **_kwargs):
+        return lambda _function: _DecoratorGroup()
+
+    @staticmethod
+    def _passthrough(*_args, **_kwargs):
+        return lambda function: function
+
+    command = _passthrough
+    llm_tool = _passthrough
+    permission_type = _passthrough
+    platform_adapter_type = _passthrough
+    event_message_type = _passthrough
+    on_llm_request = _passthrough
+    on_decorating_result = _passthrough
+
+
+class _Star:
+    def __init__(self, context):
+        self.context = context
+
+
+class _Plain:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Image:
+    @staticmethod
+    def fromFileSystem(path):
+        return ("image", str(path))
+
+
+class _Node:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _install_astrbot_stubs() -> None:
+    """安装导入 main.py 所需的最小模块桩。"""
+    astrbot = types.ModuleType("astrbot")
+    api = types.ModuleType("astrbot.api")
+    event = types.ModuleType("astrbot.api.event")
+    star = types.ModuleType("astrbot.api.star")
+    components = types.ModuleType("astrbot.api.message_components")
+
+    api.logger = types.SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+        error=lambda *_args, **_kwargs: None,
+    )
+    event.AstrMessageEvent = object
+    event.filter = _FilterStub
+    star.Context = object
+    star.Star = _Star
+    star.register = lambda *_args, **_kwargs: (lambda cls: cls)
+    components.Plain = _Plain
+    components.Image = _Image
+    components.Node = _Node
+
+    sys.modules.update(
+        {
+            "astrbot": astrbot,
+            "astrbot.api": api,
+            "astrbot.api.event": event,
+            "astrbot.api.star": star,
+            "astrbot.api.message_components": components,
+        }
+    )
+
+
+class MainCompatibilityTests(unittest.TestCase):
+    """主插件定义及纯辅助方法测试。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def test_main_module_imports_with_documented_api_surface(self) -> None:
+        self.assertTrue(hasattr(self.main, "ComfyAnimaPlugin"))
+
+    def test_natural_draw_detection_is_conservative(self) -> None:
+        detector = self.main.ComfyAnimaPlugin._looks_like_draw_request
+        self.assertTrue(detector("帮我画一个雨夜里的猫娘"))
+        self.assertTrue(detector("帮我画一个戴帽子的女孩"))
+        self.assertTrue(detector("生成一张赛博朋克城市图片"))
+        self.assertFalse(detector("帮我写一个 Python 列表"))
+
+    def test_chinese_command_keeps_multiword_tags(self) -> None:
+        extractor = self.main.ComfyAnimaPlugin._extract_command_text
+        self.assertEqual(
+            extractor("/画图 1girl, white hair, blue eyes", "1girl", "画图"),
+            "1girl, white hair, blue eyes",
+        )
+
+    def test_runtime_global_lock_allows_only_admin(self) -> None:
+        plugin = self.main.ComfyAnimaPlugin(object(), {"global_lock": True})
+
+        class Event:
+            @staticmethod
+            def get_group_id():
+                return "123"
+
+            def __init__(self, admin):
+                self._admin = admin
+
+            def is_admin(self):
+                return self._admin
+
+        self.assertIsNotNone(plugin._access_error(Event(False), "cat"))
+        self.assertIsNone(plugin._access_error(Event(True), "cat"))
+
+
+class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """验证自然语言绘图不会在第一条进度消息后提前终止。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_event_stops_only_after_generator_finishes(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_natural_draw=True)
+        plugin._access_error = lambda _event, _message: None
+        plugin._director = None
+        plugin._director_error = "test unavailable"
+
+        class Event:
+            message_str = "帮我画一个小猫"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_draw(event)
+
+        first_result = await anext(generator)
+        self.assertIn("LLM", first_result)
+        self.assertFalse(event.stopped)
+
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_success_path_yields_progress_then_image_before_stopping(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_natural_draw=True,
+            show_llm_prompt=False,
+        )
+        plugin._access_error = lambda _event, _message: None
+        plugin._director = object()
+
+        async def generate_prompt(_event, _message):
+            return "1girl, cat ears", "test-provider", "school uniform"
+
+        captured_options = []
+
+        async def run_job(_event, _options):
+            captured_options.append(_options)
+            return (["test.png"], 123, "", "", "")
+
+        plugin._generate_directed_prompt = generate_prompt
+        plugin._run_job = run_job
+        plugin._make_image_result = (
+            lambda _event, _paths, _seed, forward=False: "IMAGE_RESULT"
+        )
+        plugin._schedule_cleanup = lambda _paths: None
+
+        class Event:
+            message_str = "帮我画一个小猫"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_draw(event)
+
+        progress = await anext(generator)
+        self.assertIn("正在分析", progress)
+        self.assertFalse(event.stopped)
+
+        image_result = await anext(generator)
+        self.assertEqual(image_result, "IMAGE_RESULT")
+        self.assertEqual(captured_options[0].negative_prompt, "school uniform")
+        self.assertFalse(event.stopped)
+
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+
+class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
+    """验证风格保存提示及延迟单插件重载机制。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_scheduler_reloads_only_current_plugin(self) -> None:
+        calls = []
+
+        class StarManager:
+            async def reload(self, plugin_name):
+                calls.append(plugin_name)
+                return True, None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(_star_manager=StarManager())
+        plugin._self_reload_tasks = set()
+
+        task = plugin._schedule_self_reload(delay=0)
+        self.assertIsNotNone(task)
+        await task
+        self.assertEqual(calls, [self.main.PLUGIN_NAME])
+
+    async def test_style_save_schedules_reload_after_persistence(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=False,
+            auto_reload_after_style_save=True,
+        )
+        plugin._lora_catalog = None
+
+        async def refresh_lora_manager(_action):
+            return 1
+
+        plugin._refresh_lora_manager_before = refresh_lora_manager
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        persisted = []
+        scheduled = []
+        plugin._persist_config = (
+            lambda key, value: persisted.append((key, value)) or True
+        )
+        plugin._schedule_self_reload = (
+            lambda **_kwargs: scheduled.append(True) or object()
+        )
+
+        class Event:
+            message_str = "/lora组合保存 风格 002 <lora:test-style:0.6>"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        results = [result async for result in plugin.cmd_lora_preset_save(Event())]
+        self.assertEqual(len(results), 1)
+        self.assertIn("风格002", results[0])
+        self.assertIn("自动重载", results[0])
+        self.assertEqual(scheduled, [True])
+        self.assertEqual(persisted[0][0], "lora_presets")
+
+
+class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
+    """验证切换前刷新清单、持久化并更新 UNET 工作流设置。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_switch_refreshes_latest_catalog_before_persisting(self) -> None:
+        events = []
+        entries = (
+            types.SimpleNamespace(index=1, name="anima-a.safetensors"),
+            types.SimpleNamespace(index=2, name="anima-b.safetensors"),
+        )
+
+        class Catalog:
+            async def list_models(self):
+                events.append("list")
+                return entries
+
+            @staticmethod
+            def resolve(identifier, refreshed_entries):
+                events.append("resolve")
+                self.assertEqual(refreshed_entries, entries)
+                self.assertEqual(identifier, "2")
+                return refreshed_entries[1]
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin.config = {"workflow_file": "workflow/anima_api.json"}
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        plugin._unet_catalog = Catalog()
+        plugin._unet_catalog_error = ""
+        plugin._schedule_self_reload = (
+            lambda **kwargs: events.append(f"reload:{kwargs['reason']}") or object()
+        )
+
+        class Event:
+            message_str = "/模型切换 2"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        results = [result async for result in plugin.cmd_unet_model_switch(Event())]
+        self.assertEqual(events[:2], ["list", "resolve"])
+        self.assertEqual(plugin.config["unet_model_name"], "anima-b.safetensors")
+        self.assertEqual(plugin.settings.unet_model_name, "anima-b.safetensors")
+        self.assertEqual(events[-1], "reload:切换 UNET 模型")
+        self.assertIn("全部 2 个模型", results[-1])
+        workflow, _, _ = plugin._workflow_builder.build(
+            self.main.GenerationOptions(prompt="1girl", seed=1)
+        )
+        self.assertEqual(
+            workflow["429"]["inputs"]["unet_name"],
+            "anima-b.safetensors",
+        )
+
+
+class MandatoryLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """每次 LLM LoRA 工具调用都必须重新扫描 Manager。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_repeated_tool_calls_refresh_every_time(self) -> None:
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (types.SimpleNamespace(name="denia"),)
+
+            async def format_for_llm(self, **_kwargs):
+                return "fresh denia"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin.settings = types.SimpleNamespace(lora_max_results=50)
+
+        first = await plugin.list_anima_loras(object(), keyword="denia")
+        second = await plugin.list_anima_loras(object(), keyword="denia")
+
+        self.assertEqual(first, "fresh denia")
+        self.assertEqual(second, "fresh denia")
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+
+    async def test_deleted_lora_preset_is_omitted_after_fresh_validation(self) -> None:
+        class Catalog:
+            async def refresh_for_operation(self):
+                return (types.SimpleNamespace(name="present"),)
+
+            async def resolve_selections(self, selections, *, strict):
+                if any(selection.name == "deleted-denia" for selection in selections):
+                    raise self_main.LoraCatalogError("missing")
+                return selections
+
+        self_main = self.main
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        registry.save(
+            name="风格正常",
+            category="style",
+            selections=(LoraSelection("present", 0.5),),
+        )
+        registry.save(
+            name="风格旧缓存",
+            category="style",
+            selections=(LoraSelection("deleted-denia", 0.8),),
+        )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = registry
+
+        result = await plugin.list_anima_lora_presets(
+            object(),
+            category="风格",
+        )
+
+        self.assertIn("<lora:present:0.5>", result)
+        self.assertNotIn("<lora:deleted-denia:0.8>", result)
+        self.assertIn("风格旧缓存", result)
+
+
+class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
+    """Verify that the Web UI reuses the plugin's strict live-data rules."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_lora_search_refreshes_for_every_request(self) -> None:
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (
+                    types.SimpleNamespace(
+                        name="black deniav1-2.safetensors",
+                        category="character",
+                        model_name="Denia",
+                        base_model="Anima",
+                        trigger_words=("denia",),
+                        tags=("character",),
+                        source="manager+comfyui",
+                        favorite=False,
+                        aliases=("denia",),
+                        character_name="Denia",
+                        source_work="Wuthering Waves",
+                        from_civitai=True,
+                    ),
+                )
+
+            @staticmethod
+            def search_records(records, keyword):
+                return tuple(
+                    record
+                    for record in records
+                    if keyword.casefold() in record.name.casefold()
+                    or keyword.casefold() in record.model_name.casefold()
+                )
+
+            @staticmethod
+            def archive_summary(records):
+                return {
+                    "categories": {
+                        "character": len(records),
+                        "artist_style": 0,
+                        "mixed": 0,
+                        "unknown": 0,
+                    },
+                    "civitai_enriched": len(records),
+                    "identified_characters": len(records),
+                    "works": [],
+                }
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+
+        first = await plugin.web_ui_search_loras("denia", 50)
+        second = await plugin.web_ui_search_loras("denia", 50)
+
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+        self.assertEqual(first["items"][0]["name"], "black deniav1-2.safetensors")
+        self.assertEqual(second["total"], 1)
+
+    async def test_web_ui_archive_state_distinguishes_current_stale_and_unarchived(self) -> None:
+        catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+        record = catalog_module.LoraRecord(
+            name="characters/denia.safetensors",
+            model_name="Denia",
+            description="current metadata",
+            base_model="Anima",
+            trigger_words=("denia",),
+            tags=("character",),
+            aliases=("达妮娅",),
+            character_name="Denia",
+            source_work="Wuthering Waves",
+            sha256="abc",
+            from_civitai=True,
+        )
+        fingerprint = self.main.LoraArchiveService.record_fingerprint(record)
+        entry = {
+            "catalog_source_fingerprint": fingerprint,
+            "classification": {"category": "character"},
+        }
+
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(record, entry),
+            "archived",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(
+                record,
+                {**entry, "catalog_source_fingerprint": "old"},
+            ),
+            "stale",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(record, {}),
+            "metadata_only",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(
+                replace(record, from_civitai=False),
+                {},
+            ),
+            "unarchived",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(
+                record,
+                {"catalog_source_fingerprint": fingerprint, "classification": {}},
+            ),
+            "metadata_only",
+        )
+
+    async def test_removed_only_archive_sync_does_not_call_llm(self) -> None:
+        class Status:
+            def __init__(self, *, removed=(), changed=True):
+                self.added = ()
+                self.modified = ()
+                self.removed = tuple(removed)
+                self.changed = changed
+
+            def to_dict(self):
+                return {
+                    "added": list(self.added),
+                    "modified": list(self.modified),
+                    "removed": list(self.removed),
+                    "changed": self.changed,
+                }
+
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return ()
+
+        class Archiver:
+            def __init__(self):
+                self.synced = 0
+
+            def catalog_status(self, _records):
+                return Status(removed=("deleted.safetensors",))
+
+            def sync_catalog_presence(self, _records):
+                self.synced += 1
+                return Status(removed=(), changed=False)
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_archiver = Archiver()
+        plugin._run_lora_archive_llm = lambda *_args: self.fail("LLM must not run")
+
+        result = await plugin.web_ui_archive_loras({"sync_only": True})
+
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["removed_names"], ["deleted.safetensors"])
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+        self.assertEqual(plugin._lora_archiver.synced, 1)
+
+    async def test_provider_list_reads_instantiated_astrbot_chat_models(self) -> None:
+        class Provider:
+            def __init__(self, provider_id, model, provider_type, name, key):
+                self.provider_config = {
+                    "id": provider_id,
+                    "model": model,
+                    "type": provider_type,
+                    "name": name,
+                    "key": key,
+                }
+                self._meta = types.SimpleNamespace(
+                    id=provider_id,
+                    model=model,
+                    type=provider_type,
+                )
+
+            def meta(self):
+                return self._meta
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        runtime_provider = Provider(
+            "openai-custom-1",
+            "gpt-test",
+            "openai_chat_completion",
+            "绘图导演",
+            "secret-key",
+        )
+        plugin.context = types.SimpleNamespace(
+            get_all_providers=lambda: [runtime_provider],
+            provider_manager=types.SimpleNamespace(
+                providers_config=[
+                    {
+                        **runtime_provider.provider_config,
+                        "provider_type": "chat_completion",
+                        "enable": True,
+                    },
+                    {
+                        "id": "saved-disabled",
+                        "type": "openai_chat_completion",
+                        "provider_type": "chat_completion",
+                        "model": "gpt-disabled",
+                        "enable": False,
+                        "key": "another-secret",
+                    },
+                    {
+                        "id": "tts-provider",
+                        "type": "edge_tts",
+                        "provider_type": "text_to_speech",
+                        "enable": True,
+                    },
+                ]
+            ),
+        )
+        plugin.settings = types.SimpleNamespace(
+            prompt_llm_provider_id="openai-custom-1"
+        )
+
+        result = await plugin.web_ui_list_providers()
+
+        self.assertEqual(result["selected"], "openai-custom-1")
+        self.assertEqual(result["items"][0]["model"], "gpt-test")
+        self.assertEqual(result["items"][0]["name"], "绘图导演")
+        self.assertTrue(result["items"][0]["available"])
+        self.assertEqual(result["items"][1]["id"], "saved-disabled")
+        self.assertFalse(result["items"][1]["available"])
+        self.assertNotIn("tts-provider", str(result))
+        self.assertNotIn("key", result["items"][0])
+        self.assertNotIn("secret-key", str(result))
+        self.assertNotIn("another-secret", str(result))
+
+    async def test_settings_save_keeps_existing_password_when_omitted(self) -> None:
+        class Config(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.saved = 0
+
+            def save_config(self):
+                self.saved += 1
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.config = Config(
+            {
+                "enable_web_ui": True,
+                "web_ui_password": "existing-password",
+                "default_width": 832,
+                "max_preset_loras": 12,
+                "max_total_dynamic_loras": 12,
+            }
+        )
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin._schedule_self_reload = lambda **_kwargs: object()
+
+        result = await plugin.web_ui_save_settings({"default_width": 1024})
+
+        self.assertEqual(plugin.config["default_width"], 1024)
+        self.assertEqual(plugin.config["web_ui_password"], "existing-password")
+        self.assertEqual(plugin.config.saved, 1)
+        self.assertTrue(result["reload_scheduled"])
+
+    async def test_web_ui_metadata_fetch_refreshes_before_and_after(self) -> None:
+        record = types.SimpleNamespace(
+            name="characters/denia.safetensors",
+            file_path="E:/loras/characters/denia.safetensors",
+        )
+
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (record,)
+
+        class MetadataService:
+            def __init__(self):
+                self.paths = []
+
+            async def fetch_civitai_metadata(self, path):
+                self.paths.append(path)
+                return True, "ok"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_downloader = MetadataService()
+        plugin._lora_download_error = ""
+        plugin._lora_archiver = self.main.LoraArchiveService(Path("archive.json"))
+
+        result = await plugin.web_ui_fetch_lora_metadata(
+            {"mode": "selected", "names": [record.name]}
+        )
+
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+        self.assertEqual(plugin._lora_downloader.paths, [record.file_path])
+        self.assertEqual(result["success"], 1)
+
+    async def test_web_ui_archive_contract_supports_all_and_force(self) -> None:
+        captured = {}
+
+        class Result:
+            skipped = False
+            selected_count = 2
+            batch_count = 1
+
+            @staticmethod
+            def to_dict():
+                return {
+                    "skipped": False,
+                    "selected_count": 2,
+                    "batch_count": 1,
+                    "updated_names": ["a", "b"],
+                    "status": {"changed": False},
+                }
+
+        class Archiver:
+            async def archive_from_catalog(self, catalog, callback, **kwargs):
+                captured.update(kwargs)
+                captured["callback"] = callback
+                return Result()
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = object()
+        plugin._lora_archiver = Archiver()
+        plugin.settings = types.SimpleNamespace(prompt_llm_provider_id="director")
+
+        result = await plugin.web_ui_archive_loras(
+            {"mode": "all", "names": [], "force": True}
+        )
+
+        self.assertIsNone(captured["selected_names"])
+        self.assertFalse(captured["skip_when_unchanged"])
+        self.assertEqual(result["provider_id"], "director")
+        self.assertEqual(result["selected_count"], 2)
+
+    async def test_v2_archive_returns_run_id_and_finishes_in_background(self) -> None:
+        catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+        semantic_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_semantic"
+        )
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+        record = catalog_module.LoraRecord(
+            name="characters/denia.safetensors",
+            model_name="Denia",
+            category="character",
+            sha256="a" * 64,
+        )
+
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (record,)
+
+            async def get_detail_v2(self, current):
+                return types.SimpleNamespace(
+                    name=current.name,
+                    metadata_health=types.SimpleNamespace(
+                        status="complete",
+                        missing_sources=(),
+                        error_sources=(),
+                    ),
+                )
+
+        class Analysis:
+            def __init__(self, store):
+                self.store = store
+
+            async def run(self, details, callback, **kwargs):
+                self.store.finish_task(
+                    kwargs["run_id"],
+                    "succeeded",
+                    completed_items=len(details),
+                    failed_items=0,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = task_module.TaskStore(root / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._lora_catalog = Catalog()
+            plugin._semantic_index = semantic_module.LoraSemanticIndex.empty()
+            plugin._semantic_index_path = root / "semantic.json"
+            plugin._task_store = store
+            plugin._task_store_error = ""
+            plugin._lora_analysis = Analysis(store)
+            plugin._background_task_runs = {}
+            plugin.settings = types.SimpleNamespace(
+                prompt_llm_provider_id="director",
+            )
+            plugin.context = types.SimpleNamespace(
+                get_all_providers=lambda: [],
+                provider_manager=types.SimpleNamespace(providers_config=[]),
+                get_provider_by_id=lambda identifier: (
+                    object() if identifier == "director" else None
+                ),
+            )
+
+            result = await plugin.web_ui_archive_loras(
+                {"mode": "selected", "names": [record.name]}
+            )
+            self.assertEqual(result["status"], "queued")
+            self.assertTrue(result["run_id"])
+            task = plugin._background_task_runs[result["run_id"]]
+            await task
+            saved = store.get_task(result["run_id"])
+            self.assertEqual(saved["status"], "succeeded")
+            self.assertEqual(saved["completed_items"], 1)
+            self.assertGreaterEqual(plugin._lora_catalog.refreshes, 2)
+            store.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
