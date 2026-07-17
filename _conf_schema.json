@@ -148,7 +148,7 @@
   "reverse_prompt_system_prompt": {
     "description": "在线反推 System Prompt",
     "type": "text",
-    "hint": "留空使用插件内置的结构化 Anima 反推提示词",
+    "hint": "留空使用插件内置规则；自定义内容只作为分析偏好叠加，不能覆盖强制 JSON 协议",
     "default": ""
   },
   "max_input_image_size_mb": {

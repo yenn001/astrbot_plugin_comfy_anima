@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.1.1
+AstrBot Comfy Anima 插件 v1.1.2
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.1.1
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.1.1
+版本: 1.1.2
 日期: 2026-07-14
 """
 
@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Mapping, Optional
 
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
@@ -789,12 +789,32 @@ class ComfyAnimaPlugin(Star):
                     "正在调用所选多模态 Provider 提取结构化画面事实。",
                     "reverse_provider_started",
                 )
+
+                def reverse_progress(
+                    message: str,
+                    event_code: str,
+                    details: Mapping[str, Any],
+                ) -> None:
+                    self._record_image_task_phase(
+                        job,
+                        "provider",
+                        message,
+                        event_code,
+                        details=dict(details),
+                        level=(
+                            "WARNING"
+                            if event_code == "reverse_response_invalid"
+                            else "INFO"
+                        ),
+                    )
+
                 async with self._generation_slots:
                     result, provider_id = await self._reverse_prompt.reverse(
                         self.context,
                         event,
                         image_path,
                         supplement,
+                        reverse_progress,
                     )
                 job.state = "completed"
                 self._record_image_task_phase(
@@ -816,13 +836,21 @@ class ComfyAnimaPlugin(Star):
                 "reverse prompt",
                 operation,
             )
-        except ValueError as exc:
-            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+        except ReversePromptError as exc:
+            message = exc.user_message
+            logger.error(
+                f"[{PLUGIN_NAME}] reverse prompt failed: "
+                f"code={exc.code}, details={exc.details}"
+            )
+            yield event.plain_result(f"{MessageEmoji.ERROR} 反推失败: {message}")
             return
-        except (IncomingImageError, ReversePromptError) as exc:
+        except IncomingImageError as exc:
             message = getattr(exc, "user_message", str(exc))
             logger.error(f"[{PLUGIN_NAME}] reverse prompt failed: {exc}", exc_info=True)
             yield event.plain_result(f"{MessageEmoji.ERROR} 反推失败: {message}")
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
             return
         yield event.plain_result(
             f"{result.render(provider_id)}\n\n反推耗时：{elapsed:.2f} 秒"
@@ -875,12 +903,32 @@ class ComfyAnimaPlugin(Star):
                     "正在提取图片中的可观察画面事实。",
                     "reverse_draw_provider_started",
                 )
+
+                def reverse_progress(
+                    message: str,
+                    event_code: str,
+                    details: Mapping[str, Any],
+                ) -> None:
+                    self._record_image_task_phase(
+                        job,
+                        "provider",
+                        message,
+                        event_code,
+                        details=dict(details),
+                        level=(
+                            "WARNING"
+                            if event_code == "reverse_response_invalid"
+                            else "INFO"
+                        ),
+                    )
+
                 async with self._generation_slots:
                     reverse_result, reverse_provider = await self._reverse_prompt.reverse(
                         self.context,
                         event,
                         image_path,
                         supplement,
+                        reverse_progress,
                     )
                 job.state = "directing"
                 self._record_image_task_phase(
@@ -896,6 +944,9 @@ class ComfyAnimaPlugin(Star):
                         reverse_result.drawing_request(supplement),
                     )
                 )
+                final_access_error = self._access_error(event, final_prompt)
+                if final_access_error:
+                    raise ValueError(final_access_error)
                 negative_prompt = ", ".join(
                     part
                     for part in (
@@ -945,10 +996,15 @@ class ComfyAnimaPlugin(Star):
                 final_prompt,
                 director_provider,
             ) = await self._run_auxiliary_job(event, "reverse draw", operation)
-        except ValueError as exc:
-            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+        except ReversePromptError as exc:
+            message = exc.user_message
+            logger.error(
+                f"[{PLUGIN_NAME}] reverse draw failed: "
+                f"code={exc.code}, details={exc.details}"
+            )
+            yield event.plain_result(f"{MessageEmoji.ERROR} 反推画图失败: {message}")
             return
-        except (IncomingImageError, ReversePromptError, PromptDirectorError) as exc:
+        except (IncomingImageError, PromptDirectorError) as exc:
             message = getattr(exc, "user_message", str(exc))
             logger.error(f"[{PLUGIN_NAME}] reverse draw failed: {exc}", exc_info=True)
             yield event.plain_result(f"{MessageEmoji.ERROR} 反推画图失败: {message}")
@@ -957,6 +1013,9 @@ class ComfyAnimaPlugin(Star):
             message = getattr(exc, "user_message", str(exc))
             logger.error(f"[{PLUGIN_NAME}] reverse draw generation failed: {exc}", exc_info=True)
             yield event.plain_result(f"{MessageEmoji.ERROR} 生成失败: {message}")
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
             return
         image_paths, seed, _, _, director_warning = generated
         if director_warning:
@@ -4056,7 +4115,14 @@ QQ快捷指令:
                         )
                     raise
                 except Exception as exc:
+                    failed_stage = job.failed_stage or job.state
+                    job.failed_stage = failed_stage
                     job.state = "failed"
+                    error_code = str(
+                        getattr(exc, "code", "image_task_failed")
+                    )[:80]
+                    if not re.fullmatch(r"[a-z0-9_\-]+", error_code):
+                        error_code = "image_task_failed"
                     if self._task_store is not None and job.task_run_id:
                         safe_message = str(
                             getattr(exc, "user_message", type(exc).__name__)
@@ -4069,7 +4135,9 @@ QQ快捷指令:
                             event_code="image_task_failed",
                             details={
                                 "final_state": job.state,
+                                "failed_stage": failed_stage,
                                 "error_type": type(exc).__name__,
+                                "error_code": error_code,
                             },
                         )
                         self._task_store.finish_task(
@@ -4077,7 +4145,7 @@ QQ快捷指令:
                             "failed",
                             completed_items=0,
                             failed_items=1,
-                            error_code="image_task_failed",
+                            error_code=error_code,
                             error_summary=safe_message,
                         )
                     raise
@@ -4100,6 +4168,7 @@ QQ快捷指令:
         event_code: str,
         *,
         details: Optional[dict[str, Any]] = None,
+        level: str = "INFO",
     ) -> None:
         if self._task_store is None or not job.task_run_id:
             return
@@ -4107,6 +4176,7 @@ QQ快捷指令:
             job.task_run_id,
             phase,
             message,
+            level=level,
             event_code=event_code,
             details=details,
         )
@@ -4413,6 +4483,7 @@ QQ快捷指令:
                 image_path.unlink(missing_ok=True)
             raise
         except Exception:
+            job.failed_stage = job.failed_stage or job.state
             job.state = "failed"
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)

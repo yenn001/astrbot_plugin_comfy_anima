@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.1.1
+AstrBot Comfy Anima 插件 v1.1.2
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.1.1
+版本: 1.1.2
 日期: 2026-07-14
 """
 
@@ -562,3 +562,4 @@ class GenerationJob:
     prompt_id: Optional[str] = None
     state: str = "queued"
     task_run_id: str = ""
+    failed_stage: str = ""

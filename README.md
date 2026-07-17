@@ -1,6 +1,6 @@
 # AstrBot Comfy Anima 插件
 
-> 正式版：v1.1.1
+> 正式版：v1.1.2
 
 面向 aiocqhttp / NapCat QQ、并针对随包附带的 Anima 工作流专门适配的 ComfyUI 绘图插件。支持自然语言 LLM 分镜、局域网 LoRA 查询工具、动态 LoRA 注入、普通 LLM 回复中的 `<pic>` 标签自动出图、QQ 合并转发和群级风控。
 

@@ -1,5 +1,6 @@
 """使用轻量 AstrBot 桩验证主模块可导入及基础辅助逻辑。"""
 
+import asyncio
 import importlib
 import sys
 import tempfile
@@ -238,6 +239,230 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StopAsyncIteration):
             await anext(generator)
         self.assertTrue(event.stopped)
+
+
+class AuxiliaryImageTaskFailureTests(unittest.IsolatedAsyncioTestCase):
+    """验证反推失败阶段和安全错误码进入持久任务记录。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_reverse_failure_keeps_stage_and_omits_private_detail(self) -> None:
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+        class Event:
+            @staticmethod
+            def get_sender_id():
+                return "tester"
+
+            @staticmethod
+            def is_admin():
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._jobs_lock = asyncio.Lock()
+            plugin._active_jobs = {}
+            plugin._last_request_at = {}
+            plugin._task_store = store
+            plugin._client = None
+            plugin.settings = types.SimpleNamespace(
+                admin_ignore_cooldown=False,
+                user_cooldown=0,
+            )
+
+            async def operation(job):
+                job.state = "reverse_prompting"
+                raise self.main.ReversePromptError(
+                    "结构化反推失败",
+                    "PRIVATE_PROVIDER_BODY",
+                    code="repair_exhausted",
+                )
+
+            with self.assertRaises(self.main.ReversePromptError):
+                await plugin._run_auxiliary_job(
+                    Event(),
+                    "reverse draw",
+                    operation,
+                )
+
+            task = store.recent_tasks(limit=1)[0]
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["error_code"], "repair_exhausted")
+            self.assertEqual(task["error_summary"], "结构化反推失败")
+            events = store.read_events(run_id=task["run_id"], limit=50)["entries"]
+            failed = [
+                item
+                for item in events
+                if item["event_code"] == "image_task_failed"
+            ]
+            self.assertEqual(
+                failed[0]["details"]["failed_stage"],
+                "reverse_prompting",
+            )
+            persisted = str(events) + str(store.recent_runtime_logs(limit=50))
+            self.assertNotIn("PRIVATE_PROVIDER_BODY", persisted)
+            store.close()
+
+    async def test_nested_generation_failure_keeps_the_real_stage(self) -> None:
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+        class Event:
+            @staticmethod
+            def get_sender_id():
+                return "tester"
+
+            @staticmethod
+            def is_admin():
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._jobs_lock = asyncio.Lock()
+            plugin._active_jobs = {}
+            plugin._last_request_at = {}
+            plugin._task_store = store
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin.settings = self.main.PluginSettings.from_mapping(
+                {
+                    "admin_ignore_cooldown": False,
+                    "user_cooldown": 0,
+                    "enable_prompt_llm": True,
+                    "prompt_llm_fallback": False,
+                }
+            )
+
+            async def fail_director(_event, _prompt):
+                raise self.main.PromptDirectorError(
+                    "director failed",
+                    fatal=True,
+                )
+
+            plugin._generate_directed_prompt = fail_director
+
+            async def operation(job):
+                return await plugin._execute_job(
+                    job,
+                    self.main.GenerationOptions(prompt="safe prompt"),
+                    Event(),
+                )
+
+            with self.assertRaises(self.main.PromptDirectorError):
+                await plugin._run_auxiliary_job(
+                    Event(),
+                    "reverse draw",
+                    operation,
+                )
+
+            task = store.recent_tasks(limit=1)[0]
+            events = store.read_events(run_id=task["run_id"], limit=50)["entries"]
+            failed = [
+                item
+                for item in events
+                if item["event_code"] == "image_task_failed"
+            ]
+            self.assertEqual(failed[0]["details"]["failed_stage"], "directing")
+            self.assertEqual(failed[0]["details"]["final_state"], "failed")
+            store.close()
+
+
+class ReverseDrawAccessTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_sensitive_director_prompt_is_blocked_before_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            image_path.write_bytes(b"image")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._director = object()
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._extract_command_text = lambda *_args, **_kwargs: "safe request"
+            plugin._extract_resolution_request = lambda _text: (512, 512)
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return image_path
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        types.SimpleNamespace(
+                            negative_tags="",
+                            drawing_request=lambda _supplement: "image facts",
+                        ),
+                        "vision-provider",
+                    )
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+
+            async def directed_prompt(_event, _request):
+                return "blocked final prompt", "director-provider", ""
+
+            plugin._generate_directed_prompt = directed_prompt
+            access_checks = []
+
+            def access_error(_event, text, check_sensitive=True):
+                access_checks.append((text, check_sensitive))
+                if text == "blocked final prompt":
+                    return "final prompt blocked by policy"
+                return None
+
+            plugin._access_error = access_error
+            executed = False
+
+            async def execute_job(*_args, **_kwargs):
+                nonlocal executed
+                executed = True
+                raise AssertionError("generation must not run")
+
+            plugin._execute_job = execute_job
+
+            async def run_auxiliary(_event, _label, operation):
+                return await operation(
+                    self.main.GenerationJob("tester", "reverse draw", 0.0)
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+
+            class Event:
+                message_str = "/reverse draw safe request"
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertFalse(executed)
+        self.assertIn(("blocked final prompt", True), access_checks)
+        self.assertTrue(any("final prompt blocked by policy" in item for item in replies))
 
 
 class GenerationReplyMetadataTests(unittest.TestCase):
@@ -769,6 +994,7 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 object(),
             )
         self.assertEqual(job.state, "failed")
+        self.assertEqual(job.failed_stage, "directing")
 
 
 class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
