@@ -616,6 +616,161 @@ class MandatoryLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("风格旧缓存", result)
 
 
+class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    """The submitted workflow must use fresh exact files and safe triggers."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        cls.catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+
+    async def test_execute_job_locks_style_and_adds_role_aware_triggers(self) -> None:
+        records = (
+            self.catalog_module.LoraRecord(
+                "styles/base.safetensors",
+                category="quality_enhancement",
+                trigger_words=("masterpiece", "very aesthetic"),
+            ),
+            self.catalog_module.LoraRecord(
+                "characters/denia.safetensors",
+                category="character",
+                trigger_words=("denia_wuwa", "black coat", "silver hair"),
+                character_name="Denia",
+                aliases=("denia", "达妮娅"),
+            ),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+                _self.refreshes = 0
+
+            async def refresh_for_operation(_self):
+                _self.refreshes += 1
+                _self._cache = records
+                _self._cache_expires_at = float("inf")
+                return records
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return records
+
+        captured = []
+
+        class Builder:
+            @staticmethod
+            def build(options):
+                captured.append(options)
+                return {"workflow": True}, 123, ["out"]
+
+        class Client:
+            @staticmethod
+            async def submit(workflow):
+                self.assertEqual(workflow, {"workflow": True})
+                return "prompt-id"
+
+            @staticmethod
+            async def wait_for_images(prompt_id, preferred):
+                self.assertEqual((prompt_id, preferred), ("prompt-id", ["out"]))
+                return (object(),)
+
+            @staticmethod
+            async def download_image(_reference, job_dir):
+                return job_dir / "result.png"
+
+            @staticmethod
+            async def gpu_name():
+                return "Test GPU"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": False,
+                "default_style_preset": "",
+                "strict_lora_validation": True,
+                "max_dynamic_loras": 3,
+                "max_total_dynamic_loras": 12,
+                "max_prompt_length": 4000,
+            }
+        )
+        plugin._generation_slots = __import__("asyncio").Semaphore(1)
+        plugin._client = Client()
+        plugin._workflow_builder = Builder()
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        plugin._lora_presets.save(
+            name="风格001",
+            category="style",
+            selections=(LoraSelection("styles/base", 0.5),),
+        )
+        plugin._temp_dir = Path(tempfile.mkdtemp())
+        job = self.main.GenerationJob("u", "preview", 0.0)
+        options = self.main.GenerationOptions(
+            prompt=(
+                "1girl, casual hoodie, "
+                "<lora:styles/base:1.5>, <lora:characters/denia:0.8>"
+            ),
+            negative_prompt="black coat",
+            lora_preset="风格001",
+        )
+
+        paths, seed, prompt, _, _ = await plugin._execute_job(
+            job,
+            options,
+            object(),
+        )
+
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+        self.assertEqual(seed, 123)
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(
+            captured[0].dynamic_loras,
+            (
+                LoraSelection("styles/base", 0.5),
+                LoraSelection("characters/denia", 0.8),
+            ),
+        )
+        self.assertEqual(
+            prompt,
+            "1girl, casual hoodie, masterpiece, very aesthetic, denia_wuwa",
+        )
+        self.assertEqual(captured[0].negative_prompt, "black coat")
+        self.assertNotIn("silver hair", prompt)
+
+    async def test_fatal_lora_tool_error_never_uses_raw_prompt_fallback(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": True,
+                "prompt_llm_fallback": True,
+            }
+        )
+        plugin._generation_slots = __import__("asyncio").Semaphore(1)
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._director = object()
+
+        async def fail_director(_event, _prompt):
+            raise self.main.PromptDirectorError(
+                "LoRA 工具失败",
+                fatal=True,
+            )
+
+        plugin._generate_directed_prompt = fail_director
+        job = self.main.GenerationJob("u", "preview", 0.0)
+
+        with self.assertRaises(self.main.PromptDirectorError):
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(prompt="帮我用 LoRA 画图"),
+                object(),
+            )
+        self.assertEqual(job.state, "failed")
+
+
 class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
     """Verify that the Web UI reuses the plugin's strict live-data rules."""
 

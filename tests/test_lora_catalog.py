@@ -512,6 +512,58 @@ class CivitaiIdentityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIn("多个文件", raised.exception.user_message)
 
+    async def test_duplicate_basenames_require_full_path(self) -> None:
+        records = (
+            LoraRecord("characters/a/denia.safetensors"),
+            LoraRecord("characters/b/denia.safetensors"),
+        )
+
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return records
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        with self.assertRaises(LoraCatalogError) as raised:
+            await service.resolve_selections(
+                (LoraSelection("denia", 0.8),),
+                strict=True,
+            )
+        self.assertIn("包含文件夹", raised.exception.user_message)
+
+        resolved, record_map = await service.resolve_selections_with_records(
+            (LoraSelection("characters/b/denia", 0.8),),
+            strict=True,
+        )
+        self.assertEqual(resolved[0].name, "characters/b/denia")
+        self.assertEqual(
+            record_map["characters/b/denia"].name,
+            "characters/b/denia.safetensors",
+        )
+
+    async def test_manager_full_path_collision_blocks_legacy_runtime_name(self) -> None:
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (LoraRecord("denia.safetensors"),)
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        service._manager_items_by_name = {
+            "characters/a/denia": {},
+            "characters/b/denia": {},
+        }
+
+        for requested, strict in (
+            ("denia", True),
+            ("denia", False),
+            ("characters/a/denia", True),
+        ):
+            with self.subTest(requested=requested, strict=strict):
+                with self.assertRaises(LoraCatalogError) as raised:
+                    await service.resolve_selections(
+                        (LoraSelection(requested, 0.8),),
+                        strict=strict,
+                    )
+                self.assertIn("包含文件夹", raised.exception.user_message)
+
 
 class FunctionalLoraCategoryTests(unittest.TestCase):
     def test_metadata_signals_cover_functional_category_hierarchy(self) -> None:

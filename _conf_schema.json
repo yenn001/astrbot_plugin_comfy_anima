@@ -191,6 +191,7 @@
   "prompt_llm_timeout": {
     "description": "分镜模型超时（秒）",
     "type": "int",
+    "hint": "基础 LLM 等待预算；启用 LoRA 工具时，插件会自动额外预留每一步 Manager 扫描和清单读取时间",
     "default": 120
   },
   "prompt_llm_temperature": {

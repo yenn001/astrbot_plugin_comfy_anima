@@ -34,8 +34,8 @@
         0
       ],
       "clip": [
-        "4",
-        0
+        "462",
+        1
       ]
     },
     "class_type": "CLIPTextEncode",
@@ -54,8 +54,8 @@
         0
       ],
       "clip": [
-        "4",
-        0
+        "462",
+        1
       ]
     },
     "class_type": "CLIPTextEncode",
@@ -928,8 +928,8 @@
         0
       ],
       "clip": [
-        "4",
-        0
+        "462",
+        1
       ]
     },
     "class_type": "CLIPTextEncode",
@@ -974,8 +974,8 @@
         0
       ],
       "clip": [
-        "4",
-        0
+        "462",
+        1
       ]
     },
     "class_type": "CLIPTextEncode",
@@ -1020,8 +1020,8 @@
         0
       ],
       "clip": [
-        "4",
-        0
+        "462",
+        1
       ]
     },
     "class_type": "CLIPTextEncode",
@@ -1041,8 +1041,8 @@
         0
       ],
       "clip": [
-        "4",
-        0
+        "462",
+        1
       ]
     },
     "class_type": "CLIPTextEncode",
@@ -1072,65 +1072,13 @@
   "431": {
     "inputs": {
       "group_mode": false,
-      "default_active": true,
+      "default_active": false,
       "allow_strength_adjustment": false,
       "toggle_trigger_words": {
-        "__value__": [
-          {
-            "text": "masterpiece",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "very aesthetic",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "@4x0style",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "photo background",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "real world location",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "@hana1u",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "nai shiny style",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          },
-          {
-            "text": "@reina",
-            "active": true,
-            "highlighted": false,
-            "strength": null
-          }
-        ]
+        "__value__": []
       },
-      "orinalMessage": "masterpiece,, very aesthetic,, @4x0style,, photo background,, real world location,, @hana1u,, nai shiny style,, @reina",
-      "trigger_words": [
-        "462",
-        2
-      ]
+      "orinalMessage": "",
+      "trigger_words": ""
     },
     "class_type": "TriggerWord Toggle (LoraManager)",
     "_meta": {

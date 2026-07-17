@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.0
+AstrBot Comfy Anima 插件 v1.1.1
 
 功能描述：
 - 安全读取局域网 HTTP LoRA 清单或 ComfyUI object_info
 - 为 LLM 工具提供可搜索、可缓存的 LoRA 元数据
 
 作者: Yen
-版本: 1.1.0
+版本: 1.1.1
 日期: 2026-07-14
 """
 
@@ -1623,21 +1623,53 @@ class LoraCatalogService:
                 unique[key] = LoraCatalogService._merge_record(current, record)
         return tuple(sorted(unique.values(), key=lambda item: item.name.casefold()))
 
-    async def resolve_selections(
+    async def resolve_selections_with_records(
         self, selections: tuple[LoraSelection, ...], strict: bool = True
-    ) -> tuple[LoraSelection, ...]:
-        """把 LLM 名称解析为清单中的真实名称。"""
+    ) -> tuple[tuple[LoraSelection, ...], dict[str, LoraRecord]]:
+        """Resolve loadable names and return their latest authoritative records.
+
+        The record mapping is keyed by the canonical resolved name.  A bare
+        basename is deliberately rejected when the fresh catalog contains more
+        than one file with that basename.  This prevents a legacy LoRA Manager
+        name from silently loading the wrong character variant.
+        """
         if not selections:
-            return ()
+            return (), {}
         records = await self._get_records(force_refresh=False)
         index = {
             canonical_lora_name(record.name).casefold(): record for record in records
         }
+        basename_index: dict[str, list[LoraRecord]] = {}
+        for candidate in records:
+            canonical = canonical_lora_name(candidate.name).casefold()
+            basename_index.setdefault(canonical.rsplit("/", 1)[-1], []).append(
+                candidate
+            )
+        manager_basename_names: dict[str, list[str]] = {}
+        for manager_name in self._manager_items_by_name:
+            basename = manager_name.rsplit("/", 1)[-1]
+            manager_basename_names.setdefault(basename, []).append(manager_name)
         resolved: list[LoraSelection] = []
+        resolved_records: dict[str, LoraRecord] = {}
         missing: list[str] = []
         ambiguous: dict[str, list[str]] = {}
         for selection in selections:
-            record = index.get(canonical_lora_name(selection.name).casefold())
+            requested = canonical_lora_name(selection.name)
+            requested_key = requested.casefold()
+            basename_matches = basename_index.get(
+                requested_key.rsplit("/", 1)[-1], []
+            )
+            basename = requested_key.rsplit("/", 1)[-1]
+            collision_names = manager_basename_names.get(basename) or [
+                canonical_lora_name(candidate.name) for candidate in basename_matches
+            ]
+            record: Optional[LoraRecord] = None
+            if "/" not in requested_key and len(set(collision_names)) > 1:
+                ambiguous[selection.name] = list(dict.fromkeys(collision_names))[:5]
+            else:
+                record = index.get(requested_key)
+                if record is None and len(basename_matches) == 1:
+                    record = basename_matches[0]
             if record is None:
                 candidates = sorted(
                     (
@@ -1647,7 +1679,7 @@ class LoraCatalogService:
                     key=lambda item: (-item[0], item[1].name.casefold()),
                 )
                 candidates = [item for item in candidates if item[0] >= 70]
-                if candidates:
+                if candidates and selection.name not in ambiguous:
                     top_score = candidates[0][0]
                     top_matches = [
                         candidate
@@ -1665,23 +1697,44 @@ class LoraCatalogService:
                 if not strict:
                     resolved.append(selection)
                 continue
+            if (
+                len(set(collision_names)) > 1
+                and "/" not in canonical_lora_name(record.name)
+            ):
+                ambiguous[selection.name] = list(dict.fromkeys(collision_names))[:5]
+                missing.append(selection.name)
+                continue
             resolved.append(
                 LoraSelection(
                     name=canonical_lora_name(record.name),
                     strength=selection.strength,
                 )
             )
+            resolved_records[requested_key] = record
+            resolved_records[canonical_lora_name(record.name).casefold()] = record
+        if ambiguous:
+            raise LoraCatalogError(
+                "LoRA 简称或同名项匹配到多个文件，当前运行时无法唯一寻址；"
+                "请将 LoRA Manager 的 "
+                "lora_syntax_format 设为 full，并使用包含文件夹的精确名称",
+                f"ambiguous={ambiguous}",
+            )
         if missing and strict:
-            if ambiguous:
-                raise LoraCatalogError(
-                    "LoRA 简称匹配到多个文件，请使用更完整的角色名、作品名或精确文件名",
-                    f"ambiguous={ambiguous}",
-                )
             raise LoraCatalogError(
                 "LLM 选择了清单中不存在的 LoRA",
                 f"missing={missing}",
             )
-        return tuple(resolved)
+        return tuple(resolved), resolved_records
+
+    async def resolve_selections(
+        self, selections: tuple[LoraSelection, ...], strict: bool = True
+    ) -> tuple[LoraSelection, ...]:
+        """把 LLM 名称解析为清单中的真实名称。"""
+        resolved, _ = await self.resolve_selections_with_records(
+            selections,
+            strict=strict,
+        )
+        return resolved
 
     @staticmethod
     def _strip_html(value: str) -> str:

@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.0
+AstrBot Comfy Anima 插件 v1.1.1
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.1.0
+版本: 1.1.1
 日期: 2026-07-14
 """
 
@@ -52,12 +52,12 @@ RUNTIME_OVERRIDE = """
 7. 若涉及达妮娅或黑娅，严格遵守参考规范中的 LoRA 查询和角色连续性规则。
 8. 不要在 prompt 中加入 XML 属性之外的双引号。
 9. 每次绘图先确定完整风格底座：用户指定“风格001”或自定义风格名时，先调用 list_anima_lora_presets 精确查询；未指定风格时默认查询“风格001”。不得编造组合。
-10. 风格组合是画质、美感、画师、皮肤、背景等组成的完整底座栈。命中后原样保留其全部 LoRA tags、权重和 trigger words，不得截断、改名或另加近似风格 LoRA。
-11. 角色 LoRA 永远独立于风格栈。画面包含明确角色时，在查询风格组合之后再调用 list_anima_loras 查询角色，把真实返回的角色 LoRA 与 trigger words 追加到风格栈之后。
+10. 风格组合是画质、美感、画师、皮肤、背景等组成的完整底座栈。命中后原样保留其全部 LoRA tags 与权重，不得截断、改名或另加近似风格 LoRA；可靠 trigger words 由插件在提交前按最新 Manager 元数据统一补充。
+11. 角色 LoRA 永远独立于风格栈。画面包含明确角色时，在查询风格组合之后再调用 list_anima_loras 查询角色，只追加真实返回的精确角色 LoRA tag；不要把角色 trainedWords 列表整包复制到 prompt。
 12. 例如“用风格001画达妮娅”必须先查 list_anima_lora_presets(keyword="风格001", category="风格")，再查 list_anima_loras(keyword="denia", detail=true)，最终同时输出风格全栈和角色 LoRA；不得把角色 LoRA 当成风格组合成员。
-13. `list_anima_loras` 的角色名、作品名和别名可来自 Civitai 与管理员确认的逻辑归档，但归档只帮助检索，不证明文件仍存在。每次查询都必须以工具本次返回的最新可加载精确名称为准；需要完整说明和全部触发词时用 detail=true。
+13. `list_anima_loras` 的角色名、作品名和别名可来自 Civitai 与管理员确认的逻辑归档，但归档只帮助检索，不证明文件仍存在。每次查询都必须以工具本次返回的最新可加载精确名称为准；需要完整说明时用 detail=true，但不要自行复制其中的全部触发词。
 14. 用户写“分辨率832x1216”或“分辨率 832×1216”时，这是插件生成参数，不是画面标签；可据纵横比安排构图，但不要把“分辨率”或数字尺寸写进 prompt。
-15. 把全部 LoRA 控制标签放在最前方，顺序为风格底座 LoRA、角色 LoRA；插件会写入 `1️⃣Lora堆（默认）`，其余正面内容会写入 `内容` 节点。
+15. 把全部 LoRA 控制标签放在最前方，顺序为风格底座 LoRA、角色 LoRA；插件会写入 `1️⃣Lora堆（默认）`，并按用途补充可靠触发词，其余正面内容会写入 `内容` 节点。
 16. 不要从旧对话、归档摘要或角色常识中自行补写 LoRA 文件名与 trigger words。工具无结果、返回多候选或提示记录已失效时，改用可靠的普通英文角色标签，不得猜选。
 17. 先把需求拆成不可变身份、可变服装/饰品、动作几何、镜头、场景与光线。用户要求换装时，只保留角色名、脸、发型、发色、瞳色及非服装标志等身份词；不要机械复制角色 LoRA 的全部 trigger words。
 18. 明确换装且角色 LoRA 强绑定默认服装时，角色 LoRA 通常降到 0.55 至 0.75，并把目标服装放在正面提示词较前位置，关键服装可用 1.10 至 1.25 的轻权重。没有服装冲突时不要无故降低角色权重。
@@ -69,9 +69,10 @@ RUNTIME_OVERRIDE = """
 class PromptDirectorError(RuntimeError):
     """LLM 分镜规划失败。"""
 
-    def __init__(self, user_message: str, detail: str = ""):
+    def __init__(self, user_message: str, detail: str = "", *, fatal: bool = False):
         self.user_message = user_message
         self.detail = detail
+        self.fatal = fatal
         super().__init__(detail or user_message)
 
 
@@ -141,6 +142,19 @@ class PromptDirector:
             )
         return "\n\n".join(parts)
 
+    def _lora_tool_call_timeout(self) -> int:
+        """Return a per-call budget that covers Manager scan and catalog read."""
+        catalog_timeout = max(1, self._settings.lora_catalog_timeout)
+        if not self._settings.enable_lora_manager:
+            return catalog_timeout
+        return max(1, self._settings.lora_manager_scan_timeout) + catalog_timeout
+
+    def _lora_agent_timeout(self, tool_call_timeout: int) -> int:
+        """Reserve the configured LLM budget in addition to all tool calls."""
+        return self._settings.prompt_llm_timeout + (
+            max(1, self._settings.lora_tool_max_steps) * tool_call_timeout
+        )
+
     async def generate(
         self, context: Any, event: Any, scene_text: str, tools: Any = None
     ) -> tuple[str, str]:
@@ -178,28 +192,30 @@ class PromptDirector:
             "max_tokens": self._settings.prompt_llm_max_tokens,
         }
 
+        uses_lora_tools = tools is not None
+        tool_call_timeout = 0
+        request_timeout = self._settings.prompt_llm_timeout
         try:
-            if tools is not None and hasattr(context, "tool_loop_agent"):
-                try:
-                    response = await asyncio.wait_for(
-                        context.tool_loop_agent(
-                            event=event,
-                            chat_provider_id=provider_id,
-                            prompt=user_prompt,
-                            system_prompt=self._system_prompt(),
-                            tools=tools,
-                            max_steps=self._settings.lora_tool_max_steps,
-                            tool_call_timeout=self._settings.lora_catalog_timeout,
-                        ),
-                        timeout=self._settings.prompt_llm_timeout,
+            if uses_lora_tools:
+                if not hasattr(context, "tool_loop_agent"):
+                    raise PromptDirectorError(
+                        "当前 AstrBot 不支持 LoRA 查询工具，已停止本次绘图",
+                        fatal=True,
                     )
-                except Exception:
-                    if not hasattr(context, "llm_generate"):
-                        raise
-                    response = await asyncio.wait_for(
-                        context.llm_generate(chat_provider_id=provider_id, **kwargs),
-                        timeout=self._settings.prompt_llm_timeout,
-                    )
+                tool_call_timeout = self._lora_tool_call_timeout()
+                request_timeout = self._lora_agent_timeout(tool_call_timeout)
+                response = await asyncio.wait_for(
+                    context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=provider_id,
+                        prompt=user_prompt,
+                        system_prompt=kwargs["system_prompt"],
+                        tools=tools,
+                        max_steps=self._settings.lora_tool_max_steps,
+                        tool_call_timeout=tool_call_timeout,
+                    ),
+                    timeout=request_timeout,
+                )
             elif hasattr(context, "llm_generate"):
                 response = await asyncio.wait_for(
                     context.llm_generate(chat_provider_id=provider_id, **kwargs),
@@ -212,18 +228,43 @@ class PromptDirector:
                     timeout=self._settings.prompt_llm_timeout,
                 )
         except asyncio.TimeoutError as exc:
+            if uses_lora_tools:
+                raise PromptDirectorError(
+                    "LoRA 查询或 LLM 分镜超时，已停止本次绘图",
+                    (
+                        f"provider={provider_id}, "
+                        f"tool_call_timeout={tool_call_timeout}, "
+                        f"agent_timeout={request_timeout}"
+                    ),
+                    fatal=True,
+                ) from exc
             raise PromptDirectorError("LLM 分镜超时") from exc
         except PromptDirectorError:
             raise
         except Exception as exc:
+            if uses_lora_tools:
+                raise PromptDirectorError(
+                    "LoRA 查询工具调用失败，已停止本次绘图",
+                    f"provider={provider_id}, error={exc}",
+                    fatal=True,
+                ) from exc
             raise PromptDirectorError(
                 "LLM 分镜调用失败", f"provider={provider_id}, error={exc}"
             ) from exc
 
-        completion = getattr(response, "completion_text", None)
-        if not isinstance(completion, str) or not completion.strip():
-            raise PromptDirectorError("LLM 没有返回有效提示词")
-        instruction = self.extract_instruction(completion)
+        try:
+            completion = getattr(response, "completion_text", None)
+            if not isinstance(completion, str) or not completion.strip():
+                raise PromptDirectorError("LLM 没有返回有效提示词")
+            instruction = self.extract_instruction(completion)
+        except PromptDirectorError as exc:
+            if uses_lora_tools:
+                raise PromptDirectorError(
+                    "LoRA 工具分镜结果无效，已停止本次绘图",
+                    exc.detail or exc.user_message,
+                    fatal=True,
+                ) from exc
+            raise
         return instruction.prompt, provider_id, instruction.negative_prompt
 
     async def _resolve_provider_id(self, context: Any, event: Any) -> str:

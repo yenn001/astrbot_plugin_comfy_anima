@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..core.workflow import WorkflowError, parse_generation_options
 from ..models import GenerationJob, GenerationOptions, LoraSelection
+from ..services.lora_catalog import LoraRecord
 from ..services.lora_presets import (
     PRESET_CATEGORY_ARTIST_STYLE,
     PRESET_CATEGORY_MIXED,
@@ -466,16 +467,24 @@ class _FakeComfyClient:
 
 
 class _RecordingLoraCatalog:
-    """记录严格校验前的已合并 LoRA 选择。"""
+    """Record each source group resolved against the same fresh catalog."""
 
     def __init__(self) -> None:
-        self.selections = None
-        self.strict = None
+        self.groups = []
+        self.strict_values = []
 
     async def resolve_selections(self, selections, *, strict):
-        self.selections = tuple(selections)
-        self.strict = strict
+        self.groups.append(tuple(selections))
+        self.strict_values.append(strict)
         return tuple(selections)
+
+    async def resolve_selections_with_records(self, selections, *, strict):
+        resolved = await self.resolve_selections(selections, strict=strict)
+        records = {
+            selection.name.casefold(): LoraRecord(selection.name)
+            for selection in resolved
+        }
+        return resolved, records
 
 
 class ExecuteJobPresetTests(unittest.IsolatedAsyncioTestCase):
@@ -522,7 +531,7 @@ class ExecuteJobPresetTests(unittest.IsolatedAsyncioTestCase):
     def _job() -> GenerationJob:
         return GenerationJob(user_id="tester", prompt_preview="test", created_at=0.0)
 
-    async def test_execute_job_merges_sources_with_later_weight_override(self) -> None:
+    async def test_execute_job_locks_saved_style_weights_across_sources(self) -> None:
         registry = LoraPresetRegistry([])
         registry.save(
             name="风格1",
@@ -553,17 +562,33 @@ class ExecuteJobPresetTests(unittest.IsolatedAsyncioTestCase):
         built = plugin._workflow_builder.options
 
         expected_loras = (
-            LoraSelection("shared/model", 0.9),
+            LoraSelection("shared/model", 0.2),
             LoraSelection("preset/only", 0.3),
             LoraSelection("command/only", 0.7),
             LoraSelection("prompt/only", 0.8),
         )
         self.assertEqual(built.dynamic_loras, expected_loras)
-        self.assertEqual(catalog.selections, expected_loras)
-        self.assertTrue(catalog.strict)
+        self.assertEqual(
+            catalog.groups,
+            [
+                (
+                    LoraSelection("shared/model", 0.2),
+                    LoraSelection("preset/only", 0.3),
+                ),
+                (
+                    LoraSelection("SHARED\\MODEL", 0.6),
+                    LoraSelection("command/only", 0.7),
+                ),
+                (
+                    LoraSelection("shared/model", 0.9),
+                    LoraSelection("prompt/only", 0.8),
+                ),
+            ],
+        )
+        self.assertTrue(all(catalog.strict_values))
         self.assertEqual(
             built.prompt,
-            "1girl, portrait, preset trigger, vivid colors",
+            "1girl, portrait, vivid colors",
         )
         self.assertEqual(built.negative_prompt, "bad hands, preset trigger")
         self.assertNotIn("<lora:", built.prompt)

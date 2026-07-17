@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.1.0
+AstrBot Comfy Anima 插件 v1.1.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.1.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.1.0
+版本: 1.1.1
 日期: 2026-07-14
 """
 
@@ -89,6 +89,10 @@ from .services.lora_presets import (
     deduplicate_selections,
     normalize_category,
     parse_lora_entries,
+)
+from .services.lora_prompting import (
+    build_lora_trigger_plan,
+    merge_runtime_lora_selections,
 )
 from .services.log_console import PluginLogConsole
 from .services.image_input import IncomingImageError, IncomingImageService
@@ -4232,7 +4236,7 @@ QQ快捷指令:
                             director_negative,
                         ) = await self._generate_directed_prompt(event, options.prompt)
                     except PromptDirectorError as exc:
-                        if not self.settings.prompt_llm_fallback:
+                        if exc.fatal or not self.settings.prompt_llm_fallback:
                             raise
                         director_warning = exc.user_message
                         logger.warning(
@@ -4252,6 +4256,43 @@ QQ快捷指令:
                         options.lora_preset,
                         parsed_loras,
                     )
+                    resolved_records = {}
+
+                    async def resolve_lora_group(
+                        selections: tuple[Any, ...],
+                    ) -> tuple[Any, ...]:
+                        if not selections:
+                            return ()
+                        if not self._lora_catalog:
+                            if self.settings.strict_lora_validation:
+                                raise LoraCatalogError(
+                                    "LoRA 清单工具未启用，无法严格校验动态 LoRA"
+                                )
+                            return deduplicate_selections(selections)
+                        resolved, records = (
+                            await self._lora_catalog.resolve_selections_with_records(
+                                selections,
+                                strict=self.settings.strict_lora_validation,
+                            )
+                        )
+                        resolved_records.update(records)
+                        return deduplicate_selections(resolved)
+
+                    runtime_presets = []
+                    for selected_preset in selected_presets:
+                        runtime_presets.append(
+                            replace(
+                                selected_preset,
+                                selections=await resolve_lora_group(
+                                    selected_preset.selections
+                                ),
+                            )
+                        )
+                    selected_presets = tuple(runtime_presets)
+                    resolved_option_loras = await resolve_lora_group(
+                        options.dynamic_loras
+                    )
+                    resolved_prompt_loras = await resolve_lora_group(parsed_loras)
                     preset_selections = tuple(
                         selection
                         for selected_preset in selected_presets
@@ -4263,7 +4304,7 @@ QQ快捷指令:
                     }
                     extra_prompt_loras = {
                         canonical_lora_name(selection.name).casefold()
-                        for selection in parsed_loras
+                        for selection in resolved_prompt_loras
                         if canonical_lora_name(selection.name).casefold()
                         not in preset_names
                     }
@@ -4272,41 +4313,47 @@ QQ快捷指令:
                             "完整风格栈之外最多允许 LLM 自行追加 "
                             f"{self.settings.max_dynamic_loras} 个 LoRA"
                         )
-                    dynamic_loras = deduplicate_selections(
-                        (
-                            *preset_selections,
-                            *options.dynamic_loras,
-                            *parsed_loras,
-                        )
+                    merge_plan = merge_runtime_lora_selections(
+                        selected_presets,
+                        resolved_option_loras,
+                        resolved_prompt_loras,
                     )
+                    dynamic_loras = merge_plan.selections
+                    if merge_plan.ignored_locked_overrides:
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] 已忽略对保存风格权重的覆盖: "
+                            + ", ".join(merge_plan.ignored_locked_overrides)
+                        )
                     if len(dynamic_loras) > self.settings.max_total_dynamic_loras:
                         raise LoraWorkflowError(
                             "组合、指令与提示词中的动态 LoRA 合计最多允许 "
                             f"{self.settings.max_total_dynamic_loras} 个"
                         )
-                    if dynamic_loras:
-                        if self._lora_catalog:
-                            dynamic_loras = await self._lora_catalog.resolve_selections(
-                                dynamic_loras,
-                                strict=self.settings.strict_lora_validation,
-                            )
-                        elif self.settings.strict_lora_validation:
-                            raise LoraCatalogError(
-                                "LoRA 清单工具未启用，无法严格校验动态 LoRA"
-                            )
-                    preset_trigger_words = ", ".join(
-                        preset.trigger_words.strip(" ,")
-                        for preset in selected_presets
-                        if preset.trigger_words.strip(" ,")
+                    combined_negative = ", ".join(
+                        part
+                        for part in (
+                            options.negative_prompt.strip(" ,"),
+                            director_negative.strip(" ,"),
+                        )
+                        if part
                     )
-                    if preset_trigger_words:
-                        clean_prompt = ", ".join(
-                            part
-                            for part in (
-                                clean_prompt.strip(" ,"),
-                                preset_trigger_words,
-                            )
-                            if part
+                    trigger_plan = build_lora_trigger_plan(
+                        prompt=clean_prompt,
+                        negative_prompt=combined_negative,
+                        selections=dynamic_loras,
+                        records_by_name=resolved_records,
+                        presets=selected_presets,
+                    )
+                    clean_prompt = trigger_plan.prompt
+                    if trigger_plan.added:
+                        logger.info(
+                            f"[{PLUGIN_NAME}] 已按最新 LoRA 元数据补充触发词: "
+                            + ", ".join(trigger_plan.added)
+                        )
+                    for skipped_trigger in trigger_plan.skipped:
+                        logger.info(
+                            f"[{PLUGIN_NAME}] LoRA 触发词未自动注入: "
+                            f"{skipped_trigger}"
                         )
                     if not clean_prompt:
                         raise LoraWorkflowError("移除 LoRA 标签后绘图提示词为空")
@@ -4322,14 +4369,7 @@ QQ快捷指令:
                 effective_options = replace(
                     options,
                     prompt=clean_prompt,
-                    negative_prompt=", ".join(
-                        part
-                        for part in (
-                            options.negative_prompt.strip(" ,"),
-                            director_negative.strip(" ,"),
-                        )
-                        if part
-                    ),
+                    negative_prompt=combined_negative,
                     dynamic_loras=dynamic_loras,
                     lora_injection_mode=(
                         "replace" if replace_lora_stack else options.lora_injection_mode

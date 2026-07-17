@@ -9,11 +9,92 @@ AstrBot Comfy Anima 插件 v1.1.0
 日期: 2026-07-14
 """
 
+import json
 import unittest
 from pathlib import Path
 
 from ..core.workflow import ImageWorkflowBuilder, WorkflowBuilder, parse_generation_options
 from ..models import GenerationOptions, LoraSelection, PluginSettings
+
+
+class WorkflowTemplateTopologyTests(unittest.TestCase):
+    """Guard the model, CLIP, LoRA, prompt, and RTX edges in shipped workflows."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow_dir = Path(__file__).resolve().parents[1] / "workflow"
+
+    def _load(self, filename: str) -> dict:
+        with (self.workflow_dir / filename).open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_legacy_anima_routes_every_text_encoder_through_lora_clip(self) -> None:
+        workflow = self._load("anima_api.json")
+        text_encoders = {
+            node_id: node
+            for node_id, node in workflow.items()
+            if node.get("class_type") == "CLIPTextEncode"
+        }
+
+        self.assertEqual(
+            set(text_encoders),
+            {"6", "7", "336", "339", "341", "343"},
+        )
+        for node_id, node in text_encoders.items():
+            with self.subTest(node_id=node_id):
+                self.assertEqual(node["inputs"]["clip"], ["462", 1])
+
+        self.assertEqual(workflow["462"]["inputs"]["model"], ["429", 0])
+        self.assertEqual(workflow["462"]["inputs"]["clip"], ["4", 0])
+        self.assertEqual(workflow["8"]["inputs"]["model"], ["462", 0])
+
+    def test_legacy_trigger_toggle_is_inert_and_has_no_stale_fallback(self) -> None:
+        workflow = self._load("anima_api.json")
+        inputs = workflow["431"]["inputs"]
+
+        self.assertFalse(inputs["default_active"])
+        self.assertEqual(inputs["toggle_trigger_words"]["__value__"], [])
+        self.assertEqual(inputs["orinalMessage"], "")
+        self.assertEqual(inputs["trigger_words"], "")
+        self.assertNotEqual(inputs["trigger_words"], ["462", 2])
+
+    def test_anima_v2_lora_model_clip_and_rtx_edges_are_complete(self) -> None:
+        workflow = self._load("anima_v2_api.json")
+
+        self.assertEqual(workflow["462"]["inputs"]["model"], ["44", 0])
+        self.assertEqual(workflow["462"]["inputs"]["clip"], ["45", 0])
+        self.assertEqual(workflow["19"]["inputs"]["model"], ["462", 0])
+        self.assertEqual(workflow["11"]["inputs"]["clip"], ["462", 1])
+        self.assertEqual(workflow["12"]["inputs"]["clip"], ["462", 1])
+        self.assertEqual(workflow["8"]["inputs"]["samples"], ["19", 0])
+        self.assertEqual(workflow["552"]["inputs"]["images"], ["8", 0])
+        self.assertEqual(workflow["458"]["inputs"]["images"], ["552", 0])
+
+        for node in workflow.values():
+            self.assertNotIn(["462", 2], node.get("inputs", {}).values())
+
+    def test_standalone_rtx_workflow_remains_image_only(self) -> None:
+        workflow = self._load("rtx_upscale_api.json")
+
+        self.assertEqual(set(workflow), {"1", "552", "458"})
+        self.assertEqual(workflow["1"]["class_type"], "LoadImage")
+        self.assertEqual(
+            workflow["552"]["class_type"],
+            "RTXVideoSuperResolution",
+        )
+        self.assertEqual(workflow["552"]["inputs"]["images"], ["1", 0])
+        self.assertEqual(workflow["458"]["class_type"], "SaveImage")
+        self.assertEqual(workflow["458"]["inputs"]["images"], ["552", 0])
+        self.assertFalse(
+            any("lora" in node.get("class_type", "").lower() for node in workflow.values())
+        )
+        self.assertFalse(
+            any(
+                key in {"model", "clip", "loras"}
+                for node in workflow.values()
+                for key in node.get("inputs", {})
+            )
+        )
 
 
 class WorkflowBuilderTests(unittest.TestCase):
@@ -197,6 +278,26 @@ class AnimaV2WorkflowTests(unittest.TestCase):
         self.assertNotIn("88", workflow)
         self.assertEqual(preferred, ["458"])
         self.assertNotIn("210", workflow)
+
+    def test_anima_v2_enables_rtx_by_default(self) -> None:
+        settings = PluginSettings.from_mapping(
+            {"workflow_file": "workflow/anima_v2_api.json"}
+        )
+        builder = WorkflowBuilder(
+            settings.resolve_workflow_path(self.plugin_dir),
+            settings,
+        )
+
+        workflow, _, preferred = builder.build(
+            GenerationOptions(prompt="1girl", seed=1, width=512, height=512)
+        )
+
+        self.assertEqual(preferred, ["458"])
+        self.assertNotIn("88", workflow)
+        self.assertEqual(workflow["28"]["inputs"]["width"], 512)
+        self.assertEqual(workflow["28"]["inputs"]["height"], 512)
+        self.assertEqual(workflow["552"]["inputs"]["images"], ["8", 0])
+        self.assertEqual(workflow["458"]["inputs"]["images"], ["552", 0])
 
     def test_anima_v2_can_return_base_image_without_rtx(self) -> None:
         settings = PluginSettings.from_mapping(

@@ -2,6 +2,7 @@
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ..models import PluginSettings
 from ..services.prompt_director import PromptDirector, PromptDirectorError
@@ -199,6 +200,167 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("请使用温柔的杂志插画口吻", system_prompt)
         self.assertIn("不可变身份", system_prompt)
         self.assertIn("不得覆盖上面的输出", system_prompt)
+
+
+class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """LoRA 工具链应有独立预算，且失败时不得静默降级。"""
+
+    @staticmethod
+    def _director(**overrides: object) -> PromptDirector:
+        reference = (
+            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+        )
+        settings = PluginSettings.from_mapping(
+            {
+                "prompt_llm_provider_id": "test-provider",
+                **overrides,
+            }
+        )
+        return PromptDirector(reference, settings)
+
+    async def test_tool_budget_covers_manager_scan_and_all_agent_steps(self) -> None:
+        director = self._director(
+            prompt_llm_timeout=120,
+            lora_catalog_timeout=15,
+            lora_manager_scan_timeout=180,
+            lora_tool_max_steps=4,
+        )
+        captured: dict[str, object] = {}
+        wait_timeouts: list[float | None] = []
+
+        class Context:
+            async def tool_loop_agent(self, **kwargs: object) -> object:
+                captured.update(kwargs)
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="1girl, portrait">'},
+                )()
+
+        async def capture_wait_for(awaitable: object, timeout: float | None) -> object:
+            wait_timeouts.append(timeout)
+            return await awaitable  # type: ignore[misc]
+
+        with patch(
+            "astrbot_plugin_comfy_anima.services.prompt_director.asyncio.wait_for",
+            new=capture_wait_for,
+        ):
+            prompt, provider_id, negative = await director.generate_with_negative(
+                Context(),
+                object(),
+                "draw a portrait",
+                tools=object(),
+            )
+
+        self.assertEqual(prompt, "1girl, portrait")
+        self.assertEqual(provider_id, "test-provider")
+        self.assertEqual(negative, "")
+        self.assertEqual(captured["tool_call_timeout"], 195)
+        self.assertEqual(captured["max_steps"], 4)
+        self.assertEqual(wait_timeouts, [900])
+
+    async def test_tool_failure_never_retries_without_tools(self) -> None:
+        director = self._director()
+
+        class Context:
+            llm_generate_calls = 0
+
+            async def tool_loop_agent(self, **kwargs: object) -> object:
+                raise RuntimeError("manager scan failed")
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.llm_generate_calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="unsafe fallback">'},
+                )()
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_with_negative(
+                context,
+                object(),
+                "draw with a LoRA",
+                tools=object(),
+            )
+
+        self.assertIn("LoRA 查询工具调用失败", raised.exception.user_message)
+        self.assertTrue(raised.exception.fatal)
+        self.assertEqual(context.llm_generate_calls, 0)
+
+    async def test_missing_tool_loop_support_is_not_silently_ignored(self) -> None:
+        director = self._director()
+
+        class Context:
+            llm_generate_calls = 0
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.llm_generate_calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="unsafe fallback">'},
+                )()
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_with_negative(
+                context,
+                object(),
+                "draw with a LoRA",
+                tools=object(),
+            )
+
+        self.assertIn("不支持 LoRA 查询工具", raised.exception.user_message)
+        self.assertTrue(raised.exception.fatal)
+        self.assertEqual(context.llm_generate_calls, 0)
+
+    async def test_invalid_tool_result_is_fatal(self) -> None:
+        director = self._director()
+
+        class Context:
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                return type("Response", (), {"completion_text": "<pic>"})()
+
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_with_negative(
+                Context(),
+                object(),
+                "draw with a LoRA",
+                tools=object(),
+            )
+
+        self.assertIn("结果无效", raised.exception.user_message)
+        self.assertTrue(raised.exception.fatal)
+
+    async def test_plain_llm_call_keeps_configured_timeout(self) -> None:
+        director = self._director(prompt_llm_timeout=120)
+        wait_timeouts: list[float | None] = []
+
+        class Context:
+            async def llm_generate(self, **kwargs: object) -> object:
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="1girl, portrait">'},
+                )()
+
+        async def capture_wait_for(awaitable: object, timeout: float | None) -> object:
+            wait_timeouts.append(timeout)
+            return await awaitable  # type: ignore[misc]
+
+        with patch(
+            "astrbot_plugin_comfy_anima.services.prompt_director.asyncio.wait_for",
+            new=capture_wait_for,
+        ):
+            await director.generate_with_negative(
+                Context(),
+                object(),
+                "draw a portrait",
+            )
+
+        self.assertEqual(wait_timeouts, [120])
 
 
 if __name__ == "__main__":
