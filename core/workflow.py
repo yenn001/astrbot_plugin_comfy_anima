@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.0.0
+AstrBot Comfy Anima 插件 v1.1.0
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.4.0
+版本: 1.1.0
 日期: 2026-07-14
 """
 
@@ -20,6 +20,12 @@ from typing import Any
 from ..constants import MAX_CFG, MAX_IMAGE_SIDE, MAX_SEED, MAX_STEPS, MIN_IMAGE_SIDE
 from ..models import GenerationOptions, PluginSettings
 from .lora import inject_loras
+from .workflow_profiles import (
+    InputBinding,
+    WorkflowProfile,
+    WorkflowProfileError,
+    load_workflow_profile,
+)
 
 
 class WorkflowError(ValueError):
@@ -33,7 +39,15 @@ class WorkflowBuilder:
         self._workflow_path = workflow_path
         self._settings = settings
         self._template = self._load_workflow(workflow_path)
+        try:
+            self._profile = load_workflow_profile(workflow_path, settings)
+        except WorkflowProfileError as exc:
+            raise WorkflowError(f"工作流档案无效: {exc}") from exc
         self._validate_required_nodes()
+
+    @property
+    def profile(self) -> WorkflowProfile:
+        return self._profile
 
     @staticmethod
     def _load_workflow(path: Path) -> dict[str, Any]:
@@ -55,17 +69,29 @@ class WorkflowBuilder:
 
     def _validate_required_nodes(self) -> None:
         """验证生成必需的节点及输入字段。"""
-        node_id = self._settings.prompt_node_id
-        node = self._template.get(node_id)
-        if not isinstance(node, dict):
-            raise WorkflowError(f"工作流缺少节点 {node_id}")
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict) or not any(
-            name in inputs for name in ("positive", "text", "prompt")
-        ):
+        if self._profile.task_type != "text_to_image":
+            raise WorkflowError("当前工作流不是生图工作流")
+        binding = self._profile.prompt
+        if binding is None:
+            raise WorkflowError("工作流档案缺少正面提示词映射")
+        node = self._template.get(binding.node_id)
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            raise WorkflowError(f"工作流缺少节点 {binding.node_id}")
+        if binding.input_name:
+            if binding.input_name not in inputs:
+                raise WorkflowError(
+                    f"节点 {binding.node_id} 缺少输入 {binding.input_name}"
+                )
+        elif not any(name in inputs for name in ("positive", "text", "prompt")):
             raise WorkflowError(
-                f"节点 {node_id} 缺少 positive、text 或 prompt 文本输入"
+                f"节点 {binding.node_id} 缺少 positive、text 或 prompt 文本输入"
             )
+
+        for variant in self._profile.output_variants.values():
+            for node_id in variant.preferred_node_ids:
+                if node_id not in self._template:
+                    raise WorkflowError(f"工作流缺少输出节点 {node_id}")
 
     def get_template_input(self, node_id: str, input_name: str) -> Any:
         """读取模板节点输入，用于管理命令显示当前模型。"""
@@ -74,6 +100,35 @@ class WorkflowBuilder:
         if not isinstance(inputs, dict):
             return None
         return copy.deepcopy(inputs.get(input_name))
+
+    def template_sampler_settings(self) -> list[dict[str, Any]]:
+        """Return safe sampler defaults for WebUI inspection."""
+        result: list[dict[str, Any]] = []
+        for binding in self._profile.samplers:
+            node = self._template.get(binding.node_id)
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            result.append(
+                {
+                    "node_id": binding.node_id,
+                    "title": str((node.get("_meta") or {}).get("title") or "Sampler"),
+                    "class_type": str(node.get("class_type") or ""),
+                    "steps": inputs.get(binding.steps_input),
+                    "cfg": inputs.get(binding.cfg_input),
+                    "denoise": inputs.get(binding.denoise_input),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _resolve_input_name(inputs: dict[str, Any], binding: InputBinding) -> str:
+        if binding.input_name:
+            return binding.input_name
+        for name in ("noise_seed", "seed", "positive", "text", "prompt"):
+            if name in inputs:
+                return name
+        raise WorkflowError(f"节点 {binding.node_id} 没有可写入的兼容输入")
 
     @staticmethod
     def _set_input(
@@ -99,61 +154,69 @@ class WorkflowBuilder:
         workflow = copy.deepcopy(self._template)
         seed = options.seed if options.seed is not None else secrets.randbelow(MAX_SEED)
 
-        if self._settings.unet_model_name:
-            unet_node = workflow.get(self._settings.unet_loader_node_id)
+        unet_binding = self._profile.unet
+        if self._settings.unet_model_name and unet_binding is not None:
+            unet_node = workflow.get(unet_binding.node_id)
             unet_inputs = (
                 unet_node.get("inputs") if isinstance(unet_node, dict) else None
             )
-            input_name = self._settings.unet_model_input_name
+            input_name = unet_binding.input_name
             if not isinstance(unet_inputs, dict) or input_name not in unet_inputs:
                 raise WorkflowError(
-                    f"工作流缺少 UNET 节点 {self._settings.unet_loader_node_id} "
+                    f"工作流缺少 UNET 节点 {unet_binding.node_id} "
                     f"或输入 {input_name}"
                 )
             unet_inputs[input_name] = self._settings.unet_model_name
 
-        prompt_inputs = workflow[self._settings.prompt_node_id]["inputs"]
-        prompt_input_name = next(
-            name for name in ("positive", "text", "prompt") if name in prompt_inputs
-        )
+        prompt_binding = self._profile.prompt
+        assert prompt_binding is not None
+        prompt_inputs = workflow[prompt_binding.node_id]["inputs"]
+        prompt_input_name = self._resolve_input_name(prompt_inputs, prompt_binding)
         prompt_inputs[prompt_input_name] = options.prompt.strip()
-        inject_loras(
-            workflow,
-            self._settings.lora_loader_node_id,
-            options.dynamic_loras,
-            mode=(options.lora_injection_mode or self._settings.dynamic_lora_mode),
-        )
+        if options.dynamic_loras:
+            if not self._profile.lora_node_id:
+                raise WorkflowError("当前工作流档案没有动态 LoRA 节点")
+            inject_loras(
+                workflow,
+                self._profile.lora_node_id,
+                options.dynamic_loras,
+                mode=(options.lora_injection_mode or self._settings.dynamic_lora_mode),
+            )
         if options.negative_prompt:
-            negative_node = workflow.get(self._settings.negative_node_id)
+            negative_binding = self._profile.negative
+            if negative_binding is None:
+                raise WorkflowError("当前工作流档案没有负面提示词节点")
+            negative_node = workflow.get(negative_binding.node_id)
             if not isinstance(negative_node, dict) or not isinstance(
                 negative_node.get("inputs"), dict
             ):
                 raise WorkflowError(
-                    f"工作流缺少负面提示词节点 {self._settings.negative_node_id}"
+                    f"工作流缺少负面提示词节点 {negative_binding.node_id}"
                 )
             negative_inputs = negative_node["inputs"]
-            original = str(negative_inputs.get("positive", "")).strip()
+            input_name = self._resolve_input_name(negative_inputs, negative_binding)
+            original = str(negative_inputs.get(input_name, "")).strip()
             combined = ", ".join(
                 part for part in (original, options.negative_prompt.strip()) if part
             )
-            negative_inputs["positive"] = combined
+            negative_inputs[input_name] = combined
 
-        primary_seed_node = workflow.get(self._settings.primary_seed_node_id)
-        if isinstance(primary_seed_node, dict) and isinstance(
-            primary_seed_node.get("inputs"), dict
-        ):
-            primary_inputs = primary_seed_node["inputs"]
-            if "noise_seed" in primary_inputs:
-                primary_inputs["noise_seed"] = seed
-            elif "seed" in primary_inputs:
-                primary_inputs["seed"] = seed
-        secondary_node = workflow.get(self._settings.secondary_seed_node_id)
-        if isinstance(secondary_node, dict) and isinstance(
-            secondary_node.get("inputs"), dict
-        ):
-            secondary_node["inputs"]["seed"] = seed
+        for binding in self._profile.seed_bindings:
+            seed_node = workflow.get(binding.node_id)
+            seed_inputs = (
+                seed_node.get("inputs") if isinstance(seed_node, dict) else None
+            )
+            if not isinstance(seed_inputs, dict):
+                continue
+            input_name = self._resolve_input_name(seed_inputs, binding)
+            seed_inputs[input_name] = seed
 
-        resolution_node = workflow.get(self._settings.resolution_node_id)
+        resolution_binding = self._profile.resolution
+        resolution_node = (
+            workflow.get(resolution_binding.node_id)
+            if resolution_binding is not None
+            else None
+        )
         if isinstance(resolution_node, dict) and isinstance(
             resolution_node.get("inputs"), dict
         ):
@@ -167,39 +230,116 @@ class WorkflowBuilder:
                 if options.height is not None
                 else self._settings.default_height
             )
-            self._set_input(workflow, self._settings.resolution_node_id, "width", width)
+            assert resolution_binding is not None
             self._set_input(
-                workflow, self._settings.resolution_node_id, "height", height
+                workflow,
+                resolution_binding.node_id,
+                resolution_binding.width_input,
+                width,
+            )
+            self._set_input(
+                workflow,
+                resolution_binding.node_id,
+                resolution_binding.height_input,
+                height,
             )
         elif options.width is not None or options.height is not None:
             raise WorkflowError(
-                f"工作流缺少分辨率节点 {self._settings.resolution_node_id}"
+                "当前工作流档案没有可写入的分辨率节点"
             )
 
-        for node_id in self._settings.sampler_node_ids:
-            node = workflow.get(node_id)
+        configured_steps = int(getattr(self._settings, "sampler_steps_override", 0) or 0)
+        effective_steps = options.steps
+        if effective_steps is None and configured_steps > 0:
+            effective_steps = configured_steps
+        for binding in self._profile.samplers:
+            node = workflow.get(binding.node_id)
             if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
                 continue
-            if options.steps is not None:
-                node["inputs"]["steps"] = options.steps
+            if effective_steps is not None:
+                node["inputs"][binding.steps_input] = effective_steps
             if options.cfg is not None:
-                node["inputs"]["cfg"] = options.cfg
+                node["inputs"][binding.cfg_input] = options.cfg
+
+        if self._profile.upscale is not None:
+            binding = self._profile.upscale
+            upscale_node = workflow.get(binding.node_id)
+            inputs = (
+                upscale_node.get("inputs")
+                if isinstance(upscale_node, dict)
+                else None
+            )
+            if isinstance(inputs, dict):
+                inputs[binding.scale_input] = self._settings.rtx_scale
+                inputs[binding.quality_input] = self._settings.rtx_quality
 
         upscale_enabled = (
             self._settings.enable_upscale
             if options.enable_upscale is None
             else options.enable_upscale
         )
-        preferred_nodes = list(self._settings.output_node_ids)
-        if not upscale_enabled:
-            workflow.pop(self._settings.upscale_output_node_id, None)
-            preferred_nodes = [
-                node_id
-                for node_id in preferred_nodes
-                if node_id != self._settings.upscale_output_node_id
-            ]
+        variant_name = "rtx" if upscale_enabled else "base"
+        variant = self._profile.output_variants.get(variant_name)
+        if variant is None:
+            variant = self._profile.active_output
+        for node_id in variant.prune_node_ids:
+            workflow.pop(node_id, None)
+        preferred_nodes = list(variant.preferred_node_ids)
 
         return workflow, seed, preferred_nodes
+
+
+class ImageWorkflowBuilder:
+    """Build a standalone image-processing workflow such as RTX upscale."""
+
+    def __init__(self, workflow_path: Path, settings: PluginSettings):
+        self._workflow_path = workflow_path
+        self._settings = settings
+        self._template = WorkflowBuilder._load_workflow(workflow_path)
+        try:
+            self._profile = load_workflow_profile(workflow_path, settings)
+        except WorkflowProfileError as exc:
+            raise WorkflowError(f"工作流档案无效: {exc}") from exc
+        if self._profile.task_type != "upscale" or self._profile.input_image is None:
+            raise WorkflowError("当前工作流不是独立图片放大工作流")
+
+    @property
+    def profile(self) -> WorkflowProfile:
+        return self._profile
+
+    def build(
+        self,
+        image_name: str,
+        *,
+        scale: float | None = None,
+        quality: str | None = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        workflow = copy.deepcopy(self._template)
+        input_binding = self._profile.input_image
+        WorkflowBuilder._set_input(
+            workflow,
+            input_binding.node_id,
+            input_binding.input_name,
+            image_name,
+        )
+        if self._profile.upscale is not None:
+            binding = self._profile.upscale
+            WorkflowBuilder._set_input(
+                workflow,
+                binding.node_id,
+                binding.scale_input,
+                self._settings.rtx_scale if scale is None else scale,
+            )
+            WorkflowBuilder._set_input(
+                workflow,
+                binding.node_id,
+                binding.quality_input,
+                self._settings.rtx_quality if quality is None else quality,
+            )
+        variant = self._profile.active_output
+        for node_id in variant.prune_node_ids:
+            workflow.pop(node_id, None)
+        return workflow, list(variant.preferred_node_ids)
 
 
 def parse_generation_options(command_text: str) -> GenerationOptions:

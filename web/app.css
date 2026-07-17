@@ -338,6 +338,47 @@ h2 { margin-bottom: 0; font-size: clamp(22px, 2.2vw, 31px); line-height: 1.08; l
 .form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 17px; }
 .compact-grid { grid-template-columns: 1fr 1fr; }
 .span-2 { grid-column: span 2; }
+.workflow-sampler-station {
+  margin-top: 25px;
+  padding-top: 20px;
+  border-top: 3px double var(--line);
+}
+.workflow-sampler-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.workflow-sampler-head h3 { margin: 0; font-size: clamp(19px, 2vw, 25px); }
+.workflow-profile-strip {
+  display: grid;
+  grid-template-columns: minmax(170px, 0.75fr) minmax(220px, 1.25fr) minmax(230px, 0.9fr);
+  gap: 13px;
+  margin: 16px 0;
+  padding: 14px;
+  background: var(--sand-light);
+  border: 1px dashed var(--line);
+}
+.workflow-profile-strip > div { min-width: 0; display: grid; align-content: start; gap: 6px; }
+.workflow-profile-strip > div > span,
+.sampler-override-field > span { color: var(--muted); font: 700 9px/1.3 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+.workflow-profile-strip strong { font-family: var(--font-display); font-size: 18px; }
+.workflow-profile-strip code { overflow-wrap: anywhere; font: 11px/1.5 var(--font-mono); }
+.sampler-override-field { min-width: 0; padding-left: 14px; border-left: 1px dashed var(--line-soft); }
+.sampler-override-field input { max-width: 150px; background: var(--paper-high); }
+.sampler-override-field small { color: var(--muted); line-height: 1.45; }
+.workflow-sampler-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: 12px; }
+.workflow-sampler-list .empty-state { grid-column: 1 / -1; margin: 0; padding: 25px; border: 1px dashed var(--line-soft); }
+.sampler-template-card {
+  min-width: 0;
+  padding: 14px;
+  background: var(--paper-high);
+  border: 1.5px solid var(--line);
+  box-shadow: 3px 3px 0 var(--ink);
+}
+.sampler-template-card:nth-child(even) { transform: translateY(4px); }
+.sampler-template-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding-bottom: 9px; border-bottom: 1px dashed var(--line-soft); }
+.sampler-template-head strong { overflow-wrap: anywhere; font-family: var(--font-display); }
+.sampler-template-head code { flex: 0 0 auto; color: var(--orange-dark); font: 700 9px var(--font-mono); }
+.sampler-template-card dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0 0; }
+.sampler-template-card dl > div { min-width: 0; }
+.sampler-template-card dt { color: var(--muted); font: 700 8px var(--font-mono); text-transform: uppercase; }
+.sampler-template-card dd { margin: 4px 0 0; overflow-wrap: anywhere; font: 700 18px var(--font-display); }
 label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
 label > span,
 .mono-label { font: 700 10px/1.3 var(--font-mono); letter-spacing: 0.04em; text-transform: uppercase; }
@@ -581,6 +622,17 @@ td.multiline { white-space: pre-line; line-height: 1.55; }
 .model-card:hover { transform: translateY(-3px); box-shadow: 6px 7px 0 var(--ink); }
 .model-card.current { background: var(--orange); border-width: 3px; }
 .model-name { overflow-wrap: anywhere; font-family: var(--font-mono); font-weight: 750; }
+.model-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; }
+.model-actions button { flex: 1 1 150px; }
+.section-divider {
+  margin: 10px 0 2px;
+  padding-top: 14px;
+  border-top: 2px solid currentColor;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
 
 .theme-picker {
   min-width: 166px;
@@ -1045,6 +1097,16 @@ html[data-theme="night"] .task-detail-metrics > div, html[data-theme="night"] .t
 html[data-theme="night"] .task-event-list { border-color: #766957; }
 html[data-theme="night"] .task-event { border-color: #5f5345; }
 html[data-theme="night"] .empty-state { color: #a99b89; }
+html[data-theme="night"] .workflow-sampler-station { border-color: #766957; }
+html[data-theme="night"] .workflow-profile-strip,
+html[data-theme="night"] .sampler-template-card { color: var(--paper); background: #29251f; border-color: #766957; box-shadow: 3px 3px 0 #080706; }
+html[data-theme="night"] .sampler-template-head,
+html[data-theme="night"] .sampler-override-field { border-color: #5f5345; }
+html[data-theme="night"] .workflow-profile-strip > div > span,
+html[data-theme="night"] .sampler-override-field > span,
+html[data-theme="night"] .sampler-override-field small,
+html[data-theme="night"] .sampler-template-card dt { color: #b8aa97; }
+html[data-theme="night"] .sampler-template-head code { color: var(--orange-light); }
 html[data-theme="night"] .login-page::before { color: var(--paper); background: #0e0d0b; }
 html[data-theme="night"] .login-card { color: var(--paper); background: #29251f; border-color: #9b876f; box-shadow: 9px 9px 0 #070605; }
 html[data-theme="night"] .workshop-footer { color: #958775; border-color: #766957; }
@@ -1109,6 +1171,8 @@ html[data-theme="night"] .workshop-footer { color: #958775; border-color: #76695
   .metric-card { grid-column: span 6; }
   .metric-card:nth-child(2), .metric-card:nth-child(4) { margin-top: 0; }
   .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .workflow-profile-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sampler-override-field { grid-column: span 2; padding: 12px 0 0; border-left: 0; border-top: 1px dashed var(--line-soft); }
   label.span-3, label.span-4 { grid-column: span 2; }
   .archive-metrics { grid-template-columns: repeat(3, 1fr); }
   .profile-controls { grid-template-columns: 1fr 1fr; }
@@ -1170,6 +1234,11 @@ html[data-theme="night"] .workshop-footer { color: #958775; border-color: #76695
   .metric-card { grid-column: span 12; min-height: 132px; }
   .metric-card:nth-child(even) { margin-left: 11px; }
   .form-grid, .compact-grid, .profile-controls { grid-template-columns: 1fr; }
+  .workflow-sampler-head { align-items: flex-start; flex-direction: column; }
+  .workflow-profile-strip { grid-template-columns: 1fr; }
+  .sampler-override-field { grid-column: auto; }
+  .workflow-sampler-list { grid-template-columns: 1fr; }
+  .sampler-template-card:nth-child(even) { transform: none; }
   label.span-2, label.span-3, label.span-4, .span-2, .profile-buttons { grid-column: span 1; }
   .provider-picker, .inline-form { grid-template-columns: 1fr; }
   .card, .archive-studio, .model-lead { padding: 19px; }

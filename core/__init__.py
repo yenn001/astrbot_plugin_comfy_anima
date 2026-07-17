@@ -2,7 +2,8 @@
 
 from .access_control import AccessController, FilterLevel
 from .lora import extract_lora_selections, inject_loras
-from .workflow import WorkflowBuilder, parse_generation_options
+from .workflow import ImageWorkflowBuilder, WorkflowBuilder, parse_generation_options
+from .workflow_profiles import WorkflowProfile, WorkflowProfileError
 from .workflow_registry import WorkflowRegistry
 
 __all__ = [
@@ -11,6 +12,9 @@ __all__ = [
     "extract_lora_selections",
     "inject_loras",
     "WorkflowBuilder",
+    "ImageWorkflowBuilder",
+    "WorkflowProfile",
+    "WorkflowProfileError",
     "WorkflowRegistry",
     "parse_generation_options",
 ]

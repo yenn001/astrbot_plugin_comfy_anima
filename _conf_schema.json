@@ -50,7 +50,13 @@
     "description": "工作流文件",
     "type": "string",
     "hint": "默认使用插件内置 API 工作流；相对路径以插件目录为基准",
-    "default": "workflow/anima_api.json"
+    "default": "workflow/anima_v2_api.json"
+  },
+  "upscale_workflow_file": {
+    "description": "RTX 独立放大工作流",
+    "type": "string",
+    "hint": "用于 /放大；Anima 生成后的 RTX 链仍由当前生图工作流控制",
+    "default": "workflow/rtx_upscale_api.json"
   },
   "workflow_dir": {
     "description": "可切换工作流目录",
@@ -82,9 +88,9 @@
     "default": true
   },
   "unet_loader_node_id": {
-    "description": "Anima UNETLoader 节点 ID",
+    "description": "旧工作流 UNETLoader 节点 ID",
     "type": "string",
-    "hint": "当前专用工作流的 UNET 加载节点为 429",
+    "hint": "仅供没有 UNET 档案绑定的旧工作流回退；Anima V2 会自动使用档案声明的节点 44",
     "default": "429"
   },
   "unet_model_input_name": {
@@ -96,7 +102,7 @@
   "unet_model_name": {
     "description": "当前 Anima UNET 模型",
     "type": "string",
-    "hint": "由 /模型切换 自动保存；留空时使用工作流节点 429 内置模型",
+    "hint": "由 /模型切换 自动保存；留空时使用当前工作流档案声明的 UNET 节点内置模型",
     "default": ""
   },
   "enable_natural_draw": {
@@ -110,6 +116,50 @@
     "type": "bool",
     "hint": "从普通对话回复中提取 <pic prompt=\"...\"> 并自动生成图片",
     "default": true
+  },
+  "enable_reverse_prompt": {
+    "description": "启用在线图片反推",
+    "type": "bool",
+    "hint": "开放 /反推 与 /反推画图；只会处理用户明确发送或引用的图片",
+    "default": true
+  },
+  "reverse_prompt_provider_id": {
+    "description": "在线反推多模态 Provider",
+    "type": "string",
+    "hint": "留空时依次使用绘图导演 Provider 和当前会话 Provider；所选模型必须支持图片输入",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "reverse_prompt_timeout": {
+    "description": "在线反推超时（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "reverse_prompt_temperature": {
+    "description": "在线反推温度",
+    "type": "float",
+    "default": 0.1
+  },
+  "reverse_prompt_max_tokens": {
+    "description": "在线反推最大输出 Tokens",
+    "type": "int",
+    "default": 1600
+  },
+  "reverse_prompt_system_prompt": {
+    "description": "在线反推 System Prompt",
+    "type": "text",
+    "hint": "留空使用插件内置的结构化 Anima 反推提示词",
+    "default": ""
+  },
+  "max_input_image_size_mb": {
+    "description": "反推/放大输入图片上限（MB）",
+    "type": "int",
+    "default": 20
+  },
+  "max_input_image_pixels": {
+    "description": "反推/放大最大像素总量",
+    "type": "int",
+    "default": 40000000
   },
   "enable_prompt_llm": {
     "description": "默认启用 LLM 分镜优化",
@@ -475,6 +525,18 @@
     "hint": "关闭后只执行首轮出图，可用 --upscale 为单次任务重新开启",
     "default": true
   },
+  "rtx_scale": {
+    "description": "RTX 默认放大倍率",
+    "type": "float",
+    "hint": "支持 1.0 到 4.0，默认 2 倍",
+    "default": 2.0
+  },
+  "rtx_quality": {
+    "description": "RTX 默认画质",
+    "type": "string",
+    "options": ["LOW", "MEDIUM", "HIGH", "ULTRA"],
+    "default": "ULTRA"
+  },
   "max_concurrent_jobs": {
     "description": "插件最大并发生成数",
     "type": "int",
@@ -580,57 +642,69 @@
     "default": "ComfyUI 绘图"
   },
   "prompt_node_id": {
-    "description": "正面内容节点 ID",
+    "description": "旧工作流正面内容节点 ID",
     "type": "string",
+    "hint": "仅供没有正面提示词档案绑定的 legacy 工作流回退；Anima V2 使用 manifest 节点 11",
     "default": "210"
   },
   "negative_node_id": {
-    "description": "负面提示词节点 ID",
+    "description": "旧工作流负面提示词节点 ID",
     "type": "string",
+    "hint": "仅供没有负面提示词档案绑定的 legacy 工作流回退；Anima V2 使用 manifest 节点 12",
     "default": "13"
   },
   "primary_seed_node_id": {
-    "description": "首轮随机种节点 ID",
+    "description": "旧工作流首轮随机种节点 ID",
     "type": "string",
+    "hint": "仅供没有 seed 档案绑定的 legacy 工作流回退",
     "default": "8"
   },
   "secondary_seed_node_id": {
-    "description": "二次采样随机种节点 ID",
+    "description": "旧工作流二次采样随机种节点 ID",
     "type": "string",
+    "hint": "仅供没有 seed 档案绑定的 legacy 工作流回退",
     "default": "262"
   },
   "resolution_node_id": {
-    "description": "分辨率节点 ID",
+    "description": "旧工作流分辨率节点 ID",
     "type": "string",
+    "hint": "仅供没有分辨率档案绑定的 legacy 工作流回退；Anima V2 使用 manifest 节点 28",
     "default": "437"
   },
   "default_width": {
     "description": "默认出图宽度",
     "type": "int",
-    "hint": "用户没有指定分辨率时写入节点 437",
+    "hint": "用户没有指定分辨率时写入当前工作流档案声明的分辨率 binding",
     "default": 832
   },
   "default_height": {
     "description": "默认出图高度",
     "type": "int",
-    "hint": "用户没有指定分辨率时写入节点 437",
+    "hint": "用户没有指定分辨率时写入当前工作流档案声明的分辨率 binding",
     "default": 1216
   },
   "sampler_node_ids": {
-    "description": "允许覆盖步数与 CFG 的采样节点",
+    "description": "旧工作流允许覆盖步数与 CFG 的采样节点",
     "type": "list",
-    "hint": "默认只修改首轮采样节点",
+    "hint": "仅供没有 sampler 档案绑定的 legacy 工作流回退；档案工作流使用 manifest 中的 sampler bindings",
     "default": ["8"]
   },
+  "sampler_steps_override": {
+    "description": "WebUI 采样步数覆盖",
+    "type": "int",
+    "hint": "0 表示读取并使用当前工作流原始步数；1-100 会覆盖档案中全部采样器",
+    "default": 0
+  },
   "output_node_ids": {
-    "description": "图片输出节点优先级",
+    "description": "旧工作流图片输出节点优先级",
     "type": "list",
-    "hint": "285 是二次放大图，20 是首轮预览图",
+    "hint": "仅供没有输出档案绑定的 legacy 工作流回退；Anima V2 输出由 manifest 的 base/rtx variants 决定",
     "default": ["285", "20"]
   },
   "upscale_output_node_id": {
-    "description": "二次放大输出节点 ID",
+    "description": "旧工作流二次放大输出节点 ID",
     "type": "string",
+    "hint": "仅供没有 upscale 输出档案绑定的 legacy 工作流回退",
     "default": "285"
   }
 }

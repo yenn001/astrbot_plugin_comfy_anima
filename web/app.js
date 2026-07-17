@@ -128,6 +128,10 @@ const taskTypeLabels = {
   lora_metadata_fetch: "LoRA 元数据",
   lora_download: "LoRA 下载",
   lora_refresh: "LoRA 刷新",
+  asset_delete: "资产删除",
+  reverse_prompt: "图片反推",
+  reverse_draw: "反推画图",
+  rtx_upscale: "RTX 放大",
 };
 
 const activeTaskStatuses = new Set(["queued", "running"]);
@@ -137,11 +141,18 @@ const numberFields = new Set([
   "default_height",
   "max_concurrent_jobs",
   "user_cooldown",
+  "rtx_scale",
   "prompt_llm_temperature",
   "prompt_llm_max_tokens",
+  "reverse_prompt_timeout",
+  "reverse_prompt_temperature",
+  "reverse_prompt_max_tokens",
+  "max_input_image_size_mb",
+  "max_input_image_pixels",
   "max_total_dynamic_loras",
   "max_preset_loras",
   "max_dynamic_loras",
+  "sampler_steps_override",
   "web_ui_port",
   "web_ui_session_ttl",
 ]);
@@ -152,6 +163,7 @@ const booleanFields = new Set([
   "enable_prompt_llm",
   "enable_natural_draw",
   "enable_llm_pic_trigger",
+  "enable_reverse_prompt",
   "enable_lora_tool",
   "enable_lora_download",
   "strict_lora_validation",
@@ -433,10 +445,81 @@ async function loadBootstrap() {
   document.querySelector("#detail-resolution").textContent =
     `${data.settings.default_width} × ${data.settings.default_height}`;
   populateSettings(data.settings);
+  renderWorkflowSamplers(data.workflow_runtime || {}, data.settings || {});
   await Promise.all([
     loadProviders(data.settings.prompt_llm_provider_id),
     loadConfigProfiles({quiet: true}),
   ]);
+}
+
+function formatSamplerValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  return String(value);
+}
+
+function renderWorkflowSamplers(runtime, settings) {
+  const profileId = String(runtime.profile_id || "").trim();
+  const displayName = String(runtime.display_name || runtime.profile_name || "").trim();
+  const workflowFile = String(runtime.workflow_file || settings.workflow_file || "").trim();
+  const samplers = Array.isArray(runtime.samplers) ? runtime.samplers : [];
+  const profileBadge = document.querySelector("#workflow-profile-id");
+  const profileName = document.querySelector("#workflow-profile-name");
+  const profileFile = document.querySelector("#workflow-profile-file");
+  const samplerList = document.querySelector("#workflow-sampler-list");
+  const status = document.querySelector("#workflow-sampler-status");
+  const override = document.querySelector("#sampler-steps-override");
+  if (!profileBadge || !profileName || !profileFile || !samplerList || !status || !override) return;
+
+  profileBadge.textContent = profileId || "LEGACY / 未登记";
+  profileName.textContent = displayName || "未提供工作流显示名称";
+  profileFile.textContent = workflowFile || "—";
+  const configuredOverride = runtime.sampler_steps_override
+    ?? settings.sampler_steps_override
+    ?? 0;
+  override.value = String(Math.min(100, Math.max(0, Number(configuredOverride) || 0)));
+
+  samplerList.replaceChildren();
+  if (!samplers.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "当前 bootstrap 尚未提供采样器模板信息。";
+    samplerList.append(empty);
+    status.textContent = "需要 workflow_runtime.samplers 后才能展示节点参数；保存步数覆盖不受影响。";
+    return;
+  }
+
+  for (const sampler of samplers) {
+    const card = document.createElement("article");
+    card.className = "sampler-template-card";
+    const head = document.createElement("div");
+    head.className = "sampler-template-head";
+    const title = document.createElement("strong");
+    title.textContent = sampler.label || sampler.title || sampler.name || "Sampler";
+    const node = document.createElement("code");
+    node.textContent = `NODE ${formatSamplerValue(sampler.node_id)}`;
+    head.append(title, node);
+
+    const values = document.createElement("dl");
+    for (const [label, value] of [
+      ["Steps", sampler.steps],
+      ["CFG", sampler.cfg],
+      ["Denoise", sampler.denoise],
+    ]) {
+      const item = document.createElement("div");
+      const term = document.createElement("dt");
+      const description = document.createElement("dd");
+      term.textContent = label;
+      description.textContent = formatSamplerValue(value);
+      item.append(term, description);
+      values.append(item);
+    }
+    card.append(head, values);
+    samplerList.append(card);
+  }
+  const activeOverride = Number(override.value) || 0;
+  status.textContent = activeOverride
+    ? `已设置 ${activeOverride} 步覆盖；保存并自动重载后应用到 ${samplers.length} 个采样器。`
+    : `当前跟随工作流模板，共读取 ${samplers.length} 个采样器。`;
 }
 
 async function loadProviders(selectedOverride = null) {
@@ -542,6 +625,12 @@ async function saveSettings(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector('button[type="submit"]');
+  const samplerOverride = Number(form.elements.namedItem("sampler_steps_override")?.value ?? 0);
+  if (!Number.isInteger(samplerOverride) || samplerOverride < 0 || samplerOverride > 100) {
+    showToast("采样步数覆盖必须是 0–100 的整数", true);
+    form.elements.namedItem("sampler_steps_override")?.focus();
+    return;
+  }
   setBusy(button, true, "正在保存…");
   try {
     const data = await api("/api/settings", {
@@ -1018,7 +1107,13 @@ function renderLoraTable() {
       ? "此 LoRA 的源资料已经变化，建议重新执行 AI 建档"
       : "让绘图导演完整阅读此 LoRA 的元数据，建立带证据的可搜索档案";
     archiveButton.addEventListener("click", () => runLoraArchive("selected", {names: [item.name], button: archiveButton}));
-    actionWrap.append(detailButton, metadataButton, archiveButton);
+    const deleteButton = document.createElement("button");
+    deleteButton.className = "danger compact";
+    deleteButton.type = "button";
+    deleteButton.textContent = "删除文件";
+    deleteButton.title = "从最新 LoRA Manager 清单精确解析文件后删除；不会接收浏览器路径";
+    deleteButton.addEventListener("click", () => deleteLoraAsset(item.name, deleteButton));
+    actionWrap.append(detailButton, metadataButton, archiveButton, deleteButton);
     action.append(actionWrap);
 
     row.append(
@@ -1446,12 +1541,21 @@ async function loadModels() {
       name.className = "model-name";
       name.textContent = `${item.index}. ${item.name}`;
       const state = item.current ? chip("当前模型", "good") : chip("可切换", "neutral");
+      const actions = document.createElement("div");
+      actions.className = "model-actions";
       const button = document.createElement("button");
       button.className = item.current ? "ghost" : "secondary";
       button.textContent = item.current ? "正在使用" : "切换到此模型";
       button.disabled = item.current;
       button.addEventListener("click", () => selectModel(item.name));
-      card.append(name, state, button);
+      const deleteButton = document.createElement("button");
+      deleteButton.className = "danger";
+      deleteButton.type = "button";
+      deleteButton.textContent = item.current ? "当前模型不可删除" : "删除模型文件";
+      deleteButton.disabled = item.current;
+      deleteButton.addEventListener("click", () => deleteUnetAsset(item.name, deleteButton));
+      actions.append(button, deleteButton);
+      card.append(name, state, actions);
       grid.append(card);
     }
     empty.hidden = (data.items || []).length > 0;
@@ -1459,6 +1563,79 @@ async function loadModels() {
   } catch (error) {
     empty.textContent = error.message;
     showToast(error.message, true);
+  }
+}
+
+async function confirmedAssetName(exactName, label) {
+  const typed = window.prompt(
+    `危险操作：将永久删除 ${label} 文件。\n请输入完整精确名称确认：\n${exactName}`,
+    "",
+  );
+  if (typed === null) return "";
+  if (typed !== exactName) {
+    showToast("确认名称不一致，已取消删除。", true);
+    return "";
+  }
+  return typed;
+}
+
+async function deleteLoraAsset(exactName, button) {
+  const confirmName = await confirmedAssetName(exactName, "LoRA");
+  if (!confirmName) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "删除中…";
+  const requestDelete = (removeFromPresets) => api("/api/loras/delete", {
+    method: "POST",
+    body: JSON.stringify({
+      exact_name: exactName,
+      confirm_name: confirmName,
+      remove_from_presets: removeFromPresets,
+    }),
+  });
+  try {
+    let data;
+    try {
+      data = await requestDelete(false);
+    } catch (error) {
+      if (!String(error.message || "").includes("预设引用")) throw error;
+      const approved = window.confirm(
+        `${error.message}\n\n是否同时从所有 LoRA 组合中移除该文件后继续删除？空组合会一并删除。`,
+      );
+      if (!approved) return;
+      data = await requestDelete(true);
+    }
+    selectedLoras.delete(exactName);
+    showToast(data.message || `已删除 ${exactName}`);
+    await searchLoras(null, {skipAutoArchive: true});
+    await loadPresets();
+    if (data.reload_scheduled) setTimeout(() => window.location.replace("/login"), 2600);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function deleteUnetAsset(exactName, button) {
+  const confirmName = await confirmedAssetName(exactName, "UNET");
+  if (!confirmName) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "删除中…";
+  try {
+    const data = await api("/api/unet/delete", {
+      method: "POST",
+      body: JSON.stringify({exact_name: exactName, confirm_name: confirmName}),
+    });
+    showToast(data.message || `已删除 ${exactName}`);
+    await loadModels();
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
   }
 }
 
@@ -2118,6 +2295,18 @@ document.querySelector("#nav").addEventListener("click", (event) => {
   if (button) switchPanel(button.dataset.panel);
 });
 document.querySelector("#settings-form").addEventListener("submit", saveSettings);
+document.querySelector("#sampler-steps-override").addEventListener("input", (event) => {
+  const value = Number(event.target.value);
+  const samplerCount = bootstrapData?.workflow_runtime?.samplers?.length || 0;
+  const status = document.querySelector("#workflow-sampler-status");
+  if (!Number.isInteger(value) || value < 0 || value > 100) {
+    status.textContent = "请输入 0–100 的整数；0 表示跟随工作流模板。";
+  } else if (value === 0) {
+    status.textContent = `将跟随工作流模板，共 ${samplerCount} 个采样器。`;
+  } else {
+    status.textContent = `保存并自动重载后，将以 ${value} 步覆盖 ${samplerCount} 个采样器。`;
+  }
+});
 document.querySelector("#provider-refresh").addEventListener("click", () => {
   const select = document.querySelector("#provider-select");
   const selected = select.value === "__manual__"

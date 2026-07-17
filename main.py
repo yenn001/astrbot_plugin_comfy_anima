@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.0.0
+AstrBot Comfy Anima 插件 v1.1.0
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.0.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.0.0
+版本: 1.1.0
 日期: 2026-07-14
 """
 
@@ -45,9 +45,19 @@ from .core.lora import (
     canonical_lora_name,
     extract_lora_selections,
 )
-from .core.workflow import WorkflowBuilder, WorkflowError, parse_generation_options
+from .core.workflow import (
+    ImageWorkflowBuilder,
+    WorkflowBuilder,
+    WorkflowError,
+    parse_generation_options,
+)
 from .core.workflow_registry import WorkflowRegistry, WorkflowRegistryError
-from .models import GenerationJob, GenerationOptions, PluginSettings
+from .models import (
+    GeneratedImagePaths,
+    GenerationJob,
+    GenerationOptions,
+    PluginSettings,
+)
 from .services.comfy_client import ComfyClient, ComfyClientError
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
@@ -81,7 +91,13 @@ from .services.lora_presets import (
     parse_lora_entries,
 )
 from .services.log_console import PluginLogConsole
+from .services.image_input import IncomingImageError, IncomingImageService
+from .services.model_manager import (
+    ModelManagerError,
+    ModelManagerService,
+)
 from .services.prompt_director import PromptDirector, PromptDirectorError
+from .services.reverse_prompt import ReversePromptError, ReversePromptService
 from .services.unet_catalog import UnetCatalogError, UnetCatalogService
 from .services.task_store import TaskStore, TaskStoreError
 from .services.web_ui import WebUiActionError, WebUiError, WebUiService
@@ -91,7 +107,10 @@ WEB_UI_EDITABLE_FIELDS = (
     "comfyui_url",
     "default_width",
     "default_height",
+    "sampler_steps_override",
     "enable_upscale",
+    "rtx_scale",
+    "rtx_quality",
     "max_concurrent_jobs",
     "user_cooldown",
     "send_generation_notice",
@@ -101,6 +120,14 @@ WEB_UI_EDITABLE_FIELDS = (
     "prompt_llm_max_tokens",
     "enable_natural_draw",
     "enable_llm_pic_trigger",
+    "enable_reverse_prompt",
+    "reverse_prompt_provider_id",
+    "reverse_prompt_timeout",
+    "reverse_prompt_temperature",
+    "reverse_prompt_max_tokens",
+    "reverse_prompt_system_prompt",
+    "max_input_image_size_mb",
+    "max_input_image_pixels",
     "auto_draw_system_prompt",
     "enable_lora_tool",
     "lora_manager_url",
@@ -238,6 +265,14 @@ class ComfyAnimaPlugin(Star):
         self._internal_llm_events: set[int] = set()
         self._temp_dir = Path(tempfile.gettempdir()) / PLUGIN_NAME
         self._temp_dir.mkdir(parents=True, exist_ok=True)
+        self._image_input = IncomingImageService(self.settings, self._temp_dir)
+        self._reverse_prompt = (
+            ReversePromptService(self.settings)
+            if self.settings.enable_reverse_prompt
+            else None
+        )
+        self._upscale_workflow_builder: Optional[ImageWorkflowBuilder] = None
+        self._upscale_initialization_error = ""
         self._initialization_error: Optional[str] = None
         self._director_error: Optional[str] = None
         self._director: Optional[PromptDirector] = None
@@ -282,6 +317,28 @@ class ComfyAnimaPlugin(Star):
             self.settings.lora_presets,
             max_loras=self.settings.max_preset_loras,
         )
+        self._model_manager: Optional[ModelManagerService] = None
+        self._model_manager_error = ""
+        if (
+            self.settings.enable_lora_manager
+            and self._lora_catalog is not None
+            and self._unet_catalog is not None
+        ):
+            try:
+                self._model_manager = ModelManagerService(
+                    self.settings,
+                    self._lora_catalog,
+                    self._unet_catalog,
+                    preset_reference_resolver=self._lora_preset_references,
+                    preset_removal_callback=self._remove_lora_from_presets,
+                    current_unet_resolver=self._current_unet_model,
+                )
+            except ModelManagerError as exc:
+                self._model_manager_error = exc.user_message
+                logger.warning(
+                    f"[{PLUGIN_NAME}] model deletion service unavailable: "
+                    f"{exc.user_message}"
+                )
         self._access_controller = AccessController(
             AccessPolicy(
                 global_locked=self._global_locked,
@@ -304,6 +361,16 @@ class ComfyAnimaPlugin(Star):
             workflow_path = self.settings.resolve_workflow_path(self.plugin_dir)
             self._workflow_builder = WorkflowBuilder(workflow_path, self.settings)
             self._client = ComfyClient(self.settings)
+            try:
+                self._upscale_workflow_builder = ImageWorkflowBuilder(
+                    self.settings.resolve_upscale_workflow_path(self.plugin_dir),
+                    self.settings,
+                )
+            except (OSError, ValueError, WorkflowError) as upscale_exc:
+                self._upscale_initialization_error = str(upscale_exc)
+                logger.warning(
+                    f"[{PLUGIN_NAME}] standalone RTX workflow unavailable: {upscale_exc}"
+                )
             logger.info(
                 f"[{PLUGIN_NAME}] 初始化完成，ComfyUI: {self.settings.comfyui_url}"
             )
@@ -541,7 +608,7 @@ class ComfyAnimaPlugin(Star):
                 )
                 continue
             try:
-                image_paths, _, _, _, _ = await self._run_job(
+                image_paths, seed, _, _, _ = await self._run_job(
                     event,
                     GenerationOptions(
                         prompt=prompt,
@@ -562,6 +629,7 @@ class ComfyAnimaPlugin(Star):
                     Comp.Plain(f"{MessageEmoji.ERROR} 自动绘图失败: {message}")
                 )
                 continue
+            new_chain.append(Comp.Plain(self._generation_summary(image_paths, seed)))
             new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
             self._schedule_cleanup(image_paths)
         result.chain = new_chain
@@ -677,6 +745,281 @@ class ComfyAnimaPlugin(Star):
             event, command_text, forward=False
         ):
             yield response
+
+    @filter.command("反推")
+    async def cmd_reverse_prompt(
+        self, event: AstrMessageEvent, focus: str = ""
+    ) -> AsyncGenerator[Any, None]:
+        """Reverse one direct or replied image with an AstrBot multimodal Provider."""
+        supplement = self._extract_command_text(
+            event.message_str, focus, command="反推"
+        )
+        if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
+            return
+        access_error = self._access_error(event, supplement, check_sensitive=bool(supplement))
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        if len(supplement) > 500:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 反推补充要求不能超过 500 字符")
+            return
+
+        async def operation(job: GenerationJob) -> tuple[Any, str, float]:
+            image_path: Optional[Path] = None
+            started_at = time.monotonic()
+            try:
+                job.state = "reading_image"
+                image_path = await self._image_input.collect_one(event)
+                self._record_image_task_phase(
+                    job,
+                    "input",
+                    "输入图片校验完成，准备调用多模态 Provider。",
+                    "reverse_input_ready",
+                    details={"bytes": image_path.stat().st_size},
+                )
+                job.state = "reverse_prompting"
+                self._record_image_task_phase(
+                    job,
+                    "provider",
+                    "正在调用所选多模态 Provider 提取结构化画面事实。",
+                    "reverse_provider_started",
+                )
+                async with self._generation_slots:
+                    result, provider_id = await self._reverse_prompt.reverse(
+                        self.context,
+                        event,
+                        image_path,
+                        supplement,
+                    )
+                job.state = "completed"
+                self._record_image_task_phase(
+                    job,
+                    "provider",
+                    "多模态反推完成，结构化结果已通过校验。",
+                    "reverse_provider_completed",
+                    details={"provider_id": provider_id},
+                )
+                return result, provider_id, max(0.0, time.monotonic() - started_at)
+            finally:
+                if image_path is not None:
+                    image_path.unlink(missing_ok=True)
+
+        yield event.plain_result(f"{MessageEmoji.INFO} 正在读取图片并调用多模态模型反推……")
+        try:
+            result, provider_id, elapsed = await self._run_auxiliary_job(
+                event,
+                "reverse prompt",
+                operation,
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except (IncomingImageError, ReversePromptError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] reverse prompt failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 反推失败: {message}")
+            return
+        yield event.plain_result(
+            f"{result.render(provider_id)}\n\n反推耗时：{elapsed:.2f} 秒"
+        )
+
+    @filter.command("反推画图")
+    async def cmd_reverse_draw(
+        self, event: AstrMessageEvent, requirement: str = ""
+    ) -> AsyncGenerator[Any, None]:
+        """Reverse an image, direct the prompt, then generate with Anima."""
+        supplement = self._extract_command_text(
+            event.message_str, requirement, command="反推画图"
+        )
+        if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
+            return
+        if not self._client or not self._workflow_builder or not self._director:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 反推画图组件未就绪: "
+                f"{self._initialization_error or self._director_error or '未知错误'}"
+            )
+            return
+        access_error = self._access_error(event, supplement, check_sensitive=bool(supplement))
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        try:
+            width, height = self._extract_resolution_request(supplement)
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
+            return
+        style_preset = self._find_requested_style_preset(supplement)
+
+        async def operation(job: GenerationJob) -> tuple[Any, str, Any, str, str]:
+            image_path: Optional[Path] = None
+            try:
+                job.state = "reading_image"
+                image_path = await self._image_input.collect_one(event)
+                self._record_image_task_phase(
+                    job,
+                    "input",
+                    "输入图片校验完成，准备执行反推画图链路。",
+                    "reverse_draw_input_ready",
+                    details={"bytes": image_path.stat().st_size},
+                )
+                job.state = "reverse_prompting"
+                self._record_image_task_phase(
+                    job,
+                    "provider",
+                    "正在提取图片中的可观察画面事实。",
+                    "reverse_draw_provider_started",
+                )
+                async with self._generation_slots:
+                    reverse_result, reverse_provider = await self._reverse_prompt.reverse(
+                        self.context,
+                        event,
+                        image_path,
+                        supplement,
+                    )
+                job.state = "directing"
+                self._record_image_task_phase(
+                    job,
+                    "director",
+                    "反推结果已就绪，正在由绘图导演整理 Anima 提示词。",
+                    "reverse_draw_director_started",
+                    details={"reverse_provider_id": reverse_provider},
+                )
+                final_prompt, director_provider, directed_negative = (
+                    await self._generate_directed_prompt(
+                        event,
+                        reverse_result.drawing_request(supplement),
+                    )
+                )
+                negative_prompt = ", ".join(
+                    part
+                    for part in (
+                        reverse_result.negative_tags.strip(" ,"),
+                        directed_negative.strip(" ,"),
+                    )
+                    if part
+                )
+                generated = await self._execute_job(
+                    job,
+                    GenerationOptions(
+                        prompt=final_prompt,
+                        negative_prompt=negative_prompt,
+                        width=width,
+                        height=height,
+                        lora_preset=style_preset,
+                        use_prompt_llm=False,
+                    ),
+                    event,
+                )
+                self._record_image_task_phase(
+                    job,
+                    "comfyui",
+                    "Anima 与可选 RTX 生成链路完成，图片已下载。",
+                    "reverse_draw_output_ready",
+                    details={"director_provider_id": director_provider},
+                )
+                return (
+                    reverse_result,
+                    reverse_provider,
+                    generated,
+                    final_prompt,
+                    director_provider,
+                )
+            finally:
+                if image_path is not None:
+                    image_path.unlink(missing_ok=True)
+
+        yield event.plain_result(
+            f"{MessageEmoji.DRAW} 正在反推图片、整理 Anima 提示词并生成……"
+        )
+        try:
+            (
+                _reverse_result,
+                reverse_provider,
+                generated,
+                final_prompt,
+                director_provider,
+            ) = await self._run_auxiliary_job(event, "reverse draw", operation)
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except (IncomingImageError, ReversePromptError, PromptDirectorError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] reverse draw failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 反推画图失败: {message}")
+            return
+        except (ComfyClientError, WorkflowError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] reverse draw generation failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 生成失败: {message}")
+            return
+        image_paths, seed, _, _, director_warning = generated
+        if director_warning:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {director_warning}")
+        if self.settings.show_llm_prompt:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 反推模型: {reverse_provider}\n"
+                f"分镜模型: {director_provider}\n最终提示词: {final_prompt}"
+            )
+        yield self._make_image_result(event, image_paths, seed, forward=False)
+        self._schedule_cleanup(image_paths)
+
+    @filter.command("放大")
+    async def cmd_rtx_upscale(
+        self, event: AstrMessageEvent, scale: str = ""
+    ) -> AsyncGenerator[Any, None]:
+        """Upscale one direct or replied image with the standalone RTX workflow."""
+        if not self._client or not self._upscale_workflow_builder:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} RTX 放大工作流未就绪: "
+                f"{self._upscale_initialization_error or self._initialization_error or '未知错误'}"
+            )
+            return
+        access_error = self._access_error(event, "", check_sensitive=False)
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        scale_text = self._extract_command_text(event.message_str, scale, command="放大")
+        try:
+            scale_value = (
+                self.settings.rtx_scale
+                if not scale_text
+                else float(scale_text.rstrip("xX倍 "))
+            )
+        except ValueError:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 放大倍率必须是数字，例如 /放大 2")
+            return
+        if not 1.0 <= scale_value <= 4.0:
+            yield event.plain_result(f"{MessageEmoji.ERROR} RTX 放大倍率必须在 1 到 4 之间")
+            return
+
+        async def operation(job: GenerationJob) -> GeneratedImagePaths:
+            return await self._execute_upscale_job(job, event, scale_value)
+
+        yield event.plain_result(
+            f"{MessageEmoji.INFO} 正在上传图片并执行 RTX {scale_value:g}× 放大……"
+        )
+        try:
+            image_paths = await self._run_auxiliary_job(
+                event,
+                "RTX upscale",
+                operation,
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except (IncomingImageError, ComfyClientError, WorkflowError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] RTX upscale failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} RTX 放大失败: {message}")
+            return
+        components = [
+            Comp.Plain(self._upscale_summary(image_paths, scale_value)),
+            *(Comp.Image.fromFileSystem(path) for path in image_paths),
+        ]
+        yield event.chain_result(components)
+        self._schedule_cleanup(image_paths)
 
     @anima.command("draw")
     async def cmd_draw(
@@ -798,9 +1141,7 @@ class ComfyAnimaPlugin(Star):
             yield event.plain_result(
                 f"{MessageEmoji.WARNING} {director_warning}，已改用原始提示词"
             )
-        yield event.plain_result(
-            f"{MessageEmoji.SUCCESS} 生成完成｜Seed: {seed}｜图片: {len(image_paths)} 张"
-        )
+        yield event.plain_result(self._generation_summary(image_paths, seed))
         if self.settings.show_llm_prompt and provider_id:
             yield event.plain_result(
                 f"{MessageEmoji.INFO} 分镜模型: {provider_id}\n"
@@ -975,7 +1316,7 @@ class ComfyAnimaPlugin(Star):
     async def cmd_unet_model_switch(
         self, event: AstrMessageEvent, identifier: str = ""
     ) -> AsyncGenerator[Any, None]:
-        """刷新完整 UNET 清单后按序号或名称切换节点 429。"""
+        """刷新完整 UNET 清单后按序号或名称切换当前档案的 UNET。"""
         value = self._extract_command_text(
             event.message_str,
             identifier,
@@ -1019,15 +1360,23 @@ class ComfyAnimaPlugin(Star):
         try:
             workflow_path = new_settings.resolve_workflow_path(self.plugin_dir)
             new_builder = WorkflowBuilder(workflow_path, new_settings)
-            # 立即验证配置的节点确实能接受 UNET 输入。
+            # 新工作流由档案声明节点映射；没有档案绑定的旧工作流才回退配置。
+            profile_binding = new_builder.profile.unet
+            if profile_binding is not None:
+                unet_node_id = profile_binding.node_id
+                unet_input_name = profile_binding.input_name
+            else:
+                unet_node_id = new_settings.unet_loader_node_id
+                unet_input_name = new_settings.unet_model_input_name
+            # 立即验证目标节点确实能接受 UNET 输入。
             node_value = new_builder.get_template_input(
-                new_settings.unet_loader_node_id,
-                new_settings.unet_model_input_name,
+                unet_node_id,
+                unet_input_name,
             )
             if node_value is None:
                 raise WorkflowError(
-                    f"工作流缺少 UNET 节点 {new_settings.unet_loader_node_id} "
-                    f"或输入 {new_settings.unet_model_input_name}"
+                    f"工作流缺少 UNET 节点 {unet_node_id} "
+                    f"或输入 {unet_input_name}"
                 )
         except (OSError, ValueError, WorkflowError) as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} UNET 模型切换失败: {exc}")
@@ -1401,7 +1750,10 @@ class ComfyAnimaPlugin(Star):
 自然语言: 帮我画一个……
 /画图 <英文 Tag> - 合并转发图片
 /画图no <英文 Tag> - 直接发送图片
-两者均可追加 --preset <序号|名称>
+/反推 [关注点] - 发送或引用图片，返回结构化 Anima 提示词
+/反推画图 [补充要求] - 反推后直接调用 Anima 生图
+/放大 [倍率] - 发送或引用图片，执行独立 RTX 放大
+/画图与 /画图no 均可追加 --preset <序号|名称>
 
 管理员:
 /comfy_ls - 列出工作流
@@ -1508,6 +1860,9 @@ think 控制块内容会被自动忽略。"""
 QQ快捷指令:
 /画图 <英文 Tag> - 合并转发
 /画图no <英文 Tag> - 直接图片
+/反推 [关注点] - 在线图片反推
+/反推画图 [补充要求] - 反推并生成
+/放大 [倍率] - RTX 图片放大
 /comfy帮助 - 完整帮助
 
 可选参数:
@@ -1637,15 +1992,44 @@ QQ快捷指令:
     ) -> Any:
         """按命令模式构造普通图片或 NapCat 合并转发消息。"""
         images = [Comp.Image.fromFileSystem(path) for path in image_paths]
+        summary = self._generation_summary(image_paths, seed)
         if not forward:
-            return event.chain_result(images)
+            return event.chain_result([Comp.Plain(summary), *images])
         self_id = str(getattr(event.message_obj, "self_id", "0") or "0")
         node = Comp.Node(
             uin=self_id,
             name=self.settings.forward_sender_name,
-            content=[Comp.Plain(f"Seed: {seed}")] + images,
+            content=[Comp.Plain(summary)] + images,
         )
         return event.chain_result([node])
+
+    @staticmethod
+    def _generation_summary(image_paths: list[Path], seed: int) -> str:
+        elapsed = max(
+            0.0,
+            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
+        )
+        gpu_name = str(
+            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
+        )
+        return (
+            f"{MessageEmoji.SUCCESS} 生成完成｜Seed: {seed}｜图片: {len(image_paths)} 张\n"
+            f"生成耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+        )
+
+    @staticmethod
+    def _upscale_summary(image_paths: list[Path], scale: float) -> str:
+        elapsed = max(
+            0.0,
+            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
+        )
+        gpu_name = str(
+            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
+        )
+        return (
+            f"{MessageEmoji.SUCCESS} RTX {scale:g}× 放大完成｜图片: {len(image_paths)} 张\n"
+            f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+        )
 
     def _access_error(
         self,
@@ -1755,17 +2139,37 @@ QQ快捷指令:
     async def web_ui_bootstrap(self) -> dict[str, Any]:
         """Return a secret-free snapshot for the management dashboard."""
         settings = self.settings
+        workflow_runtime: dict[str, Any] = {
+            "profile_id": "",
+            "display_name": "工作流未就绪",
+            "workflow_file": settings.workflow_file,
+            "sampler_steps_override": settings.sampler_steps_override,
+            "samplers": [],
+        }
+        if self._workflow_builder is not None:
+            profile = self._workflow_builder.profile
+            workflow_runtime.update(
+                {
+                    "profile_id": profile.profile_id,
+                    "display_name": profile.display_name,
+                    "samplers": self._workflow_builder.template_sampler_settings(),
+                }
+            )
         return {
             "version": PLUGIN_VERSION,
             "active_jobs": len(self._active_jobs),
             "web_ui_error": self._web_ui_error,
             "lora_archive_error": getattr(self, "_lora_archive_error", ""),
+            "workflow_runtime": workflow_runtime,
             "settings": {
                 "comfyui_url": settings.comfyui_url,
                 "workflow_file": settings.workflow_file,
                 "default_width": settings.default_width,
                 "default_height": settings.default_height,
+                "sampler_steps_override": settings.sampler_steps_override,
                 "enable_upscale": settings.enable_upscale,
+                "rtx_scale": settings.rtx_scale,
+                "rtx_quality": settings.rtx_quality,
                 "max_concurrent_jobs": settings.max_concurrent_jobs,
                 "user_cooldown": settings.user_cooldown,
                 "send_generation_notice": settings.send_generation_notice,
@@ -1775,6 +2179,14 @@ QQ快捷指令:
                 "prompt_llm_max_tokens": settings.prompt_llm_max_tokens,
                 "enable_natural_draw": settings.enable_natural_draw,
                 "enable_llm_pic_trigger": settings.enable_llm_pic_trigger,
+                "enable_reverse_prompt": settings.enable_reverse_prompt,
+                "reverse_prompt_provider_id": settings.reverse_prompt_provider_id,
+                "reverse_prompt_timeout": settings.reverse_prompt_timeout,
+                "reverse_prompt_temperature": settings.reverse_prompt_temperature,
+                "reverse_prompt_max_tokens": settings.reverse_prompt_max_tokens,
+                "reverse_prompt_system_prompt": settings.reverse_prompt_system_prompt,
+                "max_input_image_size_mb": settings.max_input_image_size_mb,
+                "max_input_image_pixels": settings.max_input_image_pixels,
                 "auto_draw_system_prompt": self._auto_draw_system_prompt,
                 "enable_lora_tool": settings.enable_lora_tool,
                 "lora_manager_url": settings.lora_manager_url,
@@ -3174,6 +3586,165 @@ QQ快捷指令:
             "reload_scheduled": reload_task is not None,
         }
 
+    async def web_ui_delete_lora(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Delete one exact live LoRA without accepting a browser path."""
+        return await self._web_ui_delete_asset("lora", payload)
+
+    async def web_ui_delete_unet(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Delete one exact non-active UNET without accepting a browser path."""
+        return await self._web_ui_delete_asset("unet", payload)
+
+    async def _web_ui_delete_asset(
+        self,
+        asset_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._model_manager is None:
+            raise WebUiActionError(
+                self._model_manager_error or "模型删除服务未启用"
+            )
+        exact_name = str(payload.get("exact_name") or "").strip()
+        confirm_name = str(payload.get("confirm_name") or "").strip()
+        remove_from_presets = bool(payload.get("remove_from_presets"))
+        preset_snapshot = (
+            self._snapshot_lora_preset_state()
+            if asset_type == "lora" and remove_from_presets
+            else None
+        )
+        remote_delete_succeeded = False
+        store = self._task_store
+        run_id = ""
+        if store is not None:
+            run_id = store.create_task(
+                "asset_delete",
+                mode=asset_type,
+                requested_by="web_ui",
+                total_items=1,
+                metadata={"asset_type": asset_type, "exact_name": exact_name},
+            )
+            store.start_task(run_id, total_items=1)
+            store.append_event(
+                run_id,
+                "refresh",
+                "正在强制刷新 LoRA Manager 与 ComfyUI 最新可加载清单。",
+                event_code="asset_refresh_started",
+                item_name=exact_name,
+            )
+        try:
+            if asset_type == "lora":
+                result = await self._model_manager.delete_lora(
+                    exact_name,
+                    confirm_name,
+                    remove_from_presets=remove_from_presets,
+                )
+                remote_delete_succeeded = True
+                fresh_records = await self._lora_catalog.refresh_for_operation()
+                semantic_index = self._runtime_semantic_index()
+                semantic_index.sync_presence(fresh_records)
+                semantic_index.save(self._semantic_index_path)
+            elif asset_type == "unet":
+                result = await self._model_manager.delete_unet(
+                    exact_name,
+                    confirm_name,
+                )
+                await self._unet_catalog.list_models()
+            else:
+                raise WebUiActionError("不支持的模型类型")
+        except WebUiActionError:
+            raise
+        except (ModelManagerError, LoraCatalogError, UnetCatalogError, LoraSemanticError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            rollback_applied = False
+            rollback_failed = False
+            if preset_snapshot is not None and not remote_delete_succeeded:
+                try:
+                    rollback_applied = self._restore_lora_preset_state(preset_snapshot)
+                except ModelManagerError as rollback_exc:
+                    rollback_failed = True
+                    message = (
+                        f"{message}；LoRA 组合回滚失败："
+                        f"{rollback_exc.user_message}"
+                    )
+                    logger.error(
+                        f"[{PLUGIN_NAME}] LoRA preset rollback failed after "
+                        f"asset deletion error: {rollback_exc}"
+                    )
+                else:
+                    if rollback_applied:
+                        message = f"{message}；删除前的 LoRA 组合配置已恢复"
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] Restored LoRA preset state after "
+                            "asset deletion transaction failed"
+                        )
+            if remote_delete_succeeded:
+                message = (
+                    f"{message}；远端 LoRA 已删除，但删除后同步失败，"
+                    "已保留组合清理结果"
+                )
+            if store is not None and run_id:
+                event_message = (
+                    "远端 LoRA 已删除，但删除后的实时清单刷新失败。"
+                    if remote_delete_succeeded
+                    else "资产删除未完成，远端文件未被确认移除。"
+                )
+                if rollback_applied:
+                    event_message += " 删除前的 LoRA 组合配置和运行状态已恢复。"
+                elif rollback_failed:
+                    event_message += " LoRA 组合回滚失败，请立即检查配置。"
+                store.append_event(
+                    run_id,
+                    "delete",
+                    event_message,
+                    level="ERROR",
+                    event_code="asset_delete_failed",
+                    item_name=exact_name,
+                    details={
+                        "asset_type": asset_type,
+                        "error_type": type(exc).__name__,
+                        "remote_delete_succeeded": remote_delete_succeeded,
+                        "preset_rollback_applied": rollback_applied,
+                        "preset_rollback_failed": rollback_failed,
+                    },
+                )
+                store.finish_task(
+                    run_id,
+                    "failed",
+                    completed_items=0,
+                    failed_items=1,
+                    error_code="asset_delete_failed",
+                    error_summary=message,
+                )
+            raise WebUiActionError(message) from exc
+
+        response = result.as_dict()
+        response["run_id"] = run_id
+        response["message"] = f"已安全删除 {asset_type.upper()}：{result.exact_name}"
+        if store is not None and run_id:
+            store.append_event(
+                run_id,
+                "delete",
+                "远端删除成功，并已完成删除后的实时清单刷新。",
+                event_code="asset_delete_succeeded",
+                item_name=result.exact_name,
+                details={
+                    "asset_type": asset_type,
+                    "preset_cleanup_count": result.preset_cleanup_count,
+                },
+            )
+            store.finish_task(
+                run_id,
+                "succeeded",
+                completed_items=1,
+                failed_items=0,
+                result=response,
+            )
+        if result.removed_from_presets:
+            response["reload_scheduled"] = self._schedule_self_reload(
+                delay=1.5,
+                reason="Web UI 删除 LoRA 并清理组合",
+            ) is not None
+        return response
+
     async def web_ui_list_unet(self) -> dict[str, Any]:
         """Always read the latest UNETLoader catalog."""
         if self._unet_catalog is None:
@@ -3182,7 +3753,7 @@ QQ快捷指令:
             entries = await self._unet_catalog.list_models()
         except UnetCatalogError as exc:
             raise WebUiActionError(exc.user_message) from exc
-        current = self.settings.unet_model_name.casefold()
+        current = self._current_unet_model().casefold()
         return {
             "items": [
                 {
@@ -3399,6 +3970,233 @@ QQ快捷指令:
                 if self._active_jobs.get(user_id) is job:
                     self._active_jobs.pop(user_id, None)
 
+    async def _run_auxiliary_job(
+        self,
+        event: AstrMessageEvent,
+        label: str,
+        operation: Any,
+    ) -> Any:
+        """Apply the normal per-user duplicate and cooldown rules to image tools."""
+        user_id = str(event.get_sender_id() or "unknown")
+        now = time.monotonic()
+        async with self._jobs_lock:
+            existing = self._active_jobs.get(user_id)
+            if existing and existing.task and not existing.task.done():
+                raise ValueError("你已有图片任务，请等待完成或先取消当前任务")
+            bypass_cooldown = bool(
+                event.is_admin() and self.settings.admin_ignore_cooldown
+            )
+            if not bypass_cooldown:
+                remaining = self.settings.user_cooldown - (
+                    now - self._last_request_at.get(user_id, 0.0)
+                )
+                if remaining > 0:
+                    raise ValueError(f"操作过快，请在 {int(remaining) + 1} 秒后重试")
+            job = GenerationJob(
+                user_id=user_id,
+                prompt_preview=label[:80],
+                created_at=now,
+            )
+            task_type = {
+                "reverse prompt": "reverse_prompt",
+                "reverse draw": "reverse_draw",
+                "RTX upscale": "rtx_upscale",
+            }.get(label, "image_tool")
+            if self._task_store is not None:
+                job.task_run_id = self._task_store.create_task(
+                    task_type,
+                    mode="qq_command",
+                    requested_by=user_id,
+                    total_items=1,
+                    metadata={"operation": task_type},
+                )
+                self._task_store.start_task(job.task_run_id, total_items=1)
+                self._task_store.append_event(
+                    job.task_run_id,
+                    "run",
+                    "图片任务开始执行，正在读取本次显式提供或引用的图片。",
+                    event_code="image_task_started",
+                )
+
+            async def runner() -> Any:
+                try:
+                    result = await operation(job)
+                    if self._task_store is not None and job.task_run_id:
+                        self._task_store.append_event(
+                            job.task_run_id,
+                            "run",
+                            "图片任务的全部阶段已执行完成。",
+                            event_code="image_task_succeeded",
+                            details={"final_state": job.state},
+                        )
+                        self._task_store.finish_task(
+                            job.task_run_id,
+                            "succeeded",
+                            completed_items=1,
+                            failed_items=0,
+                            result={"final_state": job.state},
+                        )
+                    return result
+                except asyncio.CancelledError:
+                    job.state = "cancelled"
+                    if job.prompt_id and self._client:
+                        await self._client.cancel(job.prompt_id)
+                    if self._task_store is not None and job.task_run_id:
+                        self._task_store.finish_task(
+                            job.task_run_id,
+                            "cancelled",
+                            completed_items=0,
+                            failed_items=0,
+                            error_code="cancelled",
+                            error_summary="用户或管理员取消了图片任务。",
+                        )
+                    raise
+                except Exception as exc:
+                    job.state = "failed"
+                    if self._task_store is not None and job.task_run_id:
+                        safe_message = str(
+                            getattr(exc, "user_message", type(exc).__name__)
+                        )[:500]
+                        self._task_store.append_event(
+                            job.task_run_id,
+                            "run",
+                            "图片任务在当前阶段失败。",
+                            level="ERROR",
+                            event_code="image_task_failed",
+                            details={
+                                "final_state": job.state,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                        self._task_store.finish_task(
+                            job.task_run_id,
+                            "failed",
+                            completed_items=0,
+                            failed_items=1,
+                            error_code="image_task_failed",
+                            error_summary=safe_message,
+                        )
+                    raise
+
+            job.task = asyncio.create_task(runner())
+            self._active_jobs[user_id] = job
+            self._last_request_at[user_id] = now
+        try:
+            return await job.task
+        finally:
+            async with self._jobs_lock:
+                if self._active_jobs.get(user_id) is job:
+                    self._active_jobs.pop(user_id, None)
+
+    def _record_image_task_phase(
+        self,
+        job: GenerationJob,
+        phase: str,
+        message: str,
+        event_code: str,
+        *,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if self._task_store is None or not job.task_run_id:
+            return
+        self._task_store.append_event(
+            job.task_run_id,
+            phase,
+            message,
+            event_code=event_code,
+            details=details,
+        )
+
+    async def _execute_upscale_job(
+        self,
+        job: GenerationJob,
+        event: AstrMessageEvent,
+        scale: float,
+    ) -> GeneratedImagePaths:
+        """Upload one validated QQ image and execute the standalone RTX workflow."""
+        assert self._client is not None
+        assert self._upscale_workflow_builder is not None
+        source: Optional[Path] = None
+        image_paths = GeneratedImagePaths()
+        started_at = time.monotonic()
+        try:
+            job.state = "reading_image"
+            source = await self._image_input.collect_one(event)
+            self._record_image_task_phase(
+                job,
+                "input",
+                "输入图片校验完成，格式、文件大小与像素总量均在限制内。",
+                "input_image_ready",
+                details={"bytes": source.stat().st_size},
+            )
+            async with self._generation_slots:
+                job.state = "uploading"
+                self._record_image_task_phase(
+                    job,
+                    "upload",
+                    "正在将安全命名的图片副本上传到 ComfyUI input。",
+                    "comfy_upload_started",
+                )
+                uploaded = await self._client.upload_image(source)
+                job.state = "building"
+                self._record_image_task_phase(
+                    job,
+                    "workflow",
+                    "图片上传完成，正在构建独立 RTX 放大工作流。",
+                    "rtx_workflow_building",
+                    details={"scale": scale, "quality": self.settings.rtx_quality},
+                )
+                workflow, preferred_nodes = self._upscale_workflow_builder.build(
+                    uploaded.workflow_value,
+                    scale=scale,
+                    quality=self.settings.rtx_quality,
+                )
+                job.state = "submitting"
+                job.prompt_id = await self._client.submit(workflow)
+                job.state = "upscaling"
+                self._record_image_task_phase(
+                    job,
+                    "comfyui",
+                    "RTX 工作流已提交，正在等待 ComfyUI 输出。",
+                    "rtx_generation_waiting",
+                )
+                references = await self._client.wait_for_images(
+                    job.prompt_id,
+                    preferred_nodes,
+                )
+                job.state = "downloading"
+                job_dir = self._temp_dir / job.prompt_id
+                for reference in references:
+                    image_paths.append(
+                        await self._client.download_image(reference, job_dir)
+                    )
+                image_paths.elapsed_seconds = max(
+                    0.0,
+                    time.monotonic() - started_at,
+                )
+                try:
+                    image_paths.gpu_name = await self._client.gpu_name()
+                except Exception as exc:
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] unable to read ComfyUI GPU model: {exc}"
+                    )
+                job.state = "completed"
+                self._record_image_task_phase(
+                    job,
+                    "download",
+                    "RTX 输出下载完成。",
+                    "rtx_output_ready",
+                    details={"image_count": len(image_paths)},
+                )
+                return image_paths
+        except Exception:
+            for image_path in image_paths:
+                image_path.unlink(missing_ok=True)
+            raise
+        finally:
+            if source is not None:
+                source.unlink(missing_ok=True)
+
     async def _execute_job(
         self,
         job: GenerationJob,
@@ -3408,7 +4206,8 @@ QQ快捷指令:
         """占用并发槽，提交任务、等待结果并下载图片。"""
         assert self._client is not None
         assert self._workflow_builder is not None
-        image_paths: list[Path] = []
+        started_at = time.monotonic()
+        image_paths = GeneratedImagePaths()
         effective_prompt = options.prompt
         provider_id = ""
         director_negative = ""
@@ -3551,6 +4350,13 @@ QQ快捷指令:
                     image_paths.append(
                         await self._client.download_image(reference, job_dir)
                     )
+                image_paths.elapsed_seconds = max(0.0, time.monotonic() - started_at)
+                try:
+                    image_paths.gpu_name = await self._client.gpu_name()
+                except Exception as exc:
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] unable to read ComfyUI GPU model: {exc}"
+                    )
                 job.state = "completed"
                 return (
                     image_paths,
@@ -3611,6 +4417,92 @@ QQ快捷指令:
             return (default_style,), True
         return (), False
 
+    def _lora_preset_references(self, exact_name: str) -> tuple[str, ...]:
+        """Return saved preset names that currently reference one exact LoRA."""
+        target = canonical_lora_name(exact_name).casefold()
+        if not target:
+            return ()
+        return tuple(
+            preset.name
+            for preset in self._lora_presets.presets
+            if any(
+                canonical_lora_name(selection.name).casefold() == target
+                for selection in preset.selections
+            )
+        )
+
+    def _snapshot_lora_preset_state(self) -> dict[str, Any]:
+        """Capture persisted and in-memory preset state before a delete transaction."""
+        config = getattr(self, "config", None)
+        default_style = self.settings.default_style_preset
+        if config is not None:
+            default_style = str(config.get("default_style_preset", default_style) or "")
+        return {
+            "lora_presets": self._lora_presets.to_config(),
+            "default_style_preset": default_style,
+        }
+
+    def _restore_lora_preset_state(self, snapshot: dict[str, Any]) -> bool:
+        """Restore a preset cleanup that preceded an unconfirmed remote delete."""
+        presets = list(snapshot.get("lora_presets") or [])
+        default_style = str(snapshot.get("default_style_preset") or "")
+        config = getattr(self, "config", None)
+        current_default = self.settings.default_style_preset
+        if config is not None:
+            current_default = str(
+                config.get("default_style_preset", current_default) or ""
+            )
+        if (
+            self._lora_presets.to_config() == presets
+            and current_default == default_style
+        ):
+            return False
+        if not self._persist_config_updates(
+            {
+                "lora_presets": presets,
+                "default_style_preset": default_style,
+            }
+        ):
+            raise ModelManagerError(
+                "删除失败后无法恢复 LoRA 组合配置，请立即检查配置文件"
+            )
+        self._lora_presets.load(presets)
+        return True
+
+    def _remove_lora_from_presets(self, exact_name: str) -> int:
+        """Explicitly remove one LoRA from presets and persist the new registry."""
+        target = canonical_lora_name(exact_name).casefold()
+        if not target:
+            return 0
+        updated: list[dict[str, Any]] = []
+        changed_count = 0
+        removed_preset_names: set[str] = set()
+        for item in self._lora_presets.to_config():
+            remaining = []
+            removed_here = False
+            for raw in item.get("loras", []):
+                name = str(raw).split("=", 1)[0].strip()
+                if canonical_lora_name(name).casefold() == target:
+                    removed_here = True
+                    continue
+                remaining.append(raw)
+            if removed_here:
+                changed_count += 1
+            if remaining:
+                updated.append({**item, "loras": remaining})
+            elif removed_here:
+                removed_preset_names.add(str(item.get("name") or ""))
+
+        if changed_count == 0:
+            return 0
+        updates: dict[str, Any] = {"lora_presets": updated}
+        if self.settings.default_style_preset in removed_preset_names:
+            updates["default_style_preset"] = ""
+        if not self._persist_config_updates(updates):
+            raise ModelManagerError("LoRA 预设清理保存失败，已阻止删除")
+        self._lora_presets.load(updated)
+        return changed_count
+
     def _current_unet_model(self) -> str:
         """返回配置覆盖值；未覆盖时读取当前工作流模板的 UNET。"""
         configured = self.settings.unet_model_name.strip()
@@ -3618,6 +4510,13 @@ QQ快捷指令:
             return configured
         if not self._workflow_builder:
             return ""
+        binding = self._workflow_builder.profile.unet
+        if binding is not None:
+            value = self._workflow_builder.get_template_input(
+                binding.node_id,
+                binding.input_name,
+            )
+            return str(value or "").strip()
         value = self._workflow_builder.get_template_input(
             self.settings.unet_loader_node_id,
             self.settings.unet_model_input_name,

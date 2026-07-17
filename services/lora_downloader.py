@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.0.0
+AstrBot Comfy Anima 插件 v1.1.0
 
 通过 ComfyUI-Lora-Manager 从 Civitai 下载 LoRA，并在下载完成后
 再次获取该文件的 Civitai 元数据。

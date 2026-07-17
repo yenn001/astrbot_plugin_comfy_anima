@@ -1,17 +1,19 @@
 """
-AstrBot Comfy Anima 插件 v1.4.0
+AstrBot Comfy Anima 插件 v1.1.0
 
 功能描述：
 - 调用 ComfyUI HTTP API
 - 轮询任务、提取并下载生成图片
 
 作者: Yen
-版本: 1.4.0
+版本: 1.1.0
 日期: 2026-07-14
 """
 
 import asyncio
+import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -19,7 +21,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from ..models import ImageReference, PluginSettings
+from ..models import ImageReference, PluginSettings, UploadedImageReference
 
 
 class ComfyClientError(RuntimeError):
@@ -88,6 +90,79 @@ class ComfyClient:
     async def health(self) -> dict[str, Any]:
         """获取 ComfyUI 系统状态。"""
         return await self._request_json("GET", "/system_stats")
+
+    async def gpu_name(self) -> str:
+        """Return the first ComfyUI GPU model without allocator decorations."""
+        payload = await self.health()
+        devices = payload.get("devices")
+        if not isinstance(devices, list):
+            return "未知 GPU"
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            name = str(device.get("name") or "").strip()
+            if not name:
+                continue
+            name = re.sub(r"^cuda:\d+\s+", "", name, flags=re.IGNORECASE)
+            name = re.sub(r"\s*:\s*cudaMallocAsync\s*$", "", name)
+            return name.strip() or "未知 GPU"
+        return "未知 GPU"
+
+    async def upload_image(
+        self,
+        image_path: Path,
+        *,
+        subfolder: str = "astrbot_comfy_anima",
+    ) -> UploadedImageReference:
+        """Upload a validated local image to ComfyUI's input directory."""
+        source = image_path.resolve(strict=True)
+        suffix = source.suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ComfyClientError("只支持 PNG、JPEG 和 WebP 图片")
+        content = await asyncio.to_thread(source.read_bytes)
+        digest = hashlib.sha256(content).hexdigest()[:24]
+        filename = f"{digest}{suffix}"
+        form = aiohttp.FormData()
+        form.add_field(
+            "image",
+            content,
+            filename=filename,
+            content_type={
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }[suffix],
+        )
+        form.add_field("type", "input")
+        form.add_field("subfolder", subfolder)
+        form.add_field("overwrite", "true")
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self._base_url}/upload/image", data=form) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise ComfyClientError(
+                        f"ComfyUI 图片上传失败（HTTP {response.status}）",
+                        body[:1000],
+                    )
+        except asyncio.TimeoutError as exc:
+            raise ComfyClientError("上传图片到 ComfyUI 超时") from exc
+        except aiohttp.ClientError as exc:
+            raise ComfyClientError("无法上传图片到 ComfyUI", str(exc)) from exc
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ComfyClientError("ComfyUI 返回了无效的上传结果") from exc
+        name = str(payload.get("name") or "").strip()
+        returned_subfolder = str(payload.get("subfolder") or "").strip().strip("/")
+        image_type = str(payload.get("type") or "input").strip()
+        for value in (name, returned_subfolder):
+            if ".." in value or "\\" in value or value.startswith(("/", "~")):
+                raise ComfyClientError("ComfyUI 返回了不安全的图片路径")
+        if not name or Path(name).name != name or image_type != "input":
+            raise ComfyClientError("ComfyUI 返回了无效的图片引用")
+        return UploadedImageReference(name, returned_subfolder, image_type)
 
     async def queue(self) -> dict[str, Any]:
         """获取 ComfyUI 队列状态。"""

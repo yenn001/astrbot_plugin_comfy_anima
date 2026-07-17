@@ -88,6 +88,10 @@ class WebUiController(Protocol):
 
     async def web_ui_delete_preset(self, identifier: str) -> dict[str, Any]: ...
 
+    async def web_ui_delete_lora(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_delete_unet(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
     async def web_ui_list_unet(self) -> dict[str, Any]: ...
 
     async def web_ui_select_unet(self, identifier: str) -> dict[str, Any]: ...
@@ -172,6 +176,7 @@ class WebUiService:
                 web.post("/api/loras/metadata", self._fetch_lora_metadata),
                 web.post("/api/lora/metadata-fetch", self._fetch_lora_metadata),
                 web.get("/api/loras/detail", self._get_lora_detail),
+                web.post("/api/loras/delete", self._delete_lora),
                 web.put("/api/loras/semantic", self._save_lora_semantic),
                 web.get("/api/loras/archive", self._get_lora_archive),
                 web.post("/api/loras/archive", self._archive_loras),
@@ -187,6 +192,7 @@ class WebUiService:
                 ),
                 web.get("/api/unet", self._list_unet),
                 web.post("/api/unet/select", self._select_unet),
+                web.post("/api/unet/delete", self._delete_unet),
                 web.get("/api/config-profiles", self._list_config_profiles),
                 web.post("/api/config-profiles", self._save_config_profile),
                 web.post(
@@ -406,9 +412,24 @@ class WebUiService:
         return web.json_response({"ok": True, "data": payload})
 
     async def _save_settings(self, request: web.Request) -> web.Response:
-        return await self._controller_response(
-            self._controller.web_ui_save_settings(await self._read_json(request))
-        )
+        async def save() -> dict[str, Any]:
+            payload = await self._read_json(request)
+            if "sampler_steps_override" in payload:
+                raw_value = payload["sampler_steps_override"]
+                if isinstance(raw_value, bool):
+                    raise WebUiActionError("采样步数覆盖必须是 0–100 的整数")
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise WebUiActionError(
+                        "采样步数覆盖必须是 0–100 的整数"
+                    ) from exc
+                if str(raw_value).strip() != str(value) or not 0 <= value <= 100:
+                    raise WebUiActionError("采样步数覆盖必须是 0–100 的整数")
+                payload["sampler_steps_override"] = value
+            return await self._controller.web_ui_save_settings(payload)
+
+        return await self._controller_response(save())
 
     async def _list_providers(self, _request: web.Request) -> web.Response:
         return await self._controller_response(self._controller.web_ui_list_providers())
@@ -445,6 +466,11 @@ class WebUiService:
             return self._json_error("LoRA 名称无效", status=400)
         return await self._controller_response(
             self._controller.web_ui_get_lora_detail(name)
+        )
+
+    async def _delete_lora(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_lora(await self._read_json(request))
         )
 
     async def _save_lora_semantic(self, request: web.Request) -> web.Response:
@@ -498,6 +524,11 @@ class WebUiService:
         payload = await self._read_json(request)
         return await self._controller_response(
             self._controller.web_ui_select_unet(str(payload.get("identifier") or ""))
+        )
+
+    async def _delete_unet(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_unet(await self._read_json(request))
         )
 
     async def _list_config_profiles(self, _request: web.Request) -> web.Response:

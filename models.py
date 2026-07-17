@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.0.0
+AstrBot Comfy Anima 插件 v1.1.0
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.4.0
+版本: 1.1.0
 日期: 2026-07-14
 """
 
@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_UPSCALE_OUTPUT_NODE_ID,
     DEFAULT_WORKFLOW_FILE,
     MAX_IMAGE_SIDE,
+    MAX_STEPS,
     MIN_IMAGE_SIDE,
 )
 
@@ -136,6 +137,7 @@ class PluginSettings:
     web_ui_password: str = ""
     web_ui_session_ttl: int = 43200
     workflow_file: str = DEFAULT_WORKFLOW_FILE
+    upscale_workflow_file: str = "workflow/rtx_upscale_api.json"
     enable_prompt_llm: bool = True
     prompt_llm_provider_id: str = ""
     prompt_llm_timeout: int = 120
@@ -149,6 +151,14 @@ class PluginSettings:
     enable_llm_pic_trigger: bool = True
     auto_draw_system_prompt: str = ""
     max_auto_images_per_reply: int = 1
+    enable_reverse_prompt: bool = True
+    reverse_prompt_provider_id: str = ""
+    reverse_prompt_timeout: int = 120
+    reverse_prompt_temperature: float = 0.1
+    reverse_prompt_max_tokens: int = 1600
+    reverse_prompt_system_prompt: str = ""
+    max_input_image_size_mb: int = 20
+    max_input_image_pixels: int = 40_000_000
     workflow_dir: str = "workflow"
     enable_unet_switch: bool = True
     unet_catalog_url: str = ""
@@ -212,6 +222,7 @@ class PluginSettings:
     sampler_node_ids: list[str] = field(
         default_factory=lambda: [DEFAULT_PRIMARY_SAMPLER_NODE_ID]
     )
+    sampler_steps_override: int = 0
     output_node_ids: list[str] = field(
         default_factory=lambda: [
             DEFAULT_UPSCALE_OUTPUT_NODE_ID,
@@ -220,6 +231,8 @@ class PluginSettings:
     )
     upscale_output_node_id: str = DEFAULT_UPSCALE_OUTPUT_NODE_ID
     enable_upscale: bool = True
+    rtx_scale: float = 2.0
+    rtx_quality: str = "ULTRA"
     send_generation_notice: bool = True
     allow_global_interrupt: bool = False
     max_concurrent_jobs: int = 1
@@ -259,6 +272,10 @@ class PluginSettings:
                 _as_int(data.get("web_ui_session_ttl"), 43200, 300),
             ),
             workflow_file=str(data.get("workflow_file", DEFAULT_WORKFLOW_FILE)).strip(),
+            upscale_workflow_file=str(
+                data.get("upscale_workflow_file", "workflow/rtx_upscale_api.json")
+            ).strip()
+            or "workflow/rtx_upscale_api.json",
             enable_prompt_llm=_as_bool(data.get("enable_prompt_llm"), True),
             prompt_llm_provider_id=str(data.get("prompt_llm_provider_id", "")).strip(),
             prompt_llm_timeout=_as_int(data.get("prompt_llm_timeout"), 120, 10),
@@ -279,6 +296,33 @@ class PluginSettings:
             ).strip(),
             max_auto_images_per_reply=_as_int(
                 data.get("max_auto_images_per_reply"), 1, 1
+            ),
+            enable_reverse_prompt=_as_bool(data.get("enable_reverse_prompt"), True),
+            reverse_prompt_provider_id=str(
+                data.get("reverse_prompt_provider_id", "")
+            ).strip(),
+            reverse_prompt_timeout=min(
+                300,
+                _as_int(data.get("reverse_prompt_timeout"), 120, 10),
+            ),
+            reverse_prompt_temperature=min(
+                2.0,
+                max(0.0, _as_float(data.get("reverse_prompt_temperature"), 0.1)),
+            ),
+            reverse_prompt_max_tokens=min(
+                8000,
+                _as_int(data.get("reverse_prompt_max_tokens"), 1600, 256),
+            ),
+            reverse_prompt_system_prompt=str(
+                data.get("reverse_prompt_system_prompt", "")
+            ).strip(),
+            max_input_image_size_mb=min(
+                100,
+                _as_int(data.get("max_input_image_size_mb"), 20, 1),
+            ),
+            max_input_image_pixels=min(
+                100_000_000,
+                _as_int(data.get("max_input_image_pixels"), 40_000_000, 1_000_000),
             ),
             workflow_dir=str(data.get("workflow_dir", "workflow")).strip()
             or "workflow",
@@ -400,6 +444,10 @@ class PluginSettings:
             sampler_node_ids=_as_string_list(
                 data.get("sampler_node_ids"), [DEFAULT_PRIMARY_SAMPLER_NODE_ID]
             ),
+            sampler_steps_override=min(
+                MAX_STEPS,
+                _as_int(data.get("sampler_steps_override"), 0, 0),
+            ),
             output_node_ids=_as_string_list(
                 data.get("output_node_ids"),
                 [DEFAULT_UPSCALE_OUTPUT_NODE_ID, DEFAULT_PREVIEW_OUTPUT_NODE_ID],
@@ -408,6 +456,16 @@ class PluginSettings:
                 data.get("upscale_output_node_id", DEFAULT_UPSCALE_OUTPUT_NODE_ID)
             ).strip(),
             enable_upscale=_as_bool(data.get("enable_upscale"), True),
+            rtx_scale=min(
+                4.0,
+                max(1.0, _as_float(data.get("rtx_scale"), 2.0)),
+            ),
+            rtx_quality=(
+                str(data.get("rtx_quality", "ULTRA")).strip().upper()
+                if str(data.get("rtx_quality", "ULTRA")).strip().upper()
+                in {"LOW", "MEDIUM", "HIGH", "ULTRA"}
+                else "ULTRA"
+            ),
             send_generation_notice=_as_bool(data.get("send_generation_notice"), True),
             allow_global_interrupt=_as_bool(data.get("allow_global_interrupt"), False),
             max_concurrent_jobs=_as_int(data.get("max_concurrent_jobs"), 1, 1),
@@ -422,6 +480,11 @@ class PluginSettings:
     def resolve_workflow_path(self, plugin_dir: Path) -> Path:
         """解析并返回工作流路径。"""
         path = Path(self.workflow_file).expanduser()
+        return path if path.is_absolute() else plugin_dir / path
+
+    def resolve_upscale_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the standalone RTX workflow path."""
+        path = Path(self.upscale_workflow_file).expanduser()
         return path if path.is_absolute() else plugin_dir / path
 
     def resolve_director_reference_path(self, plugin_dir: Path) -> Path:
@@ -466,6 +529,28 @@ class ImageReference:
     node_id: str = ""
 
 
+@dataclass(frozen=True)
+class UploadedImageReference:
+    """A validated ComfyUI input-image reference."""
+
+    name: str
+    subfolder: str = ""
+    image_type: str = "input"
+
+    @property
+    def workflow_value(self) -> str:
+        return f"{self.subfolder.rstrip('/')}/{self.name}" if self.subfolder else self.name
+
+
+class GeneratedImagePaths(list[Path]):
+    """Generated files plus safe execution metadata for the reply layer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.elapsed_seconds: float = 0.0
+        self.gpu_name: str = "未知 GPU"
+
+
 @dataclass
 class GenerationJob:
     """正在执行或排队中的生成任务。"""
@@ -476,3 +561,4 @@ class GenerationJob:
     task: Any = None
     prompt_id: Optional[str] = None
     state: str = "queued"
+    task_run_id: str = ""

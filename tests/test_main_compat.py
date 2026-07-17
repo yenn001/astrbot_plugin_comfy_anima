@@ -8,7 +8,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from ..models import LoraSelection
+from ..models import GeneratedImagePaths, LoraSelection
 
 
 class _DecoratorGroup:
@@ -240,6 +240,150 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
 
 
+class GenerationReplyMetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def test_generation_summary_includes_elapsed_time_and_gpu(self) -> None:
+        paths = GeneratedImagePaths()
+        paths.extend([Path("one.png"), Path("two.png")])
+        paths.elapsed_seconds = 12.345
+        paths.gpu_name = "NVIDIA GeForce RTX 5060 Ti"
+        summary = self.main.ComfyAnimaPlugin._generation_summary(paths, 42)
+        self.assertIn("Seed: 42", summary)
+        self.assertIn("12.35 秒", summary)
+        self.assertIn("NVIDIA GeForce RTX 5060 Ti", summary)
+        self.assertIn("2 张", summary)
+
+    def test_explicit_lora_cleanup_updates_all_referencing_presets(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {"default_style_preset": "风格1"}
+        )
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=4)
+        plugin._lora_presets.save(
+            name="风格1",
+            category="style",
+            selections=(
+                LoraSelection("styles/base", 0.5),
+                LoraSelection("shared/remove-me", 0.4),
+            ),
+        )
+        plugin._lora_presets.save(
+            name="角色1",
+            category="character",
+            selections=(LoraSelection("shared/remove-me", 0.8),),
+        )
+        persisted = []
+        plugin._persist_config_updates = lambda updates: persisted.append(updates) or True
+
+        self.assertEqual(
+            plugin._lora_preset_references("shared/remove-me.safetensors"),
+            ("风格1", "角色1"),
+        )
+        changed = plugin._remove_lora_from_presets("shared/remove-me.safetensors")
+        self.assertEqual(changed, 2)
+        self.assertEqual(plugin._lora_preset_references("shared/remove-me"), ())
+        self.assertEqual(len(plugin._lora_presets.presets), 1)
+        self.assertEqual(plugin._lora_presets.presets[0].name, "风格1")
+        self.assertEqual(persisted[0]["lora_presets"][0]["loras"], ["styles/base=0.5"])
+
+
+class LoraDeleteTransactionTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def _plugin_with_referenced_preset(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {"default_style_preset": "风格1"}
+        )
+
+        class Config(dict):
+            def save_config(self):
+                return None
+
+        plugin.config = Config(default_style_preset="风格1")
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=4)
+        plugin._lora_presets.save(
+            name="风格1",
+            category="style",
+            selections=(LoraSelection("shared/remove-me", 0.5),),
+        )
+        plugin.config["lora_presets"] = plugin._lora_presets.to_config()
+        plugin._task_store = None
+        plugin._model_manager_error = ""
+        return plugin
+
+    async def test_unconfirmed_remote_delete_restores_preset_state(self) -> None:
+        plugin = self._plugin_with_referenced_preset()
+
+        class FailingManager:
+            async def delete_lora(_self, *_args, **_kwargs):
+                plugin._remove_lora_from_presets("shared/remove-me")
+                raise self.main.ModelManagerError("Manager 未确认删除成功")
+
+        plugin._model_manager = FailingManager()
+        with self.assertRaisesRegex(
+            self.main.WebUiActionError, "组合配置已恢复"
+        ):
+            await plugin._web_ui_delete_asset(
+                "lora",
+                {
+                    "exact_name": "shared/remove-me",
+                    "confirm_name": "shared/remove-me",
+                    "remove_from_presets": True,
+                },
+            )
+
+        self.assertEqual(
+            plugin._lora_preset_references("shared/remove-me"), ("风格1",)
+        )
+        self.assertEqual(plugin.config["default_style_preset"], "风格1")
+        self.assertEqual(len(plugin.config["lora_presets"]), 1)
+
+    async def test_post_delete_refresh_failure_keeps_cleanup(self) -> None:
+        plugin = self._plugin_with_referenced_preset()
+
+        class Result:
+            removed_from_presets = True
+            preset_cleanup_count = 1
+
+            def as_dict(self):
+                return {"deleted": True}
+
+        class SuccessfulManager:
+            async def delete_lora(_self, *_args, **_kwargs):
+                plugin._remove_lora_from_presets("shared/remove-me")
+                return Result()
+
+        class FailingCatalog:
+            async def refresh_for_operation(_self):
+                raise self.main.LoraCatalogError("删除后刷新失败")
+
+        plugin._model_manager = SuccessfulManager()
+        plugin._lora_catalog = FailingCatalog()
+        with self.assertRaisesRegex(
+            self.main.WebUiActionError, "远端 LoRA 已删除.*已保留组合清理结果"
+        ):
+            await plugin._web_ui_delete_asset(
+                "lora",
+                {
+                    "exact_name": "shared/remove-me",
+                    "confirm_name": "shared/remove-me",
+                    "remove_from_presets": True,
+                },
+            )
+
+        self.assertEqual(plugin._lora_preset_references("shared/remove-me"), ())
+        self.assertEqual(plugin.config["default_style_preset"], "")
+        self.assertEqual(plugin.config["lora_presets"], [])
+
+
 class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
     """验证风格保存提示及延迟单插件重载机制。"""
 
@@ -360,6 +504,48 @@ class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             workflow["429"]["inputs"]["unet_name"],
             "anima-b.safetensors",
+        )
+
+    async def test_switch_uses_anima_v2_profile_unet_binding(self) -> None:
+        entries = (
+            types.SimpleNamespace(index=1, name="anima-v2-a.safetensors"),
+            types.SimpleNamespace(index=2, name="anima-v2-b.safetensors"),
+        )
+
+        class Catalog:
+            async def list_models(self):
+                return entries
+
+            @staticmethod
+            def resolve(identifier, refreshed_entries):
+                self.assertEqual(identifier, "2")
+                self.assertEqual(refreshed_entries, entries)
+                return refreshed_entries[1]
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin.config = {"workflow_file": "workflow/anima_v2_api.json"}
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        plugin._unet_catalog = Catalog()
+        plugin._unet_catalog_error = ""
+        plugin._schedule_self_reload = lambda **_kwargs: object()
+
+        class Event:
+            message_str = "/模型切换 2"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        results = [result async for result in plugin.cmd_unet_model_switch(Event())]
+
+        self.assertNotIn("缺少 UNET 节点 429", "\n".join(results))
+        workflow, _, _ = plugin._workflow_builder.build(
+            self.main.GenerationOptions(prompt="1girl", seed=1)
+        )
+        self.assertEqual(
+            workflow["44"]["inputs"]["unet_name"],
+            "anima-v2-b.safetensors",
         )
 
 

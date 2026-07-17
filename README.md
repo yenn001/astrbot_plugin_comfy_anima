@@ -1,6 +1,6 @@
 # AstrBot Comfy Anima 插件
 
-> 正式版：v1.0.0
+> 正式版：v1.1.0
 
 面向 aiocqhttp / NapCat QQ、并针对随包附带的 Anima 工作流专门适配的 ComfyUI 绘图插件。支持自然语言 LLM 分镜、局域网 LoRA 查询工具、动态 LoRA 注入、普通 LLM 回复中的 `<pic>` 标签自动出图、QQ 合并转发和群级风控。
 
@@ -27,14 +27,18 @@
 - 为普通角色扮演对话注入可编辑的绘图 System Prompt；LLM 回复包含 `<pic prompt="...">` 时自动替换为图片。
 - 自动删除 `<think>...</think>` 与 `<pic>` 控制标签，不把思考内容发到 QQ。
 - `/画图` 使用 NapCat/OneBot v11 合并转发发送图片；`/画图no` 直接发送图片。
+- `/反推` 使用 AstrBot 多模态 Provider 分析用户明确发送或引用的图片，返回结构化 Anima Tags、构图和置信度；`/反推画图` 可继续交给绘图导演并生成图片。
+- `/放大 [倍率]` 将用户发送或引用的图片上传到 ComfyUI，通过独立 RTX 工作流处理；Anima 正常生图也可在同一工作流内直接串联 RTX。
+- 每次返回生图或 RTX 结果时附带实际处理耗时与 ComfyUI 报告的 GPU 型号。
+- 新版内置 `anima_v2_api.json` 使用独立工作流档案映射正面、负面、UNET、LoRA、采样器、分辨率和输出节点；旧 `anima_api.json` 保留为回退，不会与新节点编号混用。
 - 管理员可以不重载插件地列出和切换工作流。
 - 支持 `none`、`lite`、`full` 群级违禁词策略、群白名单、全局锁定及独立管理员特权。
 
 ## 环境要求
 
 1. AstrBot 通过 aiocqhttp 连接 NapCat。
-2. AstrBot 能访问 ComfyUI 的 `/prompt`、`/history`、`/view`、`/queue` 和 `/system_stats`。
-3. ComfyUI 已安装工作流所需的模型、LoRA 和自定义节点。
+2. AstrBot 能访问 ComfyUI 的 `/prompt`、`/history`、`/view`、`/queue`、`/system_stats` 和 `/upload/image`。
+3. ComfyUI 已安装工作流所需的模型、LoRA、ComfyUI-Lora-Manager 与 `RTXVideoSuperResolution` 节点。
 4. 建议 AstrBot v4.5.7 或更高版本；插件保留旧版 Provider 调用回退。管理面板模型下拉选择需要 AstrBot v4+。
 
 如果 AstrBot 在 Docker 中，`127.0.0.1` 指向 AstrBot 容器自身。请改填宿主机地址、ComfyUI 容器服务名或同网络可访问地址。
@@ -78,7 +82,9 @@ web_ui_password=至少8位且不要与其他账号共用
 - 仅删除 LoRA 时只同步逻辑索引，不会误触发全库 LLM 重归档。
 - 可把 ComfyUI 地址、工作流、节点映射、UNET 和默认分辨率保存为命名环境档案并来回切换；密码、Token、Provider、提示词、权限与风控不会进入档案。
 - 角色、画师/风格和混合 LoRA 串的创建、覆盖、校验与删除。
-- 实时读取并切换节点 `429` 使用的 UNET 模型。
+- 实时读取并切换当前工作流档案声明的 UNET 模型（Anima V2 为节点 `44`）。
+- 显示当前工作流档案及各采样器模板 Steps / CFG / Denoise，并允许把采样步数设为 `0`（跟随模板）或 `1–100`（全局覆盖）。
+- 安全删除 LoRA 与非当前 UNET：页面只提交精确名称和二次确认，不接收文件路径；后端强制刷新最新 Manager/ComfyUI 清单后解析路径，并在删除后再次刷新。
 - 任务中心持久保存 run_id、状态、进度、当前阶段、逐项重试、成功、失败和取消事件；阶段时间线默认最新在上，可切换升序/降序和每页 10/20/50/100/200 条，页面刷新或插件重载后仍可恢复。
 - 专属运行控制台每约 1.2 秒读取一次本插件持久日志视图，支持级别、模块和关键词筛选、暂停、跟随最新、复制与清空；任务创建、启动、逐阶段、重试、成功/失败/取消和收尾都会同步写入具体日志，重复等待心跳会折叠但时间线保留完整事件。
 - 三套主题按当前浏览器独立记忆，无需保存配置或重载插件：`纸感工坊`、`铅灰编辑部`、`墨夜控制室`。
@@ -160,7 +166,7 @@ http://192.168.1.50:8000/loras/
 <lora:black deniav1-2:1.00>, 1girl, black denia \(wuthering waves\), cowboy shot, from side
 ```
 
-插件会移除前面的 LoRA 标签，将它写入节点 `462` 的 `text` 与 `loras.__value__`，剩余英文 tags 写入内容节点 `210`。
+插件会移除前面的 LoRA 标签，将它写入当前工作流档案声明的 LoRA 节点（Anima V2 为节点 `462`）的 `text` 与 `loras.__value__`；剩余英文 tags 写入档案声明的正面提示词节点（Anima V2 为节点 `11`）。旧 `anima_api.json` 回退工作流仍使用内容节点 `210`。
 
 ## Civitai LoRA 下载
 
@@ -187,7 +193,7 @@ http://192.168.1.50:8000/loras/
 
 ## Anima UNET 模型切换
 
-此工作流的主模型由节点 `429` 的 `UNETLoader.unet_name` 加载，不使用 CheckpointLoader。管理员命令：
+Anima V2 的主模型由档案映射到节点 `44` 的 `UNETLoader.unet_name`，不使用 CheckpointLoader；旧工作流仍按各自档案或回退配置解析。管理员命令：
 
 ```text
 /模型列表
@@ -197,8 +203,8 @@ http://192.168.1.50:8000/loras/
 
 - `/模型列表` 每次实时读取 `comfyui_url/object_info/UNETLoader`，不会使用旧缓存。
 - `/模型切换` 在解析序号或名称之前会再次读取全部最新数据，新放入 ComfyUI UNET 目录的模型可立即被发现。
-- 切换结果保存到 `unet_model_name`，写入节点 `429` 的 `unet_name`，并自动重载插件。
-- `unet_loader_node_id` 默认 `429`；`unet_model_input_name` 默认 `unet_name`。
+- 切换结果保存到 `unet_model_name`，并写入当前工作流档案声明的 UNET 输入；Anima V2 使用节点 `44` 的 `unet_name`，随后自动重载插件。
+- `unet_loader_node_id` 默认 `429`，仅作为没有 UNET 档案绑定的旧工作流回退；`unet_model_input_name` 默认 `unet_name`。
 
 ## LoRA 组合预设与风格底座
 
@@ -277,6 +283,21 @@ LLM 的处理顺序如下：
 - 两个指令都绕过 LLM，输入内容直接写入工作流提示词节点。
 - 两个指令都支持 `--preset <序号|名称>`（别名 `--lora-preset`）；包含空格的自定义名称需要加引号。
 
+### 图片反推与 RTX 放大
+
+把图片和命令放在同一条 QQ 消息中，或回复一张图片后发送：
+
+```text
+/反推 重点分析构图和光影
+/反推画图 保持构图，换成红色礼服，用风格2
+/放大 2
+```
+
+- `/反推` 只返回结构化 Tags、负面词、构图、画面说明、候选身份和置信度。
+- `/反推画图` 会把可靠的可观察事实交给绘图导演，再经过实时 LoRA 查询与 Anima 工作流生成；低置信角色身份不会自动当成事实。
+- `/放大` 不调用生图 UNET，只通过独立 RTX 工作流处理原图；允许倍率范围为 `1–4`，留空使用后台默认值。
+- 图片内文字、二维码和指令一律视为不可信视觉内容，不会当作系统指令执行。插件不接受命令文本中的任意图片 URL。
+
 ### LLM 回复自动绘图
 
 普通角色扮演回复只要包含以下控制标签就会触发：
@@ -349,7 +370,7 @@ LLM 的处理顺序如下：
 
 - `/comfy_ls` 每次重新扫描 `workflow_dir` 下直属的 `.json` 文件。
 - `/模型列表` 实时显示局域网 ComfyUI 当前全部 UNET 文件；当前模型会标记为 `✅ 当前`。
-- `/模型切换` 切换前强制刷新最新清单，支持列表序号或完整文件名，并持久化到工作流节点 429。
+- `/模型切换` 切换前强制刷新最新清单，支持列表序号或完整文件名，并优先持久化到当前工作流档案声明的 UNET 节点（Anima V2 为节点 44）。
 - `/comfy_use` 按列表序号热切换，并可覆盖提示词输入节点与图片输出节点；不需要重载插件。
 - `/comfy_lock on` 开启后仅管理员能绘图。可在配置中关闭此命令入口。
 - `/lora刷新` 让 LoRA Manager 重新扫描磁盘，并立即更新 LLM 可查询清单。
@@ -382,18 +403,19 @@ LLM 的处理顺序如下：
 
 ## 内置工作流
 
-默认工作流为 `workflow/anima_api.json`，提示词节点 `210`，负面节点 `13`，分辨率节点 `437`，二次放大输出 `285`，首轮预览输出 `20`。
+默认生图工作流为 `workflow/anima_v2_api.json`，独立图片放大工作流为 `workflow/rtx_upscale_api.json`。节点映射以同名 manifest 为唯一真源：正面节点 `11`、负面节点 `12`、UNET 节点 `44`、LoRA Manager 节点 `462`、KSampler 节点 `19`、分辨率节点 `28`、原图输出 `88`、RTX 节点 `552`、RTX 输出 `458`。模板默认分辨率为 `832x1216`，采样参数为 `8 Steps / CFG 5 / Denoise 1`。
+
+旧 `workflow/anima_api.json` 原样保留为兼容回退。它使用旧节点 `210/13/429/437/285/20`，仅在显式切换到该工作流且没有 manifest 绑定时才读取配置中的 legacy 节点字段；新旧节点不会混用。
 
 明确引用的基础模型：
 
-- UNet：`miaomiaoHarem_anima12.safetensors`
+- UNet：`miaomiaoHarem_anima8Step10.safetensors`
 - CLIP：`qwen_3_06b_base.safetensors`
 - VAE：`qwen_image_vae.safetensors`
-- WD14 Tagger：`wd-v1-4-moat-tagger-v2`
 
-默认生效的 LoRA 包括 `(画质)anima-highres-aesthetic-boost`、`(美感细节)anima-rl-v0.1`、`anima-base-1-masterpiece-v51`、`nekoya_v1_epoch21`、`(写真背景)anima3-photo-background-v3`、`hanaru_epoch24`、`nai_shiny_style_base1` 和 `ReiNa style v6_step4000`。
+Anima V2 通过 `Lora Loader (LoraManager)` 接收插件在每次强制刷新后的动态选择，不再在工作流中固定重复加载某一组角色或风格 LoRA。保存的风格组合与本次角色 LoRA 会在提交前去重并注入一次。
 
-工作流还使用 `WeiLinPromptUIWithoutLora`、`Lora Loader (LoraManager)`、`TriggerWord Toggle (LoraManager)`、`KSampler (Efficient)`、`ResolutionMasterSimplify`、`CR Seed`、`CR Latent Input Switch`、`RTXVideoSuperResolution`、TTP 分块节点、`ImageBatchMulti` 和 `WD14Tagger|pysssss` 等非原生节点。插件不会自动下载缺失模型或节点。
+默认工作流使用 `Lora Loader (LoraManager)` 与 `RTXVideoSuperResolution` 等自定义节点。此前会在 `object_info` 注册、但运行时仍依赖可选 `sageattention` Python 包的 `PathchSageAttentionKJ` 已从模板移除，UNET 会直接连接 LoRA Manager。插件不会自动下载缺失模型、LoRA 或自定义节点。
 
 ## 取消行为
 

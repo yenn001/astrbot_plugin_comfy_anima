@@ -38,9 +38,29 @@ class _Controller:
         self.task_run_id = None
         self.task_event_query = None
         self.cancelled_task = None
+        self.deleted_lora = None
+        self.deleted_unet = None
 
     async def web_ui_bootstrap(self):
-        return {"version": "test", "settings": {}}
+        return {
+            "version": "test",
+            "settings": {"sampler_steps_override": 0},
+            "workflow_runtime": {
+                "profile_id": "anima_v2",
+                "display_name": "Anima V2 + RTX",
+                "workflow_file": "workflow/anima_v2_api.json",
+                "sampler_steps_override": 0,
+                "samplers": [
+                    {
+                        "node_id": "19",
+                        "label": "Anima KSampler",
+                        "steps": 8,
+                        "cfg": 5,
+                        "denoise": 0.6,
+                    }
+                ],
+            },
+        }
 
     async def web_ui_save_settings(self, payload):
         self.saved_settings = payload
@@ -99,11 +119,19 @@ class _Controller:
     async def web_ui_delete_preset(self, identifier):
         return {"message": identifier}
 
+    async def web_ui_delete_lora(self, payload):
+        self.deleted_lora = payload
+        return {"deleted": True, "model_type": "lora"}
+
     async def web_ui_list_unet(self):
         return {"items": []}
 
     async def web_ui_select_unet(self, identifier):
         return {"name": identifier}
+
+    async def web_ui_delete_unet(self, payload):
+        self.deleted_unet = payload
+        return {"deleted": True, "model_type": "unet"}
 
     async def web_ui_list_config_profiles(self):
         return {"items": []}
@@ -218,6 +246,31 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
                 self.assertIn(f'data-category="{category}"', self.html)
                 self.assertIn(f'value="{category}">{label}</option>', self.html)
                 self.assertIn(f'{category}: "{label}"', self.javascript)
+
+    def test_workflow_sampler_panel_reads_templates_and_saves_override(self) -> None:
+        for identifier in (
+            "workflow-profile-id",
+            "workflow-profile-name",
+            "workflow-profile-file",
+            "workflow-sampler-list",
+            "sampler-steps-override",
+        ):
+            with self.subTest(identifier=identifier):
+                self.assertIn(f'id="{identifier}"', self.html)
+        self.assertIn('name="sampler_steps_override"', self.html)
+        self.assertIn('min="0" max="100"', self.html)
+        self.assertIn("renderWorkflowSamplers(data.workflow_runtime", self.javascript)
+        self.assertIn('"sampler_steps_override",', self.javascript)
+        self.assertIn("sampler.steps", self.javascript)
+        self.assertIn("sampler.cfg", self.javascript)
+        self.assertIn("sampler.denoise", self.javascript)
+
+    def test_asset_delete_ui_uses_exact_names_not_browser_paths(self) -> None:
+        self.assertIn('api("/api/loras/delete"', self.javascript)
+        self.assertIn('api("/api/unet/delete"', self.javascript)
+        self.assertIn("confirm_name: confirmName", self.javascript)
+        self.assertIn("请输入完整精确名称确认", self.javascript)
+        self.assertNotIn("file_path: exactName", self.javascript)
 
 
 class WebUiValidationTests(unittest.TestCase):
@@ -334,6 +387,38 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved.status, 200)
         self.assertEqual(self.controller.saved_settings, {"default_width": 1024})
 
+    async def test_sampler_steps_override_is_normalized_and_range_checked(self) -> None:
+        csrf = await self._login()
+        saved = await self.client.put(
+            "/api/settings",
+            json={"sampler_steps_override": 24},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(saved.status, 200)
+        self.assertEqual(
+            self.controller.saved_settings,
+            {"sampler_steps_override": 24},
+        )
+
+        for invalid in (-1, 101, 2.5, True, "abc"):
+            with self.subTest(value=invalid):
+                response = await self.client.put(
+                    "/api/settings",
+                    json={"sampler_steps_override": invalid},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status, 400)
+
+    async def test_bootstrap_exposes_workflow_sampler_runtime(self) -> None:
+        await self._login()
+        response = await self.client.get("/api/bootstrap")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        runtime = payload["data"]["workflow_runtime"]
+        self.assertEqual(runtime["profile_id"], "anima_v2")
+        self.assertEqual(runtime["samplers"][0]["node_id"], "19")
+        self.assertEqual(runtime["samplers"][0]["steps"], 8)
+
     async def test_authenticated_routes_forward_to_controller(self) -> None:
         csrf = await self._login()
         providers = await self.client.get("/api/providers")
@@ -391,6 +476,31 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(archive.status, 200)
         self.assertEqual(self.controller.archive_payload, {"all": True})
+
+        lora_delete_payload = {
+            "exact_name": "characters/denia.safetensors",
+            "confirm_name": "characters/denia.safetensors",
+            "remove_from_presets": False,
+        }
+        deleted_lora = await self.client.post(
+            "/api/loras/delete",
+            json=lora_delete_payload,
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(deleted_lora.status, 200)
+        self.assertEqual(self.controller.deleted_lora, lora_delete_payload)
+
+        unet_delete_payload = {
+            "exact_name": "models/anima-old.safetensors",
+            "confirm_name": "models/anima-old.safetensors",
+        }
+        deleted_unet = await self.client.post(
+            "/api/unet/delete",
+            json=unet_delete_payload,
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(deleted_unet.status, 200)
+        self.assertEqual(self.controller.deleted_unet, unet_delete_payload)
 
         profile = await self.client.post(
             "/api/config-profiles/switch",
