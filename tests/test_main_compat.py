@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import types
@@ -528,11 +529,22 @@ class LoraDeleteTransactionTests(unittest.IsolatedAsyncioTestCase):
             {"default_style_preset": "风格1"}
         )
 
-        class Config(dict):
-            def save_config(self):
-                return None
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
 
-        plugin.config = Config(default_style_preset="风格1")
+        class Config(dict):
+            def __init__(self, path: Path, **values):
+                super().__init__(**values)
+                self.config_path = str(path)
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        plugin.config = Config(config_path, default_style_preset="风格1")
         plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=4)
         plugin._lora_presets.save(
             name="风格1",
@@ -540,6 +552,7 @@ class LoraDeleteTransactionTests(unittest.IsolatedAsyncioTestCase):
             selections=(LoraSelection("shared/remove-me", 0.5),),
         )
         plugin.config["lora_presets"] = plugin._lora_presets.to_config()
+        plugin.config.save_config()
         plugin._task_store = None
         plugin._model_manager_error = ""
         return plugin
@@ -634,6 +647,130 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertEqual(calls, [self.main.PLUGIN_NAME])
 
+    async def test_scheduler_debounces_multiple_pending_reloads(self) -> None:
+        calls = []
+
+        class StarManager:
+            async def reload(self, plugin_name):
+                calls.append(plugin_name)
+                return True, None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(_star_manager=StarManager())
+        plugin._self_reload_tasks = set()
+
+        first = plugin._schedule_self_reload(delay=0.05, reason="first")
+        second = plugin._schedule_self_reload(delay=0, reason="second")
+        await asyncio.gather(first, second, return_exceptions=True)
+
+        self.assertEqual(calls, [self.main.PLUGIN_NAME])
+
+    async def test_started_reload_is_not_cancelled_and_old_instance_rejects_save(
+        self,
+    ) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        class StarManager:
+            async def reload(self, plugin_name):
+                calls.append(plugin_name)
+                entered.set()
+                await release.wait()
+                return True, None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(_star_manager=StarManager())
+        plugin._self_reload_tasks = set()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=False,
+        )
+        plugin._lora_catalog = None
+        plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(0)
+        plugin._persist_config = lambda *_args: True
+
+        first = plugin._schedule_self_reload(delay=0, reason="first")
+        await entered.wait()
+        second = plugin._schedule_self_reload(delay=0, reason="second")
+        self.assertIs(first, second)
+        save_task = asyncio.create_task(
+            plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="should-not-commit",
+                entries="<lora:styles/blocked.safetensors:0.5>",
+            )
+        )
+        release.set()
+        await first
+
+        with self.assertRaisesRegex(self.main.LoraPresetError, "正在重载"):
+            await save_task
+        self.assertEqual(calls, [self.main.PLUGIN_NAME])
+        self.assertEqual(plugin._lora_presets.presets, ())
+
+    async def test_concurrent_style_saves_are_serialized_and_failure_cannot_erase_success(
+        self,
+    ) -> None:
+        self_main = self.main
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=True,
+        )
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        active_refreshes = 0
+        max_active_refreshes = 0
+
+        async def refresh(_action):
+            nonlocal active_refreshes, max_active_refreshes
+            active_refreshes += 1
+            max_active_refreshes = max(max_active_refreshes, active_refreshes)
+            await asyncio.sleep(0.01)
+            active_refreshes -= 1
+
+        class Catalog:
+            async def resolve_selections(self, selections, *, strict):
+                return selections
+
+            async def classify_selections(self, selections):
+                return {
+                    selection.name: self_main.PRESET_CATEGORY_ARTIST_STYLE
+                    for selection in selections
+                }
+
+        plugin._refresh_lora_manager_before = refresh
+        plugin._lora_catalog = Catalog()
+
+        def persist(_key, value):
+            return not any(item.get("name") == "失败风格" for item in value)
+
+        plugin._persist_config = persist
+        failed, succeeded = await asyncio.gather(
+            plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="失败风格",
+                entries="<lora:styles/fail.safetensors:0.5>",
+            ),
+            plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="成功风格",
+                entries="<lora:styles/success.safetensors:0.5>",
+            ),
+            return_exceptions=True,
+        )
+
+        self.assertIsInstance(failed, self.main.LoraPresetError)
+        self.assertEqual(succeeded.name, "成功风格")
+        self.assertEqual(max_active_refreshes, 1)
+        self.assertEqual(
+            plugin._lora_presets.resolve("成功风格").name,
+            "成功风格",
+        )
+
     async def test_style_save_schedules_reload_after_persistence(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.settings = types.SimpleNamespace(
@@ -672,6 +809,112 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduled, [True])
         self.assertEqual(persisted[0][0], "lora_presets")
 
+    async def test_conversation_tool_persists_and_survives_fresh_registry(self) -> None:
+        self_main = self.main
+
+        class Config(dict):
+            def __init__(self, path: Path):
+                super().__init__(lora_presets=[])
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        class Catalog:
+            async def resolve_selections(self, selections, *, strict):
+                return selections
+
+            async def classify_selections(self, selections):
+                return {
+                    selection.name: self_main.PRESET_CATEGORY_ARTIST_STYLE
+                    for selection in selections
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "plugin.json"
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.config = Config(config_path)
+            plugin.settings = types.SimpleNamespace(
+                max_preset_loras=12,
+                max_total_dynamic_loras=12,
+                strict_lora_validation=True,
+                auto_reload_after_style_save=True,
+            )
+            plugin._lora_catalog = Catalog()
+            plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+            plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(
+                0, result=()
+            )
+            scheduled = []
+            plugin._schedule_self_reload = (
+                lambda **kwargs: scheduled.append(kwargs) or object()
+            )
+
+            class Event:
+                @staticmethod
+                def is_admin():
+                    return True
+
+            result = await plugin.save_anima_lora_style(
+                Event(),
+                "006",
+                "<lora:styles/ink.safetensors:0.7> "
+                "<lora:styles/light.safetensors:0.4>",
+                "ink, warm light",
+                "聊天保存测试",
+            )
+            persisted = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            fresh_registry = self.main.LoraPresetRegistry(
+                persisted["lora_presets"],
+                max_loras=12,
+            )
+
+        self.assertIn("STYLE_SAVE_COMMITTED", result)
+        self.assertEqual(fresh_registry.resolve("风格006").description, "聊天保存测试")
+        self.assertEqual(len(fresh_registry.resolve("风格006").selections), 2)
+        self.assertEqual(scheduled[0]["delay"], 10.0)
+
+    async def test_conversation_tool_rejects_non_admin_without_mutation(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_presets = self.main.LoraPresetRegistry([])
+
+        class Event:
+            @staticmethod
+            def is_admin():
+                return False
+
+        result = await plugin.save_anima_lora_style(
+            Event(),
+            "006",
+            "<lora:styles/ink.safetensors:0.7>",
+        )
+
+        self.assertIn("STYLE_SAVE_DENIED", result)
+        self.assertEqual(plugin._lora_presets.presets, ())
+
+    async def test_admin_conversation_requires_committed_style_tool_result(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_llm_pic_trigger=True)
+        plugin._internal_llm_events = set()
+        plugin._auto_draw_system_prompt = ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        class Event:
+            @staticmethod
+            def is_admin():
+                return True
+
+        request = types.SimpleNamespace(system_prompt="base")
+        await plugin.inject_auto_draw_prompt(Event(), request)
+
+        self.assertIn("save_anima_lora_style", request.system_prompt)
+        self.assertIn("STYLE_SAVE_COMMITTED", request.system_prompt)
+        self.assertIn("不得用 shell", request.system_prompt)
+
 
 class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
     """验证切换前刷新清单、持久化并更新 UNET 工作流设置。"""
@@ -683,10 +926,25 @@ class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_switch_refreshes_latest_catalog_before_persisting(self) -> None:
         events = []
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
         entries = (
             types.SimpleNamespace(index=1, name="anima-a.safetensors"),
             types.SimpleNamespace(index=2, name="anima-b.safetensors"),
         )
+
+        class Config(dict):
+            def __init__(self, path: Path, **values):
+                super().__init__(**values)
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
 
         class Catalog:
             async def list_models(self):
@@ -702,7 +960,10 @@ class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
 
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.plugin_dir = Path(__file__).resolve().parents[1]
-        plugin.config = {"workflow_file": "workflow/anima_api.json"}
+        plugin.config = Config(
+            config_path,
+            workflow_file="workflow/anima_api.json",
+        )
         plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
         plugin._unet_catalog = Catalog()
         plugin._unet_catalog_error = ""
@@ -732,10 +993,25 @@ class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_switch_uses_anima_v2_profile_unet_binding(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
         entries = (
             types.SimpleNamespace(index=1, name="anima-v2-a.safetensors"),
             types.SimpleNamespace(index=2, name="anima-v2-b.safetensors"),
         )
+
+        class Config(dict):
+            def __init__(self, path: Path, **values):
+                super().__init__(**values)
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
 
         class Catalog:
             async def list_models(self):
@@ -749,7 +1025,10 @@ class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
 
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.plugin_dir = Path(__file__).resolve().parents[1]
-        plugin.config = {"workflow_file": "workflow/anima_v2_api.json"}
+        plugin.config = Config(
+            config_path,
+            workflow_file="workflow/anima_v2_api.json",
+        )
         plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
         plugin._unet_catalog = Catalog()
         plugin._unet_catalog_error = ""
@@ -1393,16 +1672,27 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("api_base", item)
 
     async def test_settings_save_keeps_existing_password_when_omitted(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
+
         class Config(dict):
-            def __init__(self, *args, **kwargs):
+            def __init__(self, path: Path, *args, **kwargs):
                 super().__init__(*args, **kwargs)
+                self.config_path = str(path)
                 self.saved = 0
+                self.save_config()
 
             def save_config(self):
                 self.saved += 1
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
 
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.config = Config(
+            config_path,
             {
                 "enable_web_ui": True,
                 "web_ui_password": "existing-password",
@@ -1427,7 +1717,7 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plugin.config["enable_reverse_json_formatter"])
         self.assertFalse(plugin.config["enable_reverse_json_repair_retry"])
         self.assertEqual(plugin.config["web_ui_password"], "existing-password")
-        self.assertEqual(plugin.config.saved, 1)
+        self.assertEqual(plugin.config.saved, 2)
         self.assertTrue(result["reload_scheduled"])
 
     async def test_web_ui_metadata_fetch_refreshes_before_and_after(self) -> None:

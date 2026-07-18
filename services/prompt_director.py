@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.4
+AstrBot Comfy Anima 插件 v1.1.5
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.1.4
+版本: 1.1.5
 日期: 2026-07-18
 """
 

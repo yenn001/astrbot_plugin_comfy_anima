@@ -2,6 +2,16 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.5] - 2026-07-18
+
+### 对话保存风格持久化修复
+
+- 新增管理员 LLM 工具 `save_anima_lora_style`，支持在普通 Bot 对话中明确要求保存或覆盖完整 LoRA 风格串。
+- 普通对话 System Prompt 强制要求：只有工具返回 `STYLE_SAVE_COMMITTED` 后才能声称保存成功，禁止用 shell、聊天记忆或口头承诺冒充持久化。
+- 对话保存复用与 `/保存风格` 相同的 Manager 强制刷新、精确 LoRA 解析、角色隔离、数量限制与配置事务。
+- 配置保存现在要求存在真实 `save_config()` writer；写盘后会从 `AstrBotConfig.config_path` 回读校验。writer 缺失、无实际写盘或内容不一致时回滚内存修改且不重载。
+- 对话工具保存成功后延迟 10 秒自动重载，为外层聊天模型保留发送最终确认的时间；重载后的新 Registry 与 WebUI 从已验证磁盘配置恢复。
+
 ## [1.1.4] - 2026-07-18
 
 ### Provider 统一发现与 LoRA 混合检索

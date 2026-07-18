@@ -1,5 +1,5 @@
 name: astrbot_plugin_comfy_anima
 desc: Anima 专用 ComfyUI 绘图、LoRA 语义建档与任务中心、三主题 WebUI、UNET 切换和 LLM 分镜
 author: Yen
-version: 1.1.4
+version: 1.1.5
 repo: "https://github.com/yenn001/astrbot_plugin_comfy_anima"

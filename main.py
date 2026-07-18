@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.1.4
+AstrBot Comfy Anima 插件 v1.1.5
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,11 +8,12 @@ AstrBot Comfy Anima 插件 v1.1.4
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.1.4
+版本: 1.1.5
 日期: 2026-07-18
 """
 
 import asyncio
+import json
 import re
 import shlex
 import tempfile
@@ -268,10 +269,13 @@ class ComfyAnimaPlugin(Star):
         self._log_console_attached = self._log_console.attach(logger)
         self._active_jobs: dict[str, GenerationJob] = {}
         self._jobs_lock = asyncio.Lock()
+        self._lora_preset_transaction_lock = asyncio.Lock()
         self._generation_slots = asyncio.Semaphore(self.settings.max_concurrent_jobs)
         self._last_request_at: dict[str, float] = {}
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._self_reload_tasks: set[asyncio.Task[Any]] = set()
+        self._self_reload_debounce_task: Optional[asyncio.Task[Any]] = None
+        self._self_reload_started = False
         self._background_task_runs: dict[str, asyncio.Task[Any]] = {}
         self._web_ui_start_task: Optional[asyncio.Task[Any]] = None
         self._web_ui: Optional[WebUiService] = None
@@ -596,6 +600,63 @@ class ComfyAnimaPlugin(Star):
                 "Stop this LoRA drawing request."
             )
 
+    @filter.llm_tool(name="save_anima_lora_style")
+    async def save_anima_lora_style(
+        self,
+        event: AstrMessageEvent,
+        name: str,
+        lora_tags: str,
+        trigger_words: str = "",
+        description: str = "",
+    ) -> str:
+        """把用户明确要求保存的完整 LoRA 风格串持久化为画师/风格预设。
+
+        只在管理员明确说“保存/覆盖为某个风格”时调用。不要根据普通绘图请求、
+        猜测或隐含偏好自动保存。相同名称会覆盖，数字名称会规范为“风格N”。
+
+        Args:
+            name(string): 用户明确指定的风格名称或数字，例如 006、风格006、暖墨。
+            lora_tags(string): 完整 LoRA 串，每项格式为 <lora:精确名称:权重>。
+            trigger_words(string): 可选的完整风格触发词，逗号分隔。
+            description(string): 可选说明或备注。
+        """
+        is_admin = getattr(event, "is_admin", None)
+        if not callable(is_admin) or not bool(is_admin()):
+            return "STYLE_SAVE_DENIED: only an AstrBot administrator may save LoRA styles."
+        if not str(name or "").strip() or not str(lora_tags or "").strip():
+            return "STYLE_SAVE_FAILED: both name and complete lora_tags are required."
+        try:
+            preset = await self._save_lora_preset_persisted(
+                category_text=PRESET_CATEGORY_ARTIST_STYLE,
+                name=name,
+                entries=lora_tags,
+                trigger_words=trigger_words,
+                description=description,
+                refresh_action="对话工具保存 LoRA 风格",
+            )
+        except (LoraPresetError, LoraCatalogError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            return f"STYLE_SAVE_FAILED: {message}"
+
+        reload_scheduled = False
+        if self.settings.auto_reload_after_style_save:
+            # Give the outer conversation model time to send its final acknowledgement.
+            reload_scheduled = self._schedule_self_reload(
+                delay=10.0,
+                reason="对话工具保存风格",
+            ) is not None
+        logger.info(
+            f"[{PLUGIN_NAME}] 对话工具已持久化风格："
+            f"name={preset.name}, loras={len(preset.selections)}, "
+            f"reload={reload_scheduled}"
+        )
+        return (
+            "STYLE_SAVE_COMMITTED: persisted=true; "
+            f"name={preset.name}; loras={len(preset.selections)}; "
+            f"reload_scheduled={str(reload_scheduled).lower()}. "
+            "The preset is now available in WebUI and survives plugin reload."
+        )
+
     @filter.on_llm_request(priority=20)
     async def inject_auto_draw_prompt(self, event: AstrMessageEvent, req: Any) -> None:
         """向普通对话 LLM 注入可编辑的 pic 标签协议。"""
@@ -605,11 +666,23 @@ class ComfyAnimaPlugin(Star):
             return
         if self._access_error(event, "", check_sensitive=False):
             return
+        prompt_parts: list[str] = []
         system_prompt = self._auto_draw_system_prompt.strip()
-        if not system_prompt:
+        if system_prompt:
+            prompt_parts.append(system_prompt)
+        is_admin = getattr(event, "is_admin", None)
+        if callable(is_admin) and bool(is_admin()):
+            prompt_parts.append(
+                "管理员明确要求保存或覆盖 LoRA 风格时，必须调用 "
+                "save_anima_lora_style 工具，并把完整精确 LoRA tags、权重、"
+                "名称、触发词和说明传入。只有工具返回 STYLE_SAVE_COMMITTED "
+                "后才能声称保存成功；不得用 shell、聊天记忆或口头承诺代替持久化。"
+            )
+        if not prompt_parts:
             return
         current = str(getattr(req, "system_prompt", "") or "")
-        req.system_prompt = f"{current}\n\n{system_prompt}".strip()
+        req.system_prompt = f"{current}\n\n" + "\n\n".join(prompt_parts)
+        req.system_prompt = req.system_prompt.strip()
 
     @filter.on_decorating_result(priority=20)
     async def render_llm_picture_tags(self, event: AstrMessageEvent) -> None:
@@ -1638,68 +1711,23 @@ class ComfyAnimaPlugin(Star):
                 lora_parts.append(token)
             index += 1
 
-        previous_presets = self._lora_presets.to_config()
         try:
-            await self._refresh_lora_manager_before("管理员保存 LoRA 组合")
-            category = normalize_category(category_text, allow_auto=True)
             joined_lora_text = " ".join(lora_parts)
-            selections = parse_lora_entries(
-                (
+            preset = await self._save_lora_preset_persisted(
+                category_text=category_text,
+                name=name,
+                entries=(
                     joined_lora_text
                     if "<lora:" in joined_lora_text.casefold()
                     else lora_parts
                 ),
-                max_loras=self.settings.max_preset_loras,
-            )
-            if self._lora_catalog:
-                selections = await self._lora_catalog.resolve_selections(
-                    selections,
-                    strict=self.settings.strict_lora_validation,
-                )
-                classifications = await self._lora_catalog.classify_selections(
-                    selections
-                )
-                if (
-                    category == PRESET_CATEGORY_ARTIST_STYLE
-                    and PRESET_CATEGORY_CHARACTER in classifications.values()
-                ):
-                    character_names = [
-                        name
-                        for name, item_category in classifications.items()
-                        if item_category == PRESET_CATEGORY_CHARACTER
-                    ]
-                    raise LoraPresetError(
-                        "风格串不能包含角色 LoRA，请把角色独立追加: "
-                        + ", ".join(character_names)
-                    )
-            if category == "auto":
-                category = (
-                    await self._lora_catalog.infer_preset_category(selections)
-                    if self._lora_catalog
-                    else "mixed"
-                )
-            if len(selections) > self.settings.max_total_dynamic_loras:
-                raise LoraPresetError(
-                    "组合本身的 LoRA 数量不能超过单次任务动态 LoRA 总上限 "
-                    f"{self.settings.max_total_dynamic_loras}"
-                )
-            preset = self._lora_presets.save(
-                name=name,
-                category=category,
-                selections=selections,
                 trigger_words=trigger_words,
                 description=description,
+                refresh_action="管理员保存 LoRA 组合",
             )
         except (LoraPresetError, LoraCatalogError) as exc:
             message = getattr(exc, "user_message", str(exc))
             yield event.plain_result(f"{MessageEmoji.ERROR} 保存失败: {message}")
-            return
-
-        if not self._persist_config("lora_presets", self._lora_presets.to_config()):
-            self._lora_presets.load(previous_presets)
-            yield event.plain_result(
-                f"{MessageEmoji.ERROR} 保存失败: 配置文件未能持久化，已回滚本次修改"
-            )
             return
         reload_note = ""
         if (
@@ -1718,6 +1746,122 @@ class ComfyAnimaPlugin(Star):
             f"{MessageEmoji.SUCCESS} 已保存 {CATEGORY_LABELS[preset.category]}组合 "
             f"“{preset.name}”\n{preset.lora_tags}{reload_note}"
         )
+
+    def _get_lora_preset_transaction_lock(self) -> asyncio.Lock:
+        """Return the shared lock used by every LoRA preset mutation."""
+        lock = getattr(self, "_lora_preset_transaction_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lora_preset_transaction_lock = lock
+        return lock
+
+    async def _save_lora_preset_persisted(
+        self,
+        *,
+        category_text: str,
+        name: str,
+        entries: Any,
+        trigger_words: str = "",
+        description: str = "",
+        enabled: bool = True,
+        refresh_action: str = "保存 LoRA 组合",
+    ) -> LoraPreset:
+        """Validate against the fresh catalog and persist one preset transactionally."""
+        async with self._get_lora_preset_transaction_lock():
+            if getattr(self, "_self_reload_started", False):
+                raise LoraPresetError("插件正在重载，请稍后重新保存 LoRA 风格")
+            return await self._save_lora_preset_persisted_locked(
+                category_text=category_text,
+                name=name,
+                entries=entries,
+                trigger_words=trigger_words,
+                description=description,
+                enabled=enabled,
+                refresh_action=refresh_action,
+            )
+
+    async def _save_lora_preset_persisted_locked(
+        self,
+        *,
+        category_text: str,
+        name: str,
+        entries: Any,
+        trigger_words: str = "",
+        description: str = "",
+        enabled: bool = True,
+        refresh_action: str = "保存 LoRA 组合",
+    ) -> LoraPreset:
+        """Run one serialized preset validation and persistence transaction."""
+        previous_presets = self._lora_presets.to_config()
+        await self._refresh_lora_manager_before(refresh_action)
+        category = normalize_category(category_text, allow_auto=True)
+        selections = parse_lora_entries(
+            entries,
+            max_loras=self.settings.max_preset_loras,
+        )
+        if self._lora_catalog:
+            selections = await self._lora_catalog.resolve_selections(
+                selections,
+                strict=self.settings.strict_lora_validation,
+            )
+            classifications = await self._lora_catalog.classify_selections(selections)
+            if (
+                category == PRESET_CATEGORY_ARTIST_STYLE
+                and PRESET_CATEGORY_CHARACTER in classifications.values()
+            ):
+                character_names = [
+                    exact_name
+                    for exact_name, item_category in classifications.items()
+                    if item_category == PRESET_CATEGORY_CHARACTER
+                ]
+                raise LoraPresetError(
+                    "风格串不能包含角色 LoRA，请把角色独立追加: "
+                    + ", ".join(character_names)
+                )
+        if category == "auto":
+            category = (
+                await self._lora_catalog.infer_preset_category(selections)
+                if self._lora_catalog
+                else PRESET_CATEGORY_MIXED
+            )
+        if len(selections) > self.settings.max_total_dynamic_loras:
+            raise LoraPresetError(
+                "组合本身的 LoRA 数量不能超过单次任务动态 LoRA 总上限 "
+                f"{self.settings.max_total_dynamic_loras}"
+            )
+        preset = self._lora_presets.save(
+            name=name,
+            category=category,
+            selections=selections,
+            trigger_words=trigger_words,
+            description=description,
+            enabled=enabled,
+        )
+        if not self._persist_config("lora_presets", self._lora_presets.to_config()):
+            self._lora_presets.load(previous_presets)
+            raise LoraPresetError("配置文件未能持久化，已回滚本次修改")
+        return preset
+
+    async def _delete_lora_preset_persisted(
+        self,
+        identifier: str,
+        *,
+        refresh_action: str = "删除 LoRA 组合",
+    ) -> LoraPreset:
+        """Serialize a preset deletion with the same durable transaction lock."""
+        async with self._get_lora_preset_transaction_lock():
+            if getattr(self, "_self_reload_started", False):
+                raise LoraPresetError("插件正在重载，请稍后重新删除 LoRA 组合")
+            previous_presets = self._lora_presets.to_config()
+            await self._refresh_lora_manager_before(refresh_action)
+            preset = self._lora_presets.delete(identifier)
+            if not self._persist_config(
+                "lora_presets",
+                self._lora_presets.to_config(),
+            ):
+                self._lora_presets.load(previous_presets)
+                raise LoraPresetError("配置文件未能持久化，已回滚本次修改")
+            return preset
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("保存风格")
@@ -1750,19 +1894,14 @@ class ComfyAnimaPlugin(Star):
             identifier,
             command="lora组合删除",
         )
-        previous_presets = self._lora_presets.to_config()
         try:
-            await self._refresh_lora_manager_before("管理员删除 LoRA 组合")
-            preset = self._lora_presets.delete(value)
+            preset = await self._delete_lora_preset_persisted(
+                value,
+                refresh_action="管理员删除 LoRA 组合",
+            )
         except (LoraPresetError, LoraCatalogError) as exc:
             message = getattr(exc, "user_message", str(exc))
             yield event.plain_result(f"{MessageEmoji.ERROR} {message}")
-            return
-        if not self._persist_config("lora_presets", self._lora_presets.to_config()):
-            self._lora_presets.load(previous_presets)
-            yield event.plain_result(
-                f"{MessageEmoji.ERROR} 删除失败: 配置文件未能持久化，已回滚本次修改"
-            )
             return
         yield event.plain_result(
             f"{MessageEmoji.SUCCESS} 已删除 LoRA 组合“{preset.name}”"
@@ -2221,53 +2360,115 @@ QQ快捷指令:
         return root
 
     def _persist_config(self, key: str, value: Any) -> bool:
-        """更新 AstrBot 插件配置并在支持时立即保存。"""
-        if self.config is None:
-            return False
-        had_previous = key in self.config
-        previous = self.config.get(key)
-        try:
-            self.config[key] = value
-            save_config = getattr(self.config, "save_config", None)
-            if callable(save_config):
-                save_config()
-            return True
-        except Exception as exc:
-            try:
-                if had_previous:
-                    self.config[key] = previous
-                else:
-                    self.config.pop(key, None)
-            except Exception:
-                pass
-            logger.warning(f"[{PLUGIN_NAME}] 保存配置 {key} 失败: {exc}")
-            return False
+        """更新 AstrBot 插件配置，写盘并在可用时回读校验。"""
+        return self._persist_config_transaction(
+            {key: value},
+            operation=f"save config key {key}",
+        )
 
     def _persist_config_updates(self, updates: dict[str, Any]) -> bool:
-        """Persist multiple configuration fields as one logical change."""
+        """Persist multiple fields atomically and verify the on-disk snapshot."""
+        return self._persist_config_transaction(
+            updates,
+            operation="save configuration updates",
+        )
+
+    def _persist_config_transaction(
+        self,
+        updates: Mapping[str, Any],
+        *,
+        operation: str,
+    ) -> bool:
+        """Write, verify, and compensate on failure without claiming memory-only success."""
         if self.config is None or not updates:
             return False
-        previous = {key: (key in self.config, self.config.get(key)) for key in updates}
-        try:
-            for key, value in updates.items():
-                self.config[key] = value
-            save_config = getattr(self.config, "save_config", None)
-            if callable(save_config):
-                save_config()
-            return True
-        except Exception as exc:
-            for key, (existed, value) in previous.items():
-                try:
-                    if existed:
-                        self.config[key] = value
-                    else:
-                        self.config.pop(key, None)
-                except Exception:
-                    pass
+        config = self.config
+        save_config = getattr(config, "save_config", None)
+        config_path = str(getattr(config, "config_path", "") or "").strip()
+        if not callable(save_config) or not config_path:
             logger.warning(
-                f"[{PLUGIN_NAME}] Failed to save Web UI configuration: {exc}"
+                f"[{PLUGIN_NAME}] {operation} rejected: durable AstrBot config writer "
+                "or config_path is unavailable"
             )
             return False
+        previous = {key: (key in config, config.get(key)) for key in updates}
+        try:
+            for key, value in updates.items():
+                config[key] = value
+            save_config()
+            if not self._verify_persisted_config(updates):
+                raise RuntimeError("配置文件回读校验失败")
+            return True
+        except Exception as exc:
+            self._restore_config_mapping(previous)
+            rollback_ok = False
+            rollback_error = ""
+            try:
+                save_config()
+                rollback_ok = self._verify_persisted_snapshot(previous)
+            except Exception as rollback_exc:
+                rollback_error = type(rollback_exc).__name__
+            logger.warning(
+                f"[{PLUGIN_NAME}] {operation} failed: {type(exc).__name__}; "
+                f"disk_rollback={rollback_ok}"
+            )
+            if not rollback_ok:
+                logger.error(
+                    f"[{PLUGIN_NAME}] configuration compensation rollback could not "
+                    f"be verified; error={rollback_error or 'verification_failed'}"
+                )
+            return False
+
+    def _restore_config_mapping(
+        self,
+        snapshot: Mapping[str, tuple[bool, Any]],
+    ) -> None:
+        """Restore selected in-memory keys before a compensating disk write."""
+        config = self.config
+        if config is None:
+            return
+        for key, (existed, value) in snapshot.items():
+            if existed:
+                config[key] = value
+            else:
+                config.pop(key, None)
+
+    def _read_persisted_config(self) -> Optional[dict[str, Any]]:
+        """Read the durable AstrBot plugin config snapshot."""
+        config_path = str(getattr(self.config, "config_path", "") or "").strip()
+        if not config_path:
+            return None
+        try:
+            with Path(config_path).open("r", encoding="utf-8-sig") as handle:
+                persisted = json.load(handle)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 配置文件回读失败: {type(exc).__name__}"
+            )
+            return None
+        return persisted if isinstance(persisted, dict) else None
+
+    def _verify_persisted_config(self, updates: Mapping[str, Any]) -> bool:
+        """Verify saved values only from the durable config file."""
+        persisted = self._read_persisted_config()
+        if persisted is None:
+            return False
+        return all(persisted.get(key) == value for key, value in updates.items())
+
+    def _verify_persisted_snapshot(
+        self,
+        snapshot: Mapping[str, tuple[bool, Any]],
+    ) -> bool:
+        """Verify both restored values and keys that must remain absent."""
+        persisted = self._read_persisted_config()
+        if persisted is None:
+            return False
+        return all(
+            (key in persisted and persisted.get(key) == value)
+            if existed
+            else key not in persisted
+            for key, (existed, value) in snapshot.items()
+        )
 
     async def web_ui_bootstrap(self) -> dict[str, Any]:
         """Return a secret-free snapshot for the management dashboard."""
@@ -3797,40 +3998,19 @@ QQ快捷指令:
         """Validate against fresh Manager data, then persist a preset."""
         if self._lora_catalog is None:
             raise WebUiActionError("LoRA 工具未启用")
-        previous_presets = self._lora_presets.to_config()
         try:
-            await self._refresh_lora_manager_before("Web UI 保存 LoRA 组合")
-            selections = parse_lora_entries(
-                payload.get("loras", []),
-                max_loras=self.settings.max_preset_loras,
-            )
-            selections = await self._lora_catalog.resolve_selections(
-                selections,
-                strict=True,
-            )
-            category = normalize_category(
-                str(payload.get("category") or "auto"),
-                allow_auto=True,
-            )
-            if category == "auto":
-                category = await self._lora_catalog.infer_preset_category(selections)
-            preset = self._lora_presets.save(
+            preset = await self._save_lora_preset_persisted(
                 name=str(payload.get("name") or ""),
-                category=category,
-                selections=selections,
+                category_text=str(payload.get("category") or "auto"),
+                entries=payload.get("loras", []),
                 trigger_words=str(payload.get("trigger_words") or ""),
                 description=str(payload.get("description") or ""),
                 enabled=bool(payload.get("enabled", True)),
+                refresh_action="Web UI 保存 LoRA 组合",
             )
         except (LoraCatalogError, LoraPresetError) as exc:
             message = getattr(exc, "user_message", str(exc))
             raise WebUiActionError(message) from exc
-        if not self._persist_config(
-            "lora_presets",
-            self._lora_presets.to_config(),
-        ):
-            self._lora_presets.load(previous_presets)
-            raise WebUiActionError("组合保存失败，配置修改已回滚")
         reload_task = self._schedule_self_reload(
             delay=1.5,
             reason="Web UI 保存 LoRA 组合",
@@ -3843,19 +4023,14 @@ QQ快捷指令:
 
     async def web_ui_delete_preset(self, identifier: str) -> dict[str, Any]:
         """Refresh Manager before deleting a saved preset."""
-        previous_presets = self._lora_presets.to_config()
         try:
-            await self._refresh_lora_manager_before("Web UI 删除 LoRA 组合")
-            preset = self._lora_presets.delete(identifier)
+            preset = await self._delete_lora_preset_persisted(
+                identifier,
+                refresh_action="Web UI 删除 LoRA 组合",
+            )
         except (LoraCatalogError, LoraPresetError) as exc:
             message = getattr(exc, "user_message", str(exc))
             raise WebUiActionError(message) from exc
-        if not self._persist_config(
-            "lora_presets",
-            self._lora_presets.to_config(),
-        ):
-            self._lora_presets.load(previous_presets)
-            raise WebUiActionError("组合删除失败，配置修改已回滚")
         reload_task = self._schedule_self_reload(
             delay=1.5,
             reason="Web UI 删除 LoRA 组合",
@@ -3874,6 +4049,21 @@ QQ快捷指令:
         return await self._web_ui_delete_asset("unet", payload)
 
     async def _web_ui_delete_asset(
+        self,
+        asset_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if asset_type == "lora" and bool(payload.get("remove_from_presets")):
+            async with self._get_lora_preset_transaction_lock():
+                if getattr(self, "_self_reload_started", False):
+                    raise WebUiActionError("插件正在重载，请稍后重新删除 LoRA")
+                return await self._web_ui_delete_asset_transaction(
+                    asset_type,
+                    payload,
+                )
+        return await self._web_ui_delete_asset_transaction(asset_type, payload)
+
+    async def _web_ui_delete_asset_transaction(
         self,
         asset_type: str,
         payload: dict[str, Any],
@@ -5004,29 +5194,45 @@ QQ快捷指令:
             return None
 
         reason_text = reason.strip() or "配置更新"
+        previous_task = getattr(self, "_self_reload_debounce_task", None)
+        if previous_task is not None and not previous_task.done():
+            if getattr(self, "_self_reload_started", False):
+                return previous_task
+            previous_task.cancel()
 
         async def reload_later() -> None:
             try:
                 await asyncio.sleep(max(0.0, delay))
-                success, error = await reload_plugin(PLUGIN_NAME)
-                if success:
-                    logger.info(f"[{PLUGIN_NAME}] {reason_text}后自动重载成功")
-                else:
-                    logger.error(
-                        f"[{PLUGIN_NAME}] {reason_text}后自动重载失败: "
-                        f"{error or '未知错误'}"
-                    )
+                async with self._get_lora_preset_transaction_lock():
+                    self._self_reload_started = True
+                    success, error = await reload_plugin(PLUGIN_NAME)
+                    if success:
+                        logger.info(f"[{PLUGIN_NAME}] {reason_text}后自动重载成功")
+                    else:
+                        self._self_reload_started = False
+                        logger.error(
+                            f"[{PLUGIN_NAME}] {reason_text}后自动重载失败: "
+                            f"{error or '未知错误'}"
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._self_reload_started = False
                 logger.error(
                     f"[{PLUGIN_NAME}] {reason_text}后自动重载异常: {exc}",
                     exc_info=True,
                 )
 
         task = asyncio.create_task(reload_later())
+        self._self_reload_debounce_task = task
         self._self_reload_tasks.add(task)
-        task.add_done_callback(self._self_reload_tasks.discard)
+
+        def discard_reload(done_task: asyncio.Task[Any]) -> None:
+            self._self_reload_tasks.discard(done_task)
+            if getattr(self, "_self_reload_debounce_task", None) is done_task:
+                self._self_reload_debounce_task = None
+
+        task.add_done_callback(discard_reload)
         return task
 
     async def terminate(self) -> None:

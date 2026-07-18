@@ -2,6 +2,8 @@
 
 import asyncio
 import importlib
+import json
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -845,17 +847,99 @@ class ConfigPersistenceTests(unittest.TestCase):
 
     def test_persist_config_restores_previous_value_when_save_fails(self) -> None:
         class FailingConfig(dict):
+            def __init__(self, path: Path):
+                super().__init__(lora_presets=[{"name": "old"}])
+                self.config_path = str(path)
+
             def save_config(self):
                 raise RuntimeError("disk unavailable")
 
-        config = FailingConfig(lora_presets=[{"name": "old"}])
+        with tempfile.TemporaryDirectory() as directory:
+            config = FailingConfig(Path(directory) / "plugin.json")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.config = config
+
+            result = plugin._persist_config("lora_presets", [{"name": "new"}])
+
+        self.assertFalse(result)
+        self.assertEqual(config["lora_presets"], [{"name": "old"}])
+
+    def test_persist_config_without_writer_fails_instead_of_claiming_success(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
-        plugin.config = config
+        plugin.config = {"lora_presets": [{"name": "old"}]}
 
         result = plugin._persist_config("lora_presets", [{"name": "new"}])
 
         self.assertFalse(result)
-        self.assertEqual(config["lora_presets"], [{"name": "old"}])
+        self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
+
+    def test_persist_config_without_config_path_rejects_noop_writer(self) -> None:
+        class NoPathNoOpConfig(dict):
+            def save_config(self):
+                return None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.config = NoPathNoOpConfig(lora_presets=[{"name": "old"}])
+
+        result = plugin._persist_config("lora_presets", [{"name": "new"}])
+
+        self.assertFalse(result)
+        self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
+
+    def test_persist_config_rejects_writer_that_does_not_update_disk(self) -> None:
+        class NoOpConfig(dict):
+            def __init__(self, path: Path):
+                super().__init__(lora_presets=[{"name": "old"}])
+                self.config_path = str(path)
+
+            def save_config(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plugin.json"
+            path.write_text(
+                json.dumps({"lora_presets": [{"name": "old"}]}),
+                encoding="utf-8-sig",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.config = NoOpConfig(path)
+
+            result = plugin._persist_config(
+                "lora_presets",
+                [{"name": "new"}],
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
+
+    def test_verify_failure_compensates_disk_back_to_previous_value(self) -> None:
+        class Config(dict):
+            def __init__(self, path: Path):
+                super().__init__(lora_presets=[{"name": "old"}])
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plugin.json"
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.config = Config(path)
+            plugin._verify_persisted_config = lambda _updates: False
+
+            result = plugin._persist_config(
+                "lora_presets",
+                [{"name": "new"}],
+            )
+            persisted = json.loads(path.read_text(encoding="utf-8-sig"))
+
+        self.assertFalse(result)
+        self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
+        self.assertEqual(persisted["lora_presets"], [{"name": "old"}])
 
 
 if __name__ == "__main__":
