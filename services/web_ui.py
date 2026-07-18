@@ -92,6 +92,10 @@ class WebUiController(Protocol):
 
     async def web_ui_delete_unet(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
+    async def web_ui_list_workflows(self) -> dict[str, Any]: ...
+
+    async def web_ui_select_workflow(self, identifier: str) -> dict[str, Any]: ...
+
     async def web_ui_list_unet(self) -> dict[str, Any]: ...
 
     async def web_ui_select_unet(self, identifier: str) -> dict[str, Any]: ...
@@ -190,6 +194,8 @@ class WebUiService:
                     "/api/presets/{identifier}",
                     self._delete_preset,
                 ),
+                web.get("/api/workflows", self._list_workflows),
+                web.post("/api/workflows/select", self._select_workflow),
                 web.get("/api/unet", self._list_unet),
                 web.post("/api/unet/select", self._select_unet),
                 web.post("/api/unet/delete", self._delete_unet),
@@ -515,6 +521,19 @@ class WebUiService:
     async def _delete_preset(self, request: web.Request) -> web.Response:
         return await self._controller_response(
             self._controller.web_ui_delete_preset(request.match_info["identifier"])
+        )
+
+    async def _list_workflows(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_workflows()
+        )
+
+    async def _select_workflow(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_select_workflow(
+                str(payload.get("identifier") or payload.get("filename") or "")
+            )
         )
 
     async def _list_unet(self, _request: web.Request) -> web.Response:

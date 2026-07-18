@@ -311,6 +311,27 @@ class SemanticOverlayTests(unittest.TestCase):
 
         self.assertIs(index.apply_overlay(fresh), fresh)
 
+    def test_fresh_hash_never_falls_back_to_name_only_archive(self) -> None:
+        archived = _record("characters/denia.safetensors", sha256="")
+        fresh = _record("characters/denia.safetensors", sha256="def67890")
+        entry = _entry(
+            archived,
+            identity_key="name:characters/denia",
+            sha256="",
+        )
+        index = LoraSemanticIndex(entries={entry.identity_key: entry})
+
+        self.assertIsNone(index.entry_for(fresh))
+        self.assertIs(index.apply_overlay(fresh), fresh)
+
+    def test_changed_source_fingerprint_rejects_matching_overlay(self) -> None:
+        record = _record("characters/denia.safetensors")
+        frozen = replace(record, source_fingerprint=semantic_source_fingerprint(record))
+        entry = _entry(frozen, source_fingerprint="0" * 64)
+        index = LoraSemanticIndex(entries={entry.identity_key: entry})
+
+        self.assertIs(index.apply_overlay(frozen), frozen)
+
 
 class SemanticSearchTests(unittest.TestCase):
     def test_search_matches_manual_alias_and_returns_safe_unique_candidate(

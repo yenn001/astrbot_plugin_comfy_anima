@@ -10,7 +10,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from ..models import GeneratedImagePaths, LoraSelection
+from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
 
 
 class _DecoratorGroup:
@@ -237,6 +237,47 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_options[0].negative_prompt, "school uniform")
         self.assertFalse(event.stopped)
 
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_natural_character_swap_stops_only_after_all_replies(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                return True
+
+        async def handle(_event, request):
+            self.assertEqual(request.source_query, "达妮娅")
+            self.assertEqual(request.target_query, "卡莲")
+            yield "SWAP_PROGRESS"
+            yield "SWAP_IMAGE"
+
+        plugin._image_input = ImageInput()
+        plugin._handle_character_swap = handle
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        class Event:
+            message_str = "把引用图片里的达妮娅换成卡莲，衣服保持不变"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_character_swap(event)
+        self.assertEqual(await anext(generator), "SWAP_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "SWAP_IMAGE")
+        self.assertFalse(event.stopped)
         with self.assertRaises(StopAsyncIteration):
             await anext(generator)
         self.assertTrue(event.stopped)
@@ -1244,6 +1285,68 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0].negative_prompt, "black coat")
         self.assertNotIn("silver hair", prompt)
 
+    async def test_character_swap_rejects_target_changed_after_planning(self) -> None:
+        current = self.catalog_module.LoraRecord(
+            "characters/kallen.safetensors",
+            sha256="bb22cc33",
+            category="character",
+            character_name="Kallen",
+            trigger_words=("kallen",),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+
+            async def refresh_for_operation(_self):
+                _self._cache = (current,)
+                _self._cache_expires_at = float("inf")
+                return (current,)
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return (current,)
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": False,
+                "default_style_preset": "",
+                "strict_lora_validation": True,
+                "max_dynamic_loras": 3,
+                "max_total_dynamic_loras": 12,
+                "max_prompt_length": 4000,
+            }
+        )
+        plugin._generation_slots = asyncio.Semaphore(1)
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        job = self.main.GenerationJob("u", "preview", 0.0)
+
+        with self.assertRaisesRegex(self.main.WorkflowError, "内容变化"):
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(
+                    prompt="1girl, kallen",
+                    use_prompt_llm=False,
+                    dynamic_loras=(
+                        LoraSelection("characters/kallen.safetensors", 0.65),
+                    ),
+                    lora_identity_expectations=(
+                        LoraIdentityExpectation(
+                            "characters/kallen.safetensors",
+                            sha256="aa11bb22",
+                        ),
+                    ),
+                    character_swap_target_lora=(
+                        "characters/kallen.safetensors"
+                    ),
+                ),
+                object(),
+            )
+        self.assertEqual(job.failed_stage, "building")
+
     async def test_fatal_lora_tool_error_never_uses_raw_prompt_fallback(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.settings = self.main.PluginSettings.from_mapping(
@@ -1274,6 +1377,81 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(job.state, "failed")
         self.assertEqual(job.failed_stage, "directing")
+
+
+class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
+    """WebUI workflow selection must separate generation and RTX tools."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def _plugin(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "workflow_dir": str(plugin.plugin_dir / "workflow"),
+                "workflow_file": "workflow/anima_api.json",
+            }
+        )
+        plugin._workflow_registry = self.main.WorkflowRegistry(
+            plugin.plugin_dir / "workflow",
+            plugin.settings,
+        )
+        plugin._active_workflow_name = "anima_api.json"
+        plugin._active_jobs = {}
+        plugin._workflow_switch_lock = asyncio.Lock()
+        plugin._initialization_error = None
+        return plugin
+
+    async def test_list_distinguishes_generation_and_standalone_upscale(self) -> None:
+        plugin = self._plugin()
+
+        result = await plugin.web_ui_list_workflows()
+
+        by_name = {item["filename"]: item for item in result["items"]}
+        self.assertTrue(by_name["anima_v2_api.json"]["selectable"])
+        self.assertEqual(
+            by_name["anima_v2_api.json"]["task_type"],
+            "text_to_image",
+        )
+        self.assertFalse(by_name["rtx_upscale_api.json"]["selectable"])
+        self.assertEqual(
+            by_name["rtx_upscale_api.json"]["task_type"],
+            "upscale",
+        )
+
+    async def test_select_persists_then_hot_switches_generation_workflow(self) -> None:
+        plugin = self._plugin()
+        persisted = []
+        plugin._persist_config_updates = lambda updates: persisted.append(updates) or True
+
+        result = await plugin.web_ui_select_workflow("anima_v2_api.json")
+
+        self.assertEqual(result["selected"], "anima_v2_api.json")
+        self.assertEqual(plugin._active_workflow_name, "anima_v2_api.json")
+        self.assertEqual(
+            persisted,
+            [{"workflow_file": "workflow/anima_v2_api.json"}],
+        )
+
+    async def test_select_rejects_upscale_and_running_jobs(self) -> None:
+        plugin = self._plugin()
+        plugin._persist_config_updates = lambda _updates: True
+        with self.assertRaisesRegex(self.main.WebUiActionError, "独立图片放大"):
+            await plugin.web_ui_select_workflow("rtx_upscale_api.json")
+
+        task = asyncio.get_running_loop().create_future()
+        plugin._active_jobs = {
+            "u": self.main.GenerationJob("u", "preview", 0.0, task=task)
+        }
+        try:
+            with self.assertRaisesRegex(self.main.WebUiActionError, "任务运行中"):
+                await plugin.web_ui_select_workflow("anima_v2_api.json")
+        finally:
+            task.cancel()
 
 
 class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):

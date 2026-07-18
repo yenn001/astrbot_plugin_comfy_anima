@@ -140,6 +140,13 @@ class PluginPageApi:
             identifier = self._path_tail(path, "/api/presets/", 500)
             return await self._controller.web_ui_delete_preset(identifier)
 
+        if method == "GET" and path == "/api/workflows":
+            return await self._controller.web_ui_list_workflows()
+        if method == "POST" and path == "/api/workflows/select":
+            return await self._controller.web_ui_select_workflow(
+                str(body.get("identifier") or body.get("filename") or "")
+            )
+
         if method == "GET" and path == "/api/unet":
             return await self._controller.web_ui_list_unet()
         if method == "POST" and path == "/api/unet/select":

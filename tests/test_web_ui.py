@@ -40,6 +40,7 @@ class _Controller:
         self.cancelled_task = None
         self.deleted_lora = None
         self.deleted_unet = None
+        self.selected_workflow = None
 
     async def web_ui_bootstrap(self):
         return {
@@ -161,6 +162,32 @@ class _Controller:
     async def web_ui_delete_lora(self, payload):
         self.deleted_lora = payload
         return {"deleted": True, "model_type": "lora"}
+
+    async def web_ui_list_workflows(self):
+        return {
+            "active": "anima_v2_api.json",
+            "items": [
+                {
+                    "filename": "anima_v2_api.json",
+                    "task_type": "text_to_image",
+                    "task_label": "生图",
+                    "selectable": True,
+                    "current": True,
+                },
+                {
+                    "filename": "rtx_upscale_api.json",
+                    "task_type": "upscale",
+                    "task_label": "独立放大",
+                    "selectable": False,
+                    "current": False,
+                    "reason": "不能设为生图工作流",
+                },
+            ],
+        }
+
+    async def web_ui_select_workflow(self, identifier):
+        self.selected_workflow = identifier
+        return {"selected": identifier, "message": "switched"}
 
     async def web_ui_list_unet(self):
         return {"items": []}
@@ -303,6 +330,16 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
         self.assertIn("sampler.steps", self.javascript)
         self.assertIn("sampler.cfg", self.javascript)
         self.assertIn("sampler.denoise", self.javascript)
+        for identifier in (
+            "workflow-select",
+            "workflow-refresh",
+            "workflow-activate",
+            "workflow-select-status",
+        ):
+            self.assertIn(f'id="{identifier}"', self.html)
+        self.assertIn('api("/api/workflows")', self.javascript)
+        self.assertIn('api("/api/workflows/select"', self.javascript)
+        self.assertIn("item.selectable", self.javascript)
 
     def test_asset_delete_ui_uses_exact_names_not_browser_paths(self) -> None:
         self.assertIn('api("/api/loras/delete"', self.javascript)
@@ -556,6 +593,24 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(deleted_unet.status, 200)
         self.assertEqual(self.controller.deleted_unet, unet_delete_payload)
+
+        workflows = await self.client.get("/api/workflows")
+        self.assertEqual(workflows.status, 200)
+        workflow_payload = await workflows.json()
+        self.assertEqual(
+            workflow_payload["data"]["items"][1]["task_type"],
+            "upscale",
+        )
+        switched = await self.client.post(
+            "/api/workflows/select",
+            json={"identifier": "anima_v2_api.json"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(switched.status, 200)
+        self.assertEqual(
+            self.controller.selected_workflow,
+            "anima_v2_api.json",
+        )
 
         profile = await self.client.post(
             "/api/config-profiles/switch",

@@ -12,6 +12,7 @@ class _Controller:
         self.search_query = None
         self.deleted_preset = None
         self.task_event_query = None
+        self.selected_workflow = None
 
     async def web_ui_bootstrap(self):
         return {"version": "test"}
@@ -38,6 +39,13 @@ class _Controller:
     async def web_ui_delete_preset(self, identifier):
         self.deleted_preset = identifier
         return {"deleted": identifier}
+
+    async def web_ui_list_workflows(self):
+        return {"active": "anima.json", "items": []}
+
+    async def web_ui_select_workflow(self, identifier):
+        self.selected_workflow = identifier
+        return {"selected": identifier}
 
     async def web_ui_get_task_events(self, run_id, after_seq, limit):
         self.task_event_query = (run_id, after_seq, limit)
@@ -75,6 +83,22 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["selected_rerank"], "rerank-main")
         self.assertIn("embedding", result)
         self.assertIn("rerank", result)
+
+    async def test_workflow_routes_reuse_safe_controller_operations(self) -> None:
+        listed = await self.api.dispatch(
+            {"method": "GET", "path": "/api/workflows"}
+        )
+        selected = await self.api.dispatch(
+            {
+                "method": "POST",
+                "path": "/api/workflows/select",
+                "body": {"identifier": "anima_v2_api.json"},
+            }
+        )
+
+        self.assertEqual(listed["active"], "anima.json")
+        self.assertEqual(selected["selected"], "anima_v2_api.json")
+        self.assertEqual(self.controller.selected_workflow, "anima_v2_api.json")
 
     async def test_settings_validate_sampler_override(self) -> None:
         result = await self.api.dispatch(
@@ -186,6 +210,14 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("item.supports_image === true", script)
                 self.assertIn("item.supports_image === false", script)
                 self.assertIn("selectedItem.supports_image !== false", script)
+                for identifier in (
+                    "workflow-select",
+                    "workflow-refresh",
+                    "workflow-activate",
+                ):
+                    self.assertIn(f'id="{identifier}"', html)
+                self.assertIn('api("/api/workflows")', script)
+                self.assertIn('api("/api/workflows/select"', script)
 
 
 if __name__ == "__main__":

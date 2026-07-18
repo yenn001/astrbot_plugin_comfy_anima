@@ -663,14 +663,13 @@ class LoraSemanticIndex:
             hashed = self.entries.get(f"sha256:{digest}")
             if hashed is not None:
                 return hashed
+            # A fresh content hash must never fall back to a name-only archive.
+            # The file at this path may have been replaced since it was indexed.
+            return None
         canonical = _canonical_key(getattr(record, "name", ""))
         direct = self.entries.get(f"name:{canonical}")
         if direct is not None:
             return direct
-        if digest:
-            # A fresh hash that disagrees with a hash-backed entry means the
-            # file content changed.  Do not reuse a same-name semantic record.
-            return None
         matches = [
             entry
             for entry in self.entries.values()
@@ -682,6 +681,12 @@ class LoraSemanticIndex:
         """Apply only a current, identity-matched semantic overlay."""
         entry = self.entry_for(record)
         if entry is None or not entry.overlay_valid:
+            return record
+        current_fingerprint = semantic_source_fingerprint(record)
+        if (
+            entry.source_fingerprint
+            and entry.source_fingerprint.casefold() != current_fingerprint.casefold()
+        ):
             return record
         category = entry.effective_category
         aliases = _dedupe_text(

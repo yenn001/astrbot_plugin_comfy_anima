@@ -19,9 +19,57 @@ def _write_workflow(path: Path, prompt_node_id: str = "210") -> None:
         "262": {"inputs": {"seed": 1}},
         "437": {"inputs": {"width": 512, "height": 512}},
         "20": {"inputs": {}},
+        "285": {"inputs": {}},
         "777": {"inputs": {}},
     }
     path.write_text(json.dumps(workflow), encoding="utf-8")
+
+
+def _write_upscale_workflow(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "1": {"inputs": {"image": "input.png"}},
+                "552": {
+                    "inputs": {
+                        "resize_type.scale": 2.0,
+                        "quality": "ULTRA",
+                    }
+                },
+                "458": {"inputs": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_dir = path.parent / "manifests"
+    manifest_dir.mkdir(exist_ok=True)
+    (manifest_dir / f"{path.stem}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile_id": "rtx_test",
+                "display_name": "RTX Test",
+                "workflow_file": path.name,
+                "task_type": "upscale",
+                "bindings": {
+                    "input_image": {"node_id": "1", "input": "image"},
+                    "upscale": {
+                        "node_id": "552",
+                        "scale_input": "resize_type.scale",
+                        "quality_input": "quality",
+                    },
+                },
+                "output_variants": {
+                    "rtx": {
+                        "preferred_node_ids": ["458"],
+                        "prune_node_ids": [],
+                    }
+                },
+                "default_output_variant": "rtx",
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class WorkflowRegistryTests(unittest.TestCase):
@@ -60,6 +108,28 @@ class WorkflowRegistryTests(unittest.TestCase):
         _write_workflow(self.workflow_dir / "two.json")
 
         self.assertEqual(len(self.registry.discover()), 2)
+
+    def test_describe_marks_upscale_visible_but_not_selectable(self) -> None:
+        _write_workflow(self.workflow_dir / "anima.json")
+        _write_upscale_workflow(self.workflow_dir / "rtx.json")
+
+        descriptors = self.registry.describe()
+
+        by_name = {item.entry.filename: item for item in descriptors}
+        self.assertTrue(by_name["anima.json"].selectable)
+        self.assertEqual(by_name["anima.json"].task_type, "text_to_image")
+        self.assertFalse(by_name["rtx.json"].selectable)
+        self.assertEqual(by_name["rtx.json"].task_type, "upscale")
+        self.assertIn("不能设为", by_name["rtx.json"].error)
+
+    def test_select_filename_uses_fresh_exact_direct_child(self) -> None:
+        _write_workflow(self.workflow_dir / "Anima.json")
+
+        selection = self.registry.select_filename("anima.JSON")
+
+        self.assertEqual(selection.entry.filename, "Anima.json")
+        with self.assertRaises(WorkflowRegistryError):
+            self.registry.select_filename("nested/anima.json")
 
     def test_select_uses_one_based_index_and_node_overrides(self) -> None:
         """Selection should copy settings and apply input/output node IDs."""

@@ -10,6 +10,7 @@ let loraArchiveFilter = "all";
 let loraArchiveStatus = null;
 let archiveRunInFlight = false;
 let profileItems = [];
+let workflowItems = [];
 let consoleEntries = [];
 let consoleCursor = 0;
 let consoleMeta = null;
@@ -602,7 +603,8 @@ async function loadBootstrap() {
   document.querySelector("#detail-comfy").textContent = data.settings.comfyui_url;
   document.querySelector("#detail-lora-manager").textContent =
     data.settings.lora_manager_url || "跟随 ComfyUI 自动发现";
-  document.querySelector("#detail-workflow").textContent = data.settings.workflow_file;
+  document.querySelector("#detail-workflow").textContent =
+    data.workflow_runtime?.workflow_file || data.settings.workflow_file;
   document.querySelector("#detail-resolution").textContent =
     `${data.settings.default_width} × ${data.settings.default_height}`;
   populateSettings(data.settings);
@@ -610,6 +612,7 @@ async function loadBootstrap() {
   await Promise.all([
     loadProviders(data.settings.prompt_llm_provider_id),
     loadConfigProfiles({quiet: true}),
+    loadWorkflows({quiet: true}),
   ]);
 }
 
@@ -681,6 +684,101 @@ function renderWorkflowSamplers(runtime, settings) {
   status.textContent = activeOverride
     ? `已设置 ${activeOverride} 步覆盖；保存并自动重载后应用到 ${samplers.length} 个采样器。`
     : `当前跟随工作流模板，共读取 ${samplers.length} 个采样器。`;
+}
+
+function renderWorkflowSelector(activeWorkflow = "") {
+  const select = document.querySelector("#workflow-select");
+  const status = document.querySelector("#workflow-select-status");
+  const activate = document.querySelector("#workflow-activate");
+  if (!select || !status || !activate) return;
+  const previous = select.value;
+  select.replaceChildren();
+  if (!workflowItems.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "工作流目录中没有可用 JSON";
+    select.append(option);
+    activate.disabled = true;
+    status.textContent = "请先检查 workflow_dir 和工作流文件。";
+    return;
+  }
+  for (const item of workflowItems) {
+    const option = document.createElement("option");
+    option.value = item.filename;
+    option.disabled = !item.selectable;
+    option.dataset.reason = item.reason || "";
+    const marker = item.current ? "● " : "";
+    const profile = item.display_name && item.display_name !== item.filename
+      ? ` · ${item.display_name}`
+      : "";
+    option.textContent = `${marker}${item.filename} · ${item.task_label || item.task_type}${profile}`;
+    select.append(option);
+  }
+  const active = workflowItems.find((item) => item.current)?.filename
+    || activeWorkflow
+    || previous;
+  const selected = workflowItems.find(
+    (item) => item.filename === active && item.selectable
+  ) || workflowItems.find((item) => item.selectable);
+  select.value = selected?.filename || "";
+  updateWorkflowSelectionStatus();
+}
+
+function updateWorkflowSelectionStatus() {
+  const select = document.querySelector("#workflow-select");
+  const status = document.querySelector("#workflow-select-status");
+  const activate = document.querySelector("#workflow-activate");
+  const item = workflowItems.find((entry) => entry.filename === select.value);
+  if (!item) {
+    activate.disabled = true;
+    status.textContent = "请选择一个可用的生图工作流。";
+    return;
+  }
+  activate.disabled = !item.selectable || item.current;
+  if (item.current) {
+    status.textContent = `当前正在使用 ${item.filename}；清单每次刷新都会重新读取工作流目录。`;
+  } else if (!item.selectable) {
+    status.textContent = item.reason || "该文件不是可切换的生图工作流。";
+  } else {
+    status.textContent = `可热切换到 ${item.filename}；只影响之后提交的生图任务。`;
+  }
+}
+
+async function loadWorkflows({quiet = false} = {}) {
+  const status = document.querySelector("#workflow-select-status");
+  if (!quiet && status) status.textContent = "正在重新扫描工作流目录…";
+  try {
+    const data = await api("/api/workflows");
+    workflowItems = Array.isArray(data.items) ? data.items : [];
+    renderWorkflowSelector(data.active || "");
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    if (!quiet) showToast(error.message, true);
+  }
+}
+
+async function activateWorkflow() {
+  const select = document.querySelector("#workflow-select");
+  const button = document.querySelector("#workflow-activate");
+  const item = workflowItems.find((entry) => entry.filename === select.value);
+  if (!item || !item.selectable || item.current) return;
+  if (!(await confirmAction(
+    `将当前生图工作流热切换为 ${item.filename}。独立 RTX 放大工作流不会被改动。`,
+    {title: "切换生图工作流", confirmLabel: "确认切换"},
+  ))) return;
+  setBusy(button, true, "正在切换…");
+  try {
+    const data = await api("/api/workflows/select", {
+      method: "POST",
+      body: JSON.stringify({identifier: item.filename}),
+    });
+    showToast(data.message || `已切换到 ${item.filename}`);
+    await loadBootstrap();
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 async function loadProviders(selectedOverride = null) {
@@ -2515,6 +2613,9 @@ document.querySelector("#nav").addEventListener("click", (event) => {
   if (button) switchPanel(button.dataset.panel);
 });
 document.querySelector("#settings-form").addEventListener("submit", saveSettings);
+document.querySelector("#workflow-refresh").addEventListener("click", () => loadWorkflows());
+document.querySelector("#workflow-activate").addEventListener("click", activateWorkflow);
+document.querySelector("#workflow-select").addEventListener("change", updateWorkflowSelectionStatus);
 document.querySelector("#sampler-steps-override").addEventListener("input", (event) => {
   const value = Number(event.target.value);
   const samplerCount = bootstrapData?.workflow_runtime?.samplers?.length || 0;

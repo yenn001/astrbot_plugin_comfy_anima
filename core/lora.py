@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.1.5
+AstrBot Comfy Anima 插件 v1.1.6
 
 功能描述：
 - 解析提示词中的 LoRA 标签
 - 将动态 LoRA 注入 Anima 工作流的 LoraManager 节点
 
 作者: Yen
-版本: 1.1.5
-日期: 2026-07-18
+版本: 1.1.6
+日期: 2026-07-19
 """
 
 import re

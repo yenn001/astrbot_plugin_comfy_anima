@@ -125,22 +125,23 @@ class IncomingImageService:
         direct = self._direct_images(event)
         if len(direct) > 1:
             raise IncomingImageError("一次只能处理一张图片")
+        quoted = self._quoted_images(event)
+        if len(quoted) > 1:
+            raise IncomingImageError("引用消息中有多张图片，请单独引用一张")
+        refs = [] if quoted else await self._quoted_refs(event)
+        if len(refs) > 1:
+            raise IncomingImageError("引用消息中有多张图片，请单独引用一张")
+        if direct and (quoted or refs):
+            raise IncomingImageError("不能同时发送新图片和引用图片，请只保留一种来源")
         if direct:
             return await self._copy_and_validate(
                 await self._materialize_component(direct[0])
             )
-
-        quoted = self._quoted_images(event)
-        if len(quoted) > 1:
-            raise IncomingImageError("引用消息中有多张图片，请单独引用一张")
         if quoted:
             return await self._copy_and_validate(
                 await self._materialize_component(quoted[0])
             )
 
-        refs = await self._quoted_refs(event)
-        if len(refs) > 1:
-            raise IncomingImageError("引用消息中有多张图片，请单独引用一张")
         if refs:
             image_type = getattr(Comp, "Image", None)
             if image_type is None:
@@ -149,6 +150,13 @@ class IncomingImageService:
                 await self._materialize_component(image_type(file=refs[0]))
             )
         raise IncomingImageError("请发送一张图片，或回复图片后再使用该指令")
+
+    async def has_any(self, event: Any) -> bool:
+        """Return whether the event carries any direct or quoted image source."""
+
+        if self._direct_images(event) or self._quoted_images(event):
+            return True
+        return bool(await self._quoted_refs(event))
 
 
 __all__ = ["IncomingImageError", "IncomingImageService"]

@@ -178,6 +178,19 @@
                   </div>
                   <span id="workflow-profile-id" class="ticket-tag">等待读取</span>
                 </div>
+                <div class="workflow-selector-row">
+                  <label for="workflow-select">
+                    <span>当前生图工作流</span>
+                    <select id="workflow-select" aria-describedby="workflow-select-status">
+                      <option value="">正在扫描工作流目录…</option>
+                    </select>
+                  </label>
+                  <div class="button-row compact-actions">
+                    <button id="workflow-refresh" class="secondary" type="button">刷新清单</button>
+                    <button id="workflow-activate" class="primary" type="button">热切换</button>
+                  </div>
+                </div>
+                <p id="workflow-select-status" class="muted live-line" role="status"></p>
                 <div class="workflow-profile-strip">
                   <div><span>配置档案</span><strong id="workflow-profile-name">—</strong></div>
                   <div><span>工作流文件</span><code id="workflow-profile-file">—</code></div>

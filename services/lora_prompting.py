@@ -194,7 +194,7 @@ def _identity_terms(record: LoraRecord) -> tuple[str, ...]:
     return tuple(values)
 
 
-def _is_character_identity_candidate(trigger: str) -> bool:
+def is_character_identity_trigger_candidate(trigger: str) -> bool:
     folded = unicodedata.normalize("NFKC", trigger).casefold()
     key = _term_key(trigger)
     if not key or folded.strip() in _GENERIC_CHARACTER_TRIGGERS:
@@ -204,7 +204,7 @@ def _is_character_identity_candidate(trigger: str) -> bool:
     return True
 
 
-def _choose_character_trigger(record: LoraRecord) -> str:
+def choose_character_identity_trigger(record: LoraRecord) -> str:
     candidates = tuple(
         cleaned
         for trigger in record.trigger_words
@@ -213,7 +213,7 @@ def _choose_character_trigger(record: LoraRecord) -> str:
     identities = _identity_terms(record)
     for trigger in candidates:
         trigger_key = _term_key(trigger)
-        if _is_character_identity_candidate(trigger) and any(
+        if is_character_identity_trigger_candidate(trigger) and any(
             identity in trigger_key or trigger_key in identity
             for identity in identities
         ):
@@ -228,6 +228,7 @@ def build_lora_trigger_plan(
     selections: tuple[LoraSelection, ...],
     records_by_name: Mapping[str, LoraRecord],
     presets: tuple[LoraPreset, ...] = (),
+    suppressed_terms: Iterable[str] = (),
 ) -> LoraTriggerPlan:
     """Append only explicit, role-appropriate trigger words.
 
@@ -240,6 +241,9 @@ def build_lora_trigger_plan(
     prompt_text = str(prompt or "").strip(" ,")
     existing = _prompt_term_keys(prompt_text)
     negative = _prompt_term_keys(negative_prompt)
+    suppressed = {
+        key for value in suppressed_terms if (key := _term_key(str(value or "")))
+    }
     added: list[str] = []
     skipped: list[str] = []
     manual_member_keys: set[str] = set()
@@ -250,6 +254,9 @@ def build_lora_trigger_plan(
         value = trigger.strip(" ,")
         key = _term_key(value)
         if not value or not key:
+            return
+        if key in suppressed:
+            skipped.append(f"{source}: trigger suppressed by semantic rewrite: {value}")
             return
         if key in negative:
             skipped.append(f"{source}: trigger conflicts with negative prompt: {value}")
@@ -296,7 +303,7 @@ def build_lora_trigger_plan(
         )
         if not is_character_role:
             continue
-        identity_trigger_key = _term_key(_choose_character_trigger(record))
+        identity_trigger_key = _term_key(choose_character_identity_trigger(record))
         for raw_trigger in record.trigger_words:
             trigger = _clean_metadata_trigger(raw_trigger)
             trigger_key = _term_key(trigger)
@@ -348,7 +355,7 @@ def build_lora_trigger_plan(
                 append_trigger(trigger, selection.name)
             continue
         if role == PRESET_CATEGORY_CHARACTER or role == "character":
-            trigger = _choose_character_trigger(record)
+            trigger = choose_character_identity_trigger(record)
             if trigger:
                 append_trigger(trigger, selection.name)
             else:
@@ -358,7 +365,7 @@ def build_lora_trigger_plan(
             continue
         if role == PRESET_CATEGORY_MIXED or role == "mixed":
             if record.character_name:
-                trigger = _choose_character_trigger(record)
+                trigger = choose_character_identity_trigger(record)
                 if trigger:
                     append_trigger(trigger, selection.name)
                 else:
@@ -377,3 +384,13 @@ def build_lora_trigger_plan(
         added=tuple(added),
         skipped=tuple(skipped),
     )
+
+
+__all__ = [
+    "LoraMergePlan",
+    "LoraTriggerPlan",
+    "build_lora_trigger_plan",
+    "choose_character_identity_trigger",
+    "is_character_identity_trigger_candidate",
+    "merge_runtime_lora_selections",
+]

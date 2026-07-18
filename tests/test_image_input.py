@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 
@@ -87,6 +87,31 @@ class IncomingImageServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(IncomingImageError):
                 await self.service.collect_one(_Event([reply]))
+
+    async def test_direct_and_quoted_sources_are_rejected_as_ambiguous(self) -> None:
+        reply = _ReplyComponent([_ImageComponent(str(self.source))])
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            with self.assertRaisesRegex(IncomingImageError, "同时"):
+                await self.service.collect_one(
+                    _Event([_ImageComponent(str(self.source)), reply])
+                )
+
+    async def test_direct_and_helper_quoted_ref_are_also_ambiguous(self) -> None:
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ), patch.object(
+            self.service,
+            "_quoted_refs",
+            AsyncMock(return_value=[str(self.source)]),
+        ):
+            with self.assertRaisesRegex(IncomingImageError, "同时"):
+                await self.service.collect_one(
+                    _Event([_ImageComponent(str(self.source))])
+                )
 
     async def test_pixel_limit_is_enforced_after_image_verification(self) -> None:
         service = IncomingImageService(

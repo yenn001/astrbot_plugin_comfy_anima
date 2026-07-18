@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.1.5
+AstrBot Comfy Anima 插件 v1.1.6
 
 功能描述：
 - 安全读取局域网 HTTP LoRA 清单或 ComfyUI object_info
 - 为 LLM 工具提供可搜索、可缓存的 LoRA 元数据
 
 作者: Yen
-版本: 1.1.5
-日期: 2026-07-18
+版本: 1.1.6
+日期: 2026-07-19
 """
 
 import asyncio

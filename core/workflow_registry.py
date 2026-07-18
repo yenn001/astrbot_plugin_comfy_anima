@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 from ..models import PluginSettings
-from .workflow import WorkflowBuilder
+from .workflow import ImageWorkflowBuilder, WorkflowBuilder, WorkflowError
+from .workflow_profiles import WorkflowProfileError, load_workflow_profile
 
 
 class WorkflowRegistryError(ValueError):
@@ -40,6 +41,18 @@ class WorkflowSelection:
     entry: WorkflowEntry
     settings: PluginSettings
     builder: WorkflowBuilder
+
+
+@dataclass(frozen=True)
+class WorkflowDescriptor:
+    """Freshly inspected workflow metadata for management surfaces."""
+
+    entry: WorkflowEntry
+    task_type: str
+    profile_id: str
+    display_name: str
+    selectable: bool
+    error: str = ""
 
 
 class WorkflowRegistry:
@@ -113,6 +126,66 @@ class WorkflowRegistry:
             The same fresh discovery result as :meth:`discover`.
         """
         return self.discover()
+
+    def describe(self) -> tuple[WorkflowDescriptor, ...]:
+        """Inspect every fresh entry and distinguish generation from upscale."""
+
+        result: list[WorkflowDescriptor] = []
+        for entry in self.discover():
+            selected_settings = replace(
+                self._settings,
+                workflow_file=str(entry.path),
+            )
+            try:
+                profile = load_workflow_profile(entry.path, selected_settings)
+                if profile.task_type == "text_to_image":
+                    WorkflowBuilder(entry.path, selected_settings)
+                    selectable = True
+                    error = ""
+                else:
+                    ImageWorkflowBuilder(entry.path, selected_settings)
+                    selectable = False
+                    error = "独立图片放大工作流不能设为当前生图工作流"
+                result.append(
+                    WorkflowDescriptor(
+                        entry=entry,
+                        task_type=profile.task_type,
+                        profile_id=profile.profile_id,
+                        display_name=profile.display_name,
+                        selectable=selectable,
+                        error=error,
+                    )
+                )
+            except (OSError, ValueError, WorkflowError, WorkflowProfileError) as exc:
+                result.append(
+                    WorkflowDescriptor(
+                        entry=entry,
+                        task_type="invalid",
+                        profile_id="",
+                        display_name=entry.filename,
+                        selectable=False,
+                        error=str(exc)[:300],
+                    )
+                )
+        return tuple(result)
+
+    def select_filename(self, filename: str) -> WorkflowSelection:
+        """Select one fresh direct-child workflow by exact filename."""
+
+        value = str(filename or "").strip()
+        if (
+            not value
+            or len(value) > 255
+            or "/" in value
+            or "\\" in value
+            or not value.casefold().endswith(".json")
+        ):
+            raise WorkflowRegistryError("Workflow filename is invalid")
+        entries = self.discover()
+        matches = [entry for entry in entries if entry.filename.casefold() == value.casefold()]
+        if len(matches) != 1:
+            raise WorkflowRegistryError("Workflow file is missing or ambiguous")
+        return self.select(matches[0].index)
 
     def select(
         self,
@@ -200,6 +273,7 @@ class WorkflowRegistry:
 
 
 __all__ = [
+    "WorkflowDescriptor",
     "WorkflowEntry",
     "WorkflowRegistry",
     "WorkflowRegistryError",

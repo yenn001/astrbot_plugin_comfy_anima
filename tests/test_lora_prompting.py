@@ -107,6 +107,33 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
         self.assertEqual(plan.prompt, "1girl, hand tuned style")
         self.assertNotIn("manager trigger", plan.prompt)
 
+    def test_semantic_rewrite_suppresses_manual_and_metadata_triggers(self) -> None:
+        preset = LoraPreset(
+            name="legacy mix",
+            category="artist_style",
+            selections=(LoraSelection("styles/base", 0.5),),
+            trigger_words="denia_wuwa, hand tuned style",
+        )
+
+        plan = build_lora_trigger_plan(
+            prompt="1girl",
+            negative_prompt="",
+            selections=preset.selections,
+            records_by_name={
+                "styles/base": LoraRecord(
+                    "styles/base",
+                    category="artist_style",
+                    trigger_words=("denia_wuwa", "manager style"),
+                )
+            },
+            presets=(preset,),
+            suppressed_terms=("denia_wuwa",),
+        )
+
+        self.assertEqual(plan.prompt, "1girl, hand tuned style")
+        self.assertNotIn("denia_wuwa", plan.prompt)
+        self.assertTrue(any("suppressed" in item for item in plan.skipped))
+
     def test_existing_trigger_is_not_duplicated(self) -> None:
         plan = build_lora_trigger_plan(
             prompt="1girl, masterpiece",

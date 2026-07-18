@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.5
+AstrBot Comfy Anima 插件 v1.1.6
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.1.5
-日期: 2026-07-18
+版本: 1.1.6
+日期: 2026-07-19
 """
 
 from dataclasses import dataclass, field
@@ -531,6 +531,15 @@ class PluginSettings:
 
 
 @dataclass(frozen=True)
+class LoraIdentityExpectation:
+    """One LoRA identity captured before a safety-critical rewrite."""
+
+    name: str
+    sha256: str = ""
+    source_fingerprint: str = ""
+
+
+@dataclass(frozen=True)
 class GenerationOptions:
     """单次生成使用的动态参数。"""
 
@@ -546,6 +555,10 @@ class GenerationOptions:
     dynamic_loras: tuple["LoraSelection", ...] = ()
     lora_preset: str = ""
     lora_injection_mode: Optional[str] = None
+    suppress_default_style: bool = False
+    suppressed_prompt_terms: tuple[str, ...] = ()
+    lora_identity_expectations: tuple["LoraIdentityExpectation", ...] = ()
+    character_swap_target_lora: str = ""
 
 
 @dataclass(frozen=True)

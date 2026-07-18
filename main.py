@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.1.5
+AstrBot Comfy Anima 插件 v1.1.6
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.1.5
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.1.5
-日期: 2026-07-18
+版本: 1.1.6
+日期: 2026-07-19
 """
 
 import asyncio
@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncGenerator, Mapping, Optional
 
+from PIL import Image
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
@@ -60,6 +61,17 @@ from .models import (
     PluginSettings,
 )
 from .services.comfy_client import ComfyClient, ComfyClientError
+from .services.character_swap import (
+    CharacterSwapError,
+    CharacterSwapPlan,
+    CharacterSwapPlanner,
+    CharacterSwapPreparation,
+    CharacterSwapRequest,
+    fit_canvas_to_aspect_ratio,
+    parse_character_swap_request,
+    parse_natural_character_swap,
+    response_text as character_swap_response_text,
+)
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
 from .services.lora_retrieval import LoraHybridSearchService
@@ -269,6 +281,7 @@ class ComfyAnimaPlugin(Star):
         self._log_console_attached = self._log_console.attach(logger)
         self._active_jobs: dict[str, GenerationJob] = {}
         self._jobs_lock = asyncio.Lock()
+        self._workflow_switch_lock = asyncio.Lock()
         self._lora_preset_transaction_lock = asyncio.Lock()
         self._generation_slots = asyncio.Semaphore(self.settings.max_concurrent_jobs)
         self._last_request_at: dict[str, float] = {}
@@ -780,6 +793,64 @@ class ComfyAnimaPlugin(Star):
             new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
             self._schedule_cleanup(image_paths)
         result.chain = new_chain
+
+    @filter.command("换角色")
+    async def cmd_character_swap(
+        self,
+        event: AstrMessageEvent,
+        request_text: str = "",
+    ) -> AsyncGenerator[Any, None]:
+        """Replace one prompt/image character while preserving the scene."""
+
+        command_text = self._extract_command_text(
+            event.message_str,
+            request_text,
+            command="换角色",
+        )
+        try:
+            request = parse_character_swap_request(command_text)
+        except CharacterSwapError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} {exc.user_message}")
+            return
+        async for response in self._handle_character_swap(event, request):
+            yield response
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=30)
+    async def natural_language_character_swap(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[Any, None]:
+        """Handle only explicit image A-to-B requests before ordinary drawing."""
+
+        message = str(event.message_str or "").strip()
+        if not message or message.startswith(("/", "／")):
+            return
+        request = parse_natural_character_swap(message)
+        if request is None:
+            return
+        has_image = await self._image_input.has_any(event)
+        if not has_image and not re.search(
+            r"(?:图片|图像|画面|引用|回复|这张图|图里|图中)",
+            message,
+        ):
+            return
+        try:
+            width, height = self._extract_resolution_request(message)
+            preset = self._find_requested_style_preset(message)
+            request = replace(
+                request,
+                width=width,
+                height=height,
+                preset=preset,
+            )
+            async for response in self._handle_character_swap(event, request):
+                yield response
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
+        finally:
+            # As with natural_language_draw, stop only after all yielded replies.
+            event.stop_event()
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=15)
@@ -2024,6 +2095,8 @@ class ComfyAnimaPlugin(Star):
 /画图no <英文 Tag> - 直接发送图片
 /反推 [关注点] - 发送或引用图片，返回结构化 Anima 提示词
 /反推画图 [补充要求] - 反推后直接调用 Anima 生图
+/换角色 A -> B [选项] - 引用单图进行单角色语义换角
+/换角色 A -> B [选项] | <完整 Tags> - 对现有 Tags 语义换角
 /放大 [倍率] - 发送或引用图片，执行独立 RTX 放大
 /画图与 /画图no 均可追加 --preset <序号|名称>
 
@@ -2134,6 +2207,8 @@ QQ快捷指令:
 /画图no <英文 Tag> - 直接图片
 /反推 [关注点] - 在线图片反推
 /反推画图 [补充要求] - 反推并生成
+/换角色 A -> B [选项] - 单图语义换角
+/换角色 A -> B [选项] | <完整 Tags> - Tags 语义换角
 /放大 [倍率] - RTX 图片放大
 /comfy帮助 - 完整帮助
 
@@ -2147,12 +2222,540 @@ QQ快捷指令:
 --llm / --raw
 --preset "风格001或自定义名称"
 
+换角专用选项（写在 | 之前）:
+--mode keep-outfit|target-outfit
+--weight 0.55~0.75
+--size 832x1216
+--negative "负面提示词"
+--preset "画师/风格组合"
+--preview
+
 示例:
 /anima draw 她在雨夜回头看向镜头 --seed 123
 /anima draw 用风格001画达妮娅，分辨率832x1216
 /anima draw 1girl, white hair, blue eyes --raw --no-upscale --preset 风格001
+/换角色 达妮娅 -> 卡莲 --preview | 1girl, denia_wuwa, school uniform, standing
 """
         yield event.plain_result(help_text)
+
+    async def _classify_character_swap(
+        self,
+        event: AstrMessageEvent,
+        job: GenerationJob,
+        planner: CharacterSwapPlanner,
+        preparation: CharacterSwapPreparation,
+    ) -> tuple[Any, str]:
+        """Run one bounded JSON classifier with a single schema-repair retry."""
+
+        if self._director is None:
+            raise CharacterSwapError(
+                "语义换角需要可用的 LLM 绘图导演 Provider",
+                code="swap_provider_unavailable",
+            )
+        provider_id = await self._director.resolve_provider_id(self.context, event)
+        system_prompt, user_prompt = planner.classification_prompts(preparation)
+        event_key = id(event)
+        self._internal_llm_events.add(event_key)
+        last_error: Optional[CharacterSwapError] = None
+        try:
+            for attempt in (1, 2):
+                job.state = "classifying_swap"
+                self._record_image_task_phase(
+                    job,
+                    "classifier",
+                    (
+                        "正在让绘图导演对编号 Tags 做受约束身份分类。"
+                        if attempt == 1
+                        else "首次结构化分类无效，正在进行一次严格 JSON 重试。"
+                    ),
+                    (
+                        "character_swap_classifier_started"
+                        if attempt == 1
+                        else "character_swap_classifier_repair_started"
+                    ),
+                    details={
+                        "attempt": attempt,
+                        "provider_id": provider_id,
+                        "tag_count": len(preparation.tags),
+                        "target_trigger_count": len(
+                            preparation.target_trigger_words
+                        ),
+                    },
+                )
+                retry_suffix = (
+                    "\nYour previous response did not satisfy the exact schema. "
+                    "Return the required JSON object only."
+                    if attempt > 1
+                    else ""
+                )
+                try:
+                    if hasattr(self.context, "llm_generate"):
+                        response = await asyncio.wait_for(
+                            self.context.llm_generate(
+                                chat_provider_id=provider_id,
+                                prompt=user_prompt + retry_suffix,
+                                system_prompt=system_prompt,
+                                temperature=0.0,
+                                max_tokens=max(
+                                    800,
+                                    min(
+                                        2000,
+                                        self.settings.prompt_llm_max_tokens,
+                                    ),
+                                ),
+                            ),
+                            timeout=self.settings.prompt_llm_timeout,
+                        )
+                    else:
+                        getter = getattr(self.context, "get_provider_by_id", None)
+                        provider = getter(provider_id) if callable(getter) else None
+                        if provider is None or not hasattr(provider, "text_chat"):
+                            raise CharacterSwapError(
+                                "找不到可用的换角分类 Provider",
+                                code="swap_provider_unavailable",
+                            )
+                        response = await asyncio.wait_for(
+                            provider.text_chat(
+                                contexts=[],
+                                prompt=user_prompt + retry_suffix,
+                                system_prompt=system_prompt,
+                                temperature=0.0,
+                                max_tokens=max(
+                                    800,
+                                    min(
+                                        2000,
+                                        self.settings.prompt_llm_max_tokens,
+                                    ),
+                                ),
+                            ),
+                            timeout=self.settings.prompt_llm_timeout,
+                        )
+                except asyncio.TimeoutError as exc:
+                    raise CharacterSwapError(
+                        "换角分类模型调用超时",
+                        code="swap_provider_timeout",
+                    ) from exc
+                except CharacterSwapError:
+                    raise
+                except Exception as exc:
+                    raise CharacterSwapError(
+                        "换角分类模型调用失败",
+                        code="swap_provider_error",
+                        details={"exception_type": type(exc).__name__},
+                    ) from exc
+
+                text = character_swap_response_text(response)
+                try:
+                    classification = planner.parse_classification(
+                        text,
+                        tag_count=len(preparation.tags),
+                        target_trigger_count=len(
+                            preparation.target_trigger_words
+                        ),
+                    )
+                except CharacterSwapError as exc:
+                    last_error = exc
+                    self._record_image_task_phase(
+                        job,
+                        "classifier",
+                        "换角分类 JSON 未通过结构与 ID 完整性校验。",
+                        "character_swap_classifier_invalid",
+                        level="WARNING",
+                        details={
+                            "attempt": attempt,
+                            "error_code": exc.code,
+                            "will_retry": attempt == 1,
+                        },
+                    )
+                    continue
+                self._record_image_task_phase(
+                    job,
+                    "classifier",
+                    "编号 Tags 已完成分类，结构与覆盖范围校验通过。",
+                    "character_swap_classifier_completed",
+                    details={
+                        "attempt": attempt,
+                        "provider_id": provider_id,
+                        "confidence": classification.confidence,
+                        "subject_count": classification.subject_count,
+                    },
+                )
+                return classification, provider_id
+        finally:
+            self._internal_llm_events.discard(event_key)
+        raise CharacterSwapError(
+            "换角分类模型连续两次未返回可用的严格 JSON",
+            code="classification_repair_exhausted",
+            details={"last_error_code": last_error.code if last_error else ""},
+        ) from last_error
+
+    async def _handle_character_swap(
+        self,
+        event: AstrMessageEvent,
+        request: CharacterSwapRequest,
+    ) -> AsyncGenerator[Any, None]:
+        """Shared explicit/natural semantic replacement pipeline."""
+
+        access_text = " ".join(
+            part
+            for part in (
+                request.source_query,
+                request.target_query,
+                request.tags,
+                request.negative_prompt,
+            )
+            if part
+        )
+        access_error = self._access_error(event, access_text)
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        if not self._client or not self._workflow_builder or not self._director:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 语义换角组件未就绪: "
+                f"{self._initialization_error or self._director_error or '未知错误'}"
+            )
+            return
+        if request.tags and await self._image_input.has_any(event):
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 不能同时提供图片和 Tags；请只选择一种输入"
+            )
+            return
+        if request.width is not None or request.height is not None:
+            if request.width is None or request.height is None:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 换角分辨率必须同时提供宽和高"
+                )
+                return
+            try:
+                self._parse_resolution_value(
+                    f"{request.width}x{request.height}"
+                )
+            except ValueError as exc:
+                yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
+                return
+
+        replace_source_style = False
+        if request.preset:
+            try:
+                preset = self._lora_presets.resolve(request.preset)
+            except LoraPresetError as exc:
+                yield event.plain_result(f"{MessageEmoji.ERROR} {exc}")
+                return
+            if preset.category != PRESET_CATEGORY_ARTIST_STYLE:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 换角的 --preset 只能选择画师/风格组合"
+                )
+                return
+            request = replace(request, preset=preset.name)
+            replace_source_style = True
+
+        async def operation(
+            job: GenerationJob,
+        ) -> tuple[CharacterSwapPlan, Any, str, str, CharacterSwapRequest]:
+            image_path: Optional[Path] = None
+            reverse_provider = ""
+            effective_request = request
+            try:
+                positive_prompt = request.tags.strip()
+                negative_prompt = request.negative_prompt.strip(" ,")
+                if not positive_prompt:
+                    if (
+                        not self.settings.enable_reverse_prompt
+                        or self._reverse_prompt is None
+                    ):
+                        raise CharacterSwapError(
+                            "图片语义换角需要先启用在线反推功能",
+                            code="reverse_prompt_disabled",
+                        )
+                    job.state = "reading_image"
+                    image_path = await self._image_input.collect_one(event)
+
+                    def image_size() -> tuple[int, int]:
+                        assert image_path is not None
+                        with Image.open(image_path) as image:
+                            return image.size
+
+                    original_width, original_height = await asyncio.to_thread(
+                        image_size
+                    )
+                    self._record_image_task_phase(
+                        job,
+                        "input",
+                        "单张输入图片已通过格式、大小与像素限制校验。",
+                        "character_swap_input_ready",
+                        details={
+                            "bytes": image_path.stat().st_size,
+                            "width": original_width,
+                            "height": original_height,
+                        },
+                    )
+                    job.state = "reverse_prompting"
+
+                    def reverse_progress(
+                        message: str,
+                        event_code: str,
+                        details: Mapping[str, Any],
+                    ) -> None:
+                        self._record_image_task_phase(
+                            job,
+                            "reverse",
+                            message,
+                            f"character_swap_{event_code}",
+                            details=dict(details),
+                            level=(
+                                "WARNING"
+                                if event_code == "reverse_response_invalid"
+                                else "INFO"
+                            ),
+                        )
+
+                    async with self._generation_slots:
+                        reverse_result, reverse_provider = (
+                            await self._reverse_prompt.reverse(
+                                self.context,
+                                event,
+                                image_path,
+                                "只记录单一人物、衣装、姿势、构图、背景和光线，"
+                                "不要执行换角或补造不可见事实。",
+                                reverse_progress,
+                            )
+                        )
+                    if len(reverse_result.characters) > 1:
+                        raise CharacterSwapError(
+                            "图片反推识别到多个角色；首版语义换角只支持单角色",
+                            code="multiple_subjects",
+                        )
+                    source_query = request.source_query
+                    if not source_query and reverse_result.characters:
+                        candidate = reverse_result.characters[0]
+                        if candidate.confidence >= 0.7:
+                            source_query = candidate.name
+                    if not source_query:
+                        raise CharacterSwapError(
+                            "无法从图片中可靠确认原角色，请用 /换角色 A -> B 明确指定 A",
+                            code="source_character_missing",
+                        )
+                    width = request.width
+                    height = request.height
+                    if width is None or height is None:
+                        width, height = fit_canvas_to_aspect_ratio(
+                            original_width,
+                            original_height,
+                        )
+                    effective_request = replace(
+                        request,
+                        source_query=source_query,
+                        width=width,
+                        height=height,
+                    )
+                    positive_prompt = reverse_result.positive_tags
+                    negative_prompt = ", ".join(
+                        part
+                        for part in (
+                            reverse_result.negative_tags.strip(" ,"),
+                            request.negative_prompt.strip(" ,"),
+                        )
+                        if part
+                    )
+                    self._record_image_task_phase(
+                        job,
+                        "reverse",
+                        "图片已转换为通过结构化校验的可观察 Tags。",
+                        "character_swap_reverse_completed",
+                        details={
+                            "provider_id": reverse_provider,
+                            "character_count": len(reverse_result.characters),
+                            "confidence": reverse_result.confidence,
+                        },
+                    )
+
+                source_access_error = self._access_error(
+                    event,
+                    ", ".join(
+                        part
+                        for part in (positive_prompt, negative_prompt)
+                        if part
+                    ),
+                )
+                if source_access_error:
+                    raise ValueError(source_access_error)
+
+                job.state = "refreshing_lora"
+                self._record_image_task_phase(
+                    job,
+                    "lora_refresh",
+                    "正在强制刷新 LoRA Manager 与 ComfyUI 当前可加载清单。",
+                    "character_swap_lora_refresh_started",
+                )
+                records = await self._refresh_lora_manager_before("语义换角规划前")
+                self._record_image_task_phase(
+                    job,
+                    "lora_refresh",
+                    "实时 LoRA 快照已就绪，开始解析原角色与目标角色。",
+                    "character_swap_lora_refresh_completed",
+                    details={"record_count": len(records)},
+                )
+                planner = CharacterSwapPlanner(self._runtime_semantic_index())
+                job.state = "planning_swap"
+                preparation = planner.prepare(
+                    effective_request,
+                    positive_prompt=positive_prompt,
+                    negative_prompt=negative_prompt,
+                    records=records,
+                    replace_source_style=replace_source_style,
+                )
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "目标角色已唯一解析，原角色 LoRA 栈与非角色 LoRA 栈已分离。",
+                    "character_swap_characters_resolved",
+                    details={
+                        "target_lora": preparation.target_record.name,
+                        "source_lora_present": preparation.source_record is not None,
+                        "preserved_lora_count": len(preparation.preserved_loras),
+                        "removed_character_lora_count": len(
+                            preparation.removed_character_loras
+                        ),
+                    },
+                )
+                classification, classifier_provider = (
+                    await self._classify_character_swap(
+                        event,
+                        job,
+                        planner,
+                        preparation,
+                    )
+                )
+                job.state = "validating_swap"
+                plan = planner.finalize(preparation, classification)
+                final_access_error = self._access_error(
+                    event,
+                    ", ".join(
+                        part
+                        for part in (plan.prompt, plan.negative_prompt)
+                        if part
+                    ),
+                )
+                if final_access_error:
+                    raise ValueError(final_access_error)
+                self._record_image_task_phase(
+                    job,
+                    "validation",
+                    "语义换角不变量已通过：唯一目标角色、原身份清除、场景栈保留。",
+                    "character_swap_plan_validated",
+                    details={
+                        "removed_term_count": len(plan.removed_terms),
+                        "kept_term_count": len(plan.kept_terms),
+                        "added_term_count": len(plan.added_terms),
+                        "final_lora_count": len(plan.loras),
+                    },
+                )
+                if effective_request.preview:
+                    job.state = "completed"
+                    return (
+                        plan,
+                        None,
+                        classifier_provider,
+                        reverse_provider,
+                        effective_request,
+                    )
+
+                generated = await self._execute_job(
+                    job,
+                    GenerationOptions(
+                        prompt=plan.prompt,
+                        negative_prompt=plan.negative_prompt,
+                        width=effective_request.width,
+                        height=effective_request.height,
+                        use_prompt_llm=False,
+                        dynamic_loras=plan.loras,
+                        lora_preset=effective_request.preset,
+                        lora_injection_mode=(
+                            "replace" if plan.suppress_default_style else None
+                        ),
+                        suppress_default_style=plan.suppress_default_style,
+                        suppressed_prompt_terms=plan.suppressed_terms,
+                        lora_identity_expectations=plan.expectations,
+                        character_swap_target_lora=plan.target_record.name,
+                    ),
+                    event,
+                )
+                self._record_image_task_phase(
+                    job,
+                    "comfyui",
+                    "语义换角重绘已完成，输出图片已下载。",
+                    "character_swap_output_ready",
+                    details={"classifier_provider_id": classifier_provider},
+                )
+                return (
+                    plan,
+                    generated,
+                    classifier_provider,
+                    reverse_provider,
+                    effective_request,
+                )
+            finally:
+                if image_path is not None:
+                    image_path.unlink(missing_ok=True)
+
+        yield event.plain_result(
+            f"{MessageEmoji.DRAW} 正在刷新 LoRA、解析角色身份并执行语义换角……"
+        )
+        try:
+            plan, generated, classifier_provider, reverse_provider, effective_request = (
+                await self._run_auxiliary_job(
+                    event,
+                    "character swap",
+                    operation,
+                )
+            )
+        except CharacterSwapError as exc:
+            logger.error(
+                f"[{PLUGIN_NAME}] character swap stopped: "
+                f"code={exc.code}, details={exc.details}"
+            )
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 语义换角已停止: {exc.user_message}"
+            )
+            return
+        except (IncomingImageError, ReversePromptError, PromptDirectorError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] character swap failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 语义换角失败: {message}")
+            return
+        except (ComfyClientError, WorkflowError, LoraCatalogError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(
+                f"[{PLUGIN_NAME}] character swap generation failed: {exc}",
+                exc_info=True,
+            )
+            yield event.plain_result(f"{MessageEmoji.ERROR} 生成失败: {message}")
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+
+        if effective_request.preview:
+            yield event.plain_result(f"{MessageEmoji.INFO} {plan.preview_text()}")
+            return
+        assert generated is not None
+        image_paths, seed, final_prompt, _provider_id, director_warning = generated
+        if director_warning:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {director_warning}")
+        info_lines = [
+            "语义换角完成：仅替换角色身份，未执行局部或像素级编辑。",
+            f"换角分类模型: {classifier_provider}",
+        ]
+        if reverse_provider:
+            info_lines.append(f"图片反推模型: {reverse_provider}")
+        if not request.tags and not effective_request.preset:
+            info_lines.append("图片输入无法继承原 LoRA 文件；本次沿用插件默认风格栈。")
+        if self.settings.show_llm_prompt:
+            info_lines.append(f"最终提示词: {final_prompt}")
+        yield event.plain_result(f"{MessageEmoji.INFO} " + "\n".join(info_lines))
+        yield self._make_image_result(event, image_paths, seed, forward=False)
+        self._schedule_cleanup(image_paths)
 
     async def _handle_direct_draw(
         self, event: AstrMessageEvent, prompt: str, *, forward: bool
@@ -2476,7 +3079,7 @@ QQ快捷指令:
         workflow_runtime: dict[str, Any] = {
             "profile_id": "",
             "display_name": "工作流未就绪",
-            "workflow_file": settings.workflow_file,
+            "workflow_file": self._active_workflow_name or settings.workflow_file,
             "sampler_steps_override": settings.sampler_steps_override,
             "samplers": [],
         }
@@ -4214,6 +4817,112 @@ QQ快捷指令:
             ) is not None
         return response
 
+    async def web_ui_list_workflows(self) -> dict[str, Any]:
+        """Rescan, validate and classify every direct workflow JSON file."""
+
+        try:
+            descriptors = self._workflow_registry.describe()
+        except WorkflowRegistryError as exc:
+            raise WebUiActionError(str(exc)) from exc
+        active = str(self._active_workflow_name or "").casefold()
+        labels = {
+            "text_to_image": "生图",
+            "upscale": "独立放大",
+            "invalid": "不可用",
+        }
+        return {
+            "active": self._active_workflow_name,
+            "items": [
+                {
+                    "index": descriptor.entry.index,
+                    "filename": descriptor.entry.filename,
+                    "display_name": descriptor.display_name,
+                    "profile_id": descriptor.profile_id,
+                    "task_type": descriptor.task_type,
+                    "task_label": labels.get(
+                        descriptor.task_type,
+                        descriptor.task_type,
+                    ),
+                    "selectable": descriptor.selectable,
+                    "current": descriptor.entry.filename.casefold() == active,
+                    "reason": descriptor.error,
+                }
+                for descriptor in descriptors
+            ],
+        }
+
+    async def web_ui_select_workflow(self, identifier: str) -> dict[str, Any]:
+        """Persist and hot-switch one freshly validated text-to-image workflow."""
+
+        value = str(identifier or "").strip()
+        if not value or len(value) > 255:
+            raise WebUiActionError("请选择一个工作流")
+        async with self._workflow_switch_lock:
+            running = [
+                job
+                for job in self._active_jobs.values()
+                if job.task is not None and not job.task.done()
+            ]
+            if running:
+                raise WebUiActionError("当前有图片任务运行中，请等待任务结束后再切换工作流")
+            try:
+                descriptors = self._workflow_registry.describe()
+                if value.isdigit():
+                    descriptor = next(
+                        (
+                            item
+                            for item in descriptors
+                            if item.entry.index == int(value)
+                        ),
+                        None,
+                    )
+                else:
+                    descriptor = next(
+                        (
+                            item
+                            for item in descriptors
+                            if item.entry.filename.casefold() == value.casefold()
+                        ),
+                        None,
+                    )
+                if descriptor is None:
+                    raise WorkflowRegistryError("Workflow file is missing")
+                if not descriptor.selectable:
+                    raise WorkflowRegistryError(
+                        descriptor.error or "当前文件不是可切换的生图工作流"
+                    )
+                selection = self._workflow_registry.select_filename(
+                    descriptor.entry.filename
+                )
+            except (WorkflowRegistryError, WorkflowError) as exc:
+                raise WebUiActionError(f"工作流切换失败：{exc}") from exc
+
+            try:
+                relative = selection.entry.path.relative_to(self.plugin_dir)
+                workflow_value = relative.as_posix()
+            except ValueError:
+                workflow_value = str(selection.entry.path)
+            if not self._persist_config_updates({"workflow_file": workflow_value}):
+                raise WebUiActionError("工作流配置保存失败，运行时未切换")
+
+            self._workflow_builder = selection.builder
+            self._active_workflow_name = selection.entry.filename
+            self._workflow_registry = WorkflowRegistry(
+                self._workflow_registry.workflow_dir,
+                selection.settings,
+            )
+            self._initialization_error = None
+            logger.info(
+                f"[{PLUGIN_NAME}] Web UI hot-switched workflow: "
+                f"{selection.entry.filename}"
+            )
+        listed = await self.web_ui_list_workflows()
+        return {
+            **listed,
+            "selected": selection.entry.filename,
+            "message": f"已热切换到生图工作流：{selection.entry.filename}",
+        }
+
     async def web_ui_list_unet(self) -> dict[str, Any]:
         """Always read the latest UNETLoader catalog."""
         if self._unet_catalog is None:
@@ -4470,6 +5179,7 @@ QQ快捷指令:
                 "reverse prompt": "reverse_prompt",
                 "reverse draw": "reverse_draw",
                 "RTX upscale": "rtx_upscale",
+                "character swap": "character_swap",
             }.get(label, "image_tool")
             if self._task_store is not None:
                 job.task_run_id = self._task_store.create_task(
@@ -4483,7 +5193,11 @@ QQ快捷指令:
                 self._task_store.append_event(
                     job.task_run_id,
                     "run",
-                    "图片任务开始执行，正在读取本次显式提供或引用的图片。",
+                    (
+                        "语义换角任务开始执行，正在校验输入与实时 LoRA 状态。"
+                        if task_type == "character_swap"
+                        else "图片任务开始执行，正在读取本次显式提供或引用的图片。"
+                    ),
                     event_code="image_task_started",
                 )
 
@@ -4731,6 +5445,7 @@ QQ快捷指令:
                     selected_presets, replace_lora_stack = self._resolve_job_presets(
                         options.lora_preset,
                         parsed_loras,
+                        suppress_default_style=options.suppress_default_style,
                     )
                     resolved_records = {}
 
@@ -4805,6 +5520,59 @@ QQ快捷指令:
                             "组合、指令与提示词中的动态 LoRA 合计最多允许 "
                             f"{self.settings.max_total_dynamic_loras} 个"
                         )
+
+                    def resolved_record_for(selection_name: str) -> Any:
+                        return resolved_records.get(
+                            canonical_lora_name(selection_name).casefold()
+                        )
+
+                    for expectation in options.lora_identity_expectations:
+                        record = resolved_record_for(expectation.name)
+                        if record is None:
+                            raise LoraWorkflowError(
+                                f"提交前无法再次确认 LoRA：{expectation.name}"
+                            )
+                        expected_hash = str(expectation.sha256 or "").casefold()
+                        current_hash = str(record.sha256 or "").casefold()
+                        if expected_hash and current_hash != expected_hash:
+                            raise LoraWorkflowError(
+                                f"LoRA 在换角规划后发生内容变化：{expectation.name}"
+                            )
+                        expected_fingerprint = str(
+                            expectation.source_fingerprint or ""
+                        ).casefold()
+                        if (
+                            expected_fingerprint
+                            and semantic_source_fingerprint(record).casefold()
+                            != expected_fingerprint
+                        ):
+                            raise LoraWorkflowError(
+                                f"LoRA 元数据在换角规划后发生变化：{expectation.name}"
+                            )
+
+                    if options.character_swap_target_lora:
+                        target_key = canonical_lora_name(
+                            options.character_swap_target_lora
+                        ).casefold()
+                        character_keys: list[str] = []
+                        for selection in dynamic_loras:
+                            record = resolved_record_for(selection.name)
+                            if record is None:
+                                continue
+                            role = str(record.category or "").casefold()
+                            if role == "character" or (
+                                role == "mixed" and bool(record.character_name)
+                            ):
+                                character_keys.append(
+                                    canonical_lora_name(record.name).casefold()
+                                )
+                        if (
+                            set(character_keys) != {target_key}
+                            or character_keys.count(target_key) != 1
+                        ):
+                            raise LoraWorkflowError(
+                                "提交前角色 LoRA 不变量失效：必须且只能保留目标角色"
+                            )
                     combined_negative = ", ".join(
                         part
                         for part in (
@@ -4819,6 +5587,7 @@ QQ快捷指令:
                         selections=dynamic_loras,
                         records_by_name=resolved_records,
                         presets=selected_presets,
+                        suppressed_terms=options.suppressed_prompt_terms,
                     )
                     clean_prompt = trigger_plan.prompt
                     if trigger_plan.added:
@@ -4910,6 +5679,8 @@ QQ快捷指令:
         self,
         explicit_identifier: str,
         parsed_loras: tuple[Any, ...],
+        *,
+        suppress_default_style: bool = False,
     ) -> tuple[tuple[LoraPreset, ...], bool]:
         """选择本次风格/角色预设，并决定是否替换节点 462 的原风格栈。"""
         if explicit_identifier:
@@ -4929,6 +5700,8 @@ QQ快捷指令:
         if expanded_style:
             return (expanded_style,), True
 
+        if suppress_default_style:
+            return (), False
         default_style = self._resolve_default_style_preset()
         if default_style:
             return (default_style,), True

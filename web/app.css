@@ -345,6 +345,12 @@ h2 { margin-bottom: 0; font-size: clamp(22px, 2.2vw, 31px); line-height: 1.08; l
 }
 .workflow-sampler-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .workflow-sampler-head h3 { margin: 0; font-size: clamp(19px, 2vw, 25px); }
+.workflow-selector-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: end; margin: 18px 0 6px; }
+.workflow-selector-row > label { min-width: 0; }
+.workflow-selector-row > label > span { display: block; margin-bottom: 7px; color: var(--muted); font: 700 9px/1.3 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+.workflow-selector-row select { width: 100%; background: var(--paper-high); }
+.workflow-selector-row .compact-actions { flex-wrap: nowrap; }
+.workflow-selector-row .compact-actions button { white-space: nowrap; }
 .workflow-profile-strip {
   display: grid;
   grid-template-columns: minmax(170px, 0.75fr) minmax(220px, 1.25fr) minmax(230px, 0.9fr);
@@ -1114,6 +1120,7 @@ html[data-theme="night"] .task-event-list { border-color: #766957; }
 html[data-theme="night"] .task-event { border-color: #5f5345; }
 html[data-theme="night"] .empty-state { color: #a99b89; }
 html[data-theme="night"] .workflow-sampler-station { border-color: #766957; }
+html[data-theme="night"] .workflow-selector-row select { color: var(--paper); background: #29251f; border-color: #766957; }
 html[data-theme="night"] .workflow-profile-strip,
 html[data-theme="night"] .sampler-template-card { color: var(--paper); background: #29251f; border-color: #766957; box-shadow: 3px 3px 0 #080706; }
 html[data-theme="night"] .sampler-template-head,
@@ -1251,6 +1258,8 @@ html[data-theme="night"] .workshop-footer { color: #958775; border-color: #76695
   .metric-card:nth-child(even) { margin-left: 11px; }
   .form-grid, .compact-grid, .profile-controls { grid-template-columns: 1fr; }
   .workflow-sampler-head { align-items: flex-start; flex-direction: column; }
+  .workflow-selector-row { grid-template-columns: 1fr; align-items: stretch; }
+  .workflow-selector-row .compact-actions { flex-wrap: wrap; }
   .workflow-profile-strip { grid-template-columns: 1fr; }
   .sampler-override-field { grid-column: auto; }
   .workflow-sampler-list { grid-template-columns: 1fr; }

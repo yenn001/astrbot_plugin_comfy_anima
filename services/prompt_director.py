@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.1.5
+AstrBot Comfy Anima 插件 v1.1.6
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.1.5
-日期: 2026-07-18
+版本: 1.1.6
+日期: 2026-07-19
 """
 
 import asyncio
@@ -294,6 +294,11 @@ class PromptDirector:
         if not provider_id:
             raise PromptDirectorError("未选择 LLM，当前会话也没有可用模型")
         return str(provider_id)
+
+    async def resolve_provider_id(self, context: Any, event: Any) -> str:
+        """Public provider resolver shared by bounded internal LLM tasks."""
+
+        return await self._resolve_provider_id(context, event)
 
     @staticmethod
     def _get_legacy_provider(context: Any, event: Any, provider_id: str) -> Any:
