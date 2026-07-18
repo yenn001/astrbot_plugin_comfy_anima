@@ -198,13 +198,19 @@
               <div class="card-head"><div><p class="eyebrow">PROMPT DIRECTOR</p><h2>LLM 绘图导演</h2></div></div>
               <div class="form-grid">
                 <div class="span-2 provider-field">
-                  <label for="provider-select"><span>思考模型 Provider</span></label>
+                  <label for="provider-select"><span>绘图导演思考模型</span></label>
                   <div class="provider-picker">
                     <select id="provider-select" name="prompt_llm_provider_id"><option value="">跟随当前会话模型</option></select>
                     <button id="provider-refresh" class="secondary inverse" type="button">读取 AstrBot 模型</button>
                   </div>
                   <input id="provider-manual" placeholder="手动填写 Provider ID" hidden>
                   <small id="provider-note" class="muted">正在读取 AstrBot 已保存模型…</small>
+                </div>
+                <div class="span-2 provider-field">
+                  <label for="reverse-provider-select"><span>图片反推多模态模型</span></label>
+                  <select id="reverse-provider-select" name="reverse_prompt_provider_id"><option value="">自动复用导演/当前会话模型</option></select>
+                  <input id="reverse-provider-manual" placeholder="手动填写多模态 Provider ID" hidden>
+                  <small id="reverse-provider-note" class="muted">明确为纯文本的模型不可选；视觉能力未知的旧模型仍可选择。</small>
                 </div>
                 <label><span>Temperature</span><input name="prompt_llm_temperature" type="number" min="0" max="2" step="0.05"></label>
                 <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
@@ -217,7 +223,6 @@
                 <label class="toggle"><input name="enable_reverse_json_formatter" type="checkbox"><span>启用本地 JSON 格式整理器</span></label>
                 <label class="toggle"><input name="enable_reverse_json_repair_retry" type="checkbox"><span>格式校验失败时重做一次</span></label>
                 <p class="span-4 muted">整理器只在本地兼容代码围栏、说明文字、尾逗号和单引号字典，不会调用额外模型；关闭后仅接受一个完整的严格 JSON 对象。安全隔离与字段校验始终开启。</p>
-                <label class="span-2"><span>反推 Provider ID</span><input name="reverse_prompt_provider_id" placeholder="留空复用绘图导演 Provider"></label>
                 <label><span>反推超时（秒）</span><input name="reverse_prompt_timeout" type="number" min="10" max="300"></label>
                 <label><span>反推 Temperature</span><input name="reverse_prompt_temperature" type="number" min="0" max="2" step="0.05"></label>
                 <label><span>反推最大 Tokens</span><input name="reverse_prompt_max_tokens" type="number" min="256" max="8000"></label>
@@ -238,6 +243,22 @@
                 <label class="toggle"><input name="enable_lora_tool" type="checkbox"><span>启用 LoRA 工具</span></label>
                 <label class="toggle"><input name="enable_lora_download" type="checkbox"><span>允许管理员下载 LoRA</span></label>
                 <label class="toggle"><input name="strict_lora_validation" type="checkbox"><span>严格校验 LoRA 文件</span></label>
+                <label class="toggle"><input name="enable_lora_hybrid_search" type="checkbox"><span>启用 Embedding + Rerank 搜索</span></label>
+                <div class="span-2 provider-field">
+                  <label for="embedding-provider-select"><span>LoRA Embedding Provider</span></label>
+                  <select id="embedding-provider-select" name="lora_embedding_provider_id"><option value="">停用向量召回</option></select>
+                  <input id="embedding-provider-manual" placeholder="手动填写 Embedding Provider ID" hidden>
+                  <small id="embedding-provider-note" class="muted">索引只覆盖本次刷新后仍可加载的 LoRA。</small>
+                </div>
+                <div class="span-2 provider-field">
+                  <label for="rerank-provider-select"><span>LoRA Rerank Provider</span></label>
+                  <select id="rerank-provider-select" name="lora_rerank_provider_id"><option value="">停用精排</option></select>
+                  <input id="rerank-provider-manual" placeholder="手动填写 Rerank Provider ID" hidden>
+                  <small id="rerank-provider-note" class="muted">精确名称与唯一别名保持优先，Rerank 不证明文件存在。</small>
+                </div>
+                <label><span>Embedding Top-K</span><input name="lora_embedding_top_k" type="number" min="4" max="100"></label>
+                <label><span>Rerank Top-N</span><input name="lora_rerank_top_n" type="number" min="1" max="50"></label>
+                <label><span>混合搜索超时（秒）</span><input name="lora_retrieval_timeout" type="number" min="3" max="120"></label>
                 <label class="span-4"><span>LoRA 自定义别名（每行一条）</span><textarea name="lora_alias_rules" rows="5" placeholder="black deniav1-2=达妮娅,denia,鸣潮达妮娅"></textarea><small class="muted">格式：精确文件名=别名1,别名2。仅补充逻辑索引，不移动实际文件。</small></label>
               </div>
             </article>

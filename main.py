@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.1.3
+AstrBot Comfy Anima 插件 v1.1.4
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.1.3
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.1.3
-日期: 2026-07-14
+版本: 1.1.4
+日期: 2026-07-18
 """
 
 import asyncio
@@ -61,6 +61,7 @@ from .models import (
 from .services.comfy_client import ComfyClient, ComfyClientError
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
+from .services.lora_retrieval import LoraHybridSearchService
 from .services.lora_analysis import (
     LoraAnalysisError,
     LoraAnalysisPipeline,
@@ -144,6 +145,12 @@ WEB_UI_EDITABLE_FIELDS = (
     "max_preset_loras",
     "max_dynamic_loras",
     "lora_alias_rules",
+    "enable_lora_hybrid_search",
+    "lora_embedding_provider_id",
+    "lora_rerank_provider_id",
+    "lora_embedding_top_k",
+    "lora_rerank_top_n",
+    "lora_retrieval_timeout",
     "strict_lora_validation",
     "default_block_level",
     "group_whitelist",
@@ -305,6 +312,15 @@ class ComfyAnimaPlugin(Star):
             self._lora_catalog.set_record_overlay(
                 self._semantic_index.apply_overlays
             )
+        self._lora_retrieval = (
+            LoraHybridSearchService(
+                self.settings,
+                self.context,
+                self._persistent_data_dir / "lora_vectors_v1.json",
+            )
+            if self._lora_catalog is not None
+            else None
+        )
         self._lora_downloader: Optional[LoraDownloadService] = None
         self._lora_download_error = ""
         if self.settings.enable_lora_manager:
@@ -475,10 +491,49 @@ class ComfyAnimaPlugin(Star):
         if not self._lora_catalog:
             return "LoRA Manager is unavailable. Stop this LoRA drawing request."
         try:
-            await self._refresh_lora_manager_before("LLM 查询 LoRA")
+            records = await self._refresh_lora_manager_before("LLM 查询 LoRA")
+            effective_limit = max(
+                1,
+                min(int(limit), self.settings.lora_max_results),
+            )
+            retrieval = getattr(self, "_lora_retrieval", None)
+            lexical_search = getattr(self._lora_catalog, "search_records", None)
+            ranked = (
+                await retrieval.search(
+                    records,
+                    keyword,
+                    limit=effective_limit,
+                )
+                if retrieval is not None
+                else (
+                    lexical_search(records, keyword)[:effective_limit]
+                    if callable(lexical_search)
+                    else records[:effective_limit]
+                )
+            )
+            diagnostics = (
+                retrieval.last_diagnostics
+                if retrieval is not None
+                else {"mode": "lexical"}
+            )
+            logger.info(
+                f"[{PLUGIN_NAME}] LoRA 搜索完成：mode={diagnostics.get('mode')}, "
+                f"embedding={bool(diagnostics.get('embedding_used'))}, "
+                f"rerank={bool(diagnostics.get('rerank_used'))}, "
+                f"fallback={diagnostics.get('fallback_code') or 'none'}, "
+                f"results={len(ranked)}"
+            )
+            formatter = getattr(self._lora_catalog, "format_records_for_llm", None)
+            if callable(formatter):
+                return await formatter(
+                    ranked,
+                    force_refresh=True,
+                    detail=bool(detail),
+                    retrieval_info=diagnostics,
+                )
             return await self._lora_catalog.format_for_llm(
                 query=keyword,
-                limit=max(1, min(int(limit), self.settings.lora_max_results)),
+                limit=effective_limit,
                 force_refresh=False,
                 detail=bool(detail),
             )
@@ -2282,6 +2337,12 @@ QQ快捷指令:
                 "max_preset_loras": settings.max_preset_loras,
                 "max_dynamic_loras": settings.max_dynamic_loras,
                 "lora_alias_rules": list(settings.lora_alias_rules),
+                "enable_lora_hybrid_search": settings.enable_lora_hybrid_search,
+                "lora_embedding_provider_id": settings.lora_embedding_provider_id,
+                "lora_rerank_provider_id": settings.lora_rerank_provider_id,
+                "lora_embedding_top_k": settings.lora_embedding_top_k,
+                "lora_rerank_top_n": settings.lora_rerank_top_n,
+                "lora_retrieval_timeout": settings.lora_retrieval_timeout,
                 "strict_lora_validation": settings.strict_lora_validation,
                 "default_block_level": settings.default_block_level,
                 "group_whitelist": list(settings.group_whitelist),
@@ -2341,97 +2402,201 @@ QQ快捷指令:
         }
 
     async def web_ui_list_providers(self) -> dict[str, Any]:
-        """Read saved and currently available AstrBot chat providers safely."""
-        getter = getattr(self.context, "get_all_providers", None)
-        providers = getter() if callable(getter) else []
-        runtime_items: dict[str, dict[str, Any]] = {}
-        for provider in providers:
+        """Return a secret-free catalog of AstrBot Chat/Embedding/Rerank models."""
+        manager = getattr(self.context, "provider_manager", None)
+        runtime_by_kind: dict[str, dict[str, dict[str, Any]]] = {
+            "chat": {},
+            "embedding": {},
+            "rerank": {},
+        }
+
+        def modalities_from(config: Mapping[str, Any]) -> tuple[list[str], Optional[bool]]:
+            raw = config.get("modalities")
+            values: list[str] = []
+            if isinstance(raw, str):
+                values = [item.strip().casefold() for item in re.split(r"[,\s]+", raw) if item.strip()]
+            elif isinstance(raw, Mapping):
+                values = [str(key).strip().casefold() for key, enabled in raw.items() if enabled]
+            elif isinstance(raw, (list, tuple, set)):
+                values = [str(item).strip().casefold() for item in raw if str(item).strip()]
+            values = list(dict.fromkeys(values))
+            supports_image: Optional[bool] = None
+            if values:
+                supports_image = any(
+                    value in {"image", "vision", "image_url", "multimodal"}
+                    or "image" in value
+                    or "vision" in value
+                    for value in values
+                )
+            return values, supports_image
+
+        def runtime_item(provider: Any, kind: str) -> Optional[dict[str, Any]]:
+            config = getattr(provider, "provider_config", {})
+            if not isinstance(config, Mapping):
+                config = {}
             try:
                 meta = provider.meta()
-            except Exception as exc:
-                logger.warning(
-                    f"[{PLUGIN_NAME}] Failed to read provider metadata: {exc}"
-                )
-                continue
-            provider_id = str(getattr(meta, "id", "") or "").strip()
+            except Exception:
+                meta = None
+            provider_id = str(
+                getattr(meta, "id", "") or config.get("id") or ""
+            ).strip()
             if not provider_id:
-                continue
-            config = getattr(provider, "provider_config", {})
-            if not isinstance(config, dict):
-                config = {}
-            model = str(getattr(meta, "model", "") or config.get("model") or "").strip()
+                return None
+            model = str(
+                getattr(meta, "model", "")
+                or config.get(f"{kind}_model")
+                or config.get("model")
+                or config.get("model_name")
+                or ""
+            ).strip()
             provider_type = str(
-                getattr(meta, "type", "") or config.get("type") or ""
+                getattr(meta, "type", "")
+                or config.get("type")
+                or config.get("provider_type")
+                or kind
             ).strip()
-            display_name = str(
-                config.get("name") or config.get("display_name") or provider_id
-            ).strip()
-            runtime_items[provider_id] = {
+            modalities, supports_image = modalities_from(config)
+            return {
                 "id": provider_id,
-                "name": display_name,
+                "name": str(
+                    config.get("name") or config.get("display_name") or provider_id
+                ).strip(),
                 "model": model,
                 "type": provider_type,
                 "enabled": True,
                 "available": True,
+                "modalities": modalities,
+                "supports_image": supports_image,
             }
 
-        items_by_id: dict[str, dict[str, Any]] = {}
-        manager = getattr(self.context, "provider_manager", None)
+        runtime_sources = (
+            ("chat", getattr(self.context, "get_all_providers", None)),
+            ("embedding", getattr(self.context, "get_all_embedding_providers", None)),
+        )
+        for kind, getter in runtime_sources:
+            providers = getter() if callable(getter) else ()
+            for provider in providers or ():
+                item = runtime_item(provider, kind)
+                if item:
+                    runtime_by_kind[kind][item["id"]] = item
+
+        rerank_instances = getattr(manager, "rerank_provider_insts", ())
+        if isinstance(rerank_instances, Mapping):
+            rerank_instances = rerank_instances.values()
+        for provider in rerank_instances or ():
+            item = runtime_item(provider, "rerank")
+            if item:
+                runtime_by_kind["rerank"][item["id"]] = item
+
+        items_by_kind: dict[str, dict[str, dict[str, Any]]] = {
+            "chat": {},
+            "embedding": {},
+            "rerank": {},
+        }
         saved_configs = getattr(manager, "providers_config", ())
         if not isinstance(saved_configs, (list, tuple)):
             saved_configs = ()
         for raw_config in saved_configs:
             if not isinstance(raw_config, dict):
                 continue
-            provider_id = str(raw_config.get("id") or "").strip()
+            merged: Mapping[str, Any] = raw_config
+            merger = getattr(manager, "get_merged_provider_config", None)
+            if callable(merger):
+                try:
+                    candidate = merger(raw_config)
+                    if isinstance(candidate, Mapping):
+                        merged = candidate
+                except Exception:
+                    merged = raw_config
+            provider_id = str(merged.get("id") or raw_config.get("id") or "").strip()
             if not provider_id:
                 continue
-            provider_kind = str(raw_config.get("provider_type") or "").strip()
-            adapter_type = str(raw_config.get("type") or "").strip()
-            if provider_kind and provider_kind != "chat_completion":
-                continue
-            if (
-                not provider_kind
-                and provider_id not in runtime_items
-                and "chat" not in adapter_type.casefold()
+            provider_kind = str(merged.get("provider_type") or "").strip().casefold()
+            adapter_type = str(merged.get("type") or "").strip()
+            if provider_kind in {"embedding", "embeddings"}:
+                kind = "embedding"
+            elif provider_kind in {"rerank", "reranker"}:
+                kind = "rerank"
+            elif provider_kind in {"chat_completion", "chat", "llm"}:
+                kind = "chat"
+            elif provider_id in runtime_by_kind["embedding"]:
+                kind = "embedding"
+            elif provider_id in runtime_by_kind["rerank"]:
+                kind = "rerank"
+            elif provider_id in runtime_by_kind["chat"]:
+                kind = "chat"
+            elif "embedding" in adapter_type.casefold():
+                kind = "embedding"
+            elif "rerank" in adapter_type.casefold():
+                kind = "rerank"
+            elif any(
+                token in adapter_type.casefold()
+                for token in ("tts", "speech", "agent_runner")
             ):
                 continue
-            runtime = runtime_items.get(provider_id, {})
-            enabled = bool(raw_config.get("enable", True))
-            items_by_id[provider_id] = {
+            else:
+                kind = "chat"
+            runtime = runtime_by_kind[kind].get(provider_id, {})
+            enabled = bool(merged.get("enable", raw_config.get("enable", True)))
+            modalities, supports_image = modalities_from(merged)
+            if not modalities and runtime:
+                modalities = list(runtime.get("modalities") or [])
+                supports_image = runtime.get("supports_image")
+            items_by_kind[kind][provider_id] = {
                 "id": provider_id,
                 "name": str(
-                    raw_config.get("name")
-                    or raw_config.get("display_name")
+                    merged.get("name")
+                    or merged.get("display_name")
                     or runtime.get("name")
                     or provider_id
                 ).strip(),
                 "model": str(
                     runtime.get("model")
-                    or raw_config.get("model")
-                    or raw_config.get("model_name")
+                    or merged.get(f"{kind}_model")
+                    or merged.get("model")
+                    or merged.get("model_name")
                     or ""
                 ).strip(),
                 "type": str(runtime.get("type") or adapter_type).strip(),
                 "enabled": enabled,
                 "available": bool(runtime) and enabled,
+                "modalities": modalities,
+                "supports_image": supports_image if kind == "chat" else None,
             }
 
-        for provider_id, runtime in runtime_items.items():
-            items_by_id.setdefault(provider_id, runtime)
-        items = list(items_by_id.values())
-        items.sort(
-            key=lambda item: (
-                not item["available"],
-                not item["enabled"],
-                item["name"].casefold(),
-                item["model"].casefold(),
-                item["id"].casefold(),
+        groups: dict[str, dict[str, Any]] = {}
+        selected_by_kind = {
+            "chat": getattr(self.settings, "prompt_llm_provider_id", ""),
+            "embedding": getattr(self.settings, "lora_embedding_provider_id", ""),
+            "rerank": getattr(self.settings, "lora_rerank_provider_id", ""),
+        }
+        for kind in ("chat", "embedding", "rerank"):
+            for provider_id, runtime in runtime_by_kind[kind].items():
+                items_by_kind[kind].setdefault(provider_id, runtime)
+            items = list(items_by_kind[kind].values())
+            items.sort(
+                key=lambda item: (
+                    not item["available"],
+                    not item["enabled"],
+                    item["name"].casefold(),
+                    item["model"].casefold(),
+                    item["id"].casefold(),
+                )
             )
-        )
+            groups[kind] = {"selected": selected_by_kind[kind], "items": items}
+        chat_items = groups["chat"]["items"]
         return {
-            "selected": self.settings.prompt_llm_provider_id,
-            "items": items,
+            # Backward-compatible fields used by older standalone WebUI builds.
+            "selected": getattr(self.settings, "prompt_llm_provider_id", ""),
+            "items": chat_items,
+            "selected_prompt": getattr(self.settings, "prompt_llm_provider_id", ""),
+            "selected_reverse": getattr(self.settings, "reverse_prompt_provider_id", ""),
+            "selected_embedding": getattr(self.settings, "lora_embedding_provider_id", ""),
+            "selected_rerank": getattr(self.settings, "lora_rerank_provider_id", ""),
+            "chat": groups["chat"],
+            "embedding": groups["embedding"],
+            "rerank": groups["rerank"],
         }
 
     async def web_ui_search_loras(
@@ -2446,10 +2611,37 @@ QQ快捷指令:
             catalog_records = await self._lora_catalog.refresh_for_operation()
         except LoraCatalogError as exc:
             raise WebUiActionError(exc.user_message) from exc
+        retrieval = getattr(self, "_lora_retrieval", None)
         records = (
-            self._lora_catalog.search_records(catalog_records, keyword)
-            if keyword.strip()
-            else catalog_records
+            await retrieval.search(
+                catalog_records,
+                keyword,
+                limit=max(1, limit),
+            )
+            if retrieval is not None
+            else (
+                self._lora_catalog.search_records(catalog_records, keyword)
+                if keyword.strip()
+                else catalog_records
+            )
+        )
+        retrieval_diagnostics = (
+            dict(retrieval.last_diagnostics)
+            if retrieval is not None
+            else {
+                "mode": "lexical",
+                "embedding_used": False,
+                "rerank_used": False,
+                "fallback_code": "",
+            }
+        )
+        logger.info(
+            f"[{PLUGIN_NAME}] WebUI LoRA 搜索完成："
+            f"mode={retrieval_diagnostics.get('mode')}, "
+            f"embedding={bool(retrieval_diagnostics.get('embedding_used'))}, "
+            f"rerank={bool(retrieval_diagnostics.get('rerank_used'))}, "
+            f"fallback={retrieval_diagnostics.get('fallback_code') or 'none'}, "
+            f"results={len(records)}"
         )
         semantic_index = self._runtime_semantic_index()
         before_presence = {
@@ -2552,6 +2744,7 @@ QQ快捷指令:
         return {
             "total": len(records),
             "catalog_total": len(catalog_records),
+            "retrieval": retrieval_diagnostics,
             "archive": archive_summary,
             "items": [
                 self._web_ui_lora_item_v2(record)
@@ -4512,7 +4705,7 @@ QQ快捷指令:
                 image_path.unlink(missing_ok=True)
             raise
 
-    async def _refresh_lora_manager_before(self, action: str) -> int:
+    async def _refresh_lora_manager_before(self, action: str) -> tuple[Any, ...]:
         """所有 LoRA 操作的统一强制刷新门禁。"""
         if not self._lora_catalog:
             raise LoraCatalogError("LoRA Manager 清单服务未启用，已停止后续 LoRA 操作")
@@ -4521,7 +4714,7 @@ QQ快捷指令:
             f"[{PLUGIN_NAME}] {action}：LoRA Manager 强制刷新完成，"
             f"最新可加载文件 {len(records)} 个"
         )
-        return len(records)
+        return records
 
     def _resolve_job_presets(
         self,

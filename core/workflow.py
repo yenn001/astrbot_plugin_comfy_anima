@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.1.3
+AstrBot Comfy Anima 插件 v1.1.4
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.1.3
-日期: 2026-07-14
+版本: 1.1.4
+日期: 2026-07-18
 """
 
 import copy

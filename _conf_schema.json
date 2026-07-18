@@ -345,6 +345,42 @@
     "hint": "每行格式：精确LoRA文件名=别名1,别名2，例如 black deniav1-2=达妮娅,denia,鸣潮达妮娅；自动 Civitai 别名之外用于人工补充",
     "default": []
   },
+  "enable_lora_hybrid_search": {
+    "description": "启用 LoRA Embedding + Rerank 混合搜索",
+    "type": "bool",
+    "hint": "每次先强制刷新 LoRA Manager 与 ComfyUI 当前可加载清单，再用 Embedding 召回、Rerank 精排；任何模型异常都会回退词法搜索，最终文件校验不受向量结果影响",
+    "default": false
+  },
+  "lora_embedding_provider_id": {
+    "description": "LoRA 搜索 Embedding Provider ID",
+    "type": "string",
+    "hint": "选择 AstrBot 已保存的 Embedding Provider；留空则跳过向量召回",
+    "default": ""
+  },
+  "lora_rerank_provider_id": {
+    "description": "LoRA 搜索 Rerank Provider ID",
+    "type": "string",
+    "hint": "选择 AstrBot 已保存的 Rerank Provider；留空则跳过精排",
+    "default": ""
+  },
+  "lora_embedding_top_k": {
+    "description": "Embedding 召回数量",
+    "type": "int",
+    "hint": "范围 4-100；只从本次刷新后仍可加载的 LoRA 中召回",
+    "default": 20
+  },
+  "lora_rerank_top_n": {
+    "description": "Rerank 精排数量",
+    "type": "int",
+    "hint": "范围 1-50；精确文件名和唯一别名命中始终优先",
+    "default": 8
+  },
+  "lora_retrieval_timeout": {
+    "description": "LoRA 混合搜索超时（秒）",
+    "type": "int",
+    "hint": "范围 3-120；超时自动回退现有词法搜索，不阻止绘图",
+    "default": 30
+  },
   "lora_tool_max_steps": {
     "description": "分镜 Agent 最大工具步骤",
     "type": "int",

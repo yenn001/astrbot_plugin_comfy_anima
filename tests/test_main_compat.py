@@ -1232,6 +1232,166 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-key", str(result))
         self.assertNotIn("another-secret", str(result))
 
+    async def test_provider_catalog_merges_sources_and_keeps_four_selections_independent(self) -> None:
+        class Provider:
+            def __init__(self, provider_id, provider_type):
+                self.provider_config = {"id": provider_id}
+                self._meta = types.SimpleNamespace(
+                    id=provider_id,
+                    model="",
+                    type=provider_type,
+                )
+
+            def meta(self):
+                return self._meta
+
+        provider_sources = {
+            "chat-vision-source": {
+                "id": "chat-vision-source",
+                "provider_type": "chat_completion",
+                "type": "openai_chat_completion",
+                "name": "Vision source",
+                "model": "vision-model",
+                "modalities": ["text", "image"],
+                "key": "vision-source-secret",
+                "base_url": "http://vision-source.invalid/v1",
+            },
+            "chat-text-source": {
+                "id": "chat-text-source",
+                "provider_type": "chat_completion",
+                "type": "openai_chat_completion",
+                "name": "Text source",
+                "model": "text-model",
+                "modalities": {"text": True, "image": False},
+                "key": "text-source-secret",
+            },
+            "embedding-source": {
+                "id": "embedding-source",
+                "provider_type": "embedding",
+                "type": "openai_embedding",
+                "name": "Embedding source",
+                "embedding_model": "bge-m3",
+                "key": "embedding-source-secret",
+                "api_base": "http://embedding-source.invalid/v1",
+            },
+            "rerank-source": {
+                "id": "rerank-source",
+                "provider_type": "rerank",
+                "type": "xinference_rerank",
+                "name": "Rerank source",
+                "rerank_model": "bge-reranker-v2-m3",
+                "key": "rerank-source-secret",
+            },
+        }
+
+        class Manager:
+            providers_config = [
+                {
+                    "id": "chat-vision",
+                    "provider_source_id": "chat-vision-source",
+                    "enable": True,
+                },
+                {
+                    "id": "chat-text",
+                    "provider_source_id": "chat-text-source",
+                    "enable": True,
+                },
+                {
+                    "id": "chat-unknown",
+                    "provider_type": "chat_completion",
+                    "type": "openai_chat_completion",
+                    "model": "legacy-unknown-model",
+                    "enable": True,
+                    "key": "unknown-chat-secret",
+                    "base_url": "http://unknown-chat.invalid/v1",
+                },
+                {
+                    "id": "embedding-main",
+                    "provider_source_id": "embedding-source",
+                    "enable": True,
+                },
+                {
+                    "id": "rerank-main",
+                    "provider_source_id": "rerank-source",
+                    "enable": True,
+                },
+            ]
+
+            def __init__(self, rerank_provider):
+                self.rerank_provider_insts = [rerank_provider]
+
+            @staticmethod
+            def get_merged_provider_config(provider_config):
+                source_id = provider_config.get("provider_source_id", "")
+                source = provider_sources.get(source_id, {})
+                return {**source, **provider_config, "id": provider_config["id"]}
+
+        vision = Provider("chat-vision", "openai_chat_completion")
+        text = Provider("chat-text", "openai_chat_completion")
+        unknown = Provider("chat-unknown", "openai_chat_completion")
+        embedding = Provider("embedding-main", "openai_embedding")
+        rerank = Provider("rerank-main", "xinference_rerank")
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(
+            get_all_providers=lambda: [vision, text, unknown],
+            get_all_embedding_providers=lambda: [embedding],
+            provider_manager=Manager(rerank),
+        )
+        plugin.settings = types.SimpleNamespace(
+            prompt_llm_provider_id="chat-text",
+            reverse_prompt_provider_id="chat-vision",
+            lora_embedding_provider_id="embedding-main",
+            lora_rerank_provider_id="rerank-main",
+        )
+
+        result = await plugin.web_ui_list_providers()
+
+        self.assertEqual(result["selected_prompt"], "chat-text")
+        self.assertEqual(result["selected_reverse"], "chat-vision")
+        self.assertEqual(result["selected_embedding"], "embedding-main")
+        self.assertEqual(result["selected_rerank"], "rerank-main")
+        self.assertEqual(result["chat"]["selected"], "chat-text")
+        self.assertEqual(result["embedding"]["selected"], "embedding-main")
+        self.assertEqual(result["rerank"]["selected"], "rerank-main")
+
+        chat = {item["id"]: item for item in result["chat"]["items"]}
+        self.assertIs(chat["chat-vision"]["supports_image"], True)
+        self.assertIs(chat["chat-text"]["supports_image"], False)
+        self.assertIsNone(chat["chat-unknown"]["supports_image"])
+        self.assertEqual(chat["chat-vision"]["model"], "vision-model")
+
+        embedding_items = {
+            item["id"]: item for item in result["embedding"]["items"]
+        }
+        rerank_items = {item["id"]: item for item in result["rerank"]["items"]}
+        self.assertEqual(embedding_items["embedding-main"]["model"], "bge-m3")
+        self.assertEqual(
+            rerank_items["rerank-main"]["model"],
+            "bge-reranker-v2-m3",
+        )
+        self.assertTrue(embedding_items["embedding-main"]["available"])
+        self.assertTrue(rerank_items["rerank-main"]["available"])
+
+        serialized = str(result)
+        for secret in (
+            "vision-source-secret",
+            "text-source-secret",
+            "embedding-source-secret",
+            "rerank-source-secret",
+            "unknown-chat-secret",
+            "http://vision-source.invalid/v1",
+            "http://embedding-source.invalid/v1",
+            "http://unknown-chat.invalid/v1",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, serialized)
+        for group_name in ("chat", "embedding", "rerank"):
+            for item in result[group_name]["items"]:
+                self.assertNotIn("key", item)
+                self.assertNotIn("base_url", item)
+                self.assertNotIn("api_base", item)
+
     async def test_settings_save_keeps_existing_password_when_omitted(self) -> None:
         class Config(dict):
             def __init__(self, *args, **kwargs):

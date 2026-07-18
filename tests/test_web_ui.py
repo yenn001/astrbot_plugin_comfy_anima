@@ -69,6 +69,10 @@ class _Controller:
     async def web_ui_list_providers(self):
         return {
             "selected": "provider-main",
+            "selected_prompt": "provider-main",
+            "selected_reverse": "provider-vision",
+            "selected_embedding": "embedding-main",
+            "selected_rerank": "rerank-main",
             "items": [
                 {
                     "id": "provider-main",
@@ -77,8 +81,43 @@ class _Controller:
                     "type": "openai_chat_completion",
                     "enabled": True,
                     "available": True,
+                    "modalities": ["text"],
+                    "supports_image": False,
                 }
             ],
+            "chat": {
+                "selected": "provider-main",
+                "items": [
+                    {
+                        "id": "provider-main",
+                        "name": "Main",
+                        "model": "gpt-test",
+                        "type": "openai_chat_completion",
+                        "enabled": True,
+                        "available": True,
+                        "modalities": ["text"],
+                        "supports_image": False,
+                    },
+                    {
+                        "id": "provider-vision",
+                        "name": "Vision",
+                        "model": "vision-test",
+                        "type": "openai_chat_completion",
+                        "enabled": True,
+                        "available": True,
+                        "modalities": ["text", "image"],
+                        "supports_image": True,
+                    },
+                ],
+            },
+            "embedding": {
+                "selected": "embedding-main",
+                "items": [{"id": "embedding-main", "available": True}],
+            },
+            "rerank": {
+                "selected": "rerank-main",
+                "items": [{"id": "rerank-main", "available": True}],
+            },
         }
 
     async def web_ui_search_loras(self, keyword, limit):
@@ -428,6 +467,21 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             provider_payload["data"]["items"][0]["id"],
             "provider-main",
+        )
+        self.assertEqual(
+            provider_payload["data"]["selected_reverse"],
+            "provider-vision",
+        )
+        self.assertEqual(
+            provider_payload["data"]["selected_embedding"],
+            "embedding-main",
+        )
+        self.assertEqual(
+            provider_payload["data"]["selected_rerank"],
+            "rerank-main",
+        )
+        self.assertTrue(
+            provider_payload["data"]["chat"]["items"][1]["supports_image"]
         )
 
         response = await self.client.get("/api/loras?q=denia&limit=12")

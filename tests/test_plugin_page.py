@@ -20,6 +20,17 @@ class _Controller:
         self.saved_settings = payload
         return {"message": "saved"}
 
+    async def web_ui_list_providers(self):
+        return {
+            "selected_prompt": "chat-main",
+            "selected_reverse": "chat-vision",
+            "selected_embedding": "embedding-main",
+            "selected_rerank": "rerank-main",
+            "chat": {"items": []},
+            "embedding": {"items": []},
+            "rerank": {"items": []},
+        }
+
     async def web_ui_search_loras(self, keyword, limit):
         self.search_query = (keyword, limit)
         return {"items": []}
@@ -52,6 +63,18 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bootstrap["version"], "test")
         self.assertEqual(searched, {"items": []})
         self.assertEqual(self.controller.search_query, ("达妮娅", 20))
+
+    async def test_provider_catalog_reuses_controller_without_flattening_groups(self) -> None:
+        result = await self.api.dispatch(
+            {"method": "GET", "path": "/api/providers"}
+        )
+
+        self.assertEqual(result["selected_prompt"], "chat-main")
+        self.assertEqual(result["selected_reverse"], "chat-vision")
+        self.assertEqual(result["selected_embedding"], "embedding-main")
+        self.assertEqual(result["selected_rerank"], "rerank-main")
+        self.assertIn("embedding", result)
+        self.assertIn("rerank", result)
 
     async def test_settings_validate_sampler_override(self) -> None:
         result = await self.api.dispatch(
@@ -135,6 +158,34 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sessionStorage.getItem(autoKey)", script)
         self.assertIn("await loadBootstrap()", script)
         self.assertIn("confirmAction", script)
+
+    def test_both_webui_builds_have_four_provider_selectors_and_vision_tristate(self) -> None:
+        plugin_root = Path(__file__).resolve().parents[1]
+        for relative_root in (Path("web"), Path("pages") / "control"):
+            with self.subTest(root=str(relative_root)):
+                html = (plugin_root / relative_root / "index.html").read_text(
+                    encoding="utf-8"
+                )
+                script = (plugin_root / relative_root / "app.js").read_text(
+                    encoding="utf-8"
+                )
+                for field_name in (
+                    "prompt_llm_provider_id",
+                    "reverse_prompt_provider_id",
+                    "lora_embedding_provider_id",
+                    "lora_rerank_provider_id",
+                ):
+                    self.assertIn(f'name="{field_name}"', html)
+                for selection_key in (
+                    "selected_prompt",
+                    "selected_reverse",
+                    "selected_embedding",
+                    "selected_rerank",
+                ):
+                    self.assertIn(selection_key, script)
+                self.assertIn("item.supports_image === true", script)
+                self.assertIn("item.supports_image === false", script)
+                self.assertIn("selectedItem.supports_image !== false", script)
 
 
 if __name__ == "__main__":

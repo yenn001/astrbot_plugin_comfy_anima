@@ -1,6 +1,6 @@
 # AstrBot Comfy Anima 插件
 
-> 正式版：v1.1.3
+> 正式版：v1.1.4
 
 面向 aiocqhttp / NapCat QQ、并针对随包附带的 Anima 工作流专门适配的 ComfyUI 绘图插件。支持自然语言 LLM 分镜、局域网 LoRA 查询工具、动态 LoRA 注入、普通 LLM 回复中的 `<pic>` 标签自动出图、QQ 合并转发和群级风控。
 
@@ -123,6 +123,8 @@ web_ui_password=至少8位且不要与其他账号共用
 - 从标题、文件名、作品名和触发词生成的角色中英文别名；已知作品会归一为中英双语逻辑归档，例如 `鸣潮 / Wuthering Waves`、`绝区零 / Zenless Zone Zero`。
 - 收藏状态、备注及使用提示。
 - ComfyUI `/object_info` 中明确属于 LoRA 输入字段的真实可加载名称。UNET、checkpoint、diffusion model、embedding、VAE 与 ControlNet 不会混入 LoRA 清单；Manager 元信息只负责补充，不能替代 ComfyUI 的可加载证据。
+- 可选启用 AstrBot Embedding + Rerank 混合搜索：向量只负责在本次刷新后的真实 LoRA 集合中召回与排序，生成前仍会再次刷新并校验精确文件名。
+- WebUI 可分别选择绘图导演 Chat Provider、图片反推多模态 Chat Provider、Embedding Provider 与 Rerank Provider；列表来自 AstrBot 已保存配置与 Provider Source 的安全合并结果。
 
 `list_anima_loras` 每次调用都会强制让 LoRA Manager 扫描磁盘、分页读取完整最新索引，并同时读取 ComfyUI 实际可加载清单；`refresh` 参数仅为旧提示词兼容。强制刷新会绕过 `lora_manager_scan_interval`，失败时不会回退到旧缓存继续绘图。
 

@@ -687,6 +687,39 @@ class ReversePromptService:
         except Exception as exc:
             raise ReversePromptError("没有可用的在线反推 Provider") from exc
 
+    @staticmethod
+    def _reject_explicit_text_only_provider(context: Any, provider_id: str) -> None:
+        """Reject only Providers that explicitly declare non-image modalities."""
+        getter = getattr(context, "get_provider_by_id", None)
+        if not callable(getter):
+            return
+        try:
+            provider = getter(provider_id)
+        except Exception:
+            return
+        config = getattr(provider, "provider_config", {}) if provider else {}
+        if not isinstance(config, Mapping):
+            return
+        raw = config.get("modalities")
+        if isinstance(raw, str):
+            values = [item.strip().casefold() for item in re.split(r"[,\s]+", raw) if item.strip()]
+        elif isinstance(raw, Mapping):
+            values = [str(key).strip().casefold() for key, enabled in raw.items() if enabled]
+        elif isinstance(raw, (list, tuple, set)):
+            values = [str(item).strip().casefold() for item in raw if str(item).strip()]
+        else:
+            values = []
+        if values and not any(
+            value in {"image", "vision", "image_url", "multimodal"}
+            or "image" in value
+            or "vision" in value
+            for value in values
+        ):
+            raise ReversePromptError(
+                "所选反推 Provider 明确为纯文本模型，请改选支持图片输入的模型",
+                code="text_only_provider",
+            )
+
     async def reverse(
         self,
         context: Any,
@@ -696,6 +729,7 @@ class ReversePromptService:
         progress: Optional[ReverseProgressCallback] = None,
     ) -> tuple[ReversePromptResult, str]:
         provider_id = await self._provider_id(context, event)
+        self._reject_explicit_text_only_provider(context, provider_id)
         prompt = "Analyze this image and return the required JSON."
         if supplement.strip():
             prompt += f" User focus: {supplement.strip()[:500]}"

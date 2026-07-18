@@ -2,6 +2,17 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.4] - 2026-07-18
+
+### Provider 统一发现与 LoRA 混合检索
+
+- 修复 AstrBot v4.26.1 Provider Source 继承配置未合并，导致已保存模型在插件面板中漏列的问题。
+- 绘图导演、图片反推、LoRA Embedding 与 LoRA Rerank 改为四个独立 Provider 选择器；反推会标明视觉、纯文本或能力未知。
+- 新增可选 LoRA 混合检索：每次先强制刷新 Manager 与 ComfyUI 当前可加载清单，再执行 Embedding 召回与 Rerank 精排。
+- 精确文件名、唯一 basename 与确定性别名保持优先；向量结果不能证明文件存在，也不能复活已删除 LoRA。
+- 新增隐私安全的向量缓存，只保存 Provider/文档哈希与归一化向量；Provider 异常、非法响应和超时自动回退词法搜索。
+- 图片反推会在调用前拒绝明确声明为纯文本的 Provider，旧配置中能力未知的模型仍保持兼容。
+
 ## [1.1.3] - 2026-07-18
 
 ### 反推 JSON 与原生管理页面

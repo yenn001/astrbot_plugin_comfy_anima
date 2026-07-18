@@ -155,6 +155,9 @@ const numberFields = new Set([
   "max_total_dynamic_loras",
   "max_preset_loras",
   "max_dynamic_loras",
+  "lora_embedding_top_k",
+  "lora_rerank_top_n",
+  "lora_retrieval_timeout",
   "sampler_steps_override",
   "web_ui_port",
   "web_ui_session_ttl",
@@ -171,6 +174,7 @@ const booleanFields = new Set([
   "enable_reverse_json_repair_retry",
   "enable_lora_tool",
   "enable_lora_download",
+  "enable_lora_hybrid_search",
   "strict_lora_validation",
   "global_lock",
   "whitelist_only",
@@ -680,50 +684,83 @@ function renderWorkflowSamplers(runtime, settings) {
 }
 
 async function loadProviders(selectedOverride = null) {
-  const select = document.querySelector("#provider-select");
-  const manual = document.querySelector("#provider-manual");
-  const note = document.querySelector("#provider-note");
-  note.textContent = "正在读取 AstrBot 已保存模型…";
+  const controls = [
+    {
+      key: "prompt", group: "chat", select: "#provider-select", manual: "#provider-manual",
+      note: "#provider-note", empty: "跟随当前会话模型", selected: "selected_prompt",
+    },
+    {
+      key: "reverse", group: "chat", select: "#reverse-provider-select", manual: "#reverse-provider-manual",
+      note: "#reverse-provider-note", empty: "自动复用导演/当前会话模型", selected: "selected_reverse", vision: true,
+    },
+    {
+      key: "embedding", group: "embedding", select: "#embedding-provider-select", manual: "#embedding-provider-manual",
+      note: "#embedding-provider-note", empty: "停用向量召回", selected: "selected_embedding",
+    },
+    {
+      key: "rerank", group: "rerank", select: "#rerank-provider-select", manual: "#rerank-provider-manual",
+      note: "#rerank-provider-note", empty: "停用精排", selected: "selected_rerank",
+    },
+  ];
+  for (const control of controls) {
+    document.querySelector(control.note).textContent = "正在读取 AstrBot 已保存模型…";
+  }
   try {
     const data = await api("/api/providers");
-    const selected = selectedOverride ?? data.selected ?? "";
-    select.replaceChildren();
-    const follow = document.createElement("option");
-    follow.value = "";
-    follow.textContent = "跟随当前会话模型";
-    select.append(follow);
-    for (const item of data.items || []) {
-      const option = document.createElement("option");
-      option.value = item.id;
-      const model = item.model ? ` · ${item.model}` : "";
-      const type = item.type ? ` · ${item.type}` : "";
-      const state = item.available ? "已加载" : item.enabled ? "未加载" : "已停用";
-      option.textContent = `${item.name}${model}${type} · ${state} [${item.id}]`;
-      option.disabled = !item.available;
-      select.append(option);
+    const overrides = typeof selectedOverride === "string"
+      ? {prompt: selectedOverride}
+      : (selectedOverride || {});
+    for (const control of controls) {
+      const select = document.querySelector(control.select);
+      const manual = document.querySelector(control.manual);
+      const note = document.querySelector(control.note);
+      const group = data[control.group] || {};
+      const items = group.items || (control.group === "chat" ? data.items || [] : []);
+      const selected = overrides[control.key] ?? data[control.selected] ?? group.selected ?? "";
+      select.replaceChildren();
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = control.empty;
+      select.append(empty);
+      for (const item of items) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        const model = item.model ? ` · ${item.model}` : "";
+        const type = item.type ? ` · ${item.type}` : "";
+        const state = item.available ? "已加载" : item.enabled ? "未加载" : "已停用";
+        const vision = control.vision
+          ? item.supports_image === true ? " · 视觉" : item.supports_image === false ? " · 纯文本" : " · 视觉未知"
+          : "";
+        option.textContent = `${item.name}${model}${type}${vision} · ${state} [${item.id}]`;
+        option.disabled = !item.available || (control.vision && item.supports_image === false);
+        select.append(option);
+      }
+      const manualOption = document.createElement("option");
+      manualOption.value = "__manual__";
+      manualOption.textContent = "手动填写 Provider ID…";
+      select.append(manualOption);
+      const selectedItem = items.find((item) => item.id === selected);
+      const selectedAllowed = selectedItem
+        && selectedItem.available
+        && (!control.vision || selectedItem.supports_image !== false);
+      if (selectedAllowed) {
+        select.value = selected;
+        manual.hidden = true;
+      } else if (selected) {
+        select.value = "__manual__";
+        manual.value = selected;
+        manual.hidden = false;
+      } else {
+        select.value = "";
+        manual.hidden = true;
+      }
+      const available = items.filter((item) => item.available).length;
+      note.textContent = items.length
+        ? `已读取 ${items.length} 个已保存 ${control.group} Provider，其中 ${available} 个当前可用`
+        : `AstrBot 当前没有可用的 ${control.group} Provider，可手动填写 ID`;
     }
-    const manualOption = document.createElement("option");
-    manualOption.value = "__manual__";
-    manualOption.textContent = "手动填写 Provider ID…";
-    select.append(manualOption);
-
-    if (selected && (data.items || []).some((item) => item.id === selected && item.available)) {
-      select.value = selected;
-      manual.hidden = true;
-    } else if (selected) {
-      select.value = "__manual__";
-      manual.value = selected;
-      manual.hidden = false;
-    } else {
-      select.value = "";
-      manual.hidden = true;
-    }
-    const available = (data.items || []).filter((item) => item.available).length;
-    note.textContent = (data.items || []).length
-      ? `已读取 ${data.items.length} 个已保存 Chat Provider，其中 ${available} 个当前可用`
-      : "AstrBot 当前没有已实例化的 Chat Provider，可手动填写 ID";
   } catch (error) {
-    note.textContent = error.message;
+    for (const control of controls) document.querySelector(control.note).textContent = error.message;
     showToast(error.message, true);
   }
 }
@@ -751,9 +788,15 @@ function collectSettings(form) {
   const result = {};
   for (const field of form.elements) {
     if (!field.name || field.type === "submit") continue;
-    if (field.name === "prompt_llm_provider_id") {
+    const providerManual = {
+      prompt_llm_provider_id: "#provider-manual",
+      reverse_prompt_provider_id: "#reverse-provider-manual",
+      lora_embedding_provider_id: "#embedding-provider-manual",
+      lora_rerank_provider_id: "#rerank-provider-manual",
+    };
+    if (providerManual[field.name]) {
       result[field.name] = field.value === "__manual__"
-        ? document.querySelector("#provider-manual").value.trim()
+        ? document.querySelector(providerManual[field.name]).value.trim()
         : field.value;
     } else if (booleanFields.has(field.name)) {
       result[field.name] = field.checked;
@@ -2485,15 +2528,30 @@ document.querySelector("#sampler-steps-override").addEventListener("input", (eve
   }
 });
 document.querySelector("#provider-refresh").addEventListener("click", () => {
-  const select = document.querySelector("#provider-select");
-  const selected = select.value === "__manual__"
-    ? document.querySelector("#provider-manual").value.trim()
-    : select.value;
-  loadProviders(selected);
+  const current = {};
+  for (const [key, selectId, manualId] of [
+    ["prompt", "#provider-select", "#provider-manual"],
+    ["reverse", "#reverse-provider-select", "#reverse-provider-manual"],
+    ["embedding", "#embedding-provider-select", "#embedding-provider-manual"],
+    ["rerank", "#rerank-provider-select", "#rerank-provider-manual"],
+  ]) {
+    const select = document.querySelector(selectId);
+    current[key] = select.value === "__manual__"
+      ? document.querySelector(manualId).value.trim()
+      : select.value;
+  }
+  loadProviders(current);
 });
-document.querySelector("#provider-select").addEventListener("change", (event) => {
-  document.querySelector("#provider-manual").hidden = event.target.value !== "__manual__";
-});
+for (const [selectId, manualId] of [
+  ["#provider-select", "#provider-manual"],
+  ["#reverse-provider-select", "#reverse-provider-manual"],
+  ["#embedding-provider-select", "#embedding-provider-manual"],
+  ["#rerank-provider-select", "#rerank-provider-manual"],
+]) {
+  document.querySelector(selectId).addEventListener("change", (event) => {
+    document.querySelector(manualId).hidden = event.target.value !== "__manual__";
+  });
+}
 document.querySelector("#profile-save").addEventListener("click", saveConfigProfile);
 document.querySelector("#profile-activate").addEventListener("click", activateConfigProfile);
 document.querySelector("#profile-delete").addEventListener("click", deleteConfigProfile);

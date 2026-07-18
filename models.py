@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.3
+AstrBot Comfy Anima 插件 v1.1.4
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.1.3
-日期: 2026-07-14
+版本: 1.1.4
+日期: 2026-07-18
 """
 
 from dataclasses import dataclass, field
@@ -204,6 +204,12 @@ class PluginSettings:
     lora_cache_ttl: int = 300
     lora_max_results: int = 50
     lora_alias_rules: list[str] = field(default_factory=list)
+    enable_lora_hybrid_search: bool = False
+    lora_embedding_provider_id: str = ""
+    lora_rerank_provider_id: str = ""
+    lora_embedding_top_k: int = 20
+    lora_rerank_top_n: int = 8
+    lora_retrieval_timeout: int = 30
     lora_tool_max_steps: int = 4
     lora_loader_node_id: str = "462"
     dynamic_lora_mode: str = "append"
@@ -405,6 +411,27 @@ class PluginSettings:
             lora_alias_rules=_as_string_list(
                 data.get("lora_alias_rules"),
                 [],
+            ),
+            enable_lora_hybrid_search=_as_bool(
+                data.get("enable_lora_hybrid_search"), False
+            ),
+            lora_embedding_provider_id=str(
+                data.get("lora_embedding_provider_id", "")
+            ).strip(),
+            lora_rerank_provider_id=str(
+                data.get("lora_rerank_provider_id", "")
+            ).strip(),
+            lora_embedding_top_k=min(
+                100,
+                _as_int(data.get("lora_embedding_top_k"), 20, 4),
+            ),
+            lora_rerank_top_n=min(
+                50,
+                _as_int(data.get("lora_rerank_top_n"), 8, 1),
+            ),
+            lora_retrieval_timeout=min(
+                120,
+                _as_int(data.get("lora_retrieval_timeout"), 30, 3),
             ),
             lora_tool_max_steps=_as_int(data.get("lora_tool_max_steps"), 4, 1),
             lora_loader_node_id=str(data.get("lora_loader_node_id", "462")).strip()

@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.1.3
+AstrBot Comfy Anima 插件 v1.1.4
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.1.3
-日期: 2026-07-14
+版本: 1.1.4
+日期: 2026-07-18
 """
 
 import asyncio
@@ -145,9 +145,18 @@ class PromptDirector:
     def _lora_tool_call_timeout(self) -> int:
         """Return a per-call budget that covers Manager scan and catalog read."""
         catalog_timeout = max(1, self._settings.lora_catalog_timeout)
+        retrieval_timeout = (
+            max(3, self._settings.lora_retrieval_timeout)
+            if getattr(self._settings, "enable_lora_hybrid_search", False)
+            else 0
+        )
         if not self._settings.enable_lora_manager:
-            return catalog_timeout
-        return max(1, self._settings.lora_manager_scan_timeout) + catalog_timeout
+            return catalog_timeout + retrieval_timeout
+        return (
+            max(1, self._settings.lora_manager_scan_timeout)
+            + catalog_timeout
+            + retrieval_timeout
+        )
 
     def _lora_agent_timeout(self, tool_call_timeout: int) -> int:
         """Reserve the configured LLM budget in addition to all tool calls."""

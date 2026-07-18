@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.1.3
+AstrBot Comfy Anima 插件 v1.1.4
 
 功能描述：
 - 安全读取局域网 HTTP LoRA 清单或 ComfyUI object_info
 - 为 LLM 工具提供可搜索、可缓存的 LoRA 元数据
 
 作者: Yen
-版本: 1.1.3
-日期: 2026-07-14
+版本: 1.1.4
+日期: 2026-07-18
 """
 
 import asyncio
@@ -1078,10 +1078,18 @@ class LoraCatalogService:
         records: tuple[LoraRecord, ...],
         query: str,
     ) -> tuple[LoraRecord, ...]:
+        return tuple(record for _score, record in cls.rank_records(records, query))
+
+    @classmethod
+    def rank_records(
+        cls,
+        records: tuple[LoraRecord, ...],
+        query: str,
+    ) -> tuple[tuple[int, LoraRecord], ...]:
+        """Return the deterministic lexical ranking together with its scores."""
         scored = [(cls._search_score(record, query), record) for record in records]
         return tuple(
-            record
-            for score, record in sorted(
+            sorted(
                 (item for item in scored if item[0] > 0),
                 key=lambda item: (
                     -item[0],
@@ -1812,6 +1820,21 @@ class LoraCatalogService:
             limit=limit,
             force_refresh=force_refresh,
         )
+        return await self.format_records_for_llm(
+            records,
+            force_refresh=force_refresh,
+            detail=detail,
+        )
+
+    async def format_records_for_llm(
+        self,
+        records: tuple[LoraRecord, ...],
+        *,
+        force_refresh: bool = False,
+        detail: bool = False,
+        retrieval_info: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Format records from one authoritative refresh snapshot for the LLM."""
         if not records:
             return "No matching LoRA files were found. Continue without LoRA."
         if detail:
@@ -1832,6 +1855,18 @@ class LoraCatalogService:
         ]
         if force_refresh:
             lines.append("The catalog was refreshed before this result.")
+        if retrieval_info:
+            mode = str(retrieval_info.get("mode") or "lexical")
+            embedding_used = bool(retrieval_info.get("embedding_used"))
+            rerank_used = bool(retrieval_info.get("rerank_used"))
+            fallback = str(retrieval_info.get("fallback_code") or "")
+            line = (
+                f"Search mode: {mode}; embedding={embedding_used}; "
+                f"rerank={rerank_used}."
+            )
+            if fallback:
+                line += f" Safe fallback: {fallback}."
+            lines.append(line)
         if self._last_warning:
             lines.append(f"Catalog warning: {self._last_warning}")
         for record in records:
