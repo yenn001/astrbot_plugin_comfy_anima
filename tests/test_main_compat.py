@@ -1255,9 +1255,17 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         plugin.plugin_dir = Path(__file__).resolve().parents[1]
         plugin._schedule_self_reload = lambda **_kwargs: object()
 
-        result = await plugin.web_ui_save_settings({"default_width": 1024})
+        result = await plugin.web_ui_save_settings(
+            {
+                "default_width": 1024,
+                "enable_reverse_json_formatter": False,
+                "enable_reverse_json_repair_retry": False,
+            }
+        )
 
         self.assertEqual(plugin.config["default_width"], 1024)
+        self.assertFalse(plugin.config["enable_reverse_json_formatter"])
+        self.assertFalse(plugin.config["enable_reverse_json_repair_retry"])
         self.assertEqual(plugin.config["web_ui_password"], "existing-password")
         self.assertEqual(plugin.config.saved, 1)
         self.assertTrue(result["reload_scheduled"])

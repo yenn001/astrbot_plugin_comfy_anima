@@ -230,16 +230,25 @@ def _strip_think_blocks(text: str) -> str:
     return "".join(visible)
 
 
-def _clean_response_text(text: str) -> str:
+def _safe_response_text(text: str) -> str:
+    """Apply mandatory privacy and resource bounds without repairing syntax."""
+
     cleaned = str(text or "")[:_MAX_RESPONSE_CHARS]
     cleaned = _strip_think_blocks(cleaned)
+    return cleaned.lstrip("\ufeff").strip()
+
+
+def _format_response_text(text: str) -> str:
+    """Apply optional compatibility cleanup used by the JSON formatter."""
+
+    cleaned = text
     cleaned = re.sub(
         r"```(?:json|javascript|js|python)?\s*",
         "",
         cleaned,
         flags=re.I,
     )
-    return cleaned.replace("```", "").strip().lstrip("\ufeff")
+    return cleaned.replace("```", "").strip()
 
 
 def _scan_json_objects(text: str) -> tuple[tuple[str, ...], bool]:
@@ -421,15 +430,86 @@ def _parse_mapping_candidates(
     return payload, strategy
 
 
-def _json_object_with_strategy(text: str) -> tuple[Mapping[str, Any], str]:
-    cleaned = _clean_response_text(text)
-    if not cleaned:
+def _json_object_with_strategy(
+    text: str,
+    *,
+    enable_formatter: bool = True,
+) -> tuple[Mapping[str, Any], str]:
+    safe_text = _safe_response_text(text)
+    if not safe_text:
         raise ReversePromptError(
             "反推模型返回了空结果",
             code="empty_response",
             details={"response_chars": 0},
         )
-    exact = _parse_mapping_candidates((cleaned,), scope="full")
+
+    if not enable_formatter:
+        parse_failed = True
+        if not _structure_depth_exceeded(safe_text):
+            try:
+                payload = _json_loads_strict(safe_text)
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+                RecursionError,
+            ):
+                payload = None
+            else:
+                parse_failed = False
+            if isinstance(payload, Mapping):
+                return payload, "strict:json"
+
+        # A syntactically complete scalar/list is invalid for this protocol,
+        # not truncated. In particular, braces inside a JSON string must never
+        # be reinterpreted as the beginning of an object.
+        if not parse_failed:
+            raise ReversePromptError(
+                "反推模型没有返回严格 JSON 对象",
+                code="invalid_json",
+                details={
+                    "response_chars": len(safe_text),
+                    "has_open_brace": "{" in safe_text,
+                    "has_close_brace": "}" in safe_text,
+                    "balanced_objects": 0,
+                    "truncated": False,
+                    "formatter_enabled": False,
+                },
+            )
+
+        balanced_objects: list[str] = []
+        incomplete = False
+        if safe_text.lstrip().startswith("{"):
+            balanced_objects, incomplete = _scan_json_objects(safe_text)
+        if incomplete:
+            raise ReversePromptError(
+                "反推模型返回的 JSON 似乎被截断",
+                code="truncated_json",
+                details={
+                    "response_chars": len(safe_text),
+                    "has_open_brace": True,
+                    "has_close_brace": "}" in safe_text,
+                    "balanced_objects": len(balanced_objects),
+                    "truncated": True,
+                    "formatter_enabled": False,
+                },
+            )
+        raise ReversePromptError(
+            "反推模型没有返回严格 JSON",
+            code="invalid_json",
+            details={
+                "response_chars": len(safe_text),
+                "has_open_brace": "{" in safe_text,
+                "has_close_brace": "}" in safe_text,
+                "balanced_objects": len(balanced_objects),
+                "truncated": False,
+                "formatter_enabled": False,
+            },
+        )
+
+    cleaned = _format_response_text(safe_text)
+    exact_scope = "formatted_full" if cleaned != safe_text else "full"
+    exact = _parse_mapping_candidates((cleaned,), scope=exact_scope)
     if exact is not None:
         return exact
 
@@ -439,11 +519,12 @@ def _json_object_with_strategy(text: str) -> tuple[Mapping[str, Any], str]:
             "反推模型返回的 JSON 似乎被截断",
             code="truncated_json",
             details={
-                "response_chars": len(cleaned),
+                "response_chars": len(safe_text),
                 "has_open_brace": True,
                 "has_close_brace": "}" in cleaned,
                 "balanced_objects": len(balanced_objects),
                 "truncated": True,
+                "formatter_enabled": True,
             },
         )
 
@@ -454,24 +535,37 @@ def _json_object_with_strategy(text: str) -> tuple[Mapping[str, Any], str]:
         "反推模型没有返回合法 JSON",
         code="invalid_json",
         details={
-            "response_chars": len(cleaned),
+            "response_chars": len(safe_text),
             "has_open_brace": "{" in cleaned,
             "has_close_brace": "}" in cleaned,
             "balanced_objects": len(balanced_objects),
             "truncated": False,
+            "formatter_enabled": True,
         },
     )
 
 
-def _json_object(text: str) -> Mapping[str, Any]:
-    payload, _strategy = _json_object_with_strategy(text)
+def _json_object(
+    text: str,
+    *,
+    enable_formatter: bool = True,
+) -> Mapping[str, Any]:
+    payload, _strategy = _json_object_with_strategy(
+        text,
+        enable_formatter=enable_formatter,
+    )
     return payload
 
 
 def _parse_reverse_prompt_with_strategy(
     text: str,
+    *,
+    enable_formatter: bool = True,
 ) -> tuple[ReversePromptResult, str]:
-    payload, strategy = _json_object_with_strategy(text)
+    payload, strategy = _json_object_with_strategy(
+        text,
+        enable_formatter=enable_formatter,
+    )
     positive = _prompt_text(
         payload.get("positive_tags", payload.get("positive_prompt", "")),
         6000,
@@ -480,7 +574,10 @@ def _parse_reverse_prompt_with_strategy(
         raise ReversePromptError(
             "反推结果缺少正面提示词",
             code="missing_positive_tags",
-            details={"response_chars": len(_clean_response_text(text))},
+            details={
+                "response_chars": len(_safe_response_text(text)),
+                "formatter_enabled": enable_formatter,
+            },
         )
     characters: list[ReverseCharacter] = []
     raw_characters = payload.get("characters")
@@ -531,8 +628,15 @@ def _parse_reverse_prompt_with_strategy(
     return result, strategy
 
 
-def parse_reverse_prompt(text: str) -> ReversePromptResult:
-    result, _strategy = _parse_reverse_prompt_with_strategy(text)
+def parse_reverse_prompt(
+    text: str,
+    *,
+    enable_formatter: bool = True,
+) -> ReversePromptResult:
+    result, _strategy = _parse_reverse_prompt_with_strategy(
+        text,
+        enable_formatter=enable_formatter,
+    )
     return result
 
 
@@ -599,8 +703,13 @@ class ReversePromptService:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._settings.reverse_prompt_timeout
         last_error: Optional[ReversePromptError] = None
+        attempts = (
+            (1, 2)
+            if self._settings.enable_reverse_json_repair_retry
+            else (1,)
+        )
 
-        for attempt in (1, 2):
+        for attempt in attempts:
             request_prompt = (
                 prompt
                 if attempt == 1
@@ -665,21 +774,34 @@ class ReversePromptService:
                 {"attempt": attempt, "response_chars": len(text)},
             )
             try:
-                result, strategy = _parse_reverse_prompt_with_strategy(text)
+                result, strategy = _parse_reverse_prompt_with_strategy(
+                    text,
+                    enable_formatter=(
+                        self._settings.enable_reverse_json_formatter
+                    ),
+                )
             except ReversePromptError as exc:
                 last_error = exc
+                will_retry = attempt < attempts[-1]
                 details = {
                     "attempt": attempt,
                     "error_code": exc.code,
-                    "will_retry": attempt == 1,
+                    "will_retry": will_retry,
+                    "formatter_enabled": (
+                        self._settings.enable_reverse_json_formatter
+                    ),
                     **exc.details,
                 }
                 self._emit_progress(
                     progress,
                     (
                         "结构化结果校验失败，将进行一次修复重试。"
-                        if attempt == 1
-                        else "修复重试仍未返回可用的结构化结果。"
+                        if will_retry
+                        else (
+                            "修复重试仍未返回可用的结构化结果。"
+                            if attempt > 1
+                            else "结构化结果校验失败，修复重试已关闭。"
+                        )
                     ),
                     "reverse_response_invalid",
                     details,
@@ -693,6 +815,13 @@ class ReversePromptService:
                 {
                     "attempt": attempt,
                     "repair_used": attempt > 1,
+                    "formatter_enabled": (
+                        self._settings.enable_reverse_json_formatter
+                    ),
+                    "formatter_used": strategy not in {
+                        "strict:json",
+                        "full:json:json",
+                    },
                     "parse_strategy": strategy,
                     "response_chars": len(text),
                 },
@@ -703,12 +832,14 @@ class ReversePromptService:
             "反推模型没有返回合法 JSON",
             code="invalid_json",
         )
+        if len(attempts) == 1:
+            raise final_error
         raise ReversePromptError(
             "反推模型连续两次未返回可用的结构化结果",
             final_error.user_message,
             code="repair_exhausted",
             details={
-                "attempts": 2,
+                "attempts": len(attempts),
                 "last_error_code": final_error.code,
                 **final_error.details,
             },

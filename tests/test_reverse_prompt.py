@@ -43,6 +43,35 @@ class ReversePromptParserTests(unittest.TestCase):
             )
         self.assertEqual(captured.exception.code, "empty_response")
 
+    def test_strict_mode_accepts_only_one_standard_json_object(self) -> None:
+        result = parse_reverse_prompt(
+            '<think>hidden</think>{"positive_tags":"1girl, portrait",'
+            '"confidence":0.8}',
+            enable_formatter=False,
+        )
+        self.assertEqual(result.positive_tags, "1girl, portrait")
+
+        invalid_values = (
+            '```json\n{"positive_tags":"portrait"}\n```',
+            'Result: {"positive_tags":"portrait"}',
+            '{"positive_tags":"portrait",}',
+            "{'positive_tags':'portrait'}",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(ReversePromptError) as captured:
+                    parse_reverse_prompt(value, enable_formatter=False)
+                self.assertEqual(captured.exception.code, "invalid_json")
+
+    def test_strict_mode_complete_scalar_with_brace_is_not_truncated(self) -> None:
+        with self.assertRaises(ReversePromptError) as captured:
+            parse_reverse_prompt(
+                '"complete scalar with { brace"',
+                enable_formatter=False,
+            )
+        self.assertEqual(captured.exception.code, "invalid_json")
+        self.assertFalse(captured.exception.details["truncated"])
+
     def test_nested_think_json_is_removed_before_final_result(self) -> None:
         result = parse_reverse_prompt(
             '<think>analysis <think>nested</think>'
@@ -291,6 +320,43 @@ class ReversePromptServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured.exception.code, "repair_exhausted")
         self.assertEqual(str(captured.exception), captured.exception.user_message)
         self.assertNotIn("private image description", str(captured.exception.details))
+
+    async def test_repair_retry_can_be_disabled(self) -> None:
+        calls = []
+        progress = []
+
+        class Context:
+            async def llm_generate(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(completion_text="plain prose")
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            image_path.write_bytes(b"test")
+            with self.assertRaises(ReversePromptError) as captured:
+                await ReversePromptService(
+                    PluginSettings.from_mapping(
+                        {
+                            "reverse_prompt_provider_id": "vision-provider",
+                            "enable_reverse_json_repair_retry": False,
+                        }
+                    )
+                ).reverse(
+                    Context(),
+                    types.SimpleNamespace(unified_msg_origin="umo"),
+                    image_path,
+                    progress=lambda message, code, details: progress.append(
+                        (message, code, dict(details))
+                    ),
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(captured.exception.code, "invalid_json")
+        codes = [item[1] for item in progress]
+        self.assertNotIn("reverse_repair_requested", codes)
+        invalid = [item for item in progress if item[1] == "reverse_response_invalid"]
+        self.assertFalse(invalid[0][2]["will_retry"])
+        self.assertNotIn("plain prose", str(progress))
 
     async def test_custom_prompt_cannot_replace_mandatory_protocol(self) -> None:
         captured = {}

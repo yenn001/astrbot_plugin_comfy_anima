@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.1.2
+AstrBot Comfy Anima 插件 v1.1.3
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.1.2
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.1.2
+版本: 1.1.3
 日期: 2026-07-14
 """
 
@@ -101,6 +101,7 @@ from .services.model_manager import (
     ModelManagerService,
 )
 from .services.prompt_director import PromptDirector, PromptDirectorError
+from .services.plugin_page import PluginPageApi
 from .services.reverse_prompt import ReversePromptError, ReversePromptService
 from .services.unet_catalog import UnetCatalogError, UnetCatalogService
 from .services.task_store import TaskStore, TaskStoreError
@@ -125,6 +126,8 @@ WEB_UI_EDITABLE_FIELDS = (
     "enable_natural_draw",
     "enable_llm_pic_trigger",
     "enable_reverse_prompt",
+    "enable_reverse_json_formatter",
+    "enable_reverse_json_repair_retry",
     "reverse_prompt_provider_id",
     "reverse_prompt_timeout",
     "reverse_prompt_temperature",
@@ -397,6 +400,18 @@ class ComfyAnimaPlugin(Star):
             self._director_error = str(exc)
             logger.error(
                 f"[{PLUGIN_NAME}] LLM 分镜模块初始化失败: {exc}", exc_info=True
+            )
+
+        self._plugin_page_api = PluginPageApi(self)
+        self._plugin_page_registered = self._plugin_page_api.register(self.context)
+        if self._plugin_page_registered:
+            logger.info(
+                f"[{PLUGIN_NAME}] AstrBot 原生 plugin-page 管理接口已注册"
+            )
+        else:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 当前 AstrBot 不支持原生 plugin-page 接口，"
+                "仍可使用可选的独立端口 WebUI"
             )
 
         if self.settings.enable_web_ui:
@@ -2221,6 +2236,8 @@ QQ快捷指令:
         return {
             "version": PLUGIN_VERSION,
             "active_jobs": len(self._active_jobs),
+            "plugin_page_registered": self._plugin_page_registered,
+            "plugin_page_path": f"/plugin-page/{PLUGIN_NAME}/control",
             "web_ui_error": self._web_ui_error,
             "lora_archive_error": getattr(self, "_lora_archive_error", ""),
             "workflow_runtime": workflow_runtime,
@@ -2243,6 +2260,12 @@ QQ快捷指令:
                 "enable_natural_draw": settings.enable_natural_draw,
                 "enable_llm_pic_trigger": settings.enable_llm_pic_trigger,
                 "enable_reverse_prompt": settings.enable_reverse_prompt,
+                "enable_reverse_json_formatter": (
+                    settings.enable_reverse_json_formatter
+                ),
+                "enable_reverse_json_repair_retry": (
+                    settings.enable_reverse_json_repair_retry
+                ),
                 "reverse_prompt_provider_id": settings.reverse_prompt_provider_id,
                 "reverse_prompt_timeout": settings.reverse_prompt_timeout,
                 "reverse_prompt_temperature": settings.reverse_prompt_temperature,

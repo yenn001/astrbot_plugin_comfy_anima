@@ -1,6 +1,6 @@
 # AstrBot Comfy Anima 插件
 
-> 正式版：v1.1.2
+> 正式版：v1.1.3
 
 面向 aiocqhttp / NapCat QQ、并针对随包附带的 Anima 工作流专门适配的 ComfyUI 绘图插件。支持自然语言 LLM 分镜、局域网 LoRA 查询工具、动态 LoRA 注入、普通 LLM 回复中的 `<pic>` 标签自动出图、QQ 合并转发和群级风控。
 
@@ -16,7 +16,7 @@
 - 所有 LoRA 查询、组合管理、下载及实际出图都经过强制刷新门禁；Manager 扫描或实际可加载清单读取失败时停止后续操作。
 - 每次生图会把各来源先解析成最新精确 LoRA 文件再合并；保存的风格/混合预设权重不可被 LLM 静默覆盖，同名 basename 会被阻止并要求使用完整文件夹路径。
 - 风格与功能 LoRA 自动使用 Manager/Civitai 的明确触发词；角色 LoRA 只补能与角色身份确证匹配的主触发词，不会把默认服装、发色等整包回灌到正面提示词。
-- 带登录认证的独立端口 Web UI 可管理核心绘图参数、LLM 导演、权限、LoRA、组合预设及 UNET 模型。
+- AstrBot 原生 `plugin-page` 可直接管理核心绘图参数、LLM 导演、权限、LoRA、组合预设、UNET、任务与日志；独立端口 Web UI 继续作为可选的局域网入口。
 - 思考模型下拉框同时读取 AstrBot 已保存配置和当前已加载实例；LoRA 清单利用 Civitai 标题、触发词与标签建立角色、作品和中英文别名归档，并在多候选时拒绝模糊猜测。
 - Web UI 支持单项、批量与全库 Civitai 元数据获取、分类筛选、目录指纹变化检测、绘图导演 LLM 多选建档和命名环境配置档案切换。
 - 插件专属持久日志控制台支持凭据脱敏；LoRA 页面明确区分资料与建档状态；WebUI 可在纸感工坊、铅灰编辑部、墨夜控制室三套主题间即时切换。
@@ -30,6 +30,7 @@
 - 自动删除 `<think>...</think>` 与 `<pic>` 控制标签，不把思考内容发到 QQ。
 - `/画图` 使用 NapCat/OneBot v11 合并转发发送图片；`/画图no` 直接发送图片。
 - `/反推` 使用 AstrBot 多模态 Provider 分析用户明确发送或引用的图片，返回结构化 Anima Tags、构图和置信度；`/反推画图` 可继续交给绘图导演并生成图片。
+- 反推 JSON 本地格式整理器和多模态修复重试均可独立开关；即使关闭整理，`<think>` 隔离、深度限制、非有限数拒绝和必填字段校验仍强制执行。
 - `/放大 [倍率]` 将用户发送或引用的图片上传到 ComfyUI，通过独立 RTX 工作流处理；Anima 正常生图也可在同一工作流内直接串联 RTX。
 - 每次返回生图或 RTX 结果时附带实际处理耗时与 ComfyUI 报告的 GPU 型号。
 - 新版内置 `anima_v2_api.json` 使用独立工作流档案映射正面、负面、UNET、LoRA、采样器、分辨率和输出节点；旧 `anima_api.json` 保留为回退，并已把全部文本编码节点接入 LoRA 后的 CLIP。
@@ -41,7 +42,7 @@
 1. AstrBot 通过 aiocqhttp 连接 NapCat。
 2. AstrBot 能访问 ComfyUI 的 `/prompt`、`/history`、`/view`、`/queue`、`/system_stats` 和 `/upload/image`。
 3. ComfyUI 已安装工作流所需的模型、LoRA、ComfyUI-Lora-Manager 与 `RTXVideoSuperResolution` 节点。
-4. 建议 AstrBot v4.5.7 或更高版本；插件保留旧版 Provider 调用回退。管理面板模型下拉选择需要 AstrBot v4+。
+4. 建议 AstrBot v4.26.1 或更高版本，以使用原生 `plugin-page`；旧版本仍可使用插件配置页及可选的独立端口 Web UI。
 
 如果 AstrBot 在 Docker 中，`127.0.0.1` 指向 AstrBot 容器自身。请改填宿主机地址、ComfyUI 容器服务名或同网络可访问地址。
 
@@ -49,7 +50,7 @@
 
 1. 在 ComfyUI 中导入 [插件安装工作流](docs/workflows/导入Comfy工作流用下载插件用.json)，按提示安装缺失的自定义节点；如有缺失的模型或 LoRA，也请一并准备。
 2. 将整个 `astrbot_plugin_comfy_anima` 目录放入 AstrBot 插件目录。
-3. 在管理面板重载插件。
+3. 在管理面板重载插件；AstrBot v4.26.1+ 会自动发现“工坊控制台”插件 Page。
 4. 设置 `comfyui_url`。
 5. 在“绘图思考模型”中选择一个已配置的聊天模型。
 6. 已安装 ComfyUI-Lora-Manager 时保持 `enable_lora_manager=true`；插件会自动访问 `comfyui_url/api/lm/loras`，同时保留 `object_info` 回退。
@@ -58,6 +59,18 @@
 9. 先执行 `/anima ping`，再用 `/画图no 1girl, white hair, portrait` 测试。
 
 `auto_draw_system_prompt` 留空时使用插件附带的 `prompts/director_reference.txt`。后台填写的自定义 System Prompt 会立即用于普通对话注入，并作为人设/风格偏好叠加到自然语言分镜；插件的实时 LoRA、输出协议和换装安全约束不会再被自定义内容覆盖。自定义内容仍必须要求需要绘图时输出合法的 `<pic prompt="英文 tags">`，没有标签就不会自动触发图片。
+
+## AstrBot 原生 plugin-page
+
+AstrBot v4.26.1+ 会自动发现 `pages/control/index.html`。在插件详情页打开“工坊控制台”，或访问：
+
+```text
+/plugin-page/astrbot_plugin_comfy_anima/control
+```
+
+原生页面复用与 6198 面板相同的业务接口和三套主题，但认证由 AstrBot Dashboard 负责：页面位于受限 iframe 中，只能通过官方 Bridge 调用带 `plugin` 权限的扩展 API，不读取 Dashboard Cookie、Token 或父页面 DOM，也不需要再次登录。危险操作使用页面内确认框；插件自动重载后会通过 Bridge 重新连接，不会刷新带短期资源令牌的 iframe。即使 `enable_web_ui=false`，原生页面仍可使用。
+
+页面内的主题与自动建档偏好在允许存储时保存在当前页面环境；若浏览器阻止 sandbox iframe 的 `localStorage`，会安全退化为本次页面会话内记忆，不影响管理功能。
 
 ## 独立端口 Web UI
 
@@ -297,6 +310,8 @@ LLM 的处理顺序如下：
 
 - `/反推` 只返回结构化 Tags、负面词、构图、画面说明、候选身份和置信度。
 - `/反推画图` 会把可靠的可观察事实交给绘图导演，再经过实时 LoRA 查询与 Anima 工作流生成；低置信角色身份不会自动当成事实。
+- `enable_reverse_json_formatter=true` 时，本地整理器兼容代码围栏、JSON 前后说明、尾逗号和单引号字典；关闭后只接受一个完整、双引号、无围栏的严格 JSON 对象。
+- `enable_reverse_json_repair_retry=true` 时，首次校验失败才会让同一多模态 Provider 重新查看原图并生成一次严格 JSON；关闭后只调用一次并直接返回安全错误。
 - `/放大` 不调用生图 UNET，只通过独立 RTX 工作流处理原图；允许倍率范围为 `1–4`，留空使用后台默认值。
 - 图片内文字、二维码和指令一律视为不可信视觉内容，不会当作系统指令执行。插件不接受命令文本中的任意图片 URL。
 

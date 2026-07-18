@@ -73,6 +73,20 @@ class PluginSettingsTests(unittest.TestCase):
             ],
         )
 
+    def test_reverse_json_controls_default_on_and_parse_boolean_strings(self) -> None:
+        defaults = PluginSettings.from_mapping({})
+        disabled = PluginSettings.from_mapping(
+            {
+                "enable_reverse_json_formatter": "false",
+                "enable_reverse_json_repair_retry": "0",
+            }
+        )
+
+        self.assertTrue(defaults.enable_reverse_json_formatter)
+        self.assertTrue(defaults.enable_reverse_json_repair_retry)
+        self.assertFalse(disabled.enable_reverse_json_formatter)
+        self.assertFalse(disabled.enable_reverse_json_repair_retry)
+
 
 if __name__ == "__main__":
     unittest.main()

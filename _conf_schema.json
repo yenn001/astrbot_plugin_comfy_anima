@@ -123,6 +123,18 @@
     "hint": "开放 /反推 与 /反推画图；只会处理用户明确发送或引用的图片",
     "default": true
   },
+  "enable_reverse_json_formatter": {
+    "description": "启用反推 JSON 格式整理器",
+    "type": "bool",
+    "hint": "推荐开启。本地兼容代码围栏、JSON 前后说明、尾逗号和单引号字典；关闭后只接受一个完整的严格 JSON 对象。安全隔离与字段校验不会关闭",
+    "default": true
+  },
+  "enable_reverse_json_repair_retry": {
+    "description": "反推 JSON 失败时重做一次",
+    "type": "bool",
+    "hint": "首次结果经严格校验及可选格式整理后仍不可用时，让同一多模态 Provider 重新查看原图并生成一次严格 JSON",
+    "default": true
+  },
   "reverse_prompt_provider_id": {
     "description": "在线反推多模态 Provider",
     "type": "string",

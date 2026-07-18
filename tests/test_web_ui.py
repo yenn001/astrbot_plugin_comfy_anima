@@ -269,7 +269,8 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
         self.assertIn('api("/api/loras/delete"', self.javascript)
         self.assertIn('api("/api/unet/delete"', self.javascript)
         self.assertIn("confirm_name: confirmName", self.javascript)
-        self.assertIn("请输入完整精确名称确认", self.javascript)
+        self.assertIn("请在下方输入完整精确名称", self.javascript)
+        self.assertIn("expectedValue: exactName", self.javascript)
         self.assertNotIn("file_path: exactName", self.javascript)
 
 

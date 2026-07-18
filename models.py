@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.1.2
+AstrBot Comfy Anima 插件 v1.1.3
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.1.2
+版本: 1.1.3
 日期: 2026-07-14
 """
 
@@ -152,6 +152,8 @@ class PluginSettings:
     auto_draw_system_prompt: str = ""
     max_auto_images_per_reply: int = 1
     enable_reverse_prompt: bool = True
+    enable_reverse_json_formatter: bool = True
+    enable_reverse_json_repair_retry: bool = True
     reverse_prompt_provider_id: str = ""
     reverse_prompt_timeout: int = 120
     reverse_prompt_temperature: float = 0.1
@@ -298,6 +300,14 @@ class PluginSettings:
                 data.get("max_auto_images_per_reply"), 1, 1
             ),
             enable_reverse_prompt=_as_bool(data.get("enable_reverse_prompt"), True),
+            enable_reverse_json_formatter=_as_bool(
+                data.get("enable_reverse_json_formatter"),
+                True,
+            ),
+            enable_reverse_json_repair_retry=_as_bool(
+                data.get("enable_reverse_json_repair_retry"),
+                True,
+            ),
             reverse_prompt_provider_id=str(
                 data.get("reverse_prompt_provider_id", "")
             ).strip(),

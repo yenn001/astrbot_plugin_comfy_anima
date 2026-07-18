@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "Comfy Anima"
+  },
+  "pages": {
+    "control": {
+      "title": "工坊控制台",
+      "description": "绘图、LoRA、模型、任务与运行日志管理"
+    }
+  }
+}

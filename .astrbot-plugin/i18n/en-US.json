@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "Comfy Anima"
+  },
+  "pages": {
+    "control": {
+      "title": "Workshop Console",
+      "description": "Manage drawing, LoRA, models, tasks, and runtime logs"
+    }
+  }
+}
