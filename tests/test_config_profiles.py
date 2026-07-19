@@ -11,6 +11,7 @@ from unittest import mock
 
 from ..services.config_profiles import (
     ENVIRONMENT_FIELDS,
+    PROFILE_SCHEMA_VERSION,
     ConfigProfileApplyError,
     ConfigProfileConflictError,
     ConfigProfileNotFoundError,
@@ -95,6 +96,82 @@ class ConfigProfileServiceTests(unittest.TestCase):
             self.assertNotIn(secret, export)
         self.assertNotIn("api_token", raw_file)
         self.assertNotIn("prompt_llm_provider_id", raw_file)
+
+    def test_v1_profiles_missing_six_pipeline_fields_are_migrated_in_place(self) -> None:
+        saved = self.service.save_profile("旧版 34", _config(), activate=True)
+        raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
+        raw["version"] = 1
+        record = raw["profiles"]["旧版 34"]
+        for field in (
+            "upscale_workflow_file",
+            "base_workflow_file",
+            "rtx_generation_workflow_file",
+            "iterative_workflow_file",
+            "inpaint_crop_workflow_file",
+            "lanpaint_workflow_file",
+        ):
+            record["settings"].pop(field)
+        self.storage_path.write_text(
+            json.dumps(raw, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        profiles = self.service.list_profiles()
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["name"], saved["name"])
+        self.assertTrue(profiles[0]["active"])
+        self.assertEqual(
+            profiles[0]["settings"]["base_workflow_file"],
+            "workflow/anima_base_api.json",
+        )
+        migrated = json.loads(self.storage_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], PROFILE_SCHEMA_VERSION)
+        self.assertEqual(
+            set(migrated["profiles"]["旧版 34"]["settings"]),
+            ENVIRONMENT_FIELDS,
+        )
+
+    def test_v2_profile_missing_required_field_is_still_corrupt(self) -> None:
+        self.service.save_profile("损坏档案", _config())
+        raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
+        raw["profiles"]["损坏档案"]["settings"].pop("comfyui_url")
+        self.storage_path.write_text(
+            json.dumps(raw, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ConfigProfileStorageError, "comfyui_url"):
+            self.service.list_profiles()
+
+    def test_import_accepts_v1_profile_with_legacy_workflow_fields_missing(self) -> None:
+        settings = self.service.save_profile("source", _config())["settings"]
+        for field in (
+            "upscale_workflow_file",
+            "base_workflow_file",
+            "rtx_generation_workflow_file",
+            "iterative_workflow_file",
+            "inpaint_crop_workflow_file",
+            "lanpaint_workflow_file",
+        ):
+            settings.pop(field)
+        payload = {
+            "schema": "astrbot-comfy-anima-environment-profile",
+            "version": 1,
+            "profile": {
+                "name": "imported-v1",
+                "created_at": "2026-07-15T00:00:00Z",
+                "updated_at": "2026-07-15T00:00:00Z",
+                "settings": settings,
+            },
+        }
+
+        imported = self.service.import_profile(payload)
+
+        self.assertEqual(
+            imported["settings"]["lanpaint_workflow_file"],
+            "workflow/anima_lanpaint_api.json",
+        )
 
     def test_create_list_overwrite_and_casefold_conflict(self) -> None:
         first = self.service.save_profile("Studio", _config(), activate=True)

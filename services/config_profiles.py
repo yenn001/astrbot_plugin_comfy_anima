@@ -42,7 +42,8 @@ from ..constants import (
 
 
 PROFILE_SCHEMA = "astrbot-comfy-anima-environment-profile"
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
+LEGACY_PROFILE_SCHEMA_VERSION = 1
 MAX_PROFILE_NAME_LENGTH = 64
 MAX_TEXT_FIELD_LENGTH = 2048
 MAX_NODE_LIST_ITEMS = 32
@@ -81,6 +82,16 @@ ENVIRONMENT_FIELD_DEFAULTS: dict[str, Any] = {
     "default_height": 1216,
 }
 ENVIRONMENT_FIELDS = frozenset(ENVIRONMENT_FIELD_DEFAULTS)
+_V1_ADDED_WORKFLOW_FIELDS = frozenset(
+    {
+        "upscale_workflow_file",
+        "base_workflow_file",
+        "rtx_generation_workflow_file",
+        "iterative_workflow_file",
+        "inpaint_crop_workflow_file",
+        "lanpaint_workflow_file",
+    }
+)
 
 _URL_FIELDS = frozenset(
     {
@@ -312,6 +323,30 @@ def extract_environment_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     return validate_environment_settings(raw)
 
 
+def _validate_stored_environment_settings(
+    settings: Mapping[str, Any],
+    *,
+    schema_version: int,
+) -> dict[str, Any]:
+    """Validate a stored snapshot and migrate the known v1 workflow gap."""
+
+    if schema_version == PROFILE_SCHEMA_VERSION:
+        return validate_environment_settings(settings)
+    if schema_version != LEGACY_PROFILE_SCHEMA_VERSION:
+        raise ConfigProfileValidationError("version 不受支持")
+    partial = validate_environment_settings(settings, require_all=False)
+    missing = ENVIRONMENT_FIELDS - set(partial)
+    unsupported_missing = missing - _V1_ADDED_WORKFLOW_FIELDS
+    if unsupported_missing:
+        names = ", ".join(sorted(unsupported_missing))
+        raise ConfigProfileValidationError(f"配置档案缺少字段：{names}")
+    completed = {
+        field: _copy(partial.get(field, default))
+        for field, default in ENVIRONMENT_FIELD_DEFAULTS.items()
+    }
+    return validate_environment_settings(completed)
+
+
 class ConfigProfileService:
     """Persist and atomically activate named environment profiles."""
 
@@ -487,7 +522,11 @@ class ConfigProfileService:
             raise ConfigProfileValidationError("导入内容必须是对象")
         if payload.get("schema") != PROFILE_SCHEMA:
             raise ConfigProfileValidationError("不是 Comfy Anima 环境配置档案")
-        if payload.get("version") != PROFILE_SCHEMA_VERSION:
+        raw_version = payload.get("version")
+        if raw_version not in {
+            LEGACY_PROFILE_SCHEMA_VERSION,
+            PROFILE_SCHEMA_VERSION,
+        }:
             raise ConfigProfileValidationError("不支持的配置档案版本")
         raw_profile = payload.get("profile")
         if not isinstance(raw_profile, Mapping):
@@ -498,7 +537,10 @@ class ConfigProfileService:
             names = ", ".join(sorted(str(key) for key in unknown))
             raise ConfigProfileValidationError(f"profile 包含不允许的字段：{names}")
         name = normalize_profile_name(raw_profile.get("name"))
-        settings = validate_environment_settings(raw_profile.get("settings", {}))
+        settings = _validate_stored_environment_settings(
+            raw_profile.get("settings", {}),
+            schema_version=int(raw_version),
+        )
         profile_id = _profile_id(name)
         now = _utc_now()
         with self._lock:
@@ -596,16 +638,28 @@ class ConfigProfileService:
                 f"无法读取配置档案文件 {self.storage_path}: {exc}"
             ) from exc
         try:
-            return self._validate_state(raw)
+            validated = self._validate_state(raw)
         except ConfigProfileValidationError as exc:
             raise ConfigProfileStorageError(f"配置档案文件损坏：{exc}") from exc
+        if validated != raw:
+            try:
+                self._write_state(validated)
+            except ConfigProfileStorageError:
+                # Migration must not make existing profiles disappear merely
+                # because a read-only filesystem prevents the optional rewrite.
+                pass
+        return validated
 
     def _validate_state(self, raw: Any) -> dict[str, Any]:
         if not isinstance(raw, Mapping):
             raise ConfigProfileValidationError("根节点必须是对象")
         if raw.get("schema") != PROFILE_SCHEMA:
             raise ConfigProfileValidationError("schema 不匹配")
-        if raw.get("version") != PROFILE_SCHEMA_VERSION:
+        raw_version = raw.get("version")
+        if raw_version not in {
+            LEGACY_PROFILE_SCHEMA_VERSION,
+            PROFILE_SCHEMA_VERSION,
+        }:
             raise ConfigProfileValidationError("version 不受支持")
         raw_profiles = raw.get("profiles")
         if not isinstance(raw_profiles, Mapping):
@@ -624,7 +678,10 @@ class ConfigProfileService:
             updated_at = raw_record.get("updated_at")
             if not isinstance(created_at, str) or not isinstance(updated_at, str):
                 raise ConfigProfileValidationError(f"档案“{name}”时间字段无效")
-            settings = validate_environment_settings(raw_record.get("settings", {}))
+            settings = _validate_stored_environment_settings(
+                raw_record.get("settings", {}),
+                schema_version=int(raw_version),
+            )
             profiles[canonical_id] = {
                 "name": name,
                 "created_at": created_at,
