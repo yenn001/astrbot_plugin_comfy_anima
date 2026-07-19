@@ -179,6 +179,78 @@ class ReversePromptResult:
         parts.append("不要把待确认身份当成事实；需要角色 LoRA 时必须查询实时清单。")
         return "\n".join(parts)
 
+    def semantic_redraw_request(
+        self,
+        supplement: str,
+        mode: str = "balanced",
+    ) -> str:
+        """Build a constrained no-mask whole-image regeneration request."""
+
+        normalized_mode = str(mode or "balanced").strip().casefold()
+        mode_rules = {
+            "preserve": (
+                "保守模式：除用户明确要求改变的项目外，尽量保留角色身份、发型、"
+                "表情、姿势、镜头、构图、背景、光线、画风，以及用户明确指定且"
+                "实时确认的非冲突 LoRA。"
+            ),
+            "balanced": (
+                "平衡模式：保留角色身份、主体数量、主要动作、镜头、构图和场景语义，"
+                "允许为完成修改而重新组织次要细节。"
+            ),
+            "free": (
+                "自由模式：把原图作为内容参考，严格服从用户的新要求；允许重新设计动作、"
+                "构图、背景和细节，但不得无故改变用户要求保留的角色身份。"
+            ),
+        }
+        if normalized_mode not in mode_rules:
+            normalized_mode = "balanced"
+        parts = [
+            "任务类型：无蒙版整图语义重绘。最终会重新生成整张图片，不是局部修补，"
+            "也不保证原像素不变。只输出 pic，不得输出 edit。",
+            mode_rules[normalized_mode],
+            (
+                "先把原图事实拆成身份、服装/饰品、表情、动作、镜头/构图、场景/天气/"
+                "光线、画风/色调和 LoRA。用户要求是最高优先级：明确替换的旧内容必须从"
+                "正面提示词删除，不能把新旧衣服、发型、场景或表情同时保留。"
+            ),
+            (
+                "未被要求改变的项目按当前模式保留。只有可观察 Tags 或实时 LoRA 元数据"
+                "明确证明旧内容时，才可把少量互斥旧词加入 negative；身份、作品名、脸、"
+                "发色、瞳色和体型不得因为换衣而进入 negative。"
+            ),
+            f"原图可观察 Tags：{self.positive_tags}",
+        ]
+        if self.composition:
+            parts.append(f"原图构图：{self.composition}")
+        if self.scene_description_zh:
+            parts.append(f"原图场景说明：{self.scene_description_zh}")
+        if self.style_notes:
+            parts.append(f"原图画风观察：{self.style_notes}")
+        if self.characters:
+            candidates = "；".join(
+                (
+                    f"{item.name}"
+                    + (f"（{item.source_work}）" if item.source_work else "")
+                    + f"，置信度 {item.confidence:.2f}"
+                )
+                for item in self.characters
+            )
+            parts.append(
+                "原图角色候选（仅作查询线索，不能越过实时清单当成确定身份）："
+                + candidates
+            )
+        if self.uncertain_terms:
+            parts.append(
+                "原图待确认项（不得当成事实）：" + "、".join(self.uncertain_terms)
+            )
+        parts.append(f"用户整图修改要求：{supplement.strip()}")
+        parts.append(
+            "用户未指定风格组合时不得自动套用默认风格001；需要其他 LoRA 时必须查询"
+            "本次实时清单。最终提示词只描述修改完成后的画面，"
+            "不得包含 change、replace、edit、redraw、mask、here 或 there 等操作词。"
+        )
+        return "\n".join(parts)
+
 
 def _clean_text(value: Any, limit: int) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" ,\n\t")

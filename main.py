@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.2.0
+AstrBot Comfy Anima 插件 v1.2.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.2.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.2.0
+版本: 1.2.1
 日期: 2026-07-19
 """
 
@@ -130,15 +130,16 @@ from .services.web_ui import WebUiActionError, WebUiError, WebUiService
 
 AUTO_DRAW_CONTROL_PROTOCOL = """
 AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）：
-- 先把用户目标归入唯一操作：从文字新生成图片、修改现有图片的遮罩区域、语义换角、仅放大现有图片。不要因为都与图片有关就一律输出 pic。
+- 先把用户目标归入唯一操作：从文字新生成图片、无蒙版整图语义重绘、修改现有图片的遮罩区域、语义换角、仅放大现有图片。不要因为都与图片有关就一律输出 pic。
 - 普通生图最终使用 `<pic prompt="英文 Anima tags" pipeline="base|rtx|iterative">`；negative 属性可选。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
 - 只有用户明确要求修改已提供图片的遮罩区域时，才使用 `<edit prompt="遮罩区域目标英文 tags" mode="quick|lanpaint">`；negative 属性可选。quick 适合快速小范围修改，lanpaint 适合复杂结构和精细多轮重绘。
 - `<pic>` 与 `<edit>` 互斥；不要同时输出。不要在 `<think>` 内输出控制标签。
 - edit 不能创建或猜测遮罩。缺少原图或同尺寸遮罩时，不输出 edit，并请用户补充：白色/透明区域重绘，黑色区域保留。
-- “画某角色穿新衣”是普通生图，不是重绘；只有“重绘遮罩区域、修补白色区域、局部重绘/inpaint”等明确语义才是 edit。
+- “画某角色穿新衣”是普通生图；引用现有图片后说“换衣服、换背景、换表情、重新画一张”属于无蒙版整图语义重绘，由插件专用 `/改图` 路由处理，不输出 edit。只有“重绘遮罩区域、修补白色区域、局部重绘/inpaint”等明确语义才是 edit。
 - “把这张图放大/超分/高清化”是独立 RTX 图片工具，不是 rtx 生图管线；不要输出 pic 或 edit，交给插件的现有图片放大路由。
 - “用 RTX 画一张/画完再放大”才是 Anima 的 rtx 生图管线；“只出底图/不要放大”用 base；“迭代放大/二次采样/细节重构”用 iterative。
 - “把图里的手修好、把这里改成红裙、重画那块区域”属于现有图片修改意图；有有效遮罩时输出 edit。edit.prompt 只写遮罩内最终应出现什么，不写“修改、替换、这里、遮罩”等操作词。
+- 无蒙版整图重绘会先反推原图再重新生成，不能声称像素级保持；用户未要求改变的身份、姿势、镜头、构图和场景按 preserve/balanced/free 模式处理。
 - “把图中 A 角色换成 B 角色并保持场景”属于语义换角，由插件专用路由处理；不要擅自退化为普通 pic 或局部 edit。
 - LoRA 文件名只能来自本次工具返回；插件会在提交前强制刷新并复核 LoRA Manager 与 ComfyUI。
 """.strip()
@@ -994,6 +995,73 @@ class ComfyAnimaPlugin(Star):
             # As with natural_language_draw, stop only after all yielded replies.
             event.stop_event()
 
+    @filter.command("改图")
+    async def cmd_semantic_redraw(
+        self,
+        event: AstrMessageEvent,
+        requirement: str = "",
+    ) -> AsyncGenerator[Any, None]:
+        """Regenerate one source image from a no-mask semantic edit request."""
+
+        command_text = self._extract_command_text(
+            event.message_str,
+            requirement,
+            command="改图",
+        )
+        swap_request = parse_natural_character_swap(command_text)
+        if swap_request is not None:
+            try:
+                width, height = self._extract_resolution_request(command_text)
+                swap_request = replace(
+                    swap_request,
+                    width=width,
+                    height=height,
+                    preset=self._find_requested_style_preset(command_text),
+                )
+            except ValueError as exc:
+                yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
+                return
+            async for response in self._handle_character_swap(event, swap_request):
+                yield response
+            return
+        try:
+            options = self._prepare_semantic_redraw_options(command_text)
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        async for response in self._handle_semantic_redraw(event, options):
+            yield response
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=27)
+    async def natural_language_semantic_redraw(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[Any, None]:
+        """Route one-image whole-frame edits before ordinary text-to-image."""
+
+        message = str(event.message_str or "").strip()
+        if (
+            not message
+            or message.startswith(("/", "／"))
+            or parse_natural_character_swap(message) is not None
+            or self._looks_like_inpaint_request(message)
+            or not self._looks_like_semantic_redraw_request(message)
+        ):
+            return
+        if not await self._image_input.has_any(event):
+            return
+        try:
+            try:
+                options = self._prepare_semantic_redraw_options(message)
+            except ValueError as exc:
+                yield event.plain_result(f"{MessageEmoji.ERROR} 改图参数错误: {exc}")
+                return
+            async for response in self._handle_semantic_redraw(event, options):
+                yield response
+        finally:
+            event.stop_event()
+
     @filter.command("重绘")
     async def cmd_inpaint(
         self, event: AstrMessageEvent, prompt: str = ""
@@ -1014,7 +1082,7 @@ class ComfyAnimaPlugin(Star):
             yield response
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=25)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=29)
     async def natural_language_inpaint(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[Any, None]:
@@ -1551,6 +1619,256 @@ class ComfyAnimaPlugin(Star):
             return
         components = [
             Comp.Plain(self._upscale_summary(image_paths, scale_value)),
+            *(Comp.Image.fromFileSystem(path) for path in image_paths),
+        ]
+        yield event.chain_result(components)
+        self._schedule_cleanup(image_paths)
+
+    async def _handle_semantic_redraw(
+        self,
+        event: AstrMessageEvent,
+        options: GenerationOptions,
+    ) -> AsyncGenerator[Any, None]:
+        """Reverse one image, apply a semantic delta, then regenerate it."""
+
+        requirement = options.prompt.strip()
+        if not requirement:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 请说明整张图片要怎样修改")
+            return
+        max_prompt_length = int(getattr(self.settings, "max_prompt_length", 2000))
+        if len(requirement) > max_prompt_length:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 改图要求不能超过 {max_prompt_length} 字符"
+            )
+            return
+        mode = str(options.semantic_redraw_mode or "balanced").strip().casefold()
+        if mode not in {"preserve", "balanced", "free"}:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 未知整图重绘模式: {mode}")
+            return
+        if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
+            return
+        pipeline_builders = getattr(self, "_pipeline_builders", {})
+        if (
+            not self._client
+            or (not getattr(self, "_workflow_builder", None) and not pipeline_builders)
+            or not self._director
+        ):
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 整图改图组件未就绪: "
+                f"{self._initialization_error or self._director_error or '未知错误'}"
+            )
+            return
+        access_error = self._access_error(event, requirement)
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+
+        async def operation(
+            job: GenerationJob,
+        ) -> tuple[Any, str, Any, str, str, str]:
+            image_path: Optional[Path] = None
+            try:
+                job.state = "reading_image"
+                image_path = await self._image_input.collect_one(event)
+
+                def image_size() -> tuple[int, int]:
+                    assert image_path is not None
+                    with Image.open(image_path) as image:
+                        return image.size
+
+                original_width, original_height = await asyncio.to_thread(image_size)
+                width = options.width
+                height = options.height
+                if width is None or height is None:
+                    width, height = fit_canvas_to_aspect_ratio(
+                        original_width,
+                        original_height,
+                    )
+                self._record_image_task_phase(
+                    job,
+                    "input",
+                    "单张原图已校验；将按原宽高比执行无蒙版整图语义重绘。",
+                    "semantic_redraw_input_ready",
+                    details={
+                        "bytes": image_path.stat().st_size,
+                        "source_width": original_width,
+                        "source_height": original_height,
+                        "target_width": width,
+                        "target_height": height,
+                        "mode": mode,
+                    },
+                )
+                job.state = "reverse_prompting"
+                self._record_image_task_phase(
+                    job,
+                    "provider",
+                    "正在提取原图的身份、服装、动作、构图、场景与画风事实。",
+                    "semantic_redraw_reverse_started",
+                    details={"mode": mode},
+                )
+
+                def reverse_progress(
+                    message: str,
+                    event_code: str,
+                    details: Mapping[str, Any],
+                ) -> None:
+                    self._record_image_task_phase(
+                        job,
+                        "provider",
+                        message,
+                        event_code,
+                        details=dict(details),
+                        level=(
+                            "WARNING"
+                            if event_code == "reverse_response_invalid"
+                            else "INFO"
+                        ),
+                    )
+
+                async with self._generation_slots:
+                    reverse_result, reverse_provider = await self._reverse_prompt.reverse(
+                        self.context,
+                        event,
+                        image_path,
+                        (
+                            "Analyze the source image exactly as shown before any edit. "
+                            "Prioritize current identity, outfit, accessories, expression, "
+                            "pose, composition, scene, lighting and style. Do not apply or "
+                            "imagine the requested future modification."
+                        ),
+                        reverse_progress,
+                    )
+                job.state = "directing"
+                self._record_image_task_phase(
+                    job,
+                    "director",
+                    "原图事实已就绪，正在计算保留、替换、删除与新增约束。",
+                    "semantic_redraw_director_started",
+                    details={
+                        "reverse_provider_id": reverse_provider,
+                        "mode": mode,
+                    },
+                )
+                request_builder = getattr(
+                    reverse_result,
+                    "semantic_redraw_request",
+                    None,
+                )
+                if callable(request_builder):
+                    director_request = request_builder(requirement, mode)
+                else:
+                    director_request = reverse_result.drawing_request(requirement)
+                instruction, director_provider = (
+                    await self._generate_directed_instruction(
+                        event,
+                        director_request,
+                    )
+                )
+                final_prompt = instruction.prompt
+                final_access_error = self._access_error(event, final_prompt)
+                if final_access_error:
+                    raise ValueError(final_access_error)
+                negative_prompt = ", ".join(
+                    part
+                    for part in (
+                        str(getattr(reverse_result, "negative_tags", "")).strip(" ,"),
+                        options.negative_prompt.strip(" ,"),
+                        instruction.negative_prompt.strip(" ,"),
+                    )
+                    if part
+                )
+                selected_pipeline = options.pipeline or instruction.pipeline
+                generated = await self._execute_job(
+                    job,
+                    replace(
+                        options,
+                        prompt=final_prompt,
+                        negative_prompt=negative_prompt,
+                        pipeline=selected_pipeline,
+                        width=width,
+                        height=height,
+                        use_prompt_llm=False,
+                        suppress_default_style=(not bool(options.lora_preset)),
+                    ),
+                    event,
+                )
+                self._record_image_task_phase(
+                    job,
+                    "comfyui",
+                    "整图语义修改已生成；结果是全图重新绘制而非像素级局部编辑。",
+                    "semantic_redraw_output_ready",
+                    details={
+                        "director_provider_id": director_provider,
+                        "mode": mode,
+                        "pipeline": selected_pipeline or "default",
+                    },
+                )
+                return (
+                    reverse_result,
+                    reverse_provider,
+                    generated,
+                    final_prompt,
+                    director_provider,
+                    mode,
+                )
+            finally:
+                if image_path is not None:
+                    image_path.unlink(missing_ok=True)
+
+        mode_label = {
+            "preserve": "保守",
+            "balanced": "平衡",
+            "free": "自由",
+        }[mode]
+        yield event.plain_result(
+            f"{MessageEmoji.DRAW} 正在反推原图并执行{mode_label}整图改图……"
+        )
+        try:
+            (
+                _reverse_result,
+                reverse_provider,
+                generated,
+                final_prompt,
+                director_provider,
+                mode,
+            ) = await self._run_auxiliary_job(event, "semantic redraw", operation)
+        except ReversePromptError as exc:
+            logger.error(
+                f"[{PLUGIN_NAME}] semantic redraw reverse failed: "
+                f"code={exc.code}, details={exc.details}"
+            )
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 整图改图反推失败: {exc.user_message}"
+            )
+            return
+        except (IncomingImageError, PromptDirectorError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] semantic redraw planning failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 整图改图准备失败: {message}")
+            return
+        except (ComfyClientError, WorkflowError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(
+                f"[{PLUGIN_NAME}] semantic redraw generation failed: {exc}",
+                exc_info=True,
+            )
+            yield event.plain_result(f"{MessageEmoji.ERROR} 整图改图失败: {message}")
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        image_paths, seed, _, _, director_warning = generated
+        if director_warning:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {director_warning}")
+        if self.settings.show_llm_prompt:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 反推模型: {reverse_provider}\n"
+                f"改图导演模型: {director_provider}\n"
+                f"整图模式: {mode}\n最终提示词: {final_prompt}"
+            )
+        components = [
+            Comp.Plain(self._semantic_redraw_summary(image_paths, seed, mode)),
             *(Comp.Image.fromFileSystem(path) for path in image_paths),
         ]
         yield event.chain_result(components)
@@ -2458,10 +2776,11 @@ class ComfyAnimaPlugin(Star):
 自然语言选择: “只要原图/不放大”、“RTX 高清放大”、“迭代放大/细节重构”
 未指定时使用 WebUI 当前默认生图管线。
 
-3 个独立工具能力（不属于生图管线切换）:
+4 个独立图片操作（不属于生图管线切换）:
 1. /放大 [倍率] - 放大用户发送或引用的图片，不经过 Anima 生图
-2. /重绘 <要求> --mode quick - Quick Inpaint Crop，小范围快速修改
-3. /重绘 <要求> --mode lanpaint - LanPaint 多轮精细重绘，适合复杂结构
+2. /改图 <要求> --mode preserve|balanced|free - 无需蒙版，理解原图后重新生成整张图
+3. /重绘 <要求> --mode quick - Quick Inpaint Crop，小范围快速修改
+4. /重绘 <要求> --mode lanpaint - LanPaint 多轮精细重绘，适合复杂结构
 重绘需提供原图与同尺寸遮罩；白色或透明区域重绘，黑色区域保留。
 
 /反推 [关注点] - 发送或引用图片，返回结构化 Anima 提示词
@@ -2581,8 +2900,9 @@ iterative - Anima 原图 + 迭代采样放大
 自然语言也可说“只要原图/不放大”、“RTX 高清放大”或“迭代放大/细节重构”。
 未指定时使用 WebUI 当前默认管线。
 
-3 个独立工具能力:
+4 个独立图片操作:
 /放大 [倍率] - 独立 RTX 图片放大，不经过 Anima 生图
+/改图 <要求> --mode preserve|balanced|free - 无蒙版整图语义重绘
 /重绘 <要求> --mode quick - Quick Inpaint Crop 快速局部重绘
 /重绘 <要求> --mode lanpaint - LanPaint 多轮精细重绘
 重绘需提供原图与同尺寸遮罩；白色或透明区域重绘，黑色区域保留。
@@ -2592,6 +2912,7 @@ QQ快捷指令:
 /画图no <英文 Tag> [--pipeline base|rtx|iterative] - 直接图片
 /反推 [关注点] - 在线图片反推
 /反推画图 [补充要求] - 反推并生成
+/改图 [要求] - 无蒙版整图修改；支持换衣、换背景、换表情或重新画一张
 /换角色 A -> B [选项] - 单图语义换角
 /换角色 A -> B [选项] | <完整 Tags> - Tags 语义换角
 /comfy帮助 - 完整帮助
@@ -2621,6 +2942,8 @@ QQ快捷指令:
 /anima draw 她在雨夜回头看向镜头 --pipeline rtx --seed 123
 /anima draw 用风格001画达妮娅，不放大
 /anima draw 1girl, white hair, blue eyes --raw --pipeline iterative --preset 风格001
+/改图 把衣服换成红色晚礼服，其他内容保持不变 --mode preserve
+/改图 参考原图重新画一张夜景版本 --mode free
 /重绘 把遮罩区域的衣服改成红裙 --mode quick
 /重绘 精细修复遮罩区域的手部 --mode lanpaint
 /换角色 达妮娅 -> 卡莲 --preview | 1girl, denia_wuwa, school uniform, standing
@@ -3633,6 +3956,31 @@ QQ快捷指令:
             f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
         )
 
+    @staticmethod
+    def _semantic_redraw_summary(
+        image_paths: list[Path],
+        seed: int,
+        mode: str,
+    ) -> str:
+        elapsed = max(
+            0.0,
+            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
+        )
+        gpu_name = str(
+            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
+        )
+        mode_label = {
+            "preserve": "保守",
+            "balanced": "平衡",
+            "free": "自由",
+        }.get(mode, "平衡")
+        return (
+            f"{MessageEmoji.SUCCESS} 整图语义重绘完成｜模式: {mode_label}｜"
+            f"Seed: {seed}｜图片: {len(image_paths)} 张\n"
+            f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}\n"
+            "说明: 本结果是整张图片重新生成，不是像素级局部修改。"
+        )
+
     def _access_error(
         self,
         event: AstrMessageEvent,
@@ -3680,15 +4028,11 @@ QQ快捷指令:
 
     @staticmethod
     def _looks_like_inpaint_request(message: str) -> bool:
-        """Recognize explicit mask or existing-image region edits conservatively."""
+        """Recognize only explicit masked/local-region edits."""
 
         edit_verb = (
             r"(?:重绘|重画|重做|改(?:成|为|一下)?|换成|替换(?:成|为)?|"
             r"修(?:复|好|一下)?|补(?:画|一下)?|擦掉|去掉|移除|删除)"
-        )
-        existing_image = (
-            r"(?:(?:这|那|刚才|上次|引用|回复)(?:张|幅|个)?"
-            r"(?:图|图片|图像|画面)|(?:图|图片|图像)(?:里|中|上|内|的))"
         )
         region = (
             r"(?:这里|那里|这块|那块|这个区域|那个区域|选中区域|"
@@ -3697,13 +4041,107 @@ QQ快捷指令:
         patterns = (
             r"(?:局部|遮罩|蒙版|白色区域|透明区域).{0,12}(?:重绘|重画|修改|替换|修补)",
             r"(?:重绘|重画|修补).{0,12}(?:遮罩|蒙版|白色区域|透明区域)",
-            rf"{existing_image}.{{0,28}}{edit_verb}",
-            rf"{edit_verb}.{{0,28}}{existing_image}",
             rf"{region}.{{0,18}}{edit_verb}",
             rf"{edit_verb}.{{0,18}}{region}",
             r"\binpaint\b",
         )
         return any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in patterns)
+
+    @staticmethod
+    def _looks_like_semantic_redraw_request(message: str) -> bool:
+        """Recognize a substantive no-mask whole-image edit or regeneration."""
+
+        if ComfyAnimaPlugin._looks_like_inpaint_request(message):
+            return False
+        target = (
+            r"(?:衣服|服装|裙子|外套|制服|背景|场景|表情|发型|发色|瞳色|"
+            r"天气|时间|光线|画风|风格|色调|动作|姿势|镜头|构图|道具|饰品)"
+        )
+        patterns = (
+            r"(?:整图|整张|全图|整幅).{0,10}(?:重绘|重画|改图|重做|重新生成)",
+            r"(?:整图|整张图|全图|整幅图).{0,24}(?:换成|改成|改为|变成|重做)",
+            r"(?:重新|再)(?:画|绘制|生成)(?:一|1)?(?:张|幅|版)",
+            r"(?:参考|照着).{0,16}(?:重新画|重画|再画|重新生成)",
+            rf"(?:换|改)(?:个|一下|成|为)?{target}",
+            rf"{target}.{{0,12}}(?:换成|改成|改为|变成|替换成|换掉|去掉|删除|移除)",
+            r"(?:把|将).{1,48}(?:换成|改成|改为|变成|替换成|换掉|去掉|删除|移除)",
+            r"(?:加上|增加|添加).{1,48}(?:衣服|服装|背景|场景|表情|发型|"
+            r"发色|瞳色|天气|光线|画风|风格|动作|姿势|道具|饰品)",
+        )
+        return any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in patterns)
+
+    @staticmethod
+    def _extract_semantic_redraw_mode_request(message: str) -> str:
+        """Infer preserve/balanced/free without treating every '保持' as a conflict."""
+
+        preserve = bool(
+            re.search(
+                r"(?:保守模式|只(?:改|换|调整)|仅(?:改|换|调整)|"
+                r"(?:其他|其它|除此之外).{0,10}(?:保持不变|不要变)|"
+                r"除了.{1,24}(?:以外|之外).{0,10}(?:保持不变|不要变))",
+                message,
+                re.IGNORECASE,
+            )
+        )
+        free = bool(
+            re.search(
+                r"(?:自由模式|自由发挥|完全重画|全部重画|推倒重来|大幅重做|"
+                r"不(?:必|用|需要)保持|无需保持|不用沿用)",
+                message,
+                re.IGNORECASE,
+            )
+        )
+        redraw_fresh = bool(
+            re.search(
+                r"(?:重新|再)(?:画|绘制|生成)(?:一|1)?(?:张|幅|版)",
+                message,
+                re.IGNORECASE,
+            )
+        )
+        asks_to_keep = bool(
+            re.search(r"(?:保持|保留|沿用|不变)", message, re.IGNORECASE)
+        )
+        if redraw_fresh and not asks_to_keep:
+            free = True
+        if preserve and free:
+            raise ValueError("同时检测到保守与自由重绘要求，请只选择一种模式")
+        if preserve:
+            return "preserve"
+        if free:
+            return "free"
+        return "balanced"
+
+    def _prepare_semantic_redraw_options(self, command_text: str) -> GenerationOptions:
+        """Parse command/natural language into one semantic-redraw request."""
+
+        options = parse_generation_options(
+            command_text,
+            mode_context="semantic_redraw",
+        )
+        if options.use_prompt_llm is False:
+            raise ValueError("整图改图必须使用图片反推与 LLM 语义规划，不支持 --raw")
+        if options.denoise is not None:
+            raise ValueError(
+                "当前整图改图属于语义重新生成，--denoise 不是改图强度；"
+                "真正的整图 img2img 强度将在独立工作流中提供"
+            )
+        detected_width, detected_height = self._extract_resolution_request(options.prompt)
+        detected_pipeline = self._extract_pipeline_request(options.prompt)
+        return replace(
+            options,
+            width=options.width if options.width is not None else detected_width,
+            height=options.height if options.height is not None else detected_height,
+            pipeline=options.pipeline or detected_pipeline,
+            lora_preset=(
+                options.lora_preset
+                or self._find_requested_style_preset(options.prompt)
+            ),
+            use_prompt_llm=False,
+            semantic_redraw_mode=(
+                options.semantic_redraw_mode
+                or self._extract_semantic_redraw_mode_request(options.prompt)
+            ),
+        )
 
     @staticmethod
     def _extract_inpaint_mode_request(message: str) -> str:
@@ -5821,6 +6259,7 @@ QQ快捷指令:
             "text_to_image": "生图",
             "upscale": "独立放大",
             "inpaint": "局部重绘",
+            "orchestration": "整图语义重绘",
             "invalid": "不可用",
         }
         generation_profiles = {
@@ -5912,6 +6351,46 @@ QQ快捷指令:
                     "enabled": enabled,
                 }
             )
+        semantic_redraw_enabled = bool(self.settings.enable_reverse_prompt)
+        semantic_redraw_ready = bool(
+            semantic_redraw_enabled
+            and getattr(self, "_reverse_prompt", None) is not None
+            and getattr(self, "_director", None) is not None
+            and getattr(self, "_client", None) is not None
+            and (
+                getattr(self, "_workflow_builder", None) is not None
+                or bool(getattr(self, "_pipeline_builders", {}))
+            )
+        )
+        items.append(
+            {
+                "index": 0,
+                "filename": "reverse_prompt + active_anima_pipeline",
+                "display_name": "无蒙版整图改图",
+                "profile_id": "semantic_redraw",
+                "task_type": "orchestration",
+                "task_label": labels["orchestration"],
+                "selectable": False,
+                "current": False,
+                "reason": (
+                    ""
+                    if semantic_redraw_ready
+                    else (
+                        "在线反推未启用"
+                        if not semantic_redraw_enabled
+                        else "反推、绘图导演或 Anima 生图组件未就绪"
+                    )
+                ),
+                "capability_group": "tool",
+                "capability_id": "semantic_redraw",
+                "command": "/改图 <要求> --mode preserve|balanced|free",
+                "summary": (
+                    "无需蒙版；先理解原图，再按保守、平衡或自由模式重新生成整张图。"
+                ),
+                "status": "ready" if semantic_redraw_ready else "unavailable",
+                "enabled": semantic_redraw_enabled,
+            }
+        )
         by_capability = {
             item["capability_id"]: item
             for item in items
@@ -5927,7 +6406,12 @@ QQ快捷指令:
             ],
             "tool_items": [
                 by_capability[capability_id]
-                for capability_id in ("standalone_rtx", "quick", "lanpaint")
+                for capability_id in (
+                    "standalone_rtx",
+                    "semantic_redraw",
+                    "quick",
+                    "lanpaint",
+                )
                 if capability_id in by_capability
             ],
         }
@@ -6474,6 +6958,7 @@ QQ快捷指令:
             task_type = {
                 "reverse prompt": "reverse_prompt",
                 "reverse draw": "reverse_draw",
+                "semantic redraw": "semantic_redraw",
                 "RTX upscale": "rtx_upscale",
                 "character swap": "character_swap",
                 "inpaint": "inpaint",
@@ -6493,7 +6978,11 @@ QQ快捷指令:
                     (
                         "语义换角任务开始执行，正在校验输入与实时 LoRA 状态。"
                         if task_type == "character_swap"
-                        else "图片任务开始执行，正在读取本次显式提供或引用的图片。"
+                        else (
+                            "整图语义重绘任务开始执行，正在读取原图并规划修改约束。"
+                            if task_type == "semantic_redraw"
+                            else "图片任务开始执行，正在读取本次显式提供或引用的图片。"
+                        )
                     ),
                     event_code="image_task_started",
                 )

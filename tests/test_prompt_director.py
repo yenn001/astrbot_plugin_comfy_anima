@@ -219,6 +219,9 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("现有图片独立 RTX 放大", system_prompt)
         self.assertIn("把图里的手修好", system_prompt)
         self.assertIn("唯一操作类型", system_prompt)
+        self.assertIn("整图语义重绘", system_prompt)
+        self.assertIn("重新生成而非像素级修改", system_prompt)
+        self.assertIn("不得自动套用默认风格001", system_prompt)
 
     def test_custom_prompt_keeps_runtime_constraints(self) -> None:
         reference = (

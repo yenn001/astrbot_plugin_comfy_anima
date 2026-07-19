@@ -8,7 +8,9 @@ from pathlib import Path
 
 from ..models import PluginSettings
 from ..services.reverse_prompt import (
+    ReverseCharacter,
     ReversePromptError,
+    ReversePromptResult,
     ReversePromptService,
     _response_text,
     parse_reverse_prompt,
@@ -16,6 +18,29 @@ from ..services.reverse_prompt import (
 
 
 class ReversePromptParserTests(unittest.TestCase):
+    def test_semantic_redraw_request_encodes_delta_and_mode_contract(self) -> None:
+        result = ReversePromptResult(
+            positive_tags="1girl, school uniform, standing, classroom",
+            composition="full body, eye level",
+            scene_description_zh="白天教室",
+            characters=(ReverseCharacter("sample heroine", "sample work", 0.91),),
+            uncertain_terms=("artist identity",),
+        )
+
+        request = result.semantic_redraw_request(
+            "只把校服换成红色晚礼服，其他保持不变",
+            "preserve",
+        )
+
+        self.assertIn("无蒙版整图语义重绘", request)
+        self.assertIn("保守模式", request)
+        self.assertIn("明确替换的旧内容必须从正面提示词删除", request)
+        self.assertIn("school uniform", request)
+        self.assertIn("红色晚礼服", request)
+        self.assertIn("不得输出 edit", request)
+        self.assertIn("不得自动套用默认风格001", request)
+        self.assertIn("待确认项（不得当成事实）", request)
+
     def test_think_content_is_ignored_and_json_is_normalized(self) -> None:
         result = parse_reverse_prompt(
             """<think>private analysis</think>

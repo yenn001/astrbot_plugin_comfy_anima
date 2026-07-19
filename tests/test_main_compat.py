@@ -11,7 +11,10 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from PIL import Image
+
 from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
+from ..services.reverse_prompt import ReversePromptResult
 
 
 class _DecoratorGroup:
@@ -124,18 +127,35 @@ class MainCompatibilityTests(unittest.TestCase):
 
     def test_image_operation_intent_routing_understands_colloquial_requests(self) -> None:
         inpaint = self.main.ComfyAnimaPlugin._looks_like_inpaint_request
+        semantic = self.main.ComfyAnimaPlugin._looks_like_semantic_redraw_request
+        semantic_mode = self.main.ComfyAnimaPlugin._extract_semantic_redraw_mode_request
         mode = self.main.ComfyAnimaPlugin._extract_inpaint_mode_request
         standalone = self.main.ComfyAnimaPlugin._looks_like_standalone_upscale_request
 
         for message in (
-            "把这张图里的衣服换成红裙",
-            "请修一下图中的手",
+            "把遮罩区域的衣服换成红裙",
+            "请局部修复透明区域里的手",
             "这里重画成一束白色百合",
             "把那块区域擦掉",
         ):
             with self.subTest(message=message):
                 self.assertTrue(inpaint(message))
         self.assertFalse(inpaint("帮我画她穿一条红裙"))
+        for message in (
+            "把这张图里的衣服换成红裙",
+            "换个背景",
+            "参考原图重新画一张",
+            "整张图改成雨夜版本",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(semantic(message))
+        self.assertFalse(semantic("把遮罩区域的衣服换成红裙"))
+        self.assertEqual(semantic_mode("只换衣服，其他保持不变"), "preserve")
+        self.assertEqual(semantic_mode("参考原图重新画一张"), "free")
+        self.assertEqual(
+            semantic_mode("重新画一张，但保留角色和构图"),
+            "balanced",
+        )
         self.assertEqual(mode("精细修复图中的手指"), "lanpaint")
         self.assertEqual(mode("快速改一下这块小范围区域"), "quick")
 
@@ -212,8 +232,9 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "base - Anima 原图",
             "rtx - Anima 原图 + RTX 高清放大",
             "iterative - Anima 原图 + 迭代采样放大",
-            "3 个独立工具能力",
+            "4 个独立图片操作",
             "/放大 [倍率]",
+            "/改图 <要求> --mode preserve|balanced|free",
             "/重绘 <要求> --mode quick",
             "/重绘 <要求> --mode lanpaint",
             "--pipeline base|rtx|iterative",
@@ -223,7 +244,7 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, help_text)
 
-    async def test_comfy_help_separates_three_generation_and_three_tool_capabilities(self) -> None:
+    async def test_comfy_help_separates_generation_and_image_operations(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         results = [item async for item in plugin.cmd_comfy_help(self._event())]
 
@@ -234,8 +255,9 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "1. base - 只生成 Anima 原图，不放大",
             "2. rtx - Anima 原图生成后执行 RTX 高清放大",
             "3. iterative - Anima 原图生成后执行迭代采样放大",
-            "3 个独立工具能力（不属于生图管线切换）",
+            "4 个独立图片操作（不属于生图管线切换）",
             "/放大 [倍率]",
+            "--mode preserve|balanced|free",
             "--mode quick",
             "--mode lanpaint",
             "--no-character-lora / --no-lora",
@@ -463,7 +485,7 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin._handle_inpaint = handle
 
         class Event:
-            message_str = "精细修复这张图里的手指"
+            message_str = "精细修复遮罩区域里的手指"
 
             def __init__(self):
                 self.stopped = False
@@ -479,6 +501,163 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StopAsyncIteration):
             await anext(generator)
         self.assertTrue(event.stopped)
+
+    async def test_natural_semantic_redraw_routes_one_image_without_mask(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                return True
+
+        plugin._image_input = ImageInput()
+        plugin._prepare_semantic_redraw_options = lambda _text: self.main.GenerationOptions(
+            prompt="把衣服换成红裙",
+            semantic_redraw_mode="preserve",
+        )
+
+        async def handle(_event, options):
+            self.assertEqual(options.semantic_redraw_mode, "preserve")
+            yield "REDRAW_PROGRESS"
+            yield "REDRAW_IMAGE"
+
+        plugin._handle_semantic_redraw = handle
+
+        class Event:
+            message_str = "把这张图里的衣服换成红裙，其他保持不变"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+        event = Event()
+        generator = plugin.natural_language_semantic_redraw(event)
+        self.assertEqual(await anext(generator), "REDRAW_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "REDRAW_IMAGE")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_semantic_redraw_preserves_source_ratio_and_applies_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            output = Path(directory) / "output.png"
+            Image.new("RGB", (1200, 600), "white").save(source)
+            Image.new("RGB", (512, 512), "white").save(output)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                max_prompt_length=2000,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._director = object()
+            plugin._initialization_error = None
+            plugin._director_error = None
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._access_error = lambda *_args, **_kwargs: None
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda _job, _phase, _message, code, **_kwargs: phases.append(code)
+            )
+            captured = {}
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return source
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*args, **_kwargs):
+                    captured["reverse_focus"] = args[3]
+                    return (
+                        ReversePromptResult(
+                            positive_tags=(
+                                "1girl, school uniform, standing, classroom"
+                            ),
+                            negative_tags="text, watermark",
+                        ),
+                        "vision-provider",
+                    )
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+
+            async def direct(_event, request):
+                captured["director_request"] = request
+                return (
+                    self.main.PictureInstruction(
+                        "1girl, red evening dress, standing, classroom",
+                        "school uniform",
+                        "base",
+                    ),
+                    "director-provider",
+                )
+
+            plugin._generate_directed_instruction = direct
+
+            async def execute(_job, options, _event):
+                captured["options"] = options
+                paths = GeneratedImagePaths()
+                paths.append(output)
+                paths.elapsed_seconds = 1.25
+                paths.gpu_name = "Test GPU"
+                return paths, 42, options.prompt, "", None
+
+            plugin._execute_job = execute
+
+            async def run_auxiliary(_event, label, operation):
+                self.assertEqual(label, "semantic redraw")
+                return await operation(
+                    self.main.GenerationJob("tester", label, time.monotonic())
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+            plugin._schedule_cleanup = lambda _paths: None
+
+            class Event:
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+                @staticmethod
+                def chain_result(components):
+                    return components
+
+            replies = [
+                item
+                async for item in plugin._handle_semantic_redraw(
+                    Event(),
+                    self.main.GenerationOptions(
+                        prompt="只把衣服换成红色晚礼服，其他保持不变",
+                        semantic_redraw_mode="preserve",
+                        use_prompt_llm=False,
+                    ),
+                )
+            ]
+
+        effective = captured["options"]
+        self.assertEqual(effective.width % 64, 0)
+        self.assertEqual(effective.height % 64, 0)
+        self.assertAlmostEqual(effective.width / effective.height, 2.0, delta=0.15)
+        self.assertEqual(effective.pipeline, "base")
+        self.assertTrue(effective.suppress_default_style)
+        self.assertIn("text, watermark", effective.negative_prompt)
+        self.assertIn("school uniform", effective.negative_prompt)
+        self.assertIn("source image exactly as shown", captured["reverse_focus"])
+        self.assertNotIn("红色晚礼服", captured["reverse_focus"])
+        self.assertIn("无蒙版整图语义重绘", captured["director_request"])
+        self.assertIn("明确替换的旧内容必须从正面提示词删除", captured["director_request"])
+        self.assertIn("不得自动套用默认风格001", captured["director_request"])
+        self.assertIn("semantic_redraw_output_ready", phases)
+        self.assertEqual(len(replies), 2)
 
 
 class AuxiliaryImageTaskFailureTests(unittest.IsolatedAsyncioTestCase):
@@ -1764,7 +1943,7 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [item["capability_id"] for item in result["tool_items"]],
-            ["standalone_rtx", "quick", "lanpaint"],
+            ["standalone_rtx", "semantic_redraw", "quick", "lanpaint"],
         )
         self.assertTrue(all(item["selectable"] for item in result["generation_items"]))
         self.assertTrue(all(not item["selectable"] for item in result["tool_items"]))
@@ -1772,6 +1951,7 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
             [item["command"] for item in result["tool_items"]],
             [
                 "/放大",
+                "/改图 <要求> --mode preserve|balanced|free",
                 "/重绘 <要求> --mode quick",
                 "/重绘 <要求> --mode lanpaint",
             ],

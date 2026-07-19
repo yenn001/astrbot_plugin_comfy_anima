@@ -402,6 +402,20 @@ class CommandParserTests(unittest.TestCase):
         self.assertEqual(result.inpaint_mode, "lanpaint")
         self.assertEqual(result.denoise, 0.42)
 
+    def test_semantic_redraw_mode_uses_separate_parser_context(self) -> None:
+        result = parse_generation_options(
+            "把衣服换成红裙 --mode preserve --pipeline base",
+            mode_context="semantic_redraw",
+        )
+        self.assertEqual(result.semantic_redraw_mode, "preserve")
+        self.assertEqual(result.inpaint_mode, "")
+        self.assertEqual(result.pipeline, "base")
+        with self.assertRaisesRegex(ValueError, "preserve"):
+            parse_generation_options(
+                "重新画一张 --mode quick",
+                mode_context="semantic_redraw",
+            )
+
 
 class DedicatedPipelineWorkflowTests(unittest.TestCase):
     @classmethod

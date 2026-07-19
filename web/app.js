@@ -136,6 +136,7 @@ const taskTypeLabels = {
   asset_delete: "资产删除",
   reverse_prompt: "图片反推",
   reverse_draw: "反推画图",
+  semantic_redraw: "整图语义重绘",
   rtx_upscale: "RTX 放大",
   inpaint: "遮罩局部重绘",
 };
@@ -741,6 +742,11 @@ function renderWorkflowTools() {
       command: "/放大",
       summary: "放大用户提供的图片，不经过 Anima 生图。",
     },
+    semantic_redraw: {
+      title: "无蒙版整图改图",
+      command: "/改图 <要求> --mode preserve|balanced|free",
+      summary: "先反推原图并应用语义修改，再通过当前 Anima 管线重新生成整张图。",
+    },
     quick: {
       title: "Quick Inpaint",
       command: "/重绘 <要求> --mode quick",
@@ -801,7 +807,7 @@ function renderWorkflowTools() {
   if (!toolWorkflowItems.length) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
-    empty.textContent = "未发现 RTX 独立放大、Quick Inpaint 或 LanPaint 专用工作流。";
+    empty.textContent = "未发现整图改图、RTX 独立放大、Quick Inpaint 或 LanPaint 能力。";
     host.append(empty);
   }
 }

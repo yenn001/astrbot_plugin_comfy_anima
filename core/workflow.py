@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.2.0
+AstrBot Comfy Anima 插件 v1.2.1
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.2.0
+版本: 1.2.1
 日期: 2026-07-19
 """
 
@@ -490,12 +490,17 @@ class InpaintWorkflowBuilder:
         return workflow, seed, list(variant.preferred_node_ids)
 
 
-def parse_generation_options(command_text: str) -> GenerationOptions:
+def parse_generation_options(
+    command_text: str,
+    *,
+    mode_context: str = "inpaint",
+) -> GenerationOptions:
     """解析 `/anima draw` 后的提示词和选项。
 
     支持 `--negative`、`--seed`、`--size`、`--steps`、`--cfg`、
     `--pipeline`、`--denoise`、`--upscale`、`--no-upscale`、`--llm`、
-    `--raw`、`--preset` 与重绘使用的 `--mode`。
+    `--raw`、`--preset` 与重绘使用的 `--mode`。`mode_context` 为
+    ``semantic_redraw`` 时，`--mode` 改为解析 preserve/balanced/free。
     含空格的负面词需要使用引号。
     """
     try:
@@ -515,6 +520,7 @@ def parse_generation_options(command_text: str) -> GenerationOptions:
     lora_preset = ""
     pipeline = ""
     inpaint_mode = ""
+    semantic_redraw_mode = ""
     denoise = None
     index = 0
 
@@ -588,17 +594,36 @@ def parse_generation_options(command_text: str) -> GenerationOptions:
                 raise ValueError("--denoise 必须在 0 到 1 之间")
         elif token == "--mode":
             raw_mode = require_value(token).strip().casefold()
-            aliases = {
-                "quick": "quick",
-                "快速": "quick",
-                "局部": "quick",
-                "lanpaint": "lanpaint",
-                "精细": "lanpaint",
-                "多轮": "lanpaint",
-            }
-            inpaint_mode = aliases.get(raw_mode, "")
-            if not inpaint_mode:
-                raise ValueError("--mode 仅支持 quick 或 lanpaint")
+            if mode_context == "semantic_redraw":
+                aliases = {
+                    "preserve": "preserve",
+                    "保守": "preserve",
+                    "保持": "preserve",
+                    "balanced": "balanced",
+                    "balance": "balanced",
+                    "平衡": "balanced",
+                    "默认": "balanced",
+                    "free": "free",
+                    "自由": "free",
+                    "重画": "free",
+                }
+                semantic_redraw_mode = aliases.get(raw_mode, "")
+                if not semantic_redraw_mode:
+                    raise ValueError(
+                        "--mode 仅支持 preserve、balanced 或 free"
+                    )
+            else:
+                aliases = {
+                    "quick": "quick",
+                    "快速": "quick",
+                    "局部": "quick",
+                    "lanpaint": "lanpaint",
+                    "精细": "lanpaint",
+                    "多轮": "lanpaint",
+                }
+                inpaint_mode = aliases.get(raw_mode, "")
+                if not inpaint_mode:
+                    raise ValueError("--mode 仅支持 quick 或 lanpaint")
         elif token == "--upscale":
             enable_upscale = True
         elif token == "--no-upscale":
@@ -631,5 +656,6 @@ def parse_generation_options(command_text: str) -> GenerationOptions:
         lora_preset=lora_preset,
         pipeline=pipeline,
         inpaint_mode=inpaint_mode,
+        semantic_redraw_mode=semantic_redraw_mode,
         denoise=denoise,
     )

@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.2.0
+AstrBot Comfy Anima 插件 v1.2.1
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.2.0
+版本: 1.2.1
 日期: 2026-07-19
 """
 
@@ -661,6 +661,7 @@ class GenerationOptions:
     character_swap_forbid_character_loras: bool = False
     pipeline: str = ""
     inpaint_mode: str = ""
+    semantic_redraw_mode: str = ""
     denoise: Optional[float] = None
 
 
