@@ -112,6 +112,22 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertEqual(request.target_query, "卡莲")
         self.assertIsNone(parse_natural_character_swap("帮我画一个卡莲"))
         self.assertIsNone(parse_natural_character_swap("把画面背景换成夜晚"))
+        self.assertIsNone(parse_natural_character_swap("把泳装换成三点式"))
+        self.assertIsNone(
+            parse_natural_character_swap("把角色泳装换成三点式，加一条白丝大腿袜")
+        )
+
+    def test_natural_character_and_outfit_edit_are_kept_separate(self) -> None:
+        request = parse_natural_character_swap(
+            "把达妮娅换成米浴并穿红色礼服，构图和背景保持不变"
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.source_query, "达妮娅")
+        self.assertEqual(request.target_query, "米浴")
+        self.assertIn("穿红色礼服", request.edit_requirement)
+        self.assertIn("构图和背景保持不变", request.edit_requirement)
 
     def test_no_character_lora_is_parsed_from_command_and_natural_language(self) -> None:
         command = parse_character_swap_request(

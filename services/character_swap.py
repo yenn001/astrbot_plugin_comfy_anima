@@ -155,6 +155,22 @@ _NON_CHARACTER_REQUEST_MARKERS = (
     "颜色",
     "风格",
     "画风",
+    "泳装",
+    "比基尼",
+    "三点式",
+    "内衣",
+    "丝袜",
+    "白丝",
+    "黑丝",
+    "袜",
+    "礼服",
+    "制服",
+    "裙",
+    "外套",
+    "上衣",
+    "裤",
+    "鞋",
+    "配饰",
 )
 _GENERIC_SOURCE_QUERY_KEYS = frozenset(
     {
@@ -218,6 +234,7 @@ class CharacterSwapRequest:
     negative_prompt: str = ""
     preview: bool = False
     use_target_lora: bool = True
+    edit_requirement: str = ""
 
     @property
     def source_kind(self) -> str:
@@ -1624,9 +1641,15 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     ).strip(" \"'，,")
     if _is_generic_source_query(source_query):
         source_query = ""
-    target_text, target_no_lora = _strip_no_character_lora_suffix(
-        match.group("target")
+    target_text, target_no_lora = _strip_no_character_lora_suffix(match.group("target"))
+    embedded_edit = ""
+    edit_split = re.split(
+        r"(?=(?:并|且|同时)(?:让|改|换|穿|戴|加|去掉|移除|保持|保留))",
+        target_text,
+        maxsplit=1,
     )
+    if len(edit_split) == 2:
+        target_text, embedded_edit = edit_split
     target_query = re.split(
         r"\s*(?:并|且|同时|衣服|服装|姿势|动作|表情|构图|背景|光线|保持|分辨率|尺寸|画布)\b",
         target_text.strip(),
@@ -1634,10 +1657,21 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     )[0].strip(" \"'，,")
     if not target_query:
         return None
-    if source_query and any(
-        marker in source_query for marker in _NON_CHARACTER_REQUEST_MARKERS
+    if any(marker in source_query for marker in _NON_CHARACTER_REQUEST_MARKERS):
+        return None
+    if _is_generic_source_query(target_query) or any(
+        marker in target_query for marker in _NON_CHARACTER_REQUEST_MARKERS
     ):
         return None
+    trailing_edit = source[match.end() :].strip(" \t，,。；;")
+    edit_requirement = "，".join(
+        part.strip(" \t，,。；;")
+        for part in (embedded_edit, trailing_edit)
+        if part.strip(" \t，,。；;")
+    )
+    edit_requirement = _NO_CHARACTER_LORA_RE.sub("", edit_requirement).strip(
+        " \t，,。；;"
+    )
     mode = (
         SWAP_MODE_TARGET_OUTFIT
         if re.search(r"(?:用|换成|采用).{0,8}(?:默认|原版|角色).{0,4}(?:衣服|服装|造型)", source)
@@ -1651,6 +1685,7 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
         target_query=target_query,
         mode=mode,
         use_target_lora=use_target_lora,
+        edit_requirement=edit_requirement,
     )
 
 
@@ -1686,6 +1721,11 @@ def response_text(response: Any) -> str:
             value = response.get(key)
             if isinstance(value, str):
                 return value
+        if "identity_tags" in response and "confidence" in response:
+            try:
+                return json.dumps(response, ensure_ascii=False)
+            except (TypeError, ValueError, RecursionError):
+                return ""
     for attribute in ("completion_text", "text", "content"):
         value = getattr(response, attribute, None)
         if isinstance(value, str):

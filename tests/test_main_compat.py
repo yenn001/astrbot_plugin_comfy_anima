@@ -541,6 +541,63 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await anext(generator)
         self.assertTrue(event.stopped)
 
+    async def test_redraw_command_without_mask_language_routes_semantic_redraw(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._looks_like_inpaint_request = lambda _text: False
+        plugin._prepare_semantic_redraw_options = lambda text: self.main.GenerationOptions(
+            prompt=text,
+            semantic_redraw_mode="preserve",
+        )
+        plugin._extract_command_text = lambda *_args, **_kwargs: (
+            "把角色泳装换成三点式，加一条白丝大腿袜，构图不变"
+        )
+
+        async def semantic(_event, options):
+            self.assertIn("泳装", options.prompt)
+            yield "SEMANTIC_REDRAW"
+
+        async def swap(_event, _request):
+            yield "WRONG_SWAP"
+
+        plugin._handle_semantic_redraw = semantic
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/重绘 把角色泳装换成三点式，加一条白丝大腿袜，构图不变"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_inpaint(Event())]
+        self.assertEqual(replies, ["SEMANTIC_REDRAW"])
+
+    async def test_redraw_command_combines_character_and_outfit_change(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._looks_like_inpaint_request = lambda _text: False
+        plugin._extract_command_text = lambda *_args, **_kwargs: (
+            "把达妮娅换成米浴并穿红色礼服，构图不变"
+        )
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        async def swap(_event, request):
+            self.assertEqual(request.target_query, "米浴")
+            self.assertIn("红色礼服", request.edit_requirement)
+            yield "COMBINED_SWAP"
+
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/重绘 把达妮娅换成米浴并穿红色礼服，构图不变"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_inpaint(Event())]
+        self.assertEqual(replies, ["COMBINED_SWAP"])
+
     async def test_semantic_redraw_preserves_source_ratio_and_applies_delta(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.png"
@@ -1878,6 +1935,59 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
             json.loads(calls[0]["prompt"]),
             {"target_character": "赛马娘的米浴"},
         )
+
+    async def test_formatter_accepts_think_extra_fields_and_numeric_strings(self) -> None:
+        plugin, _calls = self._plugin(
+            '<think>private reasoning</think>Answer:\n```json\n'
+            '{"identity_tags":"rice_shower_(umamusume), brown hair",'
+            '"confidence":"0.85","reason":"bounded"}\n```'
+        )
+        event = object()
+
+        tags, provider = await plugin._generate_semantic_target_tags(
+            event,
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags, ("rice_shower_(umamusume)", "brown hair"))
+        self.assertNotIn(id(event), plugin._internal_llm_events)
+
+    async def test_internal_llm_event_guard_is_active_during_provider_call(self) -> None:
+        seen = []
+
+        class Context:
+            async def llm_generate(inner_self, **_kwargs):
+                seen.append(id(event) in plugin._internal_llm_events)
+                return types.SimpleNamespace(
+                    completion_text=(
+                        '{"identity_tags":["rice_shower_(umamusume)"],'
+                        '"confidence":0.95}'
+                    )
+                )
+
+        class Director:
+            @staticmethod
+            async def resolve_provider_id(_context, _event):
+                return "semantic-provider"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = Context()
+        plugin._director = Director()
+        plugin.settings = types.SimpleNamespace(character_swap_timeout=5)
+        plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+        plugin._internal_llm_events = set()
+        event = object()
+
+        await plugin._generate_semantic_target_tags(
+            event,
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(seen, [True])
+        self.assertNotIn(id(event), plugin._internal_llm_events)
 
     async def test_invalid_json_confidence_and_control_tags_fail_closed(self) -> None:
         invalid_responses = (

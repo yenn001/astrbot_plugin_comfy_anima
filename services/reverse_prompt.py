@@ -661,6 +661,16 @@ def _json_object(
     return payload
 
 
+def parse_json_object_with_strategy(
+    text: str,
+    *,
+    enable_formatter: bool = True,
+) -> tuple[Mapping[str, Any], str]:
+    """Parse one bounded JSON object using the shared safe formatter."""
+
+    return _json_object_with_strategy(text, enable_formatter=enable_formatter)
+
+
 def _parse_reverse_prompt_with_strategy(
     text: str,
     *,
@@ -1189,5 +1199,6 @@ __all__ = [
     "ReversePromptError",
     "ReversePromptResult",
     "ReversePromptService",
+    "parse_json_object_with_strategy",
     "parse_reverse_prompt",
 ]
