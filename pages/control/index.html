@@ -167,7 +167,11 @@
                 <label><span>用户冷却（秒）</span><input name="user_cooldown" type="number" min="0"></label>
                 <label><span>RTX 放大倍率</span><input name="rtx_scale" type="number" min="1" max="4" step="0.1"></label>
                 <label><span>RTX 质量</span><select name="rtx_quality"><option value="ULTRA">ULTRA</option><option value="HIGH">HIGH</option><option value="MEDIUM">MEDIUM</option><option value="LOW">LOW</option></select></label>
-                <label class="toggle"><input name="enable_upscale" type="checkbox"><span>启用最终放大</span></label>
+                <label><span>默认生成管线</span><select name="default_generation_pipeline"><option value="base">Anima 原图</option><option value="rtx">Anima + RTX 放大</option><option value="iterative">Anima + 迭代放大</option></select></label>
+                <label><span>迭代目标倍率</span><input name="iterative_scale" type="number" min="1.1" max="2" step="0.1"></label>
+                <label><span>迭代轮数</span><input name="iterative_steps" type="number" min="1" max="4" step="1"></label>
+                <label><span>迭代重绘强度</span><input name="iterative_denoise" type="number" min="0.1" max="0.8" step="0.05"></label>
+                <label class="toggle"><input name="enable_inpaint" type="checkbox"><span>启用 Quick / LanPaint 遮罩重绘</span></label>
                 <label class="toggle"><input name="send_generation_notice" type="checkbox"><span>发送生成进度提示</span></label>
               </div>
               <section class="workflow-sampler-station" aria-labelledby="workflow-sampler-title">
@@ -180,17 +184,34 @@
                 </div>
                 <div class="workflow-selector-row">
                   <label for="workflow-select">
-                    <span>当前生图工作流</span>
+                    <span>生图管线（3 选 1）</span>
                     <select id="workflow-select" aria-describedby="workflow-select-status">
                       <option value="">正在扫描工作流目录…</option>
                     </select>
                   </label>
                   <div class="button-row compact-actions">
                     <button id="workflow-refresh" class="secondary" type="button">刷新清单</button>
+                    <button id="workflow-check" class="secondary" type="button">检查六管线依赖</button>
                     <button id="workflow-activate" class="primary" type="button">热切换</button>
                   </div>
                 </div>
                 <p id="workflow-select-status" class="muted live-line" role="status"></p>
+                <section class="workflow-tool-station" aria-labelledby="workflow-tool-title">
+                  <div class="workflow-tool-head">
+                    <div>
+                      <p class="eyebrow">IMAGE TOOLS</p>
+                      <h4 id="workflow-tool-title">独立工具能力</h4>
+                    </div>
+                    <span class="ticket-tag">不可切换为普通生图</span>
+                  </div>
+                  <p class="muted">以下能力读取各自专用工作流，只能通过对应图片指令调用，不会进入上方生图管线选择。</p>
+                  <div id="workflow-tool-list" class="workflow-tool-list" aria-live="polite">
+                    <p class="empty-state">正在读取独立 RTX、Quick Inpaint 与 LanPaint 能力……</p>
+                  </div>
+                </section>
+                <div id="pipeline-health-list" class="workflow-sampler-list" aria-live="polite">
+                  <p class="empty-state">点击“检查六管线依赖”读取 ComfyUI 实时节点与模型状态。</p>
+                </div>
                 <div class="workflow-profile-strip">
                   <div><span>配置档案</span><strong id="workflow-profile-name">—</strong></div>
                   <div><span>工作流文件</span><code id="workflow-profile-file">—</code></div>
@@ -227,6 +248,7 @@
                 </div>
                 <label><span>Temperature</span><input name="prompt_llm_temperature" type="number" min="0" max="2" step="0.05"></label>
                 <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
+                <label><span>换角分类总超时（秒）</span><input name="character_swap_timeout" type="number" min="30" max="600" step="1"></label>
                 <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
                 <label class="toggle"><input name="enable_natural_draw" type="checkbox"><span>启用自然语言绘图</span></label>
                 <label class="toggle"><input name="enable_llm_pic_trigger" type="checkbox"><span>解析 &lt;pic prompt&gt;</span></label>
@@ -521,7 +543,7 @@
               <button id="task-refresh" class="secondary inverse" type="button">刷新任务</button>
             </div>
             <div class="task-toolbar">
-              <label><span>任务类型</span><select id="task-type-filter"><option value="">全部类型</option><option value="lora_semantic_analysis">LoRA 语义建档</option><option value="lora_archive">旧版 LoRA 建档</option><option value="lora_metadata">LoRA 元数据</option><option value="lora_download">LoRA 下载</option><option value="asset_delete">资产删除</option><option value="reverse_prompt">图片反推</option><option value="reverse_draw">反推画图</option><option value="rtx_upscale">RTX 放大</option></select></label>
+              <label><span>任务类型</span><select id="task-type-filter"><option value="">全部类型</option><option value="lora_semantic_analysis">LoRA 语义建档</option><option value="lora_archive">旧版 LoRA 建档</option><option value="lora_metadata">LoRA 元数据</option><option value="lora_download">LoRA 下载</option><option value="asset_delete">资产删除</option><option value="reverse_prompt">图片反推</option><option value="reverse_draw">反推画图</option><option value="rtx_upscale">RTX 放大</option><option value="inpaint">局部重绘</option></select></label>
               <label><span>运行状态</span><select id="task-status-filter"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="succeeded">成功</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="timed_out">超时</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option></select></label>
               <p id="task-list-status" class="task-list-status" role="status">等待读取持久任务记录…</p>
             </div>

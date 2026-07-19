@@ -5,6 +5,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from dataclasses import replace
@@ -121,6 +122,48 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertTrue(detector("生成一张赛博朋克城市图片"))
         self.assertFalse(detector("帮我写一个 Python 列表"))
 
+    def test_image_operation_intent_routing_understands_colloquial_requests(self) -> None:
+        inpaint = self.main.ComfyAnimaPlugin._looks_like_inpaint_request
+        mode = self.main.ComfyAnimaPlugin._extract_inpaint_mode_request
+        standalone = self.main.ComfyAnimaPlugin._looks_like_standalone_upscale_request
+
+        for message in (
+            "把这张图里的衣服换成红裙",
+            "请修一下图中的手",
+            "这里重画成一束白色百合",
+            "把那块区域擦掉",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(inpaint(message))
+        self.assertFalse(inpaint("帮我画她穿一条红裙"))
+        self.assertEqual(mode("精细修复图中的手指"), "lanpaint")
+        self.assertEqual(mode("快速改一下这块小范围区域"), "quick")
+
+        self.assertTrue(standalone("把这张图放大到2倍"))
+        self.assertTrue(standalone("高清化一下", has_image=True))
+        self.assertFalse(
+            standalone("参考这张图画一张并用 RTX 放大", has_image=True)
+        )
+
+    def test_generation_pipeline_intent_handles_colloquial_variants(self) -> None:
+        extract = self.main.ComfyAnimaPlugin._extract_pipeline_request
+
+        self.assertEqual(extract("只出 Anima 底图，不要放大"), "base")
+        self.assertEqual(extract("用 RTX 画一张高清大图"), "rtx")
+        self.assertEqual(extract("使用迭代二次采样放大"), "iterative")
+        self.assertEqual(extract("不要 RTX，用迭代放大"), "iterative")
+        with self.assertRaisesRegex(ValueError, "多个互斥管线"):
+            extract("只出底图，但同时还要 RTX 放大")
+
+    def test_natural_rtx_scale_parser_is_bounded(self) -> None:
+        extract = self.main.ComfyAnimaPlugin._extract_rtx_scale_request
+
+        self.assertEqual(extract("把这张图放大到2.5倍"), 2.5)
+        self.assertEqual(extract("进行 3x 高清化"), 3.0)
+        self.assertEqual(extract("把图片高清化", default=1.75), 1.75)
+        with self.assertRaisesRegex(ValueError, "1 到 4"):
+            extract("把这张图放大到5倍")
+
     def test_chinese_command_keeps_multiword_tags(self) -> None:
         extractor = self.main.ComfyAnimaPlugin._extract_command_text
         self.assertEqual(
@@ -144,6 +187,61 @@ class MainCompatibilityTests(unittest.TestCase):
 
         self.assertIsNotNone(plugin._access_error(Event(False), "cat"))
         self.assertIsNone(plugin._access_error(Event(True), "cat"))
+
+
+class HelpTextTests(unittest.IsolatedAsyncioTestCase):
+    """聊天帮助应准确区分生图管线、独立工具与换角降级。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _event():
+        return types.SimpleNamespace(plain_result=lambda text: text)
+
+    async def test_anima_help_documents_v12_pipelines_tools_and_swap_flags(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        results = [item async for item in plugin.cmd_help(self._event())]
+
+        self.assertEqual(len(results), 1)
+        help_text = results[0]
+        for expected in (
+            "3 个可选生图管线",
+            "base - Anima 原图",
+            "rtx - Anima 原图 + RTX 高清放大",
+            "iterative - Anima 原图 + 迭代采样放大",
+            "3 个独立工具能力",
+            "/放大 [倍率]",
+            "/重绘 <要求> --mode quick",
+            "/重绘 <要求> --mode lanpaint",
+            "--pipeline base|rtx|iterative",
+            "--no-character-lora / --no-lora",
+            "目标角色 LoRA 完全未命中时会自动改用纯语义 Tags",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, help_text)
+
+    async def test_comfy_help_separates_three_generation_and_three_tool_capabilities(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        results = [item async for item in plugin.cmd_comfy_help(self._event())]
+
+        self.assertEqual(len(results), 1)
+        help_text = results[0]
+        for expected in (
+            "3 个可选生图管线（先由 Anima 生成）",
+            "1. base - 只生成 Anima 原图，不放大",
+            "2. rtx - Anima 原图生成后执行 RTX 高清放大",
+            "3. iterative - Anima 原图生成后执行迭代采样放大",
+            "3 个独立工具能力（不属于生图管线切换）",
+            "/放大 [倍率]",
+            "--mode quick",
+            "--mode lanpaint",
+            "--no-character-lora / --no-lora",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, help_text)
 
 
 class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -278,6 +376,106 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.stopped)
         self.assertEqual(await anext(generator), "SWAP_IMAGE")
         self.assertFalse(event.stopped)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_reverse_draw_command_routes_exact_no_lora_swap_phrase(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+
+        async def handle(_event, request):
+            captured.append(request)
+            yield "SWAP_PROGRESS"
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = handle
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        class Event:
+            message_str = (
+                "/反推画图 把角色换成赛马娘的米浴，无需使用角色lora"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(replies, ["SWAP_PROGRESS", "SWAP_IMAGE"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].source_query, "")
+        self.assertEqual(captured[0].target_query, "赛马娘的米浴")
+        self.assertFalse(captured[0].use_target_lora)
+
+    async def test_natural_upscale_routes_existing_image_without_llm(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(rtx_scale=2.0)
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                return True
+
+        async def handle(_event, scale):
+            self.assertEqual(scale, 2.5)
+            yield "UPSCALE_PROGRESS"
+            yield "UPSCALE_IMAGE"
+
+        plugin._image_input = ImageInput()
+        plugin._handle_rtx_upscale = handle
+
+        class Event:
+            message_str = "把这张图放大到2.5倍"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_rtx_upscale(event)
+        self.assertEqual(await anext(generator), "UPSCALE_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "UPSCALE_IMAGE")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_natural_inpaint_routes_colloquial_region_edit(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_inpaint=True)
+        plugin._find_requested_style_preset = lambda _text: "风格001"
+
+        async def handle(_event, options):
+            self.assertEqual(options.inpaint_mode, "lanpaint")
+            self.assertEqual(options.lora_preset, "风格001")
+            yield "INPAINT_PROGRESS"
+            yield "INPAINT_IMAGE"
+
+        plugin._handle_inpaint = handle
+
+        class Event:
+            message_str = "精细修复这张图里的手指"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+        event = Event()
+        generator = plugin.natural_language_inpaint(event)
+        self.assertEqual(await anext(generator), "INPAINT_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "INPAINT_IMAGE")
         with self.assertRaises(StopAsyncIteration):
             await anext(generator)
         self.assertTrue(event.stopped)
@@ -1251,6 +1449,7 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
             selections=(LoraSelection("styles/base", 0.5),),
         )
         plugin._temp_dir = Path(tempfile.mkdtemp())
+        plugin._access_error = lambda _event, _text: None
         job = self.main.GenerationJob("u", "preview", 0.0)
         options = self.main.GenerationOptions(
             prompt=(
@@ -1267,7 +1466,9 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
             object(),
         )
 
-        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+        # One refresh prepares the exact LoRA plan; a second refresh immediately
+        # before submission catches deletion, rename or metadata replacement.
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
         self.assertEqual(seed, 123)
         self.assertEqual(job.state, "completed")
         self.assertEqual(len(paths), 1)
@@ -1379,6 +1580,151 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.failed_stage, "directing")
 
 
+class CharacterSwapClassifierTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """The configured swap timeout is one total retry budget."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_timeout_retry_stays_inside_total_budget(self) -> None:
+        calls = 0
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                nonlocal calls
+                calls += 1
+                await asyncio.sleep(5)
+                return types.SimpleNamespace(completion_text="{}")
+
+        class Director:
+            @staticmethod
+            async def resolve_provider_id(_context, _event):
+                return "swap-provider"
+
+        class Planner:
+            @staticmethod
+            def classification_prompts(_preparation):
+                return "system", "user"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = Context()
+        plugin.settings = types.SimpleNamespace(
+            character_swap_timeout=1,
+            prompt_llm_max_tokens=1200,
+        )
+        plugin._director = Director()
+        plugin._internal_llm_events = set()
+        phases = []
+        plugin._record_image_task_phase = (
+            lambda _job, _stage, _message, code, **kwargs: phases.append(
+                (code, kwargs.get("details", {}))
+            )
+        )
+        job = self.main.GenerationJob("u", "swap", 0.0)
+        preparation = types.SimpleNamespace(
+            tags=("1girl",),
+            target_trigger_words=("target",),
+        )
+
+        started = time.monotonic()
+        with self.assertRaises(self.main.CharacterSwapError) as captured:
+            await plugin._classify_character_swap(
+                object(),
+                job,
+                Planner(),
+                preparation,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(captured.exception.code, "swap_provider_timeout")
+        self.assertEqual(calls, 2)
+        self.assertLess(elapsed, 1.5)
+        timeout_events = [item for item in phases if item[0] == "character_swap_classifier_timeout"]
+        self.assertEqual(len(timeout_events), 2)
+        self.assertTrue(timeout_events[0][1]["will_retry"])
+        self.assertFalse(timeout_events[1][1]["will_retry"])
+
+
+class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
+    """Pure-Tags identity planning rejects malformed or control-bearing JSON."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def _plugin(self, response_text: str):
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(completion_text=response_text)
+
+        class Director:
+            @staticmethod
+            async def resolve_provider_id(_context, _event):
+                return "semantic-provider"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = Context()
+        plugin._director = Director()
+        plugin.settings = types.SimpleNamespace(character_swap_timeout=5)
+        plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+        return plugin, calls
+
+    async def test_valid_payload_uses_json_wrapped_target_data(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "identity_tags": [
+                        "rice_shower_(umamusume)",
+                        "brown hair",
+                    ],
+                    "confidence": 0.95,
+                }
+            )
+        )
+        tags, provider = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags[0], "rice_shower_(umamusume)")
+        self.assertEqual(
+            json.loads(calls[0]["prompt"]),
+            {"target_character": "赛马娘的米浴"},
+        )
+
+    async def test_invalid_json_confidence_and_control_tags_fail_closed(self) -> None:
+        invalid_responses = (
+            "[]",
+            '{"identity_tags":["hero"],"confidence":NaN}',
+            '{"identity_tags":["hero"],"confidence":Infinity}',
+            '{"identity_tags":["hero"],"confidence":1.2}',
+            '{"identity_tags":["BREAK"],"confidence":0.95}',
+            '{"identity_tags":["embedding:hero"],"confidence":0.95}',
+            '{"identity_tags":["__hero__"],"confidence":0.95}',
+        )
+        for response_text in invalid_responses:
+            with self.subTest(response_text=response_text):
+                plugin, _calls = self._plugin(response_text)
+                with self.assertRaises(self.main.CharacterSwapError) as raised:
+                    await plugin._generate_semantic_target_tags(
+                        object(),
+                        self.main.GenerationJob("u", "swap", 0.0),
+                        "Target",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "semantic_target_tags_invalid",
+                )
+
+
 class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
     """WebUI workflow selection must separate generation and RTX tools."""
 
@@ -1402,6 +1748,7 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin._active_workflow_name = "anima_api.json"
         plugin._active_jobs = {}
+        plugin._pipeline_builders = {}
         plugin._workflow_switch_lock = asyncio.Lock()
         plugin._initialization_error = None
         return plugin
@@ -1411,10 +1758,29 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
 
         result = await plugin.web_ui_list_workflows()
 
-        by_name = {item["filename"]: item for item in result["items"]}
-        self.assertTrue(by_name["anima_v2_api.json"]["selectable"])
         self.assertEqual(
-            by_name["anima_v2_api.json"]["task_type"],
+            [item["capability_id"] for item in result["generation_items"]],
+            ["base", "rtx", "iterative"],
+        )
+        self.assertEqual(
+            [item["capability_id"] for item in result["tool_items"]],
+            ["standalone_rtx", "quick", "lanpaint"],
+        )
+        self.assertTrue(all(item["selectable"] for item in result["generation_items"]))
+        self.assertTrue(all(not item["selectable"] for item in result["tool_items"]))
+        self.assertEqual(
+            [item["command"] for item in result["tool_items"]],
+            [
+                "/放大",
+                "/重绘 <要求> --mode quick",
+                "/重绘 <要求> --mode lanpaint",
+            ],
+        )
+        by_name = {item["filename"]: item for item in result["items"]}
+        self.assertTrue(by_name["anima_base_api.json"]["selectable"])
+        self.assertFalse(by_name["anima_v2_api.json"]["selectable"])
+        self.assertEqual(
+            by_name["anima_base_api.json"]["task_type"],
             "text_to_image",
         )
         self.assertFalse(by_name["rtx_upscale_api.json"]["selectable"])
@@ -1428,13 +1794,20 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         persisted = []
         plugin._persist_config_updates = lambda updates: persisted.append(updates) or True
 
-        result = await plugin.web_ui_select_workflow("anima_v2_api.json")
+        result = await plugin.web_ui_select_workflow("anima_iterative_api.json")
 
-        self.assertEqual(result["selected"], "anima_v2_api.json")
-        self.assertEqual(plugin._active_workflow_name, "anima_v2_api.json")
+        self.assertEqual(result["selected"], "anima_iterative_api.json")
+        self.assertEqual(plugin._active_workflow_name, "anima_iterative_api.json")
+        self.assertEqual(plugin.settings.default_generation_pipeline, "iterative")
         self.assertEqual(
             persisted,
-            [{"workflow_file": "workflow/anima_v2_api.json"}],
+            [
+                {
+                    "workflow_file": "workflow/anima_iterative_api.json",
+                    "default_generation_pipeline": "iterative",
+                    "enable_upscale": True,
+                }
+            ],
         )
 
     async def test_select_rejects_upscale_and_running_jobs(self) -> None:
@@ -1449,9 +1822,92 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         }
         try:
             with self.assertRaisesRegex(self.main.WebUiActionError, "任务运行中"):
-                await plugin.web_ui_select_workflow("anima_v2_api.json")
+                await plugin.web_ui_select_workflow("anima_base_api.json")
         finally:
             task.cancel()
+
+    async def test_six_pipeline_dependency_check_uses_live_object_info(self) -> None:
+        plugin = self._plugin()
+        filenames = (
+            "anima_base_api.json",
+            "anima_rtx_api.json",
+            "anima_iterative_api.json",
+            "rtx_upscale_api.json",
+            "anima_inpaint_crop_api.json",
+            "anima_lanpaint_api.json",
+        )
+        class_types = set()
+        for filename in filenames:
+            payload = json.loads(
+                (plugin.plugin_dir / "workflow" / filename).read_text(encoding="utf-8")
+            )
+            class_types.update(node["class_type"] for node in payload.values())
+        object_info = {node_type: {} for node_type in class_types}
+        object_info.update(
+            {
+                "UNETLoader": {
+                    "input": {"required": {"unet_name": [["miaomiaoHarem_anima8Step10.safetensors"], {}]}}
+                },
+                "CLIPLoader": {
+                    "input": {
+                        "required": {
+                            "clip_name": [["qwen_3_06b_base.safetensors"], {}],
+                            "type": [["qwen_image"], {}],
+                        }
+                    }
+                },
+                "VAELoader": {
+                    "input": {"required": {"vae_name": [["qwen_image_vae.safetensors"], {}]}}
+                },
+            }
+        )
+
+        class Client:
+            async def object_info(self):
+                return object_info
+
+        plugin._client = Client()
+        result = await plugin.web_ui_check_workflows()
+        self.assertEqual(result["ready_count"], 6)
+
+        object_info.pop("LanPaint_MaskBlend")
+        degraded = await plugin.web_ui_check_workflows()
+        lanpaint = next(item for item in degraded["items"] if item["id"] == "lanpaint")
+        self.assertEqual(lanpaint["status"], "unavailable")
+        self.assertIn("LanPaint_MaskBlend", lanpaint["missing_node_types"])
+
+    def test_pipeline_priority_preserves_legacy_upscale_flags(self) -> None:
+        plugin = self._plugin()
+        plugin.settings = replace(
+            plugin.settings,
+            default_generation_pipeline="iterative",
+        )
+
+        self.assertEqual(
+            plugin._resolve_generation_pipeline(
+                self.main.GenerationOptions(
+                    prompt="1girl",
+                    pipeline="base",
+                    enable_upscale=True,
+                )
+            ),
+            "base",
+        )
+        self.assertEqual(
+            plugin._resolve_generation_pipeline(
+                self.main.GenerationOptions(
+                    prompt="1girl",
+                    enable_upscale=False,
+                )
+            ),
+            "base",
+        )
+        self.assertEqual(
+            plugin._resolve_generation_pipeline(
+                self.main.GenerationOptions(prompt="1girl"),
+            ),
+            "iterative",
+        )
 
 
 class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):

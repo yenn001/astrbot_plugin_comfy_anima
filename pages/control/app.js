@@ -11,6 +11,7 @@ let loraArchiveStatus = null;
 let archiveRunInFlight = false;
 let profileItems = [];
 let workflowItems = [];
+let toolWorkflowItems = [];
 let consoleEntries = [];
 let consoleCursor = 0;
 let consoleMeta = null;
@@ -136,6 +137,7 @@ const taskTypeLabels = {
   reverse_prompt: "图片反推",
   reverse_draw: "反推画图",
   rtx_upscale: "RTX 放大",
+  inpaint: "遮罩局部重绘",
 };
 
 const activeTaskStatuses = new Set(["queued", "running"]);
@@ -146,8 +148,12 @@ const numberFields = new Set([
   "max_concurrent_jobs",
   "user_cooldown",
   "rtx_scale",
+  "iterative_scale",
+  "iterative_steps",
+  "iterative_denoise",
   "prompt_llm_temperature",
   "prompt_llm_max_tokens",
+  "character_swap_timeout",
   "reverse_prompt_timeout",
   "reverse_prompt_temperature",
   "reverse_prompt_max_tokens",
@@ -166,6 +172,7 @@ const numberFields = new Set([
 
 const booleanFields = new Set([
   "enable_upscale",
+  "enable_inpaint",
   "send_generation_notice",
   "enable_prompt_llm",
   "enable_natural_draw",
@@ -696,10 +703,10 @@ function renderWorkflowSelector(activeWorkflow = "") {
   if (!workflowItems.length) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = "工作流目录中没有可用 JSON";
+    option.textContent = "没有可选择的 Anima 生图管线";
     select.append(option);
     activate.disabled = true;
-    status.textContent = "请先检查 workflow_dir 和工作流文件。";
+    status.textContent = "请检查 base / rtx / iterative 三个专用工作流及其 manifest。";
     return;
   }
   for (const item of workflowItems) {
@@ -722,6 +729,81 @@ function renderWorkflowSelector(activeWorkflow = "") {
   ) || workflowItems.find((item) => item.selectable);
   select.value = selected?.filename || "";
   updateWorkflowSelectionStatus();
+}
+
+function renderWorkflowTools() {
+  const host = document.querySelector("#workflow-tool-list");
+  if (!host) return;
+  host.replaceChildren();
+  const definitions = {
+    standalone_rtx: {
+      title: "RTX 独立放大",
+      command: "/放大",
+      summary: "放大用户提供的图片，不经过 Anima 生图。",
+    },
+    quick: {
+      title: "Quick Inpaint",
+      command: "/重绘 <要求> --mode quick",
+      summary: "适合边界清晰的小范围遮罩修改。",
+    },
+    lanpaint: {
+      title: "LanPaint",
+      command: "/重绘 <要求> --mode lanpaint",
+      summary: "适合复杂结构、大区域与精细多轮重绘。",
+    },
+  };
+  const profileCapabilities = {
+    rtx_upscale: "standalone_rtx",
+    anima_inpaint_crop: "quick",
+    anima_lanpaint: "lanpaint",
+  };
+  for (const item of toolWorkflowItems) {
+    const capabilityId = item.capability_id
+      || profileCapabilities[item.profile_id]
+      || item.profile_id
+      || item.filename;
+    const definition = definitions[capabilityId] || {};
+    const card = document.createElement("article");
+    card.className = "workflow-tool-card";
+    card.dataset.state = item.status || "unavailable";
+
+    const head = document.createElement("div");
+    head.className = "workflow-tool-card-head";
+    const title = document.createElement("strong");
+    title.textContent = definition.title || item.display_name || item.filename;
+    const badge = document.createElement("span");
+    badge.className = "ticket-tag";
+    badge.textContent = item.status === "ready"
+      ? "AVAILABLE"
+      : (item.status === "disabled" ? "DISABLED" : "UNAVAILABLE");
+    head.append(title, badge);
+
+    const summary = document.createElement("p");
+    summary.className = "muted";
+    summary.textContent = item.summary || definition.summary || "独立图片工具。";
+    const metadata = document.createElement("div");
+    metadata.className = "workflow-tool-meta";
+    const filename = document.createElement("code");
+    filename.textContent = item.filename || "—";
+    const command = document.createElement("code");
+    command.textContent = item.command || definition.command || "—";
+    metadata.append(filename, command);
+
+    const note = document.createElement("small");
+    note.textContent = item.status === "disabled"
+      ? "该能力已在插件设置中关闭；它不会进入普通生图管线。"
+      : (item.status === "ready"
+        ? "使用右侧指令调用；它不会进入普通生图管线。"
+        : "本地工作流未就绪，请查看依赖检查结果；不可切换为普通生图。");
+    card.append(head, summary, metadata, note);
+    host.append(card);
+  }
+  if (!toolWorkflowItems.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "未发现 RTX 独立放大、Quick Inpaint 或 LanPaint 专用工作流。";
+    host.append(empty);
+  }
 }
 
 function updateWorkflowSelectionStatus() {
@@ -749,11 +831,71 @@ async function loadWorkflows({quiet = false} = {}) {
   if (!quiet && status) status.textContent = "正在重新扫描工作流目录…";
   try {
     const data = await api("/api/workflows");
-    workflowItems = Array.isArray(data.items) ? data.items : [];
+    const allItems = Array.isArray(data.items) ? data.items : [];
+    workflowItems = Array.isArray(data.generation_items)
+      ? data.generation_items
+      : allItems.filter((item) => item.selectable && item.task_type === "text_to_image");
+    toolWorkflowItems = Array.isArray(data.tool_items)
+      ? data.tool_items
+      : allItems.filter((item) => item.task_type === "upscale" || item.task_type === "inpaint");
     renderWorkflowSelector(data.active || "");
+    renderWorkflowTools();
   } catch (error) {
     if (status) status.textContent = error.message;
     if (!quiet) showToast(error.message, true);
+  }
+}
+
+function renderPipelineHealth(data) {
+  const host = document.querySelector("#pipeline-health-list");
+  if (!host) return;
+  host.replaceChildren();
+  const labels = {
+    base: "Anima 原图",
+    rtx: "Anima + RTX",
+    iterative: "Anima + 迭代放大",
+    standalone_rtx: "RTX 独立放大",
+    quick: "Quick 遮罩重绘",
+    lanpaint: "LanPaint 精细重绘",
+  };
+  for (const item of data.items || []) {
+    const card = document.createElement("article");
+    card.className = "workflow-sampler-card";
+    const title = document.createElement("strong");
+    title.textContent = labels[item.id] || item.id;
+    const status = document.createElement("span");
+    status.className = "ticket-tag";
+    status.textContent = item.status === "ready" ? "READY" : (item.status === "disabled" ? "DISABLED" : "MISSING");
+    const detail = document.createElement("p");
+    detail.className = "muted";
+    const problems = [
+      item.local_error,
+      ...(item.missing_node_types || []).map((value) => `缺节点 ${value}`),
+      ...(item.missing_models || []).map((value) => `缺模型 ${value}`),
+    ].filter(Boolean);
+    detail.textContent = item.status === "disabled"
+      ? `${item.filename} · 已由配置关闭`
+      : (problems.length ? problems.join("；") : `${item.filename} · 节点与模型可用`);
+    card.append(title, status, detail);
+    host.append(card);
+  }
+  if (!(data.items || []).length) {
+    host.textContent = "没有收到管线检查结果。";
+  }
+}
+
+async function checkWorkflowDependencies() {
+  const button = document.querySelector("#workflow-check");
+  setBusy(button, true, "检查中…");
+  try {
+    const data = await api("/api/workflows/check");
+    renderPipelineHealth(data);
+    const enabledCount = data.enabled_count ?? data.total_count;
+    showToast(`管线检查完成：${data.ready_count}/${enabledCount} 个已启用管线可用`, (data.unavailable_count ?? 0) > 0);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -2614,6 +2756,7 @@ document.querySelector("#nav").addEventListener("click", (event) => {
 });
 document.querySelector("#settings-form").addEventListener("submit", saveSettings);
 document.querySelector("#workflow-refresh").addEventListener("click", () => loadWorkflows());
+document.querySelector("#workflow-check").addEventListener("click", checkWorkflowDependencies);
 document.querySelector("#workflow-activate").addEventListener("click", activateWorkflow);
 document.querySelector("#workflow-select").addEventListener("change", updateWorkflowSelectionStatus);
 document.querySelector("#sampler-steps-override").addEventListener("input", (event) => {

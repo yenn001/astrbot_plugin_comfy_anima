@@ -52,6 +52,12 @@ MAX_NODE_LIST_ITEMS = 32
 ENVIRONMENT_FIELD_DEFAULTS: dict[str, Any] = {
     "comfyui_url": "http://127.0.0.1:8188",
     "workflow_file": DEFAULT_WORKFLOW_FILE,
+    "upscale_workflow_file": "workflow/rtx_upscale_api.json",
+    "base_workflow_file": "workflow/anima_base_api.json",
+    "rtx_generation_workflow_file": "workflow/anima_rtx_api.json",
+    "iterative_workflow_file": "workflow/anima_iterative_api.json",
+    "inpaint_crop_workflow_file": "workflow/anima_inpaint_crop_api.json",
+    "lanpaint_workflow_file": "workflow/anima_lanpaint_api.json",
     "workflow_dir": "workflow",
     "unet_catalog_url": "",
     "unet_loader_node_id": "429",
@@ -85,7 +91,18 @@ _URL_FIELDS = frozenset(
     }
 )
 _OPTIONAL_URL_FIELDS = _URL_FIELDS - {"comfyui_url"}
-_PATH_FIELDS = frozenset({"workflow_file", "workflow_dir"})
+_PATH_FIELDS = frozenset(
+    {
+        "workflow_file",
+        "upscale_workflow_file",
+        "base_workflow_file",
+        "rtx_generation_workflow_file",
+        "iterative_workflow_file",
+        "inpaint_crop_workflow_file",
+        "lanpaint_workflow_file",
+        "workflow_dir",
+    }
+)
 _NODE_FIELDS = frozenset(
     {
         "unet_loader_node_id",
@@ -398,6 +415,10 @@ class ConfigProfileService:
             profile_id, record = self._find_profile(state, normalized_name)
             updates = validate_environment_settings(record["settings"])
             previous_settings = extract_environment_settings(config)
+            previous_raw = {
+                key: (key in config, _copy(config.get(key)))
+                for key in ENVIRONMENT_FIELDS
+            }
             previous_active = state["active_profile"]
 
             self._apply_updates(config, updates, persist_updates)
@@ -406,7 +427,17 @@ class ConfigProfileService:
                 self._write_state(state)
             except Exception as store_exc:
                 try:
-                    self._apply_updates(config, previous_settings, persist_updates)
+                    if persist_updates is None:
+                        for key, (existed, value) in previous_raw.items():
+                            if existed:
+                                config[key] = value
+                            else:
+                                config.pop(key, None)
+                        save_config = getattr(config, "save_config", None)
+                        if callable(save_config):
+                            save_config()
+                    else:
+                        self._apply_updates(config, previous_settings, persist_updates)
                 except Exception as rollback_exc:
                     raise ConfigProfileApplyError(
                         "配置已应用，但活动档案状态保存失败，且配置回滚失败："

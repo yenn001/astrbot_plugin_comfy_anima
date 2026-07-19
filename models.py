@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.1.6
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.1.6
+版本: 1.2.0
 日期: 2026-07-19
 """
 
@@ -138,9 +138,16 @@ class PluginSettings:
     web_ui_session_ttl: int = 43200
     workflow_file: str = DEFAULT_WORKFLOW_FILE
     upscale_workflow_file: str = "workflow/rtx_upscale_api.json"
+    base_workflow_file: str = "workflow/anima_base_api.json"
+    rtx_generation_workflow_file: str = "workflow/anima_rtx_api.json"
+    iterative_workflow_file: str = "workflow/anima_iterative_api.json"
+    inpaint_crop_workflow_file: str = "workflow/anima_inpaint_crop_api.json"
+    lanpaint_workflow_file: str = "workflow/anima_lanpaint_api.json"
+    default_generation_pipeline: str = "rtx"
     enable_prompt_llm: bool = True
     prompt_llm_provider_id: str = ""
     prompt_llm_timeout: int = 120
+    character_swap_timeout: int = 240
     prompt_llm_temperature: float = 0.3
     prompt_llm_max_tokens: int = 1000
     prompt_llm_fallback: bool = True
@@ -241,6 +248,10 @@ class PluginSettings:
     enable_upscale: bool = True
     rtx_scale: float = 2.0
     rtx_quality: str = "ULTRA"
+    iterative_scale: float = 1.5
+    iterative_steps: int = 3
+    iterative_denoise: float = 0.35
+    enable_inpaint: bool = True
     send_generation_notice: bool = True
     allow_global_interrupt: bool = False
     max_concurrent_jobs: int = 1
@@ -284,9 +295,50 @@ class PluginSettings:
                 data.get("upscale_workflow_file", "workflow/rtx_upscale_api.json")
             ).strip()
             or "workflow/rtx_upscale_api.json",
+            base_workflow_file=str(
+                data.get("base_workflow_file", "workflow/anima_base_api.json")
+            ).strip()
+            or "workflow/anima_base_api.json",
+            rtx_generation_workflow_file=str(
+                data.get(
+                    "rtx_generation_workflow_file",
+                    "workflow/anima_rtx_api.json",
+                )
+            ).strip()
+            or "workflow/anima_rtx_api.json",
+            iterative_workflow_file=str(
+                data.get(
+                    "iterative_workflow_file",
+                    "workflow/anima_iterative_api.json",
+                )
+            ).strip()
+            or "workflow/anima_iterative_api.json",
+            inpaint_crop_workflow_file=str(
+                data.get(
+                    "inpaint_crop_workflow_file",
+                    "workflow/anima_inpaint_crop_api.json",
+                )
+            ).strip()
+            or "workflow/anima_inpaint_crop_api.json",
+            lanpaint_workflow_file=str(
+                data.get("lanpaint_workflow_file", "workflow/anima_lanpaint_api.json")
+            ).strip()
+            or "workflow/anima_lanpaint_api.json",
+            default_generation_pipeline=(
+                str(data.get("default_generation_pipeline")).strip().lower()
+                if str(data.get("default_generation_pipeline", "")).strip().lower()
+                in {"base", "rtx", "iterative"}
+                else (
+                    "rtx" if _as_bool(data.get("enable_upscale"), True) else "base"
+                )
+            ),
             enable_prompt_llm=_as_bool(data.get("enable_prompt_llm"), True),
             prompt_llm_provider_id=str(data.get("prompt_llm_provider_id", "")).strip(),
             prompt_llm_timeout=_as_int(data.get("prompt_llm_timeout"), 120, 10),
+            character_swap_timeout=min(
+                600,
+                _as_int(data.get("character_swap_timeout"), 240, 30),
+            ),
             prompt_llm_temperature=_as_float(data.get("prompt_llm_temperature"), 0.3),
             prompt_llm_max_tokens=_as_int(data.get("prompt_llm_max_tokens"), 1000, 128),
             prompt_llm_fallback=_as_bool(data.get("prompt_llm_fallback"), True),
@@ -503,6 +555,19 @@ class PluginSettings:
                 in {"LOW", "MEDIUM", "HIGH", "ULTRA"}
                 else "ULTRA"
             ),
+            iterative_scale=min(
+                2.0,
+                max(1.1, _as_float(data.get("iterative_scale"), 1.5)),
+            ),
+            iterative_steps=min(
+                4,
+                _as_int(data.get("iterative_steps"), 3, 1),
+            ),
+            iterative_denoise=min(
+                0.8,
+                max(0.1, _as_float(data.get("iterative_denoise"), 0.35)),
+            ),
+            enable_inpaint=_as_bool(data.get("enable_inpaint"), True),
             send_generation_notice=_as_bool(data.get("send_generation_notice"), True),
             allow_global_interrupt=_as_bool(data.get("allow_global_interrupt"), False),
             max_concurrent_jobs=_as_int(data.get("max_concurrent_jobs"), 1, 1),
@@ -523,6 +588,40 @@ class PluginSettings:
         """Resolve the standalone RTX workflow path."""
         path = Path(self.upscale_workflow_file).expanduser()
         return path if path.is_absolute() else plugin_dir / path
+
+    @staticmethod
+    def _resolve_plugin_path(plugin_dir: Path, value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else plugin_dir / path
+
+    def resolve_pipeline_workflow_path(
+        self,
+        plugin_dir: Path,
+        pipeline: str,
+    ) -> Path:
+        """Resolve one explicit per-request generation pipeline."""
+        value = {
+            "base": self.base_workflow_file,
+            "rtx": self.rtx_generation_workflow_file,
+            "iterative": self.iterative_workflow_file,
+        }.get(str(pipeline or "").strip().lower())
+        if value is None:
+            raise ValueError("未知生成管线")
+        return self._resolve_plugin_path(plugin_dir, value)
+
+    def resolve_inpaint_workflow_path(
+        self,
+        plugin_dir: Path,
+        mode: str,
+    ) -> Path:
+        """Resolve the quick or LanPaint redraw workflow."""
+        value = {
+            "quick": self.inpaint_crop_workflow_file,
+            "lanpaint": self.lanpaint_workflow_file,
+        }.get(str(mode or "").strip().lower())
+        if value is None:
+            raise ValueError("未知重绘模式")
+        return self._resolve_plugin_path(plugin_dir, value)
 
     def resolve_director_reference_path(self, plugin_dir: Path) -> Path:
         """解析并返回分镜导演参考提示词路径。"""
@@ -559,6 +658,10 @@ class GenerationOptions:
     suppressed_prompt_terms: tuple[str, ...] = ()
     lora_identity_expectations: tuple["LoraIdentityExpectation", ...] = ()
     character_swap_target_lora: str = ""
+    character_swap_forbid_character_loras: bool = False
+    pipeline: str = ""
+    inpaint_mode: str = ""
+    denoise: Optional[float] = None
 
 
 @dataclass(frozen=True)

@@ -213,8 +213,13 @@ def choose_character_identity_trigger(record: LoraRecord) -> str:
     identities = _identity_terms(record)
     for trigger in candidates:
         trigger_key = _term_key(trigger)
+        comparable_trigger = trigger_key.replace("_", "")
         if is_character_identity_trigger_candidate(trigger) and any(
-            identity in trigger_key or trigger_key in identity
+            (comparable_identity := identity.replace("_", ""))
+            and (
+                comparable_identity in comparable_trigger
+                or comparable_trigger in comparable_identity
+            )
             for identity in identities
         ):
             return trigger

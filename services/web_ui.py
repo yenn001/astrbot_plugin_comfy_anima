@@ -94,6 +94,8 @@ class WebUiController(Protocol):
 
     async def web_ui_list_workflows(self) -> dict[str, Any]: ...
 
+    async def web_ui_check_workflows(self) -> dict[str, Any]: ...
+
     async def web_ui_select_workflow(self, identifier: str) -> dict[str, Any]: ...
 
     async def web_ui_list_unet(self) -> dict[str, Any]: ...
@@ -195,6 +197,7 @@ class WebUiService:
                     self._delete_preset,
                 ),
                 web.get("/api/workflows", self._list_workflows),
+                web.get("/api/workflows/check", self._check_workflows),
                 web.post("/api/workflows/select", self._select_workflow),
                 web.get("/api/unet", self._list_unet),
                 web.post("/api/unet/select", self._select_unet),
@@ -526,6 +529,11 @@ class WebUiService:
     async def _list_workflows(self, _request: web.Request) -> web.Response:
         return await self._controller_response(
             self._controller.web_ui_list_workflows()
+        )
+
+    async def _check_workflows(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_check_workflows()
         )
 
     async def _select_workflow(self, request: web.Request) -> web.Response:

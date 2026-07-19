@@ -142,6 +142,8 @@ class PluginPageApi:
 
         if method == "GET" and path == "/api/workflows":
             return await self._controller.web_ui_list_workflows()
+        if method == "GET" and path == "/api/workflows/check":
+            return await self._controller.web_ui_check_workflows()
         if method == "POST" and path == "/api/workflows/select":
             return await self._controller.web_ui_select_workflow(
                 str(body.get("identifier") or body.get("filename") or "")

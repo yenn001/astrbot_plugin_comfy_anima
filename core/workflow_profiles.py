@@ -61,6 +61,7 @@ class WorkflowProfile:
     resolution: ResolutionBinding | None = None
     samplers: tuple[SamplerBinding, ...] = ()
     input_image: InputBinding | None = None
+    mask_image: InputBinding | None = None
     upscale: UpscaleBinding | None = None
     output_variants: Mapping[str, OutputVariant] = field(default_factory=dict)
     default_output_variant: str = "base"
@@ -170,8 +171,10 @@ def load_workflow_profile(
     if not isinstance(bindings, Mapping):
         raise WorkflowProfileError("bindings must be an object")
     task_type = str(payload.get("task_type") or "text_to_image").strip()
-    if task_type not in {"text_to_image", "upscale"}:
-        raise WorkflowProfileError("task_type must be text_to_image or upscale")
+    if task_type not in {"text_to_image", "upscale", "inpaint"}:
+        raise WorkflowProfileError(
+            "task_type must be text_to_image, upscale or inpaint"
+        )
 
     seed_raw = bindings.get("seed", [])
     if isinstance(seed_raw, Mapping):
@@ -269,7 +272,7 @@ def load_workflow_profile(
         prompt=_binding(
             bindings.get("positive_prompt"),
             "positive_prompt",
-            required=task_type == "text_to_image",
+            required=task_type in {"text_to_image", "inpaint"},
         ),
         negative=_binding(bindings.get("negative_prompt"), "negative_prompt"),
         unet=_binding(bindings.get("unet"), "unet"),
@@ -284,6 +287,7 @@ def load_workflow_profile(
         resolution=resolution,
         samplers=tuple(samplers),
         input_image=_binding(bindings.get("input_image"), "input_image"),
+        mask_image=_binding(bindings.get("mask_image"), "mask_image"),
         upscale=upscale,
         output_variants=variants,
         default_output_variant=_clean_id(

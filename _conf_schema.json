@@ -58,6 +58,62 @@
     "hint": "用于 /放大；Anima 生成后的 RTX 链仍由当前生图工作流控制",
     "default": "workflow/rtx_upscale_api.json"
   },
+  "base_workflow_file": {
+    "description": "Anima 原图管线工作流",
+    "type": "string",
+    "default": "workflow/anima_base_api.json"
+  },
+  "rtx_generation_workflow_file": {
+    "description": "Anima + RTX 管线工作流",
+    "type": "string",
+    "default": "workflow/anima_rtx_api.json"
+  },
+  "iterative_workflow_file": {
+    "description": "Anima + 迭代放大管线工作流",
+    "type": "string",
+    "default": "workflow/anima_iterative_api.json"
+  },
+  "inpaint_crop_workflow_file": {
+    "description": "Quick Inpaint Crop 重绘工作流",
+    "type": "string",
+    "default": "workflow/anima_inpaint_crop_api.json"
+  },
+  "lanpaint_workflow_file": {
+    "description": "LanPaint 精细重绘工作流",
+    "type": "string",
+    "default": "workflow/anima_lanpaint_api.json"
+  },
+  "default_generation_pipeline": {
+    "description": "默认 Anima 生成管线",
+    "type": "string",
+    "options": ["base", "rtx", "iterative"],
+    "hint": "base 仅原图；rtx 默认执行 RTX 放大；iterative 使用迭代采样放大",
+    "default": "rtx"
+  },
+  "iterative_scale": {
+    "description": "迭代放大目标倍率",
+    "type": "float",
+    "hint": "范围 1.1 到 2.0",
+    "default": 1.5
+  },
+  "iterative_steps": {
+    "description": "迭代放大轮数",
+    "type": "int",
+    "hint": "范围 1 到 4",
+    "default": 3
+  },
+  "iterative_denoise": {
+    "description": "迭代放大重绘强度",
+    "type": "float",
+    "hint": "范围 0.1 到 0.8；请求中的 --denoise 优先",
+    "default": 0.35
+  },
+  "enable_inpaint": {
+    "description": "启用遮罩局部重绘",
+    "type": "bool",
+    "hint": "支持 /重绘 --mode quick|lanpaint；白色或透明区域重绘",
+    "default": true
+  },
   "workflow_dir": {
     "description": "可切换工作流目录",
     "type": "string",
@@ -205,6 +261,12 @@
     "type": "int",
     "hint": "基础 LLM 等待预算；启用 LoRA 工具时，插件会自动额外预留每一步 Manager 扫描和清单读取时间",
     "default": 120
+  },
+  "character_swap_timeout": {
+    "description": "换角 Tags 分类超时（秒）",
+    "type": "int",
+    "hint": "整个换角 Tags 分类阶段的总预算，独立于图片反推超时；范围 30 到 600 秒，首次超时只会在剩余预算内重试一次",
+    "default": 240
   },
   "prompt_llm_temperature": {
     "description": "分镜模型 Temperature",

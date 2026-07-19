@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.1.0
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 测试工作流参数替换和指令解析
 
 作者: Yen
-版本: 1.1.0
+版本: 1.2.0
 日期: 2026-07-14
 """
 
@@ -13,7 +13,12 @@ import json
 import unittest
 from pathlib import Path
 
-from ..core.workflow import ImageWorkflowBuilder, WorkflowBuilder, parse_generation_options
+from ..core.workflow import (
+    ImageWorkflowBuilder,
+    InpaintWorkflowBuilder,
+    WorkflowBuilder,
+    parse_generation_options,
+)
 from ..models import GenerationOptions, LoraSelection, PluginSettings
 
 
@@ -188,6 +193,40 @@ class WorkflowBuilderTests(unittest.TestCase):
             "<lora:styles/selected:0.65>, <lora:characters/hero:0.8>",
         )
 
+    def test_explicit_replace_clears_template_with_empty_dynamic_stack(self) -> None:
+        """纯 Tags 换角即使没有动态 LoRA，也必须清空模板静态栈。"""
+
+        template_inputs = self.builder._template["462"]["inputs"]
+        self.assertTrue(template_inputs["loras"]["__value__"])
+        self.assertTrue(template_inputs["text"])
+
+        workflow, _, _ = self.builder.build(
+            GenerationOptions(
+                prompt="1girl, rice_shower_(umamusume)",
+                seed=1,
+                dynamic_loras=(),
+                lora_injection_mode="replace",
+                character_swap_forbid_character_loras=True,
+            )
+        )
+
+        inputs = workflow["462"]["inputs"]
+        self.assertEqual(inputs["loras"]["__value__"], [])
+        self.assertEqual(inputs["text"], "")
+        self.assertTrue(template_inputs["loras"]["__value__"])
+
+    def test_empty_dynamic_stack_preserves_template_without_explicit_replace(self) -> None:
+        """普通生图的历史模板行为不因安全清栈支持而改变。"""
+
+        template_inputs = self.builder._template["462"]["inputs"]
+        workflow, _, _ = self.builder.build(
+            GenerationOptions(prompt="1girl, portrait", seed=1)
+        )
+        inputs = workflow["462"]["inputs"]
+
+        self.assertEqual(inputs["loras"], template_inputs["loras"])
+        self.assertEqual(inputs["text"], template_inputs["text"])
+
     def test_default_resolution_is_832_by_1216(self) -> None:
         """未指定分辨率时应使用 Anima 竖图默认值。"""
         workflow, _, _ = self.builder.build(
@@ -354,6 +393,91 @@ class CommandParserTests(unittest.TestCase):
         """不允许只有选项而没有提示词。"""
         with self.assertRaises(ValueError):
             parse_generation_options("--seed 1")
+
+    def test_pipeline_inpaint_mode_and_denoise_are_parsed(self) -> None:
+        result = parse_generation_options(
+            "red evening dress --pipeline iterative --mode lanpaint --denoise 0.42"
+        )
+        self.assertEqual(result.pipeline, "iterative")
+        self.assertEqual(result.inpaint_mode, "lanpaint")
+        self.assertEqual(result.denoise, 0.42)
+
+
+class DedicatedPipelineWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plugin_dir = Path(__file__).resolve().parents[1]
+
+    def test_base_rtx_and_iterative_pipelines_have_separate_outputs(self) -> None:
+        settings = PluginSettings.from_mapping(
+            {
+                "iterative_scale": 1.6,
+                "iterative_steps": 4,
+                "iterative_denoise": 0.3,
+            }
+        )
+        base = WorkflowBuilder(
+            settings.resolve_pipeline_workflow_path(self.plugin_dir, "base"),
+            settings,
+        )
+        base_workflow, _, base_nodes = base.build(
+            GenerationOptions(prompt="1girl", width=512, height=512)
+        )
+        self.assertEqual(base_nodes, ["88"])
+        self.assertNotIn("552", base_workflow)
+
+        rtx = WorkflowBuilder(
+            settings.resolve_pipeline_workflow_path(self.plugin_dir, "rtx"),
+            settings,
+        )
+        rtx_workflow, _, rtx_nodes = rtx.build(
+            GenerationOptions(prompt="1girl", width=512, height=512)
+        )
+        self.assertEqual(rtx_nodes, ["458"])
+        self.assertEqual(rtx_workflow["552"]["inputs"]["images"], ["8", 0])
+
+        iterative = WorkflowBuilder(
+            settings.resolve_pipeline_workflow_path(self.plugin_dir, "iterative"),
+            settings,
+        )
+        iterative_workflow, _, iterative_nodes = iterative.build(
+            GenerationOptions(prompt="1girl", denoise=0.48)
+        )
+        self.assertEqual(iterative_nodes, ["103"])
+        self.assertEqual(iterative_workflow["101"]["inputs"]["upscale_factor"], 1.6)
+        self.assertEqual(iterative_workflow["101"]["inputs"]["steps"], 4)
+        self.assertEqual(iterative_workflow["100"]["inputs"]["denoise"], 0.48)
+        self.assertEqual(iterative_workflow["19"]["inputs"]["denoise"], 1.0)
+
+    def test_quick_and_lanpaint_receive_source_mask_prompt_and_lora(self) -> None:
+        settings = PluginSettings.from_mapping({})
+        for mode, expected_node in (("quick", "26"), ("lanpaint", "25")):
+            builder = InpaintWorkflowBuilder(
+                settings.resolve_inpaint_workflow_path(self.plugin_dir, mode),
+                settings,
+            )
+            workflow, seed, preferred = builder.build(
+                "incoming/source.png",
+                "incoming/mask.png",
+                GenerationOptions(
+                    prompt="red evening dress",
+                    negative_prompt="school uniform",
+                    seed=77,
+                    denoise=0.6,
+                    dynamic_loras=(LoraSelection("characters/hero", 0.7),),
+                    lora_injection_mode="replace",
+                ),
+            )
+            self.assertEqual(seed, 77)
+            self.assertEqual(preferred, [expected_node])
+            self.assertEqual(workflow["1"]["inputs"]["image"], "incoming/source.png")
+            self.assertEqual(workflow["2"]["inputs"]["image"], "incoming/mask.png")
+            self.assertEqual(workflow["11"]["inputs"]["text"], "red evening dress")
+            self.assertIn("school uniform", workflow["12"]["inputs"]["text"])
+            self.assertEqual(
+                workflow["462"]["inputs"]["loras"]["__value__"][0]["name"],
+                "characters/hero",
+            )
 
 
 if __name__ == "__main__":

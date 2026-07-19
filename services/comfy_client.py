@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.0
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 调用 ComfyUI HTTP API
 - 轮询任务、提取并下载生成图片
 
 作者: Yen
-版本: 1.1.0
+版本: 1.2.0
 日期: 2026-07-14
 """
 
@@ -17,7 +17,7 @@ import re
 import uuid
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 
@@ -90,6 +90,13 @@ class ComfyClient:
     async def health(self) -> dict[str, Any]:
         """获取 ComfyUI 系统状态。"""
         return await self._request_json("GET", "/system_stats")
+
+    async def object_info(self, node_type: str = "") -> dict[str, Any]:
+        """Return registered ComfyUI node definitions for dependency checks."""
+
+        value = str(node_type or "").strip()
+        path = f"/object_info/{quote(value, safe='')}" if value else "/object_info"
+        return await self._request_json("GET", path)
 
     async def gpu_name(self) -> str:
         """Return the first ComfyUI GPU model without allocator decorations."""

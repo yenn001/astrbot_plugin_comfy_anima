@@ -5,12 +5,22 @@ from pathlib import Path
 from typing import Optional
 
 from ..models import PluginSettings
-from .workflow import ImageWorkflowBuilder, WorkflowBuilder, WorkflowError
+from .workflow import (
+    ImageWorkflowBuilder,
+    InpaintWorkflowBuilder,
+    WorkflowBuilder,
+    WorkflowError,
+)
 from .workflow_profiles import WorkflowProfileError, load_workflow_profile
 
 
 class WorkflowRegistryError(ValueError):
     """Raised when workflow discovery or selection cannot be completed."""
+
+
+SELECTABLE_GENERATION_PROFILES = frozenset(
+    {"anima_base", "anima_rtx", "anima_iterative"}
+)
 
 
 @dataclass(frozen=True)
@@ -140,12 +150,22 @@ class WorkflowRegistry:
                 profile = load_workflow_profile(entry.path, selected_settings)
                 if profile.task_type == "text_to_image":
                     WorkflowBuilder(entry.path, selected_settings)
-                    selectable = True
-                    error = ""
-                else:
+                    selectable = profile.profile_id in SELECTABLE_GENERATION_PROFILES
+                    error = (
+                        ""
+                        if selectable
+                        else "旧版兼容工作流仅用于回滚，不能设为六管线默认入口"
+                    )
+                elif profile.task_type == "upscale":
                     ImageWorkflowBuilder(entry.path, selected_settings)
                     selectable = False
                     error = "独立图片放大工作流不能设为当前生图工作流"
+                elif profile.task_type == "inpaint":
+                    InpaintWorkflowBuilder(entry.path, selected_settings)
+                    selectable = False
+                    error = "重绘工作流请通过 /重绘 使用，不能设为当前生图工作流"
+                else:
+                    raise WorkflowRegistryError("不支持的工作流任务类型")
                 result.append(
                     WorkflowDescriptor(
                         entry=entry,

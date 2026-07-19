@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.6
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.1.6
+版本: 1.2.0
 日期: 2026-07-19
 """
 
@@ -27,6 +27,11 @@ _PIC_TAG_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _ANY_PIC_TAG_RE = re.compile(r"</?pic\b[^>]*>", flags=re.IGNORECASE | re.DOTALL)
+_EDIT_TAG_RE = re.compile(
+    r"<edit\b(?P<attrs>(?:[^>\"']|\"[^\"]*\"|'[^']*')*)/?>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_ANY_EDIT_TAG_RE = re.compile(r"</?edit\b[^>]*>", flags=re.IGNORECASE | re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think\b[^>]*>", flags=re.IGNORECASE)
 _PROMPT_ATTR_RE = re.compile(
     r"\bprompt\s*=\s*([\"'])(.*?)\1",
@@ -36,6 +41,14 @@ _NEGATIVE_ATTR_RE = re.compile(
     r"\bnegative\s*=\s*([\"'])(.*?)\1",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_PIPELINE_ATTR_RE = re.compile(
+    r"\bpipeline\s*=\s*([\"'])(.*?)\1",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_MODE_ATTR_RE = re.compile(
+    r"\bmode\s*=\s*([\"'])(.*?)\1",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 RUNTIME_OVERRIDE = """
@@ -43,7 +56,7 @@ RUNTIME_OVERRIDE = """
 请从用户提供的剧情或描述中只选择一个最值得定格的视觉核心，优先保证镜头、动作几何、
 角色外观连续性与生成稳定性。参考规范用于指导你的导演思路，但本次调用的输出协议覆盖参考规范：
 
-1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅在确有需要时可增加可选的 `negative="..."` 属性，`prompt` 属性始终必需。
+1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅当用户明确指定生成管线时增加 `pipeline="base|rtx|iterative"`；仅在确有需要时增加可选的 `negative="..."` 属性，`prompt` 属性始终必需。
 2. prompt 必须是单行英文：先写 Anima tags，最后用英文句号分隔一句简短自然语言画面描述；negative 也必须是单行英文 tags。
 3. 普通标签使用自然空格和半角逗号；不得改写工具返回的 LoRA 文件名或 trigger words。
 4. 默认不添加质量词或安全词；只有用户明确要求时才加入。
@@ -63,6 +76,10 @@ RUNTIME_OVERRIDE = """
 18. 明确换装且角色 LoRA 强绑定默认服装时，角色 LoRA 通常降到 0.55 至 0.75，并把目标服装放在正面提示词较前位置，关键服装可用 1.10 至 1.25 的轻权重。没有服装冲突时不要无故降低角色权重。
 19. 只有元数据明确指出旧服装词时，才把少量互斥旧服装词写入 negative；不得把角色名、作品名、脸、发色、瞳色、体型等身份词放入 negative。无法可靠区分时宁可省略 negative，不得猜测。
 20. 按“明确用户要求 > 当前剧情连续性 > 本次工具元数据 > 一般推断”解决冲突；去掉同义重复，只保留一个镜头、一个主要动作方向和一套服装。
+21. pipeline 只按用户明确意图选择：原图/不放大/base 使用 base；RTX/高清放大使用 rtx；迭代放大/细节重构/二次采样使用 iterative。用户未指定时省略 pipeline 属性，由插件采用 WebUI 当前默认值。不得把 pipeline 词写进 prompt。
+22. 本调用是生图分镜，不得输出 edit 标签。局部重绘由插件的独立重绘协议处理。
+23. 区分“生成后放大”和“放大已有图片”：前者可选择 rtx 生图管线，后者属于独立 RTX 图片工具，不能伪造成 pic。区分“新画一个穿红裙的角色”和“把这张图的衣服改成红裙”：前者是 pic，后者只有在原图与有效遮罩齐全时才是 edit。
+24. 先在内部锁定唯一操作类型，再规划提示词。不要把 base、rtx、iterative、quick、lanpaint、放大倍率、遮罩位置或“修改/替换/重绘”等操作指令写进视觉 prompt。
 """.strip()
 
 
@@ -88,6 +105,8 @@ class PictureResponse:
     prompts: tuple[str, ...]
     text: str
     negative_prompts: tuple[str, ...] = ()
+    pipelines: tuple[str, ...] = ()
+    edits: tuple["EditInstruction", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,6 +115,16 @@ class PictureInstruction:
 
     prompt: str
     negative_prompt: str = ""
+    pipeline: str = ""
+
+
+@dataclass(frozen=True)
+class EditInstruction:
+    """One normalized local-redraw request carried by an ``edit`` tag."""
+
+    prompt: str
+    negative_prompt: str = ""
+    mode: str = "quick"
 
 
 class PromptDirector:
@@ -189,6 +218,19 @@ class PromptDirector:
         Returns:
             规范化提示词和实际 provider ID。
         """
+        instruction, provider_id = await self.generate_instruction(
+            context,
+            event,
+            scene_text,
+            tools,
+        )
+        return instruction.prompt, provider_id, instruction.negative_prompt
+
+    async def generate_instruction(
+        self, context: Any, event: Any, scene_text: str, tools: Any = None
+    ) -> tuple[PictureInstruction, str]:
+        """Generate one validated picture instruction including its pipeline."""
+
         provider_id = await self._resolve_provider_id(context, event)
         user_prompt = (
             "请把下面的剧情或画面需求导演成一张图。只返回规定的 pic 标签。\n\n"
@@ -274,7 +316,95 @@ class PromptDirector:
                     fatal=True,
                 ) from exc
             raise
-        return instruction.prompt, provider_id, instruction.negative_prompt
+        return instruction, provider_id
+
+    async def generate_edit_instruction(
+        self, context: Any, event: Any, scene_text: str, tools: Any = None
+    ) -> tuple[EditInstruction, str]:
+        """Plan a masked redraw without allowing the model to invent a mask."""
+
+        provider_id = await self._resolve_provider_id(context, event)
+        user_prompt = (
+            "用户已提供原图与明确遮罩。请只规划白色或透明遮罩区域的局部重绘。"
+            "只返回规定的 edit 标签。\n\n"
+            f"用户内容：\n{scene_text.strip()}"
+        )
+        system_prompt = self._system_prompt() + "\n\n" + (
+            "这是局部重绘调用。忽略上文要求输出 pic 的第1条，最终只输出一个 "
+            "`<edit prompt=\"英文 tags\" mode=\"quick|lanpaint\">`；可选 "
+            "`negative=\"英文 tags\"`。quick 用于小范围、快速、边界清晰的修改；"
+            "lanpaint 用于大区域、复杂结构、手脚、服装重构或用户明确要求精细多轮重绘。"
+            "不得输出 pic，不得假设或描述遮罩以外的修改，不得声称已创建遮罩。"
+            "先从口语命令中提取遮罩区域的最终目标状态：例如‘把这里的衣服换成红裙’"
+            "只写 red dress 等结果标签；‘修好图里的手’应描述结构正确的手部结果，并优先"
+            "选择 lanpaint。prompt 中不得出现 change、replace、edit、mask、here、there 等"
+            "操作或位置指代词，也不得重复描述黑色保留区域。"
+        )
+        tool_call_timeout = self._lora_tool_call_timeout() if tools is not None else 0
+        request_timeout = (
+            self._lora_agent_timeout(tool_call_timeout)
+            if tools is not None
+            else self._settings.prompt_llm_timeout
+        )
+        try:
+            if tools is not None:
+                if not hasattr(context, "tool_loop_agent"):
+                    raise PromptDirectorError(
+                        "当前 AstrBot 不支持 LoRA 查询工具，已停止本次重绘",
+                        fatal=True,
+                    )
+                response = await asyncio.wait_for(
+                    context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=provider_id,
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        tools=tools,
+                        max_steps=self._settings.lora_tool_max_steps,
+                        tool_call_timeout=tool_call_timeout,
+                    ),
+                    timeout=request_timeout,
+                )
+            elif hasattr(context, "llm_generate"):
+                response = await asyncio.wait_for(
+                    context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        temperature=min(2.0, self._settings.prompt_llm_temperature),
+                        max_tokens=self._settings.prompt_llm_max_tokens,
+                    ),
+                    timeout=request_timeout,
+                )
+            else:
+                provider = self._get_legacy_provider(context, event, provider_id)
+                response = await asyncio.wait_for(
+                    provider.text_chat(
+                        contexts=[],
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        temperature=min(2.0, self._settings.prompt_llm_temperature),
+                        max_tokens=self._settings.prompt_llm_max_tokens,
+                    ),
+                    timeout=request_timeout,
+                )
+        except asyncio.TimeoutError as exc:
+            raise PromptDirectorError("LLM 重绘规划超时", fatal=tools is not None) from exc
+        except PromptDirectorError:
+            raise
+        except Exception as exc:
+            raise PromptDirectorError(
+                "LLM 重绘规划失败",
+                f"provider={provider_id}, error={exc}",
+                fatal=tools is not None,
+            ) from exc
+        completion = getattr(response, "completion_text", None)
+        if not isinstance(completion, str) or not completion.strip():
+            raise PromptDirectorError("LLM 没有返回有效重绘提示词")
+        instructions = self.extract_edit_instructions(completion, max_edits=1)
+        if not instructions:
+            raise PromptDirectorError("LLM 没有返回合法 edit 标签")
+        return instructions[0], provider_id
 
     async def _resolve_provider_id(self, context: Any, event: Any) -> str:
         """优先使用配置模型，否则使用当前会话模型。"""
@@ -330,6 +460,7 @@ class PromptDirector:
             return instructions[0]
         prompt = ""
         negative_prompt = ""
+        parsed: Any = None
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict) and isinstance(parsed.get("prompt"), str):
@@ -353,6 +484,11 @@ class PromptDirector:
         return PictureInstruction(
             prompt=PromptDirector._normalize_prompt(prompt),
             negative_prompt=PromptDirector._normalize_negative_prompt(negative_prompt),
+            pipeline=(
+                PromptDirector._normalize_pipeline(parsed.get("pipeline"))
+                if isinstance(parsed, dict) and parsed.get("pipeline") is not None
+                else ""
+            ),
         )
 
     @staticmethod
@@ -373,6 +509,7 @@ class PromptDirector:
             if prompt_match is None:
                 continue
             negative_match = _NEGATIVE_ATTR_RE.search(attributes)
+            pipeline_match = _PIPELINE_ATTR_RE.search(attributes)
             negative_prompt = (
                 PromptDirector._normalize_negative_prompt(negative_match.group(2))
                 if negative_match
@@ -382,9 +519,46 @@ class PromptDirector:
                 PictureInstruction(
                     prompt=PromptDirector._normalize_prompt(prompt_match.group(2)),
                     negative_prompt=negative_prompt,
+                    pipeline=PromptDirector._normalize_pipeline(
+                        pipeline_match.group(2)
+                    ) if pipeline_match else "",
                 )
             )
             if max_prompts is not None and len(instructions) >= max_prompts:
+                break
+        return instructions
+
+    @staticmethod
+    def extract_edit_instructions(
+        model_output: str, *, max_edits: int | None = None
+    ) -> list[EditInstruction]:
+        """Extract validated masked-redraw instructions from ``edit`` tags."""
+
+        if max_edits is not None and max_edits < 0:
+            raise ValueError("max_edits 不能小于 0")
+        if max_edits == 0:
+            return []
+        visible_text = PromptDirector._remove_think_content(model_output)
+        instructions: list[EditInstruction] = []
+        for match in _EDIT_TAG_RE.finditer(visible_text):
+            attributes = match.group("attrs")
+            prompt_match = _PROMPT_ATTR_RE.search(attributes)
+            if prompt_match is None:
+                continue
+            negative_match = _NEGATIVE_ATTR_RE.search(attributes)
+            mode_match = _MODE_ATTR_RE.search(attributes)
+            instructions.append(
+                EditInstruction(
+                    prompt=PromptDirector._normalize_prompt(prompt_match.group(2)),
+                    negative_prompt=PromptDirector._normalize_negative_prompt(
+                        negative_match.group(2) if negative_match else ""
+                    ),
+                    mode=PromptDirector._normalize_inpaint_mode(
+                        mode_match.group(2) if mode_match else "quick"
+                    ),
+                )
+            )
+            if max_edits is not None and len(instructions) >= max_edits:
                 break
         return instructions
 
@@ -428,6 +602,8 @@ class PromptDirector:
         text = PromptDirector._remove_think_content(model_output, marker)
         text = _PIC_TAG_RE.sub(marker, text)
         text = _ANY_PIC_TAG_RE.sub(marker, text)
+        text = _EDIT_TAG_RE.sub(marker, text)
+        text = _ANY_EDIT_TAG_RE.sub(marker, text)
         escaped_marker = re.escape(marker)
         text = re.sub(rf"(?m)^[ \t]*(?:{escaped_marker}[ \t]*)+(?:\r?\n|$)", "", text)
         text = re.sub(
@@ -455,11 +631,49 @@ class PromptDirector:
         instructions = PromptDirector.extract_pic_instructions(
             model_output, max_prompts=max_prompts
         )
+        edits = PromptDirector.extract_edit_instructions(
+            model_output,
+            max_edits=max_prompts,
+        )
         return PictureResponse(
             prompts=tuple(item.prompt for item in instructions),
             text=PromptDirector.clean_response_text(model_output),
             negative_prompts=tuple(item.negative_prompt for item in instructions),
+            pipelines=tuple(item.pipeline for item in instructions),
+            edits=tuple(edits),
         )
+
+    @staticmethod
+    def _normalize_pipeline(value: Any) -> str:
+        aliases = {
+            "base": "base",
+            "原图": "base",
+            "不放大": "base",
+            "rtx": "rtx",
+            "高清放大": "rtx",
+            "iterative": "iterative",
+            "迭代": "iterative",
+            "迭代放大": "iterative",
+        }
+        normalized = aliases.get(str(value or "rtx").strip().casefold())
+        if normalized is None:
+            raise PromptDirectorError("LLM 返回了未知生成管线")
+        return normalized
+
+    @staticmethod
+    def _normalize_inpaint_mode(value: Any) -> str:
+        aliases = {
+            "quick": "quick",
+            "快速": "quick",
+            "局部": "quick",
+            "lanpaint": "lanpaint",
+            "精细": "lanpaint",
+            "多轮": "lanpaint",
+        }
+        normalized = aliases.get(str(value or "quick").strip().casefold())
+        if normalized is None:
+            raise PromptDirectorError("LLM 返回了未知重绘模式")
+        return normalized
 
     @staticmethod
     def _remove_think_content(model_output: str, replacement: str = " ") -> str:

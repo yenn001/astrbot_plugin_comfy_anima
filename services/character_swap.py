@@ -156,6 +156,37 @@ _NON_CHARACTER_REQUEST_MARKERS = (
     "风格",
     "画风",
 )
+_GENERIC_SOURCE_QUERY_KEYS = frozenset(
+    {
+        "角色",
+        "人物",
+        "主角",
+        "原角色",
+        "原人物",
+        "当前角色",
+        "当前人物",
+        "这个角色",
+        "这个人物",
+        "那个角色",
+        "那个人物",
+        "图中角色",
+        "图中人物",
+        "图片中角色",
+        "图片中人物",
+        "画面中角色",
+        "画面中人物",
+        "她",
+        "他",
+        "ta",
+    }
+)
+_NO_CHARACTER_LORA_RE = re.compile(
+    r"(?:无需|不用|不要|别用|禁用|禁止(?:使用)?|"
+    r"不(?:需要|使用|加载|添加|挂载))"
+    r"(?:再)?(?:使用|加载|添加|挂载)?\s*"
+    r"(?:任何\s*)?(?:目标\s*)?(?:角色\s*)?lo[-\s]?ra",
+    re.IGNORECASE,
+)
 
 
 class CharacterSwapError(RuntimeError):
@@ -186,6 +217,7 @@ class CharacterSwapRequest:
     height: Optional[int] = None
     negative_prompt: str = ""
     preview: bool = False
+    use_target_lora: bool = True
 
     @property
     def source_kind(self) -> str:
@@ -213,7 +245,8 @@ class CharacterSwapPreparation:
     request: CharacterSwapRequest
     tags: tuple[str, ...]
     negative_prompt: str
-    target_record: LoraRecord
+    target_record: Optional[LoraRecord]
+    target_metadata_record: Optional[LoraRecord]
     source_record: Optional[LoraRecord]
     preserved_loras: tuple[LoraSelection, ...]
     preserved_lora_records: tuple[LoraRecord, ...]
@@ -230,7 +263,7 @@ class CharacterSwapPlan:
     negative_prompt: str
     loras: tuple[LoraSelection, ...]
     expectations: tuple[LoraIdentityExpectation, ...]
-    target_record: LoraRecord
+    target_record: Optional[LoraRecord]
     source_record: Optional[LoraRecord]
     target_identity_trigger: str
     removed_terms: tuple[str, ...]
@@ -244,7 +277,7 @@ class CharacterSwapPlan:
         added = "、".join(self.added_terms[:12]) or "无"
         return (
             "语义换角预览（未提交 ComfyUI）\n"
-            f"目标 LoRA：{self.target_record.name}\n"
+            f"目标身份来源：{self.target_record.name if self.target_record else '纯语义 Tags（未使用角色 LoRA）'}\n"
             f"保留 Tags：{len(self.kept_terms)} 项\n"
             f"移除身份：{removed}\n"
             f"新增身份：{added}\n"
@@ -260,6 +293,36 @@ def _identity_key(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     text = _WEIGHT_SUFFIX_RE.sub("", text)
     return re.sub(r"[^0-9a-z@_\u3400-\u9fff]+", "", text)
+
+
+def _is_generic_source_query(value: Any) -> bool:
+    return _identity_key(value) in _GENERIC_SOURCE_QUERY_KEYS
+
+
+def _is_meaningful_identity_key(value: str) -> bool:
+    if re.search(r"[\u3400-\u9fff]", value):
+        return len(value) >= 2
+    return len(value) >= 3
+
+
+def _contains_identity_fragment(container: str, fragment: str) -> bool:
+    return bool(
+        container
+        and fragment
+        and _is_meaningful_identity_key(fragment)
+        and fragment in container
+    )
+
+
+def _strip_no_character_lora_suffix(value: str) -> tuple[str, bool]:
+    """Remove a trailing natural-language no-LoRA directive from a target."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    match = _NO_CHARACTER_LORA_RE.search(normalized)
+    if match is None:
+        return normalized, False
+    target = normalized[: match.start()].rstrip(" \t，,。；;、:-")
+    return target, True
 
 
 def _canonical_key(value: Any) -> str:
@@ -320,9 +383,10 @@ def _prompt_term_key(value: str) -> str:
 
 def _is_character_record(record: LoraRecord) -> bool:
     category = str(record.category or "").strip().casefold()
-    return category == "character" or (
-        category == "mixed" and bool(str(record.character_name or "").strip())
-    )
+    # Character identity evidence is authoritative even if an older archive or
+    # manual edit left the broad category stale. Failing closed here prevents
+    # a misclassified character LoRA from surviving a semantic replacement.
+    return category == "character" or bool(str(record.character_name or "").strip())
 
 
 def _entry_is_fresh(entry: Optional[SemanticEntry], record: LoraRecord) -> bool:
@@ -343,8 +407,16 @@ def _trusted_identity_values(
     values: list[str] = []
     canonical = canonical_lora_name(record.name)
     basename = PurePosixPath(canonical).name
-    values.extend((canonical, basename, str(record.model_name or "")))
-    values.extend(_split_names(record.character_name))
+    values.extend((canonical, basename))
+    record_names = _split_names(record.character_name)
+    values.extend(record_names)
+    record_works = _split_names(record.source_work)
+    # A work title is contextual evidence, not a character identity. Likewise,
+    # LoraRecord.aliases mixes filenames, titles, tags and trained words without
+    # provenance, so neither may independently authorize an automatic swap.
+    for name in record_names:
+        for work in record_works:
+            values.extend((f"{work} {name}", f"{name} {work}"))
 
     entry = semantic_index.entry_for(record)
     if _entry_is_fresh(entry, record):
@@ -363,6 +435,8 @@ def _trusted_identity_values(
             for fact in entry.effective_facts("aliases")
             if fact.source == "manual"
             or (
+                fact.source == "llm_inferred"
+                and
                 fact.confidence >= 0.9
                 and entry.analysis_confidence >= 0.85
             )
@@ -375,10 +449,56 @@ def _trusted_identity_values(
         )
         values.extend(names)
         values.extend(aliases)
-        for name in names or _split_names(record.character_name):
+        trusted_names = _dedupe_text((*names, *aliases)) or record_names
+        for name in trusted_names:
             for work in works:
                 values.extend((f"{work} {name}", f"{name} {work}"))
     return _dedupe_text(values)
+
+
+def _query_identity_keys(value: str) -> tuple[str, ...]:
+    """Build conservative Chinese-natural-language variants for exact/fuzzy lookup."""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    variants = [text]
+    stripped = re.sub(
+        r"(?:这个|那个|一位|一个)?(?:角色|人物|角色名)$",
+        "",
+        text,
+    ).strip()
+    variants.append(stripped)
+    variants.append(
+        re.sub(r"(?:里面|里边|当中|之中|中)?的", " ", stripped).strip()
+    )
+    return tuple(
+        dict.fromkeys(key for item in variants if (key := _identity_key(item)))
+    )
+
+
+def _bounded_edit_distance(left: str, right: str, limit: int = 1) -> int:
+    """Return a small Levenshtein distance, stopping once it exceeds ``limit``."""
+
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, start=1):
+        current = [row]
+        row_min = current[0]
+        for column, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[column] + 1,
+                    previous[column - 1] + (left_char != right_char),
+                )
+            )
+            row_min = min(row_min, current[-1])
+        if row_min > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
 
 
 def _same_lora(left: LoraRecord, right: LoraRecord) -> bool:
@@ -405,10 +525,10 @@ def resolve_character_record(
     explicit_file = bool(
         re.search(r"\.(?:safetensors|ckpt|pt|bin)$", raw_query, re.IGNORECASE)
     )
-    normalized_query = _identity_key(
+    query_keys = _query_identity_keys(
         canonical_lora_name(raw_query) if explicit_file else raw_query
     )
-    if not normalized_query:
+    if not query_keys:
         raise CharacterSwapError(
             f"{role_label}角色不能为空",
             code="empty_character_query",
@@ -436,11 +556,48 @@ def resolve_character_record(
         best_value = ""
         for score, value in candidates:
             key = _identity_key(value)
-            if key and key == normalized_query and score > best_score:
+            if key and key in query_keys and score > best_score:
                 best_score = score
                 best_value = value
         if best_score:
             matches.append((best_score, record, best_value))
+
+    if not matches and not explicit_path and not explicit_file:
+        fuzzy_matches: list[tuple[int, LoraRecord, str]] = []
+        for record in records:
+            if not _is_character_record(record):
+                continue
+            best_distance = 2
+            best_value = ""
+            for value in _trusted_identity_values(record, semantic_index):
+                candidate_key = _identity_key(value)
+                if len(candidate_key) < 2:
+                    continue
+                for query_key in query_keys:
+                    distance = _bounded_edit_distance(query_key, candidate_key, 1)
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_value = value
+            if best_distance == 1:
+                fuzzy_matches.append((80, record, best_value))
+        fuzzy_unique = {
+            (str(item[1].sha256 or "").casefold(), _canonical_key(item[1].name))
+            for item in fuzzy_matches
+        }
+        if len(fuzzy_unique) == 1:
+            suggested = fuzzy_matches[0][1]
+            suggested_name = (
+                _split_names(suggested.character_name)[0]
+                if _split_names(suggested.character_name)
+                else suggested.name
+            )
+            raise CharacterSwapError(
+                f"没有精确找到{role_label}角色“{query}”；疑似“{suggested_name}”。"
+                "为避免换错角色，请使用建议名称重新发送",
+                code="character_suggestion",
+                details={"suggested_lora": suggested.name},
+            )
+        matches = fuzzy_matches
 
     if not matches:
         raise CharacterSwapError(
@@ -572,18 +729,54 @@ class CharacterSwapPlanner:
         negative_prompt: str,
         records: Sequence[LoraRecord],
         replace_source_style: bool = False,
+        fallback_target_tags: Sequence[str] = (),
     ) -> CharacterSwapPreparation:
         if request.mode not in SWAP_MODES:
             raise CharacterSwapError(
                 "换角模式只支持 keep-outfit 或 target-outfit",
                 code="unsupported_swap_mode",
             )
-        target = resolve_character_record(
-            records,
-            request.target_query,
-            self._semantic_index,
-            role_label="目标",
+        if (
+            request.source_query.strip()
+            and _identity_key(request.source_query) == _identity_key(request.target_query)
+        ):
+            raise CharacterSwapError(
+                "原角色与目标角色名称相同，已停止无效换角",
+                code="same_character",
+            )
+        target_metadata: Optional[LoraRecord] = None
+        explicit_target = "/" in request.target_query.replace("\\", "/") or bool(
+            re.search(
+                r"\.(?:safetensors|ckpt|pt|bin)$",
+                request.target_query,
+                re.IGNORECASE,
+            )
         )
+        try:
+            target_metadata = resolve_character_record(
+                records,
+                request.target_query,
+                self._semantic_index,
+                role_label="目标",
+            )
+        except CharacterSwapError as exc:
+            # Suggestions and ambiguity are never bypassed by pure-Tags mode.
+            # Only a true miss may use separately validated semantic candidates.
+            if (
+                exc.code != "character_not_found"
+                or explicit_target
+                or not fallback_target_tags
+            ):
+                raise
+        target = target_metadata if request.use_target_lora else None
+        if (
+            (target is None or not request.use_target_lora)
+            and request.mode == SWAP_MODE_TARGET_OUTFIT
+        ):
+            raise CharacterSwapError(
+                "未加载目标角色 LoRA 时只支持 keep-outfit，不能自动替换为目标默认服装",
+                code="semantic_target_outfit_unsupported",
+            )
         source: Optional[LoraRecord] = None
         if request.source_query.strip():
             try:
@@ -598,7 +791,11 @@ class CharacterSwapPlanner:
                 # Missing is tolerable; ambiguity is not.
                 if exc.code != "character_not_found":
                     raise
-        if source is not None and _same_lora(source, target):
+        if (
+            source is not None
+            and target_metadata is not None
+            and _same_lora(source, target_metadata)
+        ):
             raise CharacterSwapError(
                 "原角色与目标角色解析为同一个 LoRA，已停止无效换角",
                 code="same_character",
@@ -623,10 +820,13 @@ class CharacterSwapPlanner:
             raise CharacterSwapError(
                 "提示词中含有多个不同角色 LoRA，无法安全确定要替换哪一个",
                 code="multiple_character_loras",
-            )
+        )
         if character_pairs:
             prompt_source = character_pairs[0][1]
-            if _same_lora(prompt_source, target):
+            if target_metadata is not None and _same_lora(
+                prompt_source,
+                target_metadata,
+            ):
                 raise CharacterSwapError(
                     "提示词已经使用目标角色 LoRA，无法确认原角色身份",
                     code="target_already_present",
@@ -668,9 +868,25 @@ class CharacterSwapPlanner:
             )
         _reject_obvious_multi_subject(tags)
 
-        target_triggers = _target_trigger_candidates(target)
-        deterministic_trigger = choose_character_identity_trigger(target)
+        metadata_target_triggers = (
+            _target_trigger_candidates(target_metadata)
+            if target_metadata is not None
+            else ()
+        )
+        target_triggers = metadata_target_triggers or _dedupe_text(
+            fallback_target_tags
+        )
+        deterministic_trigger = (
+            choose_character_identity_trigger(target)
+            if target is not None
+            else ""
+        )
         if not target_triggers:
+            if not request.use_target_lora:
+                raise CharacterSwapError(
+                    "用户已禁用目标角色 LoRA，但未取得可验证的普通身份 Tags",
+                    code="semantic_target_tags_missing",
+                )
             raise CharacterSwapError(
                 "目标角色 LoRA 没有可验证的 Civitai/Manager 触发词",
                 code="missing_target_trigger",
@@ -680,12 +896,17 @@ class CharacterSwapPlanner:
             if source is not None
             else _dedupe_text((request.source_query,))
         )
-        target_hints = _trusted_identity_values(target, self._semantic_index)
+        target_hints = (
+            _trusted_identity_values(target_metadata, self._semantic_index)
+            if target_metadata is not None
+            else _dedupe_text((request.target_query,))
+        )
         return CharacterSwapPreparation(
             request=request,
             tags=tags,
             negative_prompt=negative_prompt.strip(" ,"),
             target_record=target,
+            target_metadata_record=target_metadata,
             source_record=source,
             preserved_loras=tuple(preserved_selections),
             preserved_lora_records=tuple(preserved_records),
@@ -709,18 +930,28 @@ Identity includes the source character name, identity token, hair color/style, e
 color, facial markings, species traits and other character-defining appearance.
 Outfit includes clothes, shoes and ordinary accessories. Preserve pose, action,
 expression, camera, composition, scene, lighting, style and quality. Weighted tag
-groups that mix incompatible buckets must go to uncertain_ids. Also select one
-metadata trigger that uniquely identifies the target character; generic subject,
-appearance, outfit, pose, style and quality triggers are invalid identities. For
-the target metadata, separately identify physical appearance triggers and default
-outfit triggers. Do not invent either group. For target-outfit mode, select only
-metadata triggers that explicitly describe the target's default outfit. Return one
-JSON object only. Do not include explanations."""
+groups that mix incompatible buckets must go to uncertain_ids. Also verify the
+numbered target candidates against the exact requested target character and select
+exactly one unique identity token when it is supported. Return null when no candidate
+can be proven to identify that exact character. Generic subject, physical appearance,
+outfit, pose, style and quality tags are invalid identities. Separately identify only
+stable physical appearance candidates and default-outfit candidates; leave pose,
+scene, style, quality and unknown candidates unselected. Do not invent any target
+tag. For target-outfit mode, select only candidates that explicitly describe the
+target's default outfit. Confidence must reflect both source classification and the
+target-name-to-identity match. Return one JSON object only. Do not include
+explanations."""
         payload = {
             "source_character": preparation.request.source_query,
             "source_identity_hints": list(preparation.source_identity_hints[:24]),
             "target_character": preparation.request.target_query,
             "target_identity_hints": list(preparation.target_identity_hints[:24]),
+            "target_candidate_source": (
+                "lora_metadata"
+                if preparation.target_metadata_record is not None
+                else "bounded_semantic_generation"
+            ),
+            "target_lora_will_be_loaded": preparation.target_record is not None,
             "mode": preparation.request.mode,
             "source_tags": [
                 {"id": index, "tag": tag}
@@ -868,9 +1099,10 @@ JSON object only. Do not include explanations."""
                 "首版语义换角只支持单角色，分类模型判断并非单一人物",
                 code="multiple_subjects",
             )
-        if classification.confidence < 0.82:
+        minimum_confidence = 0.9 if preparation.target_record is None else 0.82
+        if classification.confidence < minimum_confidence:
             raise CharacterSwapError(
-                "换角分类置信度不足 0.82，已停止自动改写",
+                f"换角分类置信度不足 {minimum_confidence:.2f}，已停止自动改写",
                 code="low_classification_confidence",
             )
         if classification.uncertain_ids:
@@ -899,6 +1131,17 @@ JSON object only. Do not include explanations."""
             if reliable_source_trigger:
                 source_identity_keys.add(
                     _prompt_term_key(reliable_source_trigger)
+                )
+        classified_source_ids = set(classification.source_identity_ids)
+        for index, term in enumerate(preparation.tags):
+            nested_key = _identity_key(term)
+            if index not in classified_source_ids and any(
+                _contains_identity_fragment(nested_key, source_key)
+                for source_key in source_identity_keys
+            ):
+                raise CharacterSwapError(
+                    "含有可靠原角色身份词的加权或复合 Tag 未被完整移除",
+                    code="source_identity_group_misclassified",
                 )
         for item_id in classification.source_identity_ids:
             term = preparation.tags[item_id]
@@ -938,7 +1181,46 @@ JSON object only. Do not include explanations."""
                 )
 
         target_trigger = preparation.deterministic_target_trigger
-        if not target_trigger:
+        if preparation.target_record is None:
+            trigger_id = classification.target_identity_trigger_id
+            if trigger_id is None:
+                raise CharacterSwapError(
+                    "纯 Tags 换角无法确认唯一目标身份 Tag",
+                    code="semantic_target_identity_unverified",
+                )
+            target_trigger = preparation.target_trigger_words[trigger_id]
+            folded_target = unicodedata.normalize(
+                "NFKC",
+                target_trigger,
+            ).casefold()
+            target_key = _prompt_term_key(target_trigger)
+            if (
+                not is_character_identity_trigger_candidate(target_trigger)
+                or target_key in _GENERIC_NON_IDENTITY_KEYS
+                or any(marker in folded_target for marker in _APPEARANCE_MARKERS)
+                or any(marker in folded_target for marker in _OBVIOUS_OUTFIT_MARKERS)
+            ):
+                raise CharacterSwapError(
+                    "分类模型选择了通用、外观或服装词作为目标身份触发词",
+                    code="unsafe_target_trigger",
+                )
+            if preparation.target_metadata_record is not None:
+                expected_trigger = choose_character_identity_trigger(
+                    preparation.target_metadata_record
+                )
+                if not expected_trigger or _prompt_term_key(
+                    expected_trigger
+                ) != _prompt_term_key(target_trigger):
+                    raise CharacterSwapError(
+                        "分类模型未选择 LoRA 元数据中可证明的目标身份词",
+                        code="semantic_target_identity_unverified",
+                    )
+            elif trigger_id != 0:
+                raise CharacterSwapError(
+                    "纯语义身份规划的首项身份锚点未通过分类确认",
+                    code="semantic_target_identity_unverified",
+                )
+        elif not target_trigger:
             trigger_id = classification.target_identity_trigger_id
             if trigger_id is None:
                 raise CharacterSwapError(
@@ -1008,6 +1290,11 @@ JSON object only. Do not include explanations."""
         )
 
         added_terms: list[str] = [target_trigger]
+        if preparation.target_record is None:
+            added_terms.extend(
+                preparation.target_trigger_words[index]
+                for index in classification.target_appearance_trigger_ids
+            )
         if preparation.request.mode == SWAP_MODE_TARGET_OUTFIT:
             added_terms.extend(
                 preparation.target_trigger_words[index]
@@ -1038,7 +1325,10 @@ JSON object only. Do not include explanations."""
         kept_negative = tuple(
             term
             for term in negative_terms
-            if _prompt_term_key(term) not in target_negative_keys
+            if not any(
+                _contains_identity_fragment(_identity_key(term), target_key)
+                for target_key in target_negative_keys
+            )
         )
         negative_prompt = ", ".join(kept_negative)
 
@@ -1052,12 +1342,16 @@ JSON object only. Do not include explanations."""
                 source_suppressed.append(source_trigger)
         suppressed_terms = _dedupe_text(source_suppressed)
 
-        target_selection = LoraSelection(
-            preparation.target_record.name,
-            preparation.request.target_lora_strength,
-        )
-        loras = (*preparation.preserved_loras, target_selection)
-        records = (*preparation.preserved_lora_records, preparation.target_record)
+        if preparation.target_record is not None:
+            target_selection = LoraSelection(
+                preparation.target_record.name,
+                preparation.request.target_lora_strength,
+            )
+            loras = (*preparation.preserved_loras, target_selection)
+            records = (*preparation.preserved_lora_records, preparation.target_record)
+        else:
+            loras = preparation.preserved_loras
+            records = preparation.preserved_lora_records
         self._verify_final_invariants(
             preparation,
             prompt,
@@ -1095,26 +1389,37 @@ JSON object only. Do not include explanations."""
         target_trigger: str,
         suppressed_terms: Sequence[str],
     ) -> None:
-        target_key = _canonical_key(preparation.target_record.name)
         character_keys = {
             _canonical_key(record.name) for record in records if _is_character_record(record)
         }
-        if character_keys != {target_key}:
-            raise CharacterSwapError(
-                "最终 LoRA 栈未能保持唯一目标角色",
-                code="final_character_stack_invalid",
-            )
-        if sum(_canonical_key(item.name) == target_key for item in loras) != 1:
-            raise CharacterSwapError(
-                "目标角色 LoRA 必须且只能注入一次",
-                code="target_lora_count_invalid",
-            )
+        if preparation.target_record is None:
+            if character_keys:
+                raise CharacterSwapError(
+                    "纯语义换角的最终 LoRA 栈仍残留角色 LoRA",
+                    code="final_character_stack_invalid",
+                )
+        else:
+            target_key = _canonical_key(preparation.target_record.name)
+            if character_keys != {target_key}:
+                raise CharacterSwapError(
+                    "最终 LoRA 栈未能保持唯一目标角色",
+                    code="final_character_stack_invalid",
+                )
+            if sum(_canonical_key(item.name) == target_key for item in loras) != 1:
+                raise CharacterSwapError(
+                    "目标角色 LoRA 必须且只能注入一次",
+                    code="target_lora_count_invalid",
+                )
         positive_keys = {_prompt_term_key(term) for term in _split_prompt_terms(prompt)}
         negative_keys = {
             _prompt_term_key(term) for term in _split_prompt_terms(negative_prompt)
         }
         target_trigger_key = _prompt_term_key(target_trigger)
-        if target_trigger_key not in positive_keys or target_trigger_key in negative_keys:
+        target_in_negative = any(
+            _contains_identity_fragment(key, target_trigger_key)
+            for key in negative_keys
+        )
+        if target_trigger_key not in positive_keys or target_in_negative:
             raise CharacterSwapError(
                 "目标身份触发词未正确进入正面提示词或仍存在于负面提示词",
                 code="target_trigger_conflict",
@@ -1122,7 +1427,10 @@ JSON object only. Do not include explanations."""
         leaked = {
             _prompt_term_key(term)
             for term in suppressed_terms
-            if _prompt_term_key(term) in positive_keys
+            if any(
+                _contains_identity_fragment(key, _prompt_term_key(term))
+                for key in positive_keys
+            )
         }
         if leaked:
             raise CharacterSwapError(
@@ -1199,6 +1507,7 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
     height: Optional[int] = None
     negative_prompt = ""
     preview = False
+    use_target_lora = True
     index = 0
 
     def require_value(option: str) -> str:
@@ -1238,6 +1547,8 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
             negative_prompt = require_value(token).strip()
         elif token == "--preview":
             preview = True
+        elif token in {"--no-character-lora", "--no-lora"}:
+            use_target_lora = False
         elif token.startswith("--"):
             raise CharacterSwapError(
                 f"不支持的换角选项：{token}",
@@ -1258,7 +1569,12 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
             code="invalid_swap_mapping",
         )
     source_query = match.group("source").strip(" \"'，,")
-    target_query = match.group("target").strip(" \"'，,")
+    target_text, natural_no_lora = _strip_no_character_lora_suffix(
+        match.group("target")
+    )
+    target_query = target_text.strip(" \"'，,")
+    if natural_no_lora:
+        use_target_lora = False
     if not target_query:
         raise CharacterSwapError(
             "目标角色不能为空",
@@ -1285,13 +1601,14 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
         height=height,
         negative_prompt=negative_prompt,
         preview=preview,
+        use_target_lora=use_target_lora,
     )
 
 
 def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     """Recognize only explicit A-to-B natural-language replacement requests."""
 
-    source = _clean_text(text, 1000)
+    source = unicodedata.normalize("NFKC", _clean_text(text, 1000))
     if not re.search(r"(?:替换成|替换为|换成|换为)", source):
         return None
     match = re.search(
@@ -1305,24 +1622,35 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
         "",
         match.group("source").strip(),
     ).strip(" \"'，,")
+    if _is_generic_source_query(source_query):
+        source_query = ""
+    target_text, target_no_lora = _strip_no_character_lora_suffix(
+        match.group("target")
+    )
     target_query = re.split(
         r"\s*(?:并|且|同时|衣服|服装|姿势|动作|表情|构图|背景|光线|保持|分辨率|尺寸|画布)\b",
-        match.group("target").strip(),
+        target_text.strip(),
         maxsplit=1,
     )[0].strip(" \"'，,")
-    if not source_query or not target_query:
+    if not target_query:
         return None
-    if any(marker in source_query for marker in _NON_CHARACTER_REQUEST_MARKERS):
+    if source_query and any(
+        marker in source_query for marker in _NON_CHARACTER_REQUEST_MARKERS
+    ):
         return None
     mode = (
         SWAP_MODE_TARGET_OUTFIT
         if re.search(r"(?:用|换成|采用).{0,8}(?:默认|原版|角色).{0,4}(?:衣服|服装|造型)", source)
         else SWAP_MODE_KEEP_OUTFIT
     )
+    use_target_lora = not (
+        target_no_lora or bool(_NO_CHARACTER_LORA_RE.search(source))
+    )
     return CharacterSwapRequest(
         source_query=source_query,
         target_query=target_query,
         mode=mode,
+        use_target_lora=use_target_lora,
     )
 
 

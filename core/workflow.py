@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.6
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.1.6
+版本: 1.2.0
 日期: 2026-07-19
 """
 
@@ -173,7 +173,7 @@ class WorkflowBuilder:
         prompt_inputs = workflow[prompt_binding.node_id]["inputs"]
         prompt_input_name = self._resolve_input_name(prompt_inputs, prompt_binding)
         prompt_inputs[prompt_input_name] = options.prompt.strip()
-        if options.dynamic_loras:
+        if options.dynamic_loras or options.lora_injection_mode == "replace":
             if not self._profile.lora_node_id:
                 raise WorkflowError("当前工作流档案没有动态 LoRA 节点")
             inject_loras(
@@ -260,6 +260,11 @@ class WorkflowBuilder:
                 node["inputs"][binding.steps_input] = effective_steps
             if options.cfg is not None:
                 node["inputs"][binding.cfg_input] = options.cfg
+            if (
+                options.denoise is not None
+                and self._profile.profile_id != "anima_iterative"
+            ):
+                node["inputs"][binding.denoise_input] = options.denoise
 
         if self._profile.upscale is not None:
             binding = self._profile.upscale
@@ -272,6 +277,29 @@ class WorkflowBuilder:
             if isinstance(inputs, dict):
                 inputs[binding.scale_input] = self._settings.rtx_scale
                 inputs[binding.quality_input] = self._settings.rtx_quality
+
+        if self._profile.profile_id == "anima_iterative":
+            iterative_node = workflow.get("101")
+            iterative_inputs = (
+                iterative_node.get("inputs")
+                if isinstance(iterative_node, dict)
+                else None
+            )
+            if isinstance(iterative_inputs, dict):
+                iterative_inputs["upscale_factor"] = self._settings.iterative_scale
+                iterative_inputs["steps"] = self._settings.iterative_steps
+            iterative_sampler = workflow.get("100")
+            iterative_sampler_inputs = (
+                iterative_sampler.get("inputs")
+                if isinstance(iterative_sampler, dict)
+                else None
+            )
+            if isinstance(iterative_sampler_inputs, dict):
+                iterative_sampler_inputs["denoise"] = (
+                    options.denoise
+                    if options.denoise is not None
+                    else self._settings.iterative_denoise
+                )
 
         upscale_enabled = (
             self._settings.enable_upscale
@@ -342,11 +370,132 @@ class ImageWorkflowBuilder:
         return workflow, list(variant.preferred_node_ids)
 
 
+class InpaintWorkflowBuilder:
+    """Build an Anima image-plus-mask redraw workflow."""
+
+    def __init__(self, workflow_path: Path, settings: PluginSettings):
+        self._workflow_path = workflow_path
+        self._settings = settings
+        self._template = WorkflowBuilder._load_workflow(workflow_path)
+        try:
+            self._profile = load_workflow_profile(workflow_path, settings)
+        except WorkflowProfileError as exc:
+            raise WorkflowError(f"工作流档案无效: {exc}") from exc
+        if (
+            self._profile.task_type != "inpaint"
+            or self._profile.input_image is None
+            or self._profile.mask_image is None
+            or self._profile.prompt is None
+        ):
+            raise WorkflowError("当前工作流不是完整的重绘工作流")
+        for variant in self._profile.output_variants.values():
+            for node_id in variant.preferred_node_ids:
+                if node_id not in self._template:
+                    raise WorkflowError(f"工作流缺少输出节点 {node_id}")
+
+    @property
+    def profile(self) -> WorkflowProfile:
+        return self._profile
+
+    def build(
+        self,
+        image_name: str,
+        mask_name: str,
+        options: GenerationOptions,
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        workflow = copy.deepcopy(self._template)
+        seed = options.seed if options.seed is not None else secrets.randbelow(MAX_SEED)
+
+        input_binding = self._profile.input_image
+        mask_binding = self._profile.mask_image
+        assert input_binding is not None and mask_binding is not None
+        WorkflowBuilder._set_input(
+            workflow,
+            input_binding.node_id,
+            input_binding.input_name,
+            image_name,
+        )
+        WorkflowBuilder._set_input(
+            workflow,
+            mask_binding.node_id,
+            mask_binding.input_name,
+            mask_name,
+        )
+
+        unet_binding = self._profile.unet
+        if self._settings.unet_model_name and unet_binding is not None:
+            WorkflowBuilder._set_input(
+                workflow,
+                unet_binding.node_id,
+                unet_binding.input_name,
+                self._settings.unet_model_name,
+            )
+
+        prompt_binding = self._profile.prompt
+        assert prompt_binding is not None
+        WorkflowBuilder._set_input(
+            workflow,
+            prompt_binding.node_id,
+            prompt_binding.input_name,
+            options.prompt.strip(),
+        )
+        if options.dynamic_loras:
+            if not self._profile.lora_node_id:
+                raise WorkflowError("当前重绘工作流没有动态 LoRA 节点")
+            inject_loras(
+                workflow,
+                self._profile.lora_node_id,
+                options.dynamic_loras,
+                mode=(
+                    options.lora_injection_mode
+                    or self._settings.dynamic_lora_mode
+                ),
+            )
+
+        if options.negative_prompt and self._profile.negative is not None:
+            binding = self._profile.negative
+            node = workflow.get(binding.node_id)
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict):
+                raise WorkflowError("重绘负面提示词节点无效")
+            original = str(inputs.get(binding.input_name, "")).strip()
+            inputs[binding.input_name] = ", ".join(
+                part
+                for part in (original, options.negative_prompt.strip())
+                if part
+            )
+
+        for binding in self._profile.seed_bindings:
+            WorkflowBuilder._set_input(
+                workflow,
+                binding.node_id,
+                binding.input_name,
+                seed,
+            )
+        for binding in self._profile.samplers:
+            node = workflow.get(binding.node_id)
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            if options.steps is not None:
+                inputs[binding.steps_input] = options.steps
+            if options.cfg is not None:
+                inputs[binding.cfg_input] = options.cfg
+            if options.denoise is not None:
+                inputs[binding.denoise_input] = options.denoise
+
+        variant = self._profile.active_output
+        for node_id in variant.prune_node_ids:
+            workflow.pop(node_id, None)
+        return workflow, seed, list(variant.preferred_node_ids)
+
+
 def parse_generation_options(command_text: str) -> GenerationOptions:
     """解析 `/anima draw` 后的提示词和选项。
 
     支持 `--negative`、`--seed`、`--size`、`--steps`、`--cfg`、
-    `--upscale`、`--no-upscale`、`--llm`、`--raw` 与 `--preset`。
+    `--pipeline`、`--denoise`、`--upscale`、`--no-upscale`、`--llm`、
+    `--raw`、`--preset` 与重绘使用的 `--mode`。
     含空格的负面词需要使用引号。
     """
     try:
@@ -364,6 +513,9 @@ def parse_generation_options(command_text: str) -> GenerationOptions:
     enable_upscale = None
     use_prompt_llm = None
     lora_preset = ""
+    pipeline = ""
+    inpaint_mode = ""
+    denoise = None
     index = 0
 
     def require_value(option: str) -> str:
@@ -413,6 +565,40 @@ def parse_generation_options(command_text: str) -> GenerationOptions:
                 raise ValueError("--cfg 必须是数字") from exc
             if not 0 <= cfg <= MAX_CFG:
                 raise ValueError(f"--cfg 必须在 0 到 {MAX_CFG:g} 之间")
+        elif token == "--pipeline":
+            pipeline = require_value(token).strip().lower()
+            aliases = {
+                "原图": "base",
+                "base": "base",
+                "rtx": "rtx",
+                "放大": "rtx",
+                "iterative": "iterative",
+                "迭代": "iterative",
+                "迭代放大": "iterative",
+            }
+            pipeline = aliases.get(pipeline, "")
+            if not pipeline:
+                raise ValueError("--pipeline 仅支持 base、rtx 或 iterative")
+        elif token == "--denoise":
+            try:
+                denoise = float(require_value(token))
+            except ValueError as exc:
+                raise ValueError("--denoise 必须是数字") from exc
+            if not 0.0 <= denoise <= 1.0:
+                raise ValueError("--denoise 必须在 0 到 1 之间")
+        elif token == "--mode":
+            raw_mode = require_value(token).strip().casefold()
+            aliases = {
+                "quick": "quick",
+                "快速": "quick",
+                "局部": "quick",
+                "lanpaint": "lanpaint",
+                "精细": "lanpaint",
+                "多轮": "lanpaint",
+            }
+            inpaint_mode = aliases.get(raw_mode, "")
+            if not inpaint_mode:
+                raise ValueError("--mode 仅支持 quick 或 lanpaint")
         elif token == "--upscale":
             enable_upscale = True
         elif token == "--no-upscale":
@@ -443,4 +629,7 @@ def parse_generation_options(command_text: str) -> GenerationOptions:
         enable_upscale=enable_upscale,
         use_prompt_llm=use_prompt_llm,
         lora_preset=lora_preset,
+        pipeline=pipeline,
+        inpaint_mode=inpaint_mode,
+        denoise=denoise,
     )

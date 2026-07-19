@@ -7,6 +7,7 @@ from ..services.lora_catalog import LoraRecord
 from ..services.lora_presets import LoraPreset
 from ..services.lora_prompting import (
     build_lora_trigger_plan,
+    choose_character_identity_trigger,
     merge_runtime_lora_selections,
 )
 
@@ -47,6 +48,19 @@ class RuntimeLoraMergeTests(unittest.TestCase):
 
 
 class RuntimeLoraTriggerTests(unittest.TestCase):
+    def test_identity_trigger_matches_spaced_name_to_underscore_tag(self) -> None:
+        record = LoraRecord(
+            "characters/kallen.safetensors",
+            category="character",
+            character_name="Kallen Kaslana",
+            trigger_words=("kallen_kaslana", "white hair"),
+        )
+
+        self.assertEqual(
+            choose_character_identity_trigger(record),
+            "kallen_kaslana",
+        )
+
     def test_style_gets_all_triggers_but_character_gets_identity_only(self) -> None:
         selections = (
             LoraSelection("styles/base", 0.5),

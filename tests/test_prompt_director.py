@@ -158,6 +158,39 @@ class PictureResponseParserTests(unittest.TestCase):
             "1girl, red evening gown",
         )
 
+    def test_picture_pipeline_and_edit_protocol_are_parsed(self) -> None:
+        parsed = PromptDirector.parse_picture_response(
+            '<pic prompt="1girl, portrait" pipeline="iterative">'
+        )
+        self.assertEqual(parsed.pipelines, ("iterative",))
+
+        edited = PromptDirector.parse_picture_response(
+            '正在处理。<edit prompt="red evening dress" mode="lanpaint" '
+            'negative="school uniform">'
+        )
+        self.assertEqual(edited.prompts, ())
+        self.assertEqual(len(edited.edits), 1)
+        self.assertEqual(edited.edits[0].mode, "lanpaint")
+        self.assertEqual(edited.edits[0].negative_prompt, "school uniform")
+        self.assertEqual(edited.text, "正在处理。")
+
+    def test_unknown_pipeline_or_edit_mode_is_rejected(self) -> None:
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector.extract_pic_instructions(
+                '<pic prompt="1girl" pipeline="magic">'
+            )
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector.extract_edit_instructions(
+                '<edit prompt="red dress" mode="guess">'
+            )
+
+    def test_think_edit_never_triggers(self) -> None:
+        parsed = PromptDirector.parse_picture_response(
+            '<think><edit prompt="hidden" mode="quick"></think>正文'
+        )
+        self.assertEqual(parsed.edits, ())
+        self.assertEqual(parsed.text, "正文")
+
     def test_negative_attribute_rejects_lora_or_chinese_content(self) -> None:
         with self.assertRaises(PromptDirectorError):
             PromptDirector.extract_instruction(
@@ -183,6 +216,9 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("不可变身份", system_prompt)
         self.assertIn("0.55 至 0.75", system_prompt)
         self.assertIn('negative="..."', system_prompt)
+        self.assertIn("现有图片独立 RTX 放大", system_prompt)
+        self.assertIn("把图里的手修好", system_prompt)
+        self.assertIn("唯一操作类型", system_prompt)
 
     def test_custom_prompt_keeps_runtime_constraints(self) -> None:
         reference = (

@@ -128,6 +128,86 @@ class IncomingImageServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(IncomingImageError):
                 await service.collect_one(_Event([_ImageComponent(str(oversized))]))
 
+    async def test_reply_source_plus_direct_mask_builds_inpaint_pair(self) -> None:
+        mask = self.root / "mask.png"
+        Image.new("RGB", (32, 24), "black").save(mask)
+        with Image.open(mask) as image:
+            image.putpixel((5, 5), (255, 255, 255))
+            image.save(mask)
+        reply = _ReplyComponent([_ImageComponent(str(self.source))])
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            pair = await self.service.collect_inpaint_pair(
+                _Event([reply, _ImageComponent(str(mask))])
+            )
+        self.assertEqual((pair.width, pair.height), (32, 24))
+        self.assertEqual(pair.mask_source, "explicit_image")
+        self.assertTrue(pair.source.is_file())
+        self.assertTrue(pair.mask.is_file())
+
+    async def test_two_direct_images_use_source_then_mask_order(self) -> None:
+        mask = self.root / "direct-mask.png"
+        Image.new("RGB", (32, 24), "white").save(mask)
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            pair = await self.service.collect_inpaint_pair(
+                _Event(
+                    [
+                        _ImageComponent(str(self.source)),
+                        _ImageComponent(str(mask)),
+                    ]
+                )
+            )
+        self.assertEqual(pair.mask_source, "explicit_image")
+
+    async def test_inpaint_rejects_mismatched_or_empty_mask(self) -> None:
+        mismatched = self.root / "mismatched.png"
+        Image.new("RGB", (16, 16), "white").save(mismatched)
+        empty = self.root / "empty-mask.png"
+        Image.new("RGB", (32, 24), "black").save(empty)
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            with self.assertRaisesRegex(IncomingImageError, "尺寸"):
+                await self.service.collect_inpaint_pair(
+                    _Event(
+                        [
+                            _ImageComponent(str(self.source)),
+                            _ImageComponent(str(mismatched)),
+                        ]
+                    )
+                )
+            with self.assertRaisesRegex(IncomingImageError, "遮罩为空"):
+                await self.service.collect_inpaint_pair(
+                    _Event(
+                        [
+                            _ImageComponent(str(self.source)),
+                            _ImageComponent(str(empty)),
+                        ]
+                    )
+                )
+
+    async def test_single_transparent_png_uses_alpha_mask(self) -> None:
+        rgba = self.root / "alpha-source.png"
+        image = Image.new("RGBA", (32, 24), (255, 128, 0, 255))
+        image.putpixel((4, 4), (255, 128, 0, 0))
+        image.save(rgba)
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            pair = await self.service.collect_inpaint_pair(
+                _Event([_ImageComponent(str(rgba))])
+            )
+        self.assertEqual(pair.mask_source, "source_alpha")
+        with Image.open(pair.mask) as mask:
+            self.assertEqual(mask.getpixel((4, 4)), (255, 255, 255))
+
 
 if __name__ == "__main__":
     unittest.main()

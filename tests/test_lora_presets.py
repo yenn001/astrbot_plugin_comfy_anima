@@ -527,6 +527,7 @@ class ExecuteJobPresetTests(unittest.IsolatedAsyncioTestCase):
         plugin._temp_dir = Path(".")
         plugin._director = None
         plugin._director_error = None
+        plugin._access_error = lambda _event, _text: None
         return plugin
 
     @staticmethod
@@ -585,6 +586,7 @@ class ExecuteJobPresetTests(unittest.IsolatedAsyncioTestCase):
                     LoraSelection("shared/model", 0.9),
                     LoraSelection("prompt/only", 0.8),
                 ),
+                expected_loras,
             ],
         )
         self.assertTrue(all(catalog.strict_values))

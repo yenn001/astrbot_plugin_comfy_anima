@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.1.6
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 解析提示词中的 LoRA 标签
 - 将动态 LoRA 注入 Anima 工作流的 LoraManager 节点
 
 作者: Yen
-版本: 1.1.6
+版本: 1.2.0
 日期: 2026-07-19
 """
 
@@ -89,10 +89,10 @@ def inject_loras(
         selections: 本次动态 LoRA。
         mode: `append` 保留基础 LoRA，`replace` 仅保留动态 LoRA。
     """
-    if not selections:
-        return
     if mode not in {"append", "replace"}:
         raise LoraWorkflowError("动态 LoRA 模式必须是 append 或 replace")
+    if not selections and mode == "append":
+        return
     node = workflow.get(str(node_id))
     if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
         raise LoraWorkflowError(f"工作流缺少 LoRA 节点 {node_id}")

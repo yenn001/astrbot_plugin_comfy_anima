@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.1.0
+AstrBot Comfy Anima 插件 v1.2.0
 
 功能描述：
 - 测试 ComfyUI 历史输出图片提取逻辑
 
 作者: Yen
-版本: 1.1.0
+版本: 1.2.0
 日期: 2026-07-14
 """
 

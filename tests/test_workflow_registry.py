@@ -116,8 +116,9 @@ class WorkflowRegistryTests(unittest.TestCase):
         descriptors = self.registry.describe()
 
         by_name = {item.entry.filename: item for item in descriptors}
-        self.assertTrue(by_name["anima.json"].selectable)
+        self.assertFalse(by_name["anima.json"].selectable)
         self.assertEqual(by_name["anima.json"].task_type, "text_to_image")
+        self.assertIn("回滚", by_name["anima.json"].error)
         self.assertFalse(by_name["rtx.json"].selectable)
         self.assertEqual(by_name["rtx.json"].task_type, "upscale")
         self.assertIn("不能设为", by_name["rtx.json"].error)

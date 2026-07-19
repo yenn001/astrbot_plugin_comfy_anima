@@ -1,85 +1,411 @@
-# AstrBot Comfy Anima 插件
+# AstrBot Comfy Anima
 
-> 正式版：v1.1.6
+> 当前正式版本：v1.2.0
 
-面向 aiocqhttp / NapCat QQ、并针对随包附带的 Anima 工作流专门适配的 ComfyUI 绘图插件。支持自然语言 LLM 分镜、局域网 LoRA 查询工具、动态 LoRA 注入、普通 LLM 回复中的 `<pic>` 标签自动出图、QQ 合并转发和群级风控。
+面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、单角色语义换角、RTX 放大、遮罩重绘、LoRA 实时索引和管理页面放在同一套受控流程中。
 
-## 功能
+本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“六条处理管线”和“依赖”两节。
 
-- 用户发送“帮我画一个……”时，插件调用后台选择的 AstrBot 聊天模型，把自然语言导演为高收敛英文 Danbooru Tags，再提交 ComfyUI。
-- LLM 可自行调用 `list_anima_loras`，把 ComfyUI 实际可加载列表与 ComfyUI-Lora-Manager 元数据合并，搜索角色、画风、触发词和说明，并使用实际存在的名称。
-- LLM 可调用 `list_anima_lora_presets` 取得完整风格底座栈；默认使用 `风格001`，也可选择其他 `风格NNN` 或自定义风格名称。
-- 管理员可直接在普通对话中要求机器人“把这串 LoRA 保存为风格006”；模型必须调用 `save_anima_lora_style` 完成真实写盘，未取得 `STYLE_SAVE_COMMITTED` 时不得口头宣称保存成功。
-- 风格底座与角色 LoRA 分工明确：风格栈负责画质、美感、画师、皮肤、背景等，明确角色则由 LLM 再调用 `list_anima_loras` 独立查询并追加。
-- 支持管理员通过 Civitai 模型页 URL 下载 LoRA；完成后自动补抓元数据并刷新 LLM 可查询清单。
-- 保存或覆盖画师/风格组合后，会先完成配置写盘与回读校验，再延迟自动重载本插件；写盘器缺失或磁盘内容不一致时会回滚并明确报错。
-- 提供 Anima UNET 模型实时列表与切换；切换前强制重新读取局域网 ComfyUI 最新完整模型清单。
-- 所有 LoRA 查询、组合管理、下载及实际出图都经过强制刷新门禁；Manager 扫描或实际可加载清单读取失败时停止后续操作。
-- 每次生图会把各来源先解析成最新精确 LoRA 文件再合并；保存的风格/混合预设权重不可被 LLM 静默覆盖，同名 basename 会被阻止并要求使用完整文件夹路径。
-- 风格与功能 LoRA 自动使用 Manager/Civitai 的明确触发词；角色 LoRA 只补能与角色身份确证匹配的主触发词，不会把默认服装、发色等整包回灌到正面提示词。
-- AstrBot 原生 `plugin-page` 可直接管理核心绘图参数、LLM 导演、权限、LoRA、组合预设、UNET、任务与日志；独立端口 Web UI 继续作为可选的局域网入口。
-- 两套 WebUI 均可实时扫描并热切换生图工作流；独立 RTX 放大和无效工作流会分型展示但禁选，且存在运行中图片任务时不会切换。
-- 思考模型下拉框同时读取 AstrBot 已保存配置和当前已加载实例；LoRA 清单利用 Civitai 标题、触发词与标签建立角色、作品和中英文别名归档，并在多候选时拒绝模糊猜测。
-- Web UI 支持单项、批量与全库 Civitai 元数据获取、分类筛选、目录指纹变化检测、绘图导演 LLM 多选建档和命名环境配置档案切换。
-- 插件专属持久日志控制台支持凭据脱敏；LoRA 页面明确区分资料与建档状态；WebUI 可在纸感工坊、铅灰编辑部、墨夜控制室三套主题间即时切换。
-- 逐 LoRA 语义建档会独立调用、校验、最多两次结构修复并立即落盘，支持部分成功、人工审核优先、完整安全资料档案、持久任务时间线和插件重载后恢复。实时 Manager + ComfyUI 可加载清单始终是唯一文件存在性依据。
-- 详情身份始终以刚刷新的 ComfyUI 可加载记录为准，SHA-256 作为不可变关联依据；目录指纹在应用 AI 别名覆盖前固化，避免刚完成的档案被误判为过期。
-- 支持加速/采样、画质增强、细节修复、构图/姿势、光影/色彩、背景/环境、服装/概念七类功能 LoRA，并严格隔离 UNET、checkpoint 等非 LoRA 资产。
-- 任务时间线支持升降序和每页 10-200 条并逐阶段同步持久控制台；风格名称可省略尾部括号备注；绘图导演支持换装冲突处理和可选负面提示词。
-- 后台可自由创建、命名、启停和保存 LoRA 串组合；也可通过管理员命令即时创建、覆盖、列出或删除，无需重载插件。
-- `<lora:名称:权重>` 不会作为普通文本送入提示词节点，而是注入工作流的 LoraManager 节点 `462`。
-- 为普通角色扮演对话注入可编辑的绘图 System Prompt；LLM 回复包含 `<pic prompt="...">` 时自动替换为图片。
-- 自动删除 `<think>...</think>` 与 `<pic>` 控制标签，不把思考内容发到 QQ。
-- `/画图` 使用 NapCat/OneBot v11 合并转发发送图片；`/画图no` 直接发送图片。
-- `/反推` 使用 AstrBot 多模态 Provider 分析用户明确发送或引用的图片，返回结构化 Anima Tags、构图和置信度；`/反推画图` 可继续交给绘图导演并生成图片。
-- `/换角色 A -> B` 可对单张图片执行单角色语义换角；也可用 `/换角色 A -> B | <完整 Tags>` 改写已有提示词。默认只替换身份并保留衣装、姿势、构图、背景和风格，且明确不是局部重绘。
-- 反推 JSON 本地格式整理器和多模态修复重试均可独立开关；即使关闭整理，`<think>` 隔离、深度限制、非有限数拒绝和必填字段校验仍强制执行。
-- `/放大 [倍率]` 将用户发送或引用的图片上传到 ComfyUI，通过独立 RTX 工作流处理；Anima 正常生图也可在同一工作流内直接串联 RTX。
-- 每次返回生图或 RTX 结果时附带实际处理耗时与 ComfyUI 报告的 GPU 型号。
-- 新版内置 `anima_v2_api.json` 使用独立工作流档案映射正面、负面、UNET、LoRA、采样器、分辨率和输出节点；旧 `anima_api.json` 保留为回退，并已把全部文本编码节点接入 LoRA 后的 CLIP。
-- 管理员可以不重载插件地列出和切换工作流。
-- 支持 `none`、`lite`、`full` 群级违禁词策略、群白名单、全局锁定及独立管理员特权。
+- 项目地址：<https://github.com/yenn001/astrbot_plugin_comfy_anima>
+- 更新记录：[CHANGELOG.md](CHANGELOG.md)
+- 配置字段：[\_conf_schema.json](_conf_schema.json)
 
-## 环境要求
+## 六条处理管线
 
-1. AstrBot 通过 aiocqhttp 连接 NapCat。
-2. AstrBot 能访问 ComfyUI 的 `/prompt`、`/history`、`/view`、`/queue`、`/system_stats` 和 `/upload/image`。
-3. ComfyUI 已安装工作流所需的模型、LoRA、ComfyUI-Lora-Manager 与 `RTXVideoSuperResolution` 节点。
-4. 建议 AstrBot v4.26.1 或更高版本，以使用原生 `plugin-page`；旧版本仍可使用插件配置页及可选的独立端口 Web UI。
+插件所说的“六管线”是三条文生图管线，加上一条独立放大和两条遮罩重绘管线。它们不是六个都能设为默认生图工作流。
 
-如果 AstrBot 在 Docker 中，`127.0.0.1` 指向 AstrBot 容器自身。请改填宿主机地址、ComfyUI 容器服务名或同网络可访问地址。
+| 管线 | 内置 API 工作流 | 用途 | 使用入口 | 可在生图下拉框选择 |
+| --- | --- | --- | --- | --- |
+| Anima 原图 | `anima_base_api.json` | 只生成 Anima 原图，不做二次放大 | `--pipeline base` | 是 |
+| Anima + RTX | `anima_rtx_api.json` | Anima 生图后执行 RTX 放大 | `--pipeline rtx` | 是 |
+| Anima + 迭代放大 | `anima_iterative_api.json` | Anima 生图后进行迭代采样和细节重构 | `--pipeline iterative` | 是 |
+| RTX 独立放大 | `rtx_upscale_api.json` | 只放大用户提供的图片，不重新调用 Anima | `/放大` | 否 |
+| Quick 遮罩重绘 | `anima_inpaint_crop_api.json` | 裁切遮罩附近区域，适合快速、小范围修改 | `/重绘 --mode quick` | 否 |
+| LanPaint 精细重绘 | `anima_lanpaint_api.json` | 多步遮罩重绘，适合复杂结构或精细修改 | `/重绘 --mode lanpaint` | 否 |
+
+因此，WebUI 的“当前生图工作流”只出现三个可选项是正常行为。独立 RTX、Quick 和 LanPaint 会显示在“检查六管线依赖”结果中，但不会进入生图工作流下拉框，也不会被 `/comfy_use` 设为默认文生图入口。
+
+默认生图管线由 `default_generation_pipeline` 决定，仓库默认值为 `rtx`。单次请求的优先级为：
+
+1. 显式 `--pipeline base|rtx|iterative`。
+2. 兼容参数 `--upscale` 或 `--no-upscale`。
+3. 绘图导演在用户明确表达时选择的管线。
+4. WebUI / 插件配置中的默认管线。
+
+`workflow/anima_v2_api.json` 与 `workflow/anima_api.json` 作为兼容、回滚资产保留，不属于六条默认处理管线。
+
+## 主要能力
+
+- 自然语言绘图：由 AstrBot 中已配置的聊天 Provider 把中文画面要求整理为 Anima / Danbooru 风格英文 Tags。
+- 直接 Tags：`/画图` 和 `/画图no` 跳过 LLM，直接把用户输入写入工作流。
+- 图片反推：使用 AstrBot 多模态 Provider 提取结构化 Tags、构图、角色候选和置信度。
+- 单角色语义换角：从图片或完整 Tags 中移除原角色身份，保留服装、姿势、构图、背景和风格，再以目标 LoRA 或纯语义 Tags 重建整张图。
+- LoRA 实时刷新：查询、保存组合、换角和提交任务前读取 LoRA Manager 与 ComfyUI 当前实际可加载清单。
+- LoRA 管理：搜索、Civitai 元数据、语义建档、中英文别名、人工审核、组合预设、下载与受控删除。
+- 模型管理：实时读取并切换 Anima UNET；工作流 manifest 决定实际节点绑定。
+- 两套管理页面：AstrBot 原生 `plugin-page` 与可选的独立端口 WebUI，共用同一套后端能力。
+- 任务与日志：记录脱敏的阶段、状态、耗时、重试和错误，不把完整提示词、图片路径或 Provider 原始回复写进任务时间线。
+
+## 环境与依赖
+
+### AstrBot 与网络
+
+- AstrBot 通过 aiocqhttp 连接 NapCat / OneBot v11。`/画图` 的 QQ 合并转发功能依赖该适配器。
+- 原生 `plugin-page` 需要 AstrBot 提供插件 Pages 与官方 Bridge；相关接口曾在 AstrBot 4.26.1 部署环境验证，但这不是仓库声明的严格最低版本。未提供该能力的版本不会出现原生页面，可改用插件配置页或按需开启独立端口 WebUI，并自行验证其余插件接口兼容性。
+- AstrBot 必须能访问 ComfyUI 的 `/prompt`、`/history`、`/view`、`/queue`、`/system_stats`、`/upload/image` 和 `/object_info`；启用 `allow_global_interrupt=true` 时还需要 `/interrupt`。
+- 如果 AstrBot 在 Docker 中，`127.0.0.1` 指向 AstrBot 容器自身。请改用宿主机地址、ComfyUI 容器服务名或同一容器网络中的可访问地址。
+
+### Python 依赖
+
+仓库的 [requirements.txt](requirements.txt) 目前包含：
+
+```text
+aiohttp>=3.9.0,<4.0.0
+Pillow>=10.0.0,<13.0.0
+```
+
+若 AstrBot 没有自动安装插件依赖，可在 AstrBot 所使用的 Python 环境中执行：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### ComfyUI 模型
+
+六条新管线的当前模板明确引用下列文件名。使用不同 UNET 时，优先通过 `/模型列表` 与 `/模型切换` 写入运行配置；更换 CLIP、VAE 或工作流拓扑时，需要同步检查 API 工作流以及 manifest 中的节点绑定。兼容工作流与 `docs/workflows/` 依赖检查资产可能保留不同的历史模型名，应按各自文件内容单独核对，不能把下表视为整个仓库所有 JSON 的统一模型声明。
+
+| 类型 | 内置文件名 |
+| --- | --- |
+| UNET | `miaomiaoHarem_anima8Step10.safetensors` |
+| CLIP | `qwen_3_06b_base.safetensors` |
+| VAE | `qwen_image_vae.safetensors` |
+
+插件不会自动下载缺失的 UNET、CLIP、VAE、LoRA 或自定义节点。
+
+### ComfyUI 自定义节点
+
+六条管线使用的关键非核心节点如下：
+
+| 能力 | 必需节点类 |
+| --- | --- |
+| Anima 动态 LoRA | `Lora Loader (LoraManager)`，来自 ComfyUI-Lora-Manager |
+| RTX 生图后放大 / 独立放大 | `RTXVideoSuperResolution`，工作流记录的节点包标识为 `comfyui_nvidia_rtx_nodes` |
+| 迭代放大 | `PixelKSampleUpscalerProvider`、`IterativeImageUpscale`、`ColorMatch` |
+| Quick 重绘 | `InpaintCropImproved`、`InpaintStitchImproved` |
+| LanPaint | `LanPaint_KSampler`、`LanPaint_MaskBlend` |
+
+RTX 两条路径还需要满足 NVIDIA RTX 节点上游对显卡、驱动和运行环境的要求；没有该环境时可使用 `base`，或在迭代节点可用时选择 `iterative`。
+
+可先把 [docs/workflows/导入Comfy工作流用下载插件用.json](docs/workflows/导入Comfy工作流用下载插件用.json) 导入 ComfyUI，让 ComfyUI Manager 检查基础 Anima / LoRA Manager / RTX 依赖。迭代放大、Quick 与 LanPaint 还应按上表逐项确认节点类是否注册；管理页面的“检查六管线依赖”和 ComfyUI 报出的缺失 `class_type` 才是当前实例的最终依据。各节点仓库名称可能随上游调整。
+
+`workflow/*.json` 是插件提交给 ComfyUI 的 API Format 工作流；`docs/workflows/` 中的文件主要用于在 ComfyUI 前端检查依赖，不要把两者用途混淆。
 
 ## 安装与首次配置
 
-1. 在 ComfyUI 中导入 [插件安装工作流](docs/workflows/导入Comfy工作流用下载插件用.json)，按提示安装缺失的自定义节点；如有缺失的模型或 LoRA，也请一并准备。
-2. 将整个 `astrbot_plugin_comfy_anima` 目录放入 AstrBot 插件目录。
-3. 在管理面板重载插件；AstrBot v4.26.1+ 会自动发现“工坊控制台”插件 Page。
-4. 设置 `comfyui_url`。
-5. 在“绘图思考模型”中选择一个已配置的聊天模型。
-6. 已安装 ComfyUI-Lora-Manager 时保持 `enable_lora_manager=true`；插件会自动访问 `comfyui_url/api/lm/loras`，同时保留 `object_info` 回退。
-7. 建议保持 `strict_lora_validation=true`，这样后台组合在出图时、管理员命令在保存时都会核对 ComfyUI 实际可加载名称。
-8. 需要通过 QQ 下载 Civitai LoRA 时开启 `enable_lora_download`，按网络环境设置 `lora_download_timeout`，并保持 `lora_download_allowed_hosts` 仅包含受信任的 Civitai 官方域名。
-9. 先执行 `/anima ping`，再用 `/画图no 1girl, white hair, portrait` 测试。
+1. 通过 AstrBot 插件管理器安装，或把整个仓库放入当前 AstrBot 的插件目录。手动克隆示例：
 
-`auto_draw_system_prompt` 留空时使用插件附带的 `prompts/director_reference.txt`。后台填写的自定义 System Prompt 会立即用于普通对话注入，并作为人设/风格偏好叠加到自然语言分镜；插件的实时 LoRA、输出协议和换装安全约束不会再被自定义内容覆盖。自定义内容仍必须要求需要绘图时输出合法的 `<pic prompt="英文 tags">`，没有标签就不会自动触发图片。
+   ```bash
+   git clone https://github.com/yenn001/astrbot_plugin_comfy_anima.git
+   ```
+
+2. 安装 Python 依赖。
+3. 在 ComfyUI 中导入依赖检查工作流，安装缺失自定义节点，并准备模型与 LoRA。
+4. 在 AstrBot 后台重载插件。
+5. 设置 `comfyui_url`。如果反向代理要求 Bearer Token，再填写 `api_token`。
+6. 选择“绘图思考模型”；需要 `/反推`、图片换角或 `/反推画图` 时，再选择支持图片输入的多模态 Provider。
+7. 使用 ComfyUI-Lora-Manager 时保持 `enable_lora_manager=true`。建议保持 `strict_lora_validation=true`。
+8. 先执行 `/anima ping`，再在管理页面点击“检查六管线依赖”。
+9. 最后用一条最小请求验证：
+
+   ```text
+   /画图no 1girl, white hair, blue eyes, portrait --pipeline base
+   ```
+
+### 建议优先确认的配置
+
+| 配置 | 作用 | 建议 |
+| --- | --- | --- |
+| `comfyui_url` | ComfyUI 服务地址 | 填写 AstrBot 实际可访问的地址 |
+| `prompt_llm_provider_id` | 自然语言分镜、换角分类和语义规划 | 选择稳定的聊天 Provider |
+| `reverse_prompt_provider_id` | 图片反推 | 选择支持图片输入的 Provider；留空时按配置回退 |
+| `default_generation_pipeline` | 默认文生图管线 | `base`、`rtx` 或 `iterative` |
+| `enable_inpaint` | Quick / LanPaint 重绘 | 只有依赖就绪时开启 |
+| `strict_lora_validation` | 提交前核对真实 LoRA 文件 | 建议保持开启 |
+| `default_style_preset` | 未指定风格时使用的组合 | 默认 `风格001`，请替换为自己的真实 LoRA 栈 |
+| `max_concurrent_jobs` | 插件并发任务数 | 按显存和 ComfyUI 使用方式设置 |
+| `enable_web_ui` | 独立端口管理面板 | 默认关闭；需要时再开启并设置强密码 |
+
+完整配置、范围和提示以 [\_conf_schema.json](_conf_schema.json) 为准。
+
+## 绘图用法
+
+### 自然语言绘图
+
+开启 `enable_natural_draw` 并选好绘图思考模型后，可以直接发送普通 QQ 消息：
+
+```text
+帮我画一名站在雨夜车站的少女，电影感灯光
+用风格001画一名白发角色，分辨率832x1216，只要Anima原图
+画一幅山顶日出，使用迭代采样放大
+```
+
+插件只在识别到明确绘图意图时接管消息。自然语言中的“不要放大”“RTX 放大”“迭代放大”会用于选择对应生图管线；若同时出现互斥要求，请求会被拒绝而不是猜测。
+
+### 直接 Tags
+
+```text
+/画图 1girl, white hair, blue eyes, rain, neon city
+/画图no 1girl, black dress, portrait, looking at viewer
+/画图no 1girl, white hair, portrait --preset 风格001 --pipeline base
+/画图 1girl, red dress, night city --pipeline iterative --size 832x1216
+```
+
+- `/画图` 使用 QQ 合并转发发送结果。
+- `/画图no` 直接发送图片。
+- 两个命令都跳过 LLM，输入应是可直接用于 Anima 的 Tags。
+- `--preset` 接受 LoRA 组合的稳定序号或精确名称；名称含空格时请加引号。
+
+### 高级 `/anima` 命令
+
+```text
+/anima draw <剧情或Tags>
+/anima prompt <剧情>
+/anima status
+/anima cancel
+/anima ping
+/anima help
+```
+
+`/anima draw` 常用选项：
+
+| 选项 | 说明 |
+| --- | --- |
+| `--negative "..."` | 追加负面提示词 |
+| `--seed 123456` | 指定随机种子 |
+| `--size 832x1216` | 指定画布尺寸 |
+| `--steps 30` | 覆盖采样步数 |
+| `--cfg 5` | 覆盖 CFG |
+| `--pipeline base|rtx|iterative` | 指定三条文生图管线之一 |
+| `--denoise 0.35` | 覆盖当前 manifest 声明的采样器 denoise；文生图与重绘均可能受影响 |
+| `--upscale` / `--no-upscale` | 兼容参数，分别映射到 RTX / 原图管线 |
+| `--llm` | 强制使用绘图导演 |
+| `--raw` / `--no-llm` | 直接使用输入 Tags |
+| `--preset "风格001"` | 使用一个 LoRA 组合 |
+
+示例：
+
+```text
+/anima draw 她在雨夜回头看向镜头 --pipeline rtx --seed 123
+/anima draw 1girl, white hair, portrait --raw --pipeline base --preset 风格001
+/anima prompt 一名少女站在海边，夕阳逆光
+```
+
+### LLM 回复自动出图
+
+开启 `enable_llm_pic_trigger` 后，普通角色扮演或对话模型可以用控制标签触发图片：
+
+```xml
+<pic prompt="1girl, close-up, rain, blue eyes" pipeline="rtx" negative="text, watermark">
+```
+
+明确的遮罩重绘请求可使用：
+
+```xml
+<edit prompt="red evening dress, detailed fabric" mode="quick" negative="school uniform">
+```
+
+`<pic>` 与 `<edit>` 互斥；`<think>...</think>` 中的标签不会执行。插件还会检查真实图片、遮罩、权限、风控、管线和 LoRA 清单，模型输出并不直接获得任意工作流控制权。
+
+## 图片反推与独立 RTX 放大
+
+把图片与命令放在同一条消息中，或回复一张图片后发送：
+
+```text
+/反推 重点分析构图和光线
+/反推画图 保持构图，改成红色礼服，使用RTX放大
+/放大 2
+```
+
+- `/反推` 只返回经过结构校验的 Tags、负面词、构图、描述、角色候选和置信度。
+- `/反推画图` 先反推可观察事实，再交给绘图导演和所选 Anima 管线重新生成。它不是像素保真的图生图。
+- `/放大` 只执行独立 RTX 工作流，不加载 Anima UNET。倍率范围为 `1` 到 `4`，留空使用 `rtx_scale`。
+- 插件只读取用户本条消息或明确引用消息中的图片，不接受命令文本里的任意图片 URL。
+
+## 遮罩局部重绘
+
+```text
+/重绘 把遮罩区域的校服换成红色晚礼服 --mode quick
+/重绘 修复遮罩内的手部结构并保持其余画面 --mode lanpaint --denoise 0.8
+```
+
+支持三种明确输入方式：
+
+1. 回复一张原图，同时发送一张遮罩图。
+2. 在同一条消息中按“原图、遮罩”顺序发送两张图片。
+3. 只发送一张带透明区域的 PNG；透明区域会转换为重绘遮罩。
+
+遮罩规则：白色或透明区域重绘，黑色区域保留。原图与遮罩尺寸必须完全一致，遮罩必须包含有效的非黑区域。插件不会根据“这里”“那里”或图片内容猜测遮罩，也不会自动缩放尺寸不一致的遮罩。
+
+- `quick`：裁切并重绘遮罩附近区域，通常更快，适合小范围修改。
+- `lanpaint`：多步处理和遮罩融合，适合复杂结构或需要更细致重构的区域。
+
+普通“画某角色穿新衣”仍属于文生图；只有明确提到遮罩、蒙版、白色 / 透明区域或 inpaint 时，才会进入局部重绘。
+
+## 单角色语义换角
+
+语义换角会重新生成整张图，只把角色身份从 A 改为 B，并尽量保留衣服、姿势、动作、表情、构图、背景、光线、画风和非角色 LoRA。它不是人脸替换、像素级编辑或局部重绘。
+
+### 图片输入
+
+回复或发送一张单角色图片：
+
+```text
+/换角色 达妮娅 -> 卡莲 --preview
+/换角色 达妮娅 -> 卡莲 --mode keep-outfit --preset 风格001
+```
+
+也可以用明确的自然语言图片请求：
+
+```text
+把图片里的达妮娅换成赛马娘的米浴，保持衣服、姿势和背景
+```
+
+### 完整 Tags 输入
+
+用 `|` 分隔换角选项和完整 Tags，所有选项必须写在 `|` 之前：
+
+```text
+/换角色 达妮娅 -> 卡莲 --preview | <lora:characters/denia:0.8>, 1girl, denia_wuwa, school uniform, standing, rainy street
+/换角色 达妮娅 -> 卡莲 --negative "low quality" | 1girl, denia_wuwa, casual hoodie, looking at viewer
+```
+
+图片与 Tags 不能同时提供。当前换角只支持单角色；多图、多主体、多个角色 LoRA、歧义角色或无法完整分类的 Tags 会失败关闭。
+
+### 目标角色 LoRA 模式
+
+默认情况下，插件会在强制刷新后的最新 LoRA 清单中唯一解析目标角色：
+
+- 只接受真实可加载文件、明确角色名、可信人工别名或仍有效的高置信语义档案。
+- 同名、多版本或多服装候选无法唯一确认时不会猜选。
+- 规划后、提交前再次核对文件名、SHA-256 和元数据来源指纹。
+- 最终角色 LoRA 栈必须且只能保留目标角色；风格和功能 LoRA 可按规则保留。
+
+`keep-outfit` 是默认模式，只替换身份并保留当前服装。`target-outfit` 会尝试使用目标角色默认服装，但只有 LoRA 当前元数据能明确证明服装触发词时才允许执行。
+
+目标角色 LoRA 权重可用 `--weight` 设置，安全范围为 `0.55` 到 `0.75`。
+
+### 无角色 LoRA / 纯语义 Tags 模式
+
+当最新清单中对普通角色名发生真实未命中时，请求会自动尝试纯语义 Tags。也可以显式禁止加载目标角色 LoRA，即使库中存在对应文件：
+
+```text
+/换角色 达妮娅 -> 赛马娘的米浴 --no-character-lora
+/换角色 达妮娅 -> 赛马娘的米浴 --no-lora | 1girl, denia_wuwa, school uniform, standing, rainy street
+```
+
+`--no-lora` 是 `--no-character-lora` 的兼容别名。自然语言图片请求也会识别“无需 / 不用 / 不使用 / 不要 / 禁止使用角色 LoRA”：
+
+```text
+把图片里的达妮娅换成赛马娘的米浴，无需使用角色 LoRA
+```
+
+纯语义模式的边界：
+
+- 插件仍会用最新清单核对目标名称；歧义、多候选、近似建议和显式但不存在的文件路径继续失败关闭，不会借纯语义模式绕过角色确认。
+- 绘图 Provider 生成数量受限、只描述身份与稳定外观的英文普通 Tags。
+- 最终 LoRA 栈禁止出现任何角色 LoRA；画师、风格、画质和功能型 LoRA 仍可保留。
+- 只支持 `keep-outfit`，不支持依赖目标 LoRA 元数据的 `target-outfit`。
+- 角色还原度通常低于专用 LoRA 模式；Provider 不能给出合格 Tags 时会停止，不会编造文件名继续提交。
+
+建议首次换新角色或处理复杂 weighted Tags 时先加 `--preview`。预览仍会执行必要的图片反推、LoRA 刷新、语义 Tags 规划和分类校验，只跳过最终 ComfyUI 生图提交，并显示移除、保留和新增摘要。
+
+### 换角专用选项
+
+| 选项 | 说明 |
+| --- | --- |
+| `--mode keep-outfit|target-outfit` | 保留当前衣服，或使用可证明的目标默认服装 |
+| `--weight 0.55~0.75` | 目标角色 LoRA 权重；参数始终校验该范围，纯语义模式中不会用于注入，建议省略 |
+| `--size 832x1216` | 指定重生成画布 |
+| `--negative "..."` | 追加负面提示词 |
+| `--preset "..."` | 替换或应用一个画师 / 风格组合 |
+| `--no-character-lora` | 强制纯语义 Tags，不使用任何角色 LoRA |
+| `--no-lora` | 上一选项的兼容别名 |
+| `--preview` | 完成规划与校验，但跳过 ComfyUI 生图提交 |
+
+## LoRA 实时刷新与组合
+
+LoRA Manager 的元数据记录不等同于文件当前可加载。插件将 Manager 返回的数据与 ComfyUI 实际节点清单交叉验证，并在关键操作中强制刷新：
+
+- LLM 调用 `list_anima_loras` 或 `list_anima_lora_presets` 前。
+- 管理员执行查询、保存、删除或下载相关命令时。
+- 生图、遮罩重绘和语义换角规划前。
+- 工作流提交前，对最终精确文件再次复核。
+
+严格模式下，Manager 扫描或 ComfyUI 清单读取失败会停止本次操作，不会拿旧缓存冒充最新文件。删除、改名和同 basename 歧义会在重新解析时被拦截；语义换角还会对规划中记录的 LoRA 校验 SHA-256 与元数据来源指纹，发现内容或身份资料变化时停止提交。
+
+角色 LoRA 与画师 / 风格组合分开管理：风格组合负责画质、美感、画师、皮肤、背景和功能性 LoRA；角色身份由实时查询单独加入。不要把常用角色硬编码进默认风格栈。
+
+可用的管理员命令：
+
+```text
+/lora刷新
+/lora下载 <Civitai模型页URL>
+/lora组合列表 [角色|风格|混合]
+/lora组合保存 <角色|风格|混合|auto> <名称|数字|auto> <LoRA串> [--trigger "触发词"] [--description "说明"]
+/保存风格 <名称|数字> <LoRA串> [--trigger "触发词"] [--description "说明"]
+/lora组合删除 <序号|名称>
+```
+
+- `/lora刷新` 触发 Manager 扫描并立即更新 LLM 可查询清单。
+- `/lora下载` 只接受配置允许的 Civitai HTTPS 主机；下载后会尝试补抓元数据并刷新清单。文件下载成功而后处理失败时会报告“部分成功”。
+- 组合保存会解析成最新精确文件名并做数量、分类和重复校验。同名保存表示覆盖。
+- `/保存风格 001 ...` 会规范为 `风格001`。开启 `auto_reload_after_style_save` 时，画师 / 风格组合持久化成功后会延迟重载插件。
+- 管理页面可以为 LoRA 建立带来源和置信度的角色 / 作品 / 风格档案，并允许人工审核别名；人工事实优先于 LLM 推断。
+- 可选 Embedding / Rerank 只帮助候选召回和排序，不能替代最终的真实文件确认。
+
+## 工作流、UNET 与管理命令
+
+```text
+/comfy_ls
+/comfy_use <序号>
+/comfy_lock on|off|status
+/模型列表
+/模型切换 <序号|完整UNET文件名>
+/违禁级别 none|lite|full
+/comfy帮助
+```
+
+- `/comfy_ls` 每次重新扫描并列出 `workflow_dir` 下的直属 `.json` 文件；实际切换时再校验 manifest 和任务类型。
+- `/comfy_use` 只允许热切换 manifest 认可的三条文生图工作流；旧版 `input_id` / `output_id` 临时覆盖参数已被拒绝，运行中有图片任务时也不会切换。
+- `/模型列表` 实时读取 ComfyUI 的 UNETLoader 清单。
+- `/模型切换` 在切换前刷新完整清单，并把模型应用到三条生图与两条重绘 Builder；独立 RTX 不使用 Anima UNET。
+- `/comfy_lock on` 后只允许管理员绘图。
+- `/违禁级别` 修改当前 QQ 群的 `none`、`lite` 或 `full` 词库策略。
 
 ## AstrBot 原生 plugin-page
 
-AstrBot v4.26.1+ 会自动发现 `pages/control/index.html`。在插件详情页打开“工坊控制台”，或访问：
+支持原生插件页面的 AstrBot 会发现 `pages/control/index.html`。可从插件详情页打开“工坊控制台”，或访问：
 
 ```text
 /plugin-page/astrbot_plugin_comfy_anima/control
 ```
 
-原生页面复用与 6198 面板相同的业务接口和三套主题，但认证由 AstrBot Dashboard 负责：页面位于受限 iframe 中，只能通过官方 Bridge 调用带 `plugin` 权限的扩展 API，不读取 Dashboard Cookie、Token 或父页面 DOM，也不需要再次登录。危险操作使用页面内确认框；插件自动重载后会通过 Bridge 重新连接，不会刷新带短期资源令牌的 iframe。即使 `enable_web_ui=false`，原生页面仍可使用。
+该页面通过 AstrBot Dashboard 官方 Bridge 调用带插件权限的后端接口，不读取 Dashboard Cookie、Token 或父页面 DOM，也不需要再次登录。即使 `enable_web_ui=false`，原生 plugin-page 仍可使用。
 
-“绘图与工作流”区会在每次刷新时重新扫描 `workflow_dir`：可验证的 `text_to_image` 工作流允许热切换；`upscale` 工作流只作为独立放大工具展示；无效 JSON 或档案错误会显示原因但不能选择。切换会先持久化配置，再更新运行时构建器，且不会改动独立 RTX 放大工作流。
+页面主要提供：
 
-页面内的主题与自动建档偏好在允许存储时保存在当前页面环境；若浏览器阻止 sandbox iframe 的 `localStorage`，会安全退化为本次页面会话内记忆，不影响管理功能。
+- 核心绘图、并发、默认管线、采样器覆盖和 LLM Provider 配置。
+- 三条可选生图工作流的实时扫描与热切换。
+- “检查六管线依赖”，分别验证三条生图、独立 RTX、Quick 和 LanPaint。
+- UNET 实时清单与切换。
+- LoRA 搜索、元数据获取、语义建档、人工审核、组合、下载与受控删除。
+- 环境配置档案；档案不包含密码、Token、Provider 提示词、权限和风控设置。
+- 持久任务中心、阶段时间线和脱敏日志控制台。
+- `纸感工坊`、`铅灰编辑部`、`墨夜控制室` 三套本地主题。
 
-## 独立端口 Web UI
+## 独立端口 WebUI
 
-插件可以在 AstrBot 之外启动一个轻量级局域网管理面板。默认关闭，启用前必须设置登录密码：
+独立 WebUI 默认关闭。需要使用时至少配置：
 
 ```text
 enable_web_ui=true
@@ -89,402 +415,95 @@ web_ui_username=admin
 web_ui_password=至少8位且不要与其他账号共用
 ```
 
-启动后使用浏览器访问 `http://AstrBot服务器IP:6198`。面板包含：
-
-- 运行概览、ComfyUI 地址、默认分辨率、当前风格和 UNET 状态。
-- 核心绘图参数、LLM 绘图导演 System Prompt、权限与风控设置；思考模型下拉框直接读取 AstrBot 已保存 Chat Provider，并标明当前是否已加载可用。
-- 强制刷新后的 LoRA 搜索、Civitai URL 下载及元数据刷新；同时展示角色、画师/风格、七类功能型、混合、未分类、作品归档、角色名和可搜索别名。
-- 每个 LoRA 均可即时执行 LoRA Manager 的“从 Civitai 获取元数据”；支持单选、多选和全库批量操作，完成后再次刷新真实可加载清单。
-- 使用目录指纹检测新增、修改和删除；可让所选绘图导演 Provider 完整阅读模型说明、全部触发词、标签与别名，并归入角色、画师/风格、混合或未分类。支持单项、多选、全选及仅归档变化项。
-- LoRA 表格显示 `资料就绪 / 建档中 / 可搜索 / 待确认 / 失败 / 资料变化` 状态；分类和建档状态可交叉筛选，`unclassified` 不再被误算成完成。
-- “完整档案”会在再次强制刷新后展示模型与版本说明、全部触发词、标签、作者、许可、示例图安全生成参数、使用建议、文件/版本状态、元数据健康和字段来源；不向浏览器返回服务器绝对路径。
-- 每个 LoRA 支持人工审核角色名、作品名、画师/风格名和自然语言别名；人工事实优先于 LLM 推断，且只写逻辑索引，不移动或改名实际文件。
-- 仅删除 LoRA 时只同步逻辑索引，不会误触发全库 LLM 重归档。
-- 可把 ComfyUI 地址、工作流、节点映射、UNET 和默认分辨率保存为命名环境档案并来回切换；密码、Token、Provider、提示词、权限与风控不会进入档案。
-- 角色、画师/风格和混合 LoRA 串的创建、覆盖、校验与删除。
-- 实时读取并切换当前工作流档案声明的 UNET 模型（Anima V2 为节点 `44`）。
-- 显示当前工作流档案及各采样器模板 Steps / CFG / Denoise，并允许把采样步数设为 `0`（跟随模板）或 `1–100`（全局覆盖）。
-- 安全删除 LoRA 与非当前 UNET：页面只提交精确名称和二次确认，不接收文件路径；后端强制刷新最新 Manager/ComfyUI 清单后解析路径，并在删除后再次刷新。
-- 任务中心持久保存 run_id、状态、进度、当前阶段、逐项重试、成功、失败和取消事件；阶段时间线默认最新在上，可切换升序/降序和每页 10/20/50/100/200 条，页面刷新或插件重载后仍可恢复。
-- 专属运行控制台每约 1.2 秒读取一次本插件持久日志视图，支持级别、模块和关键词筛选、暂停、跟随最新、复制与清空；任务创建、启动、逐阶段、重试、成功/失败/取消和收尾都会同步写入具体日志，重复等待心跳会折叠但时间线保留完整事件。
-- 三套主题按当前浏览器独立记忆，无需保存配置或重载插件：`纸感工坊`、`铅灰编辑部`、`墨夜控制室`。
-
-安全约束：
-
-- 只允许绑定 `0.0.0.0`、回环地址或私有局域网 IP，不接受公网 IP 或域名。
-- 密码不会通过 Web API 回显；设置页密码框留空表示保持原密码。
-- 使用 HttpOnly、SameSite 登录 Cookie、CSRF Token、登录频率限制和安全响应头。
-- 配置保存、组合修改和 UNET 切换后会自动重载当前插件；重载后需要重新登录。
-- LoRA 页面上的每一次查询、刷新、组合操作和下载都会先执行强制刷新门禁。
-- 日志写入 SQLite 持久视图前会遮盖常见 API Key、Token、Bearer、密码、Cookie、Session 和 URL 凭据；任务事件不会保存原始提示词、完整模型回复或思考内容。
-- 建议只在可信局域网开放端口；若需要跨公网访问，请在可信反向代理后配置 HTTPS 和额外访问控制。
-
-## 局域网 LoRA 工具
-
-推荐安装 [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)。插件会读取：
-
-- 展示名、实际文件路径、目录、基础模型和 SHA-256。
-- CivitAI 模型标题、触发词、标签、说明、推荐权重信息和预览地址。
-- 从标题、文件名、作品名和触发词生成的角色中英文别名；已知作品会归一为中英双语逻辑归档，例如 `鸣潮 / Wuthering Waves`、`绝区零 / Zenless Zone Zero`。
-- 收藏状态、备注及使用提示。
-- ComfyUI `/object_info` 中明确属于 LoRA 输入字段的真实可加载名称。UNET、checkpoint、diffusion model、embedding、VAE 与 ControlNet 不会混入 LoRA 清单；Manager 元信息只负责补充，不能替代 ComfyUI 的可加载证据。
-- 可选启用 AstrBot Embedding + Rerank 混合搜索：向量只负责在本次刷新后的真实 LoRA 集合中召回与排序，生成前仍会再次刷新并校验精确文件名。
-- WebUI 可分别选择绘图导演 Chat Provider、图片反推多模态 Chat Provider、Embedding Provider 与 Rerank Provider；列表来自 AstrBot 已保存配置与 Provider Source 的安全合并结果。
-
-`list_anima_loras` 每次调用都会强制让 LoRA Manager 扫描磁盘、分页读取完整最新索引，并同时读取 ComfyUI 实际可加载清单；`refresh` 参数仅为旧提示词兼容。强制刷新会绕过 `lora_manager_scan_interval`，失败时不会回退到旧缓存继续绘图。
-
-为避免删除或重命名 LoRA 后仍选中旧记录，Manager-only 元数据不会再被视为可加载文件；只有同时出现在 ComfyUI 实际清单中的名称才会提供给 LLM。每次实际构建工作流前还会再次执行同样的强制刷新与严格校验。
-
-角色检索无需输入完整文件名。可以使用角色名、作品名、Civitai 触发词或部分名称，例如 `达妮娅`、`denia`、`鸣潮达妮娅`、`绝区零 sunna`、`拉米尔`、`remielle`。只有唯一高置信候选才会自动解析为真实文件名；若同一角色存在多个服装或版本 LoRA，插件会要求提供更完整名称，不会自行猜选。
-
-若自动元信息仍缺少中文名或常用简称，可在 AstrBot 配置或端口 Web UI 的 `lora_alias_rules` 中人工补充，每行格式如下：
+启动后访问：
 
 ```text
-black deniav1-2=达妮娅,denia,鸣潮达妮娅
+http://AstrBot服务器IP:6198
 ```
 
-这些分类和别名只作用于插件索引、搜索与展示，不会移动、重命名或复制实际 LoRA 文件。
-
-### LoRA 语义建档
-
-Web UI 会先对最新可加载目录计算稳定语义指纹。文件名、SHA-256、Civitai 描述、全部触发词、标签、角色/作品线索或别名发生变化时会标记为待更新；目录不变时“仅建档变化项”不会重复调用 LLM。
-
-当前建档流程不再把多个 LoRA 塞进一个批量回复。每个 LoRA 都会独立执行以下步骤：
-
-1. 再次刷新 LoRA Manager，并与 ComfyUI 实际可加载清单取交集。
-2. 聚合 Manager 列表、metadata、model-description、usage-tips、模型/版本双描述、全部触发词、标签、作者、许可和示例图安全参数。
-3. 让 `prompt_llm_provider_id` 所选绘图导演只返回一个带精确 `asset_id` 的 JSON 档案。
-4. 验证身份、分类结构、证据来源和置信度；格式错误时把验证错误反馈给模型，最多自动修复两次。
-5. 单项成功立即原子写入 `lora_semantic_v2.json`；单项失败写入 `failed` 状态并继续处理后续 LoRA，不回滚已经成功的结果。
-
-高置信且结构完整的记录进入 `searchable`；低置信、证据不足或 `unclassified` 进入 `review_needed`。分类包括 `character`、`artist_style`、七类功能型、`mixed` 与 `unclassified`。人工审核事实使用 `manual` 来源并具有最高优先级。每个事实保留 `observed / derived / llm_inferred / manual` 来源、置信度和证据，建档摘要也会持久保存。
-
-后台运行记录保存在 `task_events.sqlite3`，包括阶段、项目、尝试次数、心跳、进度和安全错误码；不会保存原始 Prompt、完整 LLM 回复、思考过程、API Key 或 Cookie。插件重载会把未完成任务标记为 `interrupted`。
-
-语义建档专用 System Prompt 位于 `prompts/lora_semantic_analysis.txt`。它与绘图用 `<图像生成要求>` 分离，允许整理可靠的中英文译名、罗马音和作品简称，同时要求身份一致、证据可追踪。旧 `lora_archive.json` 只用于安全迁移和回滚兼容，不再是新建档主索引。
-
-配置项 `lora_catalog_url` 支持以下形式：
-
-```text
-http://192.168.1.50:8188
-http://192.168.1.50:8188/object_info
-http://192.168.1.50:8000/loras.json
-http://192.168.1.50:8000/loras.txt
-http://192.168.1.50:8000/loras/
-```
-
-- 地址仅填写 IP 和端口时，插件自动追加 `/object_info`，从 ComfyUI 节点信息提取 LoRA 文件名。
-- JSON 可使用字符串列表，或 `{ "loras": [{"name": "...", "trigger_words": [...]}] }`。
-- 文本清单每行一个文件；也支持 `名称|触发词1,触发词2|描述`。
-- HTTP 目录页会读取指向 `.safetensors`、`.pt`、`.ckpt` 或 `.bin` 的链接。
-- 默认只允许私有、回环或链路本地 IP，禁止公网地址、域名、URL 凭据和重定向。
-- LLM 独立查询角色时通常选择 1 个最匹配的角色 LoRA；完整风格底座按预设整体使用，不应按这一建议截断。
-- `strict_lora_validation` 开启时，任何不在清单中的 LoRA 都会在提交 ComfyUI 前被拒绝。
-- `dynamic_lora_mode=append` 会保留工作流节点 462 中已有的基础画质 LoRA；`replace` 则只保留本次动态选择。
-
-提示词示例：
-
-```text
-<lora:black deniav1-2:1.00>, 1girl, black denia \(wuthering waves\), cowboy shot, from side
-```
-
-插件会移除前面的 LoRA 标签，将它写入当前工作流档案声明的 LoRA 节点（Anima V2 为节点 `462`）的 `text` 与 `loras.__value__`；剩余英文 tags 写入档案声明的正面提示词节点（Anima V2 为节点 `11`）。旧 `anima_api.json` 回退工作流仍使用内容节点 `210`。
-
-## Civitai LoRA 下载
-
-管理员可以直接发送 Civitai 模型页 URL：
-
-```text
-/lora下载 https://civitai.com/models/123456/example-model
-/lora下载 https://civitai.red/models/123456/example-model?modelVersionId=789012
-```
-
-下载规则：
-
-- 仅接受 `https` 模型页 URL，支持的站点为 `civitai.com` 与 `civitai.red`；不接受 HTTP、其他域名、文件直链或带 URL 凭据的地址。
-- URL 带有 `modelVersionId` 时下载指定版本；没有 `modelVersionId` 时自动选择该模型最新的可用版本。
-- LoRA 文件下载完成后，插件会再次抓取对应 Civitai 元数据，并刷新 LoRA Manager/LLM 可查询清单，无需手动执行 `/lora刷新`。
-- 如果文件已经成功下载，但后续 Civitai 元数据抓取或清单刷新失败，命令会明确返回“部分成功”；这表示 LoRA 文件已落盘，仅元数据或即时索引尚未完整更新，不会误报为完全失败。
-- 此命令仅限 AstrBot 管理员使用，并受 `enable_lora_download` 开关控制。
-
-相关配置：
-
-- `enable_lora_download`：是否开放 `/lora下载` 管理命令；不需要远程下载时建议关闭。
-- `lora_download_timeout`：单次 Civitai 查询与下载允许等待的超时时间，请根据 LoRA 文件大小和外网速度设置。
-- `lora_download_allowed_hosts`：下载 URL 主机白名单。默认应保留 `civitai.com`、`civitai.red`；该配置用于显式收紧可信主机，不代表插件支持其他站点的页面格式。
-
-## Anima UNET 模型切换
-
-Anima V2 的主模型由档案映射到节点 `44` 的 `UNETLoader.unet_name`，不使用 CheckpointLoader；旧工作流仍按各自档案或回退配置解析。管理员命令：
-
-```text
-/模型列表
-/模型切换 2
-/模型切换 miaomiaoHarem_anima13.safetensors
-```
-
-- `/模型列表` 每次实时读取 `comfyui_url/object_info/UNETLoader`，不会使用旧缓存。
-- `/模型切换` 在解析序号或名称之前会再次读取全部最新数据，新放入 ComfyUI UNET 目录的模型可立即被发现。
-- 切换结果保存到 `unet_model_name`，并写入当前工作流档案声明的 UNET 输入；Anima V2 使用节点 `44` 的 `unet_name`，随后自动重载插件。
-- `unet_loader_node_id` 默认 `429`，仅作为没有 UNET 档案绑定的旧工作流回退；`unet_model_input_name` 默认 `unet_name`。
-
-## LoRA 组合预设与风格底座
-
-管理面板的 `lora_presets` 使用 AstrBot `template_list`，可新增三类模板：
-
-- `角色 LoRA 组合`：角色身份、服装或角色变体。
-- `画师/风格 LoRA 组合`：完整风格底座，建议成套保存画质、美感、画师、皮肤、背景等 LoRA。
-- `混合 LoRA 组合`：角色与画师/风格 LoRA 的成套组合。
-
-自然语言绘图的标准约定是：`风格NNN` 只保存完整风格底座，角色 LoRA 不放进风格串。角色由 LLM 根据画面人物另行查询，这样同一个 `风格001` 可以自由搭配达妮娅、黑娅或其他角色。
-
-每个组合可填写名称、LoRA 串、trigger words、说明和启用状态。`loras` 每行使用 `精确名称=权重`。随包默认的 `风格001` 为：
-
-```text
-(画质)anima-highres-aesthetic-boost=0.50
-(美感细节)anima-rl-v0.1=0.40
-anima-base-1-masterpiece-v51=0.50
-748cm_v2_anima=0.30
-hanaru_epoch24=0.31
-nekoya_v1_epoch21=0.30
-real skin.baka.v1-000010=0.65
-(写真背景)anima3-photo-background-v3=0.30
-```
-
-- 默认风格名称是精确的 `风格001`。快捷保存时填写数字 `001` 会规范为 `风格001`，前导零会保留；也可直接填写完整名称。
-- 风格显示名可以附加尾部备注，例如 `风格2（凛然）`；自然语言使用 `风格2` 时会解析到该完整名称。若多个预设共享同一省略备注简称，插件会要求使用完整名称，不会猜选。
-- 同名保存采用覆盖更新：再次保存 `风格001` 会替换原有 `风格001`，不会创建两个同名组合。
-- `风格001` 及其他 `风格NNN` 中不得放入角色 LoRA；角色 LoRA 应保持在 LoRA Manager 清单中，供 `list_anima_loras` 按角色独立查询。
-- `trigger_words` 会在应用组合时自动追加到正面提示词，LoRA tags 则注入节点 `462`。
-- 关闭 `enabled` 后，该组合不会出现在 LLM 查询结果中，也不能被绘图指令选择。
-- 单个组合数量受 `max_preset_loras` 限制；组合、提示词内 LoRA 与其他动态 LoRA 的去重后总数受 `max_total_dynamic_loras` 限制。
-- 管理员查看、保存或删除 LoRA 组合前都会强制刷新 Manager；后台录入的组合会在实际出图前再次刷新并严格校验。任何已经删除或改名的 LoRA 都会在提交 ComfyUI 前被拒绝。
-- 应用任意画师/风格组合时，插件会自动以 `replace` 模式替换节点 `462` 的旧风格栈，再把角色 LoRA 追加在后；无需手动切换全局 `dynamic_lora_mode`。
-
-自然语言示例：
-
-```text
-请用风格001帮我画一名站在雨夜车站的少女
-用风格001画达妮娅，分辨率832x1216
-用“水墨电影感”这个组合画一个山顶日出场景
-```
-
-LLM 的处理顺序如下：
-
-1. 用户指定风格时查询该精确名称；未指定时默认查询 `风格001`。
-2. 使用 `list_anima_lora_presets` 返回的完整风格 LoRA 栈及 trigger words。
-3. 如果画面包含明确角色，再用 `list_anima_loras` 查询角色，把角色 LoRA 和 trigger words 追加到风格栈之后。
-4. 任何一步都只使用工具真实结果，不根据风格名或角色名编造 LoRA。
-
-因此“用风格001画达妮娅”会先查询 `风格001` 的完整底座，再独立查询 `denia` 角色 LoRA，最终两者同时生效；达妮娅 LoRA 不会被保存进 `风格001`。
-
-## 使用方式
-
-### 自然语言绘图
-
-直接发送普通 QQ 消息：
-
-```text
-帮我画一个赛博朋克风格的猫，在下雨的东京街头
-用风格001画达妮娅站在海边，分辨率832x1216
-```
-
-插件会使用所选模型分析镜头、优化英文提示词并生成图片。自然语言中的 `分辨率832x1216`、`分辨率 832x1216` 和 `分辨率 832×1216` 会作为生成参数写入分辨率节点，不会混进正面提示词；未指定时默认使用 `832x1216`。
-
-### 直接 Tag 指令
-
-```text
-/画图 1girl, white hair, blue eyes, rain, neon city, cinematic lighting
-/画图no 1girl, black dress, portrait, looking at viewer
-/画图no 1girl, white hair, portrait --preset 风格001
-/画图 1girl, red dress, night city --preset "水墨电影感"
-```
-
-- `/画图`：以 QQ 合并转发发送，适合减少刷屏。
-- `/画图no`：直接发送图片，更简洁。
-- 两个指令都绕过 LLM，输入内容直接写入工作流提示词节点。
-- 两个指令都支持 `--preset <序号|名称>`（别名 `--lora-preset`）；包含空格的自定义名称需要加引号。
-
-### 图片反推与 RTX 放大
-
-把图片和命令放在同一条 QQ 消息中，或回复一张图片后发送：
-
-```text
-/反推 重点分析构图和光影
-/反推画图 保持构图，换成红色礼服，用风格2
-/放大 2
-```
-
-- `/反推` 只返回结构化 Tags、负面词、构图、画面说明、候选身份和置信度。
-- `/反推画图` 会把可靠的可观察事实交给绘图导演，再经过实时 LoRA 查询与 Anima 工作流生成；低置信角色身份不会自动当成事实。
-- `enable_reverse_json_formatter=true` 时，本地整理器兼容代码围栏、JSON 前后说明、尾逗号和单引号字典；关闭后只接受一个完整、双引号、无围栏的严格 JSON 对象。
-- `enable_reverse_json_repair_retry=true` 时，首次校验失败才会让同一多模态 Provider 重新查看原图并生成一次严格 JSON；关闭后只调用一次并直接返回安全错误。
-- `/放大` 不调用生图 UNET，只通过独立 RTX 工作流处理原图；允许倍率范围为 `1–4`，留空使用后台默认值。
-- 图片内文字、二维码和指令一律视为不可信视觉内容，不会当作系统指令执行。插件不接受命令文本中的任意图片 URL。
-
-### 单角色语义换角
-
-图片模式请发送或引用一张图：
-
-```text
-/换角色 达妮娅 -> 卡莲
-/换角色 达妮娅 -> 卡莲 --size 832x1216 --preset "风格2（凛然）"
-```
-
-已有完整提示词时使用 `|` 分隔；所有选项必须写在 `|` 之前：
-
-```text
-/换角色 达妮娅 -> 卡莲 --preview | <lora:characters/denia:0.8>, 1girl, denia_wuwa, black hair, school uniform, standing, rainy street
-/换角色 达妮娅 -> 卡莲 --weight 0.65 --negative "low quality" | 1girl, denia_wuwa, casual hoodie, looking at viewer
-```
-
-支持的换角专用选项：
-
-```text
---mode keep-outfit|target-outfit
---weight 0.55~0.75
---size 宽x高
---negative "负面提示词"
---preset "画师/风格组合"
---preview
-```
-
-- `keep-outfit` 为默认模式：删除 A 的角色 LoRA、身份词和人物定义外观，保留当前衣服、普通饰品、姿势、表情、镜头、场景、光线及风格/功能 LoRA。
-- `target-outfit` 会同时移除原衣服；只有目标 LoRA 当前元数据能明确证明默认服装触发词时才执行，否则停止而不猜测。
-- 图片输入先走现有在线结构化反推，再执行同一套换角规则并重新生成；它不会保留原图像素，也不等价于蒙版、局部重绘或人脸替换。
-- 首版只支持单角色。多图、直接图片与引用图片同时存在、图片和 Tags 同时提供、多人 Tags、多个角色 LoRA、目标歧义或分类低置信度都会被拒绝。
-- 每次先刷新 LoRA Manager 与 ComfyUI 可加载清单，提交前再次验证目标路径、SHA 和元数据指纹；删除或替换了 LoRA 时不会继续使用旧归档。
-- LLM 只能把编号 Tags 分组，并从目标 LoRA 当前元数据的编号触发词中选择；最终提示词和 LoRA 栈由插件确定性重建，Embedding/Rerank 只可辅助搜索，不能替用户决定文件。
-- `--preview` 不提交 ComfyUI，只显示删除、保留与新增摘要，建议首次使用新角色或复杂 weighted Tags 时先预览。
-
-### LLM 回复自动绘图
-
-普通角色扮演回复只要包含以下控制标签就会触发：
-
-```text
-<think>这里可以是模型内部的分镜分析</think>
-<pic prompt="1girl, close-up, rain, blue eyes, cinematic lighting">
-```
-
-换装等确有排除需求时可选：
-
-```text
-<pic prompt="1girl, red evening gown, silver hair" negative="school uniform, necktie">
-```
-
-插件会移除控制标签，保留标签外的正文，并把图片加入最终 QQ 回复；可选 `negative` 会写入工作流负面节点。绘图导演会先删除角色默认服装正面词、强化目标服装，并仅在元数据有证据时加入少量旧服装负面词；角色身份词不会进入负面提示。`<think>` 内的 `<pic>` 不会触发。
-
-### 高级 Anima 指令
-
-```text
-/anima draw <剧情或提示词>
-/anima prompt <剧情>
-/anima status
-/anima cancel
-/anima ping
-/anima help
-```
-
-`/anima draw` 支持：
-
-```text
---negative "bad hands, text"
---seed 123456
---size 1024x1536
---steps 30
---cfg 5
---upscale / --no-upscale
---llm / --raw
---preset "风格001或自定义名称"
-```
-
-例如：
-
-```text
-/anima draw 她在雨夜回头看向镜头 --preset 风格001
-/anima draw 1girl, white hair, portrait --raw --preset "水墨电影感"
-```
-
-`--preset` 可使用 `/lora组合列表` 显示的序号或精确名称；每次任务只能选择一个组合。
-
-## 管理指令
-
-以下切换指令仅 AstrBot 管理员可用：
-
-```text
-/comfy_ls
-/comfy_use <序号> [input_id] [output_id]
-/comfy_lock on|off|status
-/模型列表
-/模型切换 <序号|完整UNET文件名>
-/lora刷新
-/lora下载 <Civitai模型页URL>
-/lora组合列表 [角色|风格|混合]
-/lora组合保存 <角色|风格|混合|auto> <名称|数字|auto> <LoRA串> [--trigger "触发词"] [--description "说明"]
-/保存风格 <名称|数字> <LoRA串> [--trigger "触发词"] [--description "说明"]
-/lora组合删除 <序号|名称>
-/违禁级别 none|lite|full
-/comfy帮助
-```
-
-- `/comfy_ls` 每次重新扫描 `workflow_dir` 下直属的 `.json` 文件。
-- `/模型列表` 实时显示局域网 ComfyUI 当前全部 UNET 文件；当前模型会标记为 `✅ 当前`。
-- `/模型切换` 切换前强制刷新最新清单，支持列表序号或完整文件名，并优先持久化到当前工作流档案声明的 UNET 节点（Anima V2 为节点 44）。
-- `/comfy_use` 按列表序号热切换，并可覆盖提示词输入节点与图片输出节点；不需要重载插件。
-- `/comfy_lock on` 开启后仅管理员能绘图。可在配置中关闭此命令入口。
-- `/lora刷新` 让 LoRA Manager 重新扫描磁盘，并立即更新 LLM 可查询清单。
-- `/lora下载` 从受支持的 Civitai HTTPS 模型页下载 LoRA；未指定 `modelVersionId` 时选择最新版本，下载后自动补抓元数据并刷新清单。文件已下载但元数据或刷新阶段失败时会明确报告“部分成功”。
-- `/lora组合列表` 显示全部组合（包含禁用项）及稳定的全局序号，也可按角色、风格或混合分类筛选；筛选后序号不会改变。
-- `/lora组合保存` 创建或覆盖同名组合（名称匹配不区分大小写）。分类使用 `auto` 时会依据 LoRA Manager 元数据推断；名称使用数字会规范为 `角色N`、`风格N` 或 `组合N` 并保留前导零，使用 `auto` 会选择下一个可用编号。组合自身数量不得超过单次动态 LoRA 总上限。
-- `/保存风格` 是完整风格栈的快捷入口，例如 `/保存风格 001 <LoRA串>`；保存为 `风格001`，同名时直接覆盖。
-- 保存的分类为“画师/风格”时，`auto_reload_after_style_save=true` 会在成功持久化后自动重载插件；角色与混合组合不会触发自动重载。
-- `/lora组合删除` 按稳定的全局序号或精确名称删除组合，禁用组合也可以删除。
-- `/违禁级别` 修改当前 QQ 群的过滤策略并保存配置。
-- `/comfy帮助` 查看包含 `/lora下载` 在内的当前可用命令；下载入口是否可用取决于 `enable_lora_download`。
-
-保存示例：
-
-```text
-/保存风格 001 <lora:(画质)anima-highres-aesthetic-boost:0.50> <lora:(美感细节)anima-rl-v0.1:0.40> <lora:anima-base-1-masterpiece-v51:0.50> <lora:748cm_v2_anima:0.30> <lora:hanaru_epoch24:0.31> <lora:nekoya_v1_epoch21:0.30> <lora:real skin.baka.v1-000010:0.65> <lora:(写真背景)anima3-photo-background-v3:0.30> --description "默认完整风格底座"
-/保存风格 风格001 <lora:你新喜欢的真实LoRA名称:0.70> --description "同名保存，覆盖旧的风格001"
-```
-
-示例名称仅表示分类结构，请使用自己的真实 LoRA 名称。风格串中不要加入 `Denia` 等角色 LoRA；角色由 LLM 调用 `list_anima_loras` 动态查询。LoRA 名称必须与 LoRA Manager/ComfyUI 清单中的实际名称一致；开启严格校验后，不存在的名称会被拒绝保存。
-
-## 风控说明
-
-- `lite`：拦截未成年人色情、非自愿性行为、兽交、乱伦等高风险中英文词。
-- `full`：包含 Lite，并额外拦截一般露骨色情、重度血腥、自残及毒品词。
-- `none`：不进行词库检查，但仍受全局锁定和白名单约束。
-- 中文检查会识别简单的空格/标点拆分；英文使用单词边界以减少误判。
-- 可分别配置管理员无视冷却、白名单和违禁词；“无视违禁词”默认关闭。
-- 群白名单只约束群聊，私聊仍受全局锁定和违禁词策略约束。
-
-## 内置工作流
-
-默认生图工作流为 `workflow/anima_v2_api.json`，独立图片放大工作流为 `workflow/rtx_upscale_api.json`。节点映射以同名 manifest 为唯一真源：正面节点 `11`、负面节点 `12`、UNET 节点 `44`、LoRA Manager 节点 `462`、KSampler 节点 `19`、分辨率节点 `28`、原图输出 `88`、RTX 节点 `552`、RTX 输出 `458`。模板默认分辨率为 `832x1216`，采样参数为 `8 Steps / CFG 5 / Denoise 1`。
-
-旧 `workflow/anima_api.json` 原样保留为兼容回退。它使用旧节点 `210/13/429/437/285/20`，仅在显式切换到该工作流且没有 manifest 绑定时才读取配置中的 legacy 节点字段；新旧节点不会混用。
-
-明确引用的基础模型：
-
-- UNet：`miaomiaoHarem_anima8Step10.safetensors`
-- CLIP：`qwen_3_06b_base.safetensors`
-- VAE：`qwen_image_vae.safetensors`
-
-Anima V2 通过 `Lora Loader (LoraManager)` 接收插件在每次强制刷新后的动态选择，不再在工作流中固定重复加载某一组角色或风格 LoRA。保存的风格组合与本次角色 LoRA 会在提交前去重并注入一次。
-
-默认工作流使用 `Lora Loader (LoraManager)` 与 `RTXVideoSuperResolution` 等自定义节点。此前会在 `object_info` 注册、但运行时仍依赖可选 `sageattention` Python 包的 `PathchSageAttentionKJ` 已从模板移除，UNET 会直接连接 LoRA Manager。插件不会自动下载缺失模型、LoRA 或自定义节点。
-
-## 取消行为
-
-默认取消只删除尚在 ComfyUI 队列中的任务。运行中的任务可能继续占用显卡，但插件会停止等待。只有 ComfyUI 不与其他用户或程序共用时，才建议开启 `allow_global_interrupt`，因为它会中断 ComfyUI 当前全局任务。
+独立 WebUI 与原生 plugin-page 使用相同业务接口和前端功能，但采用自己的登录会话。后端只允许监听回环地址、`0.0.0.0`、私有 IP 或链路本地 IP，不接受公网 IP 或域名作为绑定目标。密码和 `api_token` 不会通过设置 API 回显；插件不会主动输出这些值，WebUI 日志控制台还会对常见凭据格式做额外脱敏。
+
+内置服务使用 HTTP，不自行提供 TLS。不要把 6198 端口直接暴露到公网，也不要让登录凭据或会话经过不可信网络。确需远程访问时，应使用可信 VPN，或由你自己的反向代理终止 HTTPS 并完成认证。
+
+## 安全与权限
+
+- 图片输入有格式、文件大小和像素总量限制；临时图片在任务结束后清理。
+- 图片中文字、二维码和提示注入都按不可信视觉内容处理，不会变成系统命令。
+- `/反推`、`/放大`、`/重绘` 和图片换角只读取本条或明确引用的图片。
+- 重绘必须有真实遮罩；生图与重绘控制标签互斥。
+- LoRA / UNET 模型删除要求最新清单中的精确名称和二次确认；浏览器只提交精确名与确认名，实际文件路径由后端根据 Manager 清单解析。
+- `lora_download_allowed_hosts` 应只保留可信 Civitai 官方域名；不要放开任意下载主机。
+- `unet_lan_only` 与 `lora_lan_only` 建议保持开启，避免清单请求访问公网、携带 URL 凭据或跟随不可信重定向。
+- 群白名单、全局锁定、用户冷却和 `none|lite|full` 词库策略在最终提示词提交前仍会执行。
+- 管理员忽略冷却、白名单或违禁词是独立配置；“忽略违禁词”默认应保持关闭。
+- 默认取消只移除尚在 ComfyUI 队列中的任务。`allow_global_interrupt=true` 可能中断 ComfyUI 当前全局任务，只适合不与其他用户或程序共享的实例。
 
 ## 常见问题
 
-- 工作流校验失败：在同一 ComfyUI 中手动运行工作流，检查缺失节点、模型和 LoRA。
-- 能对话但自然语言不出图：确认已选择绘图思考模型，并检查群白名单、全局锁定和违禁等级。
-- 普通角色扮演回复不自动出图：确认 `enable_llm_pic_trigger` 已开启，且最终回复确实包含合法 `<pic prompt="英文 tags">`。
-- `/画图` 合并转发失败：确认当前平台为 aiocqhttp/NapCat，并允许 OneBot v11 合并转发。
-- 连接 `127.0.0.1` 失败：AstrBot 与 ComfyUI 不在同一主机或容器网络。
-- 图片过大：提高 `max_image_size_mb` 或关闭二次放大。
+### WebUI 为什么只看到三个工作流？
+
+这是预期行为。下拉框只选择 `base`、`rtx`、`iterative` 三条文生图管线。独立 RTX 用 `/放大`，Quick / LanPaint 用 `/重绘`。点击“检查六管线依赖”可以查看全部六项。
+
+### “检查六管线依赖”有项目不可用
+
+先在同一 ComfyUI 中手动运行对应工作流，检查错误中报告的 `class_type`、模型和文件名。建议重新导入 `docs/workflows/导入Comfy工作流用下载插件用.json`，让 ComfyUI Manager 检测缺失节点。某条附加管线失败不会改变其他管线的依赖要求。
+
+### `character_not_found` 或无法确认目标角色
+
+先执行 `/lora刷新`，确认目标是否有唯一角色记录。普通角色名在目标 LoRA 真实缺失时会尝试纯语义 Tags；若要无条件禁止加载角色 LoRA，请使用：
+
+```text
+/换角色 A -> B --no-character-lora --preview
+```
+
+该选项不会绕过名称安全解析：歧义、近似候选以及显式但不存在的 `.safetensors` 路径仍会报错，不会静默降级。纯语义模式还要求可用的绘图 Provider，并且只支持 `keep-outfit`。
+
+### 纯语义换角仍失败
+
+检查绘图 Provider 是否可调用、`character_swap_timeout` 是否足够，以及模型是否返回了合格的受限英文身份 Tags。若请求同时要求 `target-outfit`，请改为默认 `keep-outfit`。插件会拒绝在纯语义模式中残留任何角色 LoRA。
+
+### LoRA 明明在 Manager 中，插件仍说不可用
+
+Manager 元数据不代表 ComfyUI 当前能加载该文件。检查 `/object_info` 中的 Lora Manager 节点清单、Manager 扫描状态、完整子目录路径和同 basename 冲突。严格模式不会使用仅存在于旧元数据或旧缓存中的记录。
+
+### 自然语言能聊天但不出图
+
+检查 `enable_natural_draw`、绘图思考模型、全局锁定、群白名单、冷却和违禁级别。普通 LLM 回复自动出图还要求 `enable_llm_pic_trigger=true`，并且最终回复包含合法的 `<pic prompt="...">`。
+
+### `/反推` 或图片换角无法读取图片
+
+确认使用 aiocqhttp / NapCat 发送或引用了单张图片，所选 Provider 支持图片输入，图片没有超过 `max_input_image_size_mb` 和 `max_input_image_pixels`。图片换角当前只接受单角色输入。
+
+### `/重绘` 报遮罩错误
+
+确认原图和遮罩尺寸完全一致；白色或透明区域是重绘区域，纯黑遮罩会被视为空。只发一张图片时，它必须是带透明区域的 PNG。
+
+### 连接 `127.0.0.1` 失败
+
+AstrBot 与 ComfyUI 很可能不在同一个网络命名空间。Docker 部署请使用宿主机地址、容器服务名或同网络地址，并确认反向代理允许插件所需的 HTTP 接口。
+
+### `/画图` 合并转发失败
+
+确认平台是 aiocqhttp / NapCat，且 OneBot v11 合并转发可用。可先使用 `/画图no` 判断生成链路本身是否正常。
+
+### 取消后显卡仍在运行
+
+默认取消只停止插件等待并删除排队项，不一定中断已经开始的 ComfyUI 任务。除非 ComfyUI 是独占实例，否则不要开启全局中断。
+
+## 数据、升级与排查资料
+
+运行时语义索引、任务记录、缓存、下载状态和本地配置保存在插件数据目录，不应提交到源码仓库。升级前建议备份 AstrBot 插件配置、数据目录、自定义工作流与人工 LoRA 别名。
+
+排查问题时请同时提供：
+
+- AstrBot 插件日志中的错误码和阶段。
+- “检查六管线依赖”的对应项目结果。
+- ComfyUI 运行同一 API 工作流时的节点错误。
+- 是否使用 Docker / 反向代理，以及 AstrBot 访问的 `comfyui_url`。
+- 相关 LoRA 的精确文件名和 `/lora刷新` 结果；不要提供服务器绝对路径、密码或 Token。
+
+## 许可证
+
+仓库当前未附带明确的 `LICENSE` 文件，许可条款仍待项目作者确认。在明确许可证发布前，不应默认本项目允许复制、修改、再分发或商用。
+
+ComfyUI、自定义节点、模型、LoRA、Civitai 资源及其他第三方内容分别受其各自许可证和使用条款约束；使用者需要自行确认授权范围。

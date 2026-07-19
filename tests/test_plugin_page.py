@@ -214,10 +214,19 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
                     "workflow-select",
                     "workflow-refresh",
                     "workflow-activate",
+                    "workflow-tool-title",
+                    "workflow-tool-list",
                 ):
                     self.assertIn(f'id="{identifier}"', html)
                 self.assertIn('api("/api/workflows")', script)
                 self.assertIn('api("/api/workflows/select"', script)
+                self.assertIn("function renderWorkflowTools()", script)
+                self.assertIn("data.generation_items", script)
+                self.assertIn("data.tool_items", script)
+                self.assertNotIn(
+                    'body: JSON.stringify({identifier: item.filename, tool:',
+                    script,
+                )
 
 
 if __name__ == "__main__":
