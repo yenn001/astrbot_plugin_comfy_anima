@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-07-21
+
+### 纯语义换角与 Provider 响应兼容
+
+- 修复“纯语义身份 Tags 规划未返回可验证结果”误拒绝：统一读取 AstrBot 的字符串、Mapping、`completion_text`、可见 `result_chain` Plain/JSON 组件，同时识别 `role=err`、无 choices 和全模型失败，不再把 Provider 错误误报为 JSON 格式错误。
+- 纯语义身份规划新增结构兼容层，支持明确的 `canonical_identity_tag + appearance_tags`、旧版 `identity_tags`、安全字段别名、百分比/0–100 整数置信度和 Danbooru 括号转义；非 ASCII、路径、LoRA、控制词和低置信度仍然失败关闭。
+- `--no-character-lora` 现在真正以语义身份为执行依据；多个目标角色 LoRA 文件变体不再阻断纯语义模式，但错别字建议、显式文件请求、多人、错误身份锚点以及最终角色 LoRA 注入仍会停止。
+- LoRA 工具分镜和重绘分镜使用同一套可见响应解包逻辑；明确 Provider 失败不再被当作提示词协议问题重复运行完整工具循环。
+- 增加纯语义结构兼容、Provider 错误、结果链 JSON、低置信度、合法限定角色名和重复目标 LoRA 文件回归测试；全量测试增至 513 项。
+
 ## [1.4.1] - 2026-07-20
 
 ### Provider 失败闭锁与语义改图合同

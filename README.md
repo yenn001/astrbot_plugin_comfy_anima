@@ -1,16 +1,16 @@
 # AstrBot Comfy Anima
 
-> 当前开发版本：v1.4.1
+> 当前正式版本：v1.4.2
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、LoRA 实时索引和管理页面放在同一套受控流程中。
 
-本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“七项工作流能力”和“依赖”两节。
+本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 
 - 项目地址：<https://github.com/yenn001/astrbot_plugin_comfy_anima>
 - 更新记录：[CHANGELOG.md](CHANGELOG.md)
 - 配置字段：[\_conf_schema.json](_conf_schema.json)
 
-## 七项工作流能力
+## 八项工作流能力
 
 插件包含三条可选文生图管线，以及整图 img2img、底图控制、独立放大和两条遮罩重绘工具。只有前三条能设为默认文生图工作流。
 
@@ -34,7 +34,7 @@
 3. 绘图导演在用户明确表达时选择的管线。
 4. WebUI / 插件配置中的默认管线。
 
-`workflow/anima_v2_api.json` 与 `workflow/anima_api.json` 作为兼容、回滚资产保留，不属于七项正式工作流能力。
+`workflow/anima_v2_api.json` 与 `workflow/anima_api.json` 作为兼容、回滚资产保留，不属于八项正式工作流能力。
 
 ## 主要能力
 
@@ -76,7 +76,7 @@ python -m pip install -r requirements.txt
 
 ### ComfyUI 模型
 
-七份 API 工作流的当前模板明确引用下列文件名。使用不同 UNET 时，优先通过 `/模型列表` 与 `/模型切换` 写入运行配置；更换 CLIP、VAE 或工作流拓扑时，需要同步检查 API 工作流以及 manifest 中的节点绑定。兼容工作流与 `docs/workflows/` 依赖检查资产可能保留不同的历史模型名，应按各自文件内容单独核对，不能把下表视为整个仓库所有 JSON 的统一模型声明。
+八份 API 工作流的当前模板明确引用下列文件名。使用不同 UNET 时，优先通过 `/模型列表` 与 `/模型切换` 写入运行配置；更换 CLIP、VAE 或工作流拓扑时，需要同步检查 API 工作流以及 manifest 中的节点绑定。兼容工作流与 `docs/workflows/` 依赖检查资产可能保留不同的历史模型名，应按各自文件内容单独核对，不能把下表视为整个仓库所有 JSON 的统一模型声明。
 
 | 类型 | 内置文件名 |
 | --- | --- |
@@ -88,7 +88,7 @@ python -m pip install -r requirements.txt
 
 ### ComfyUI 自定义节点
 
-七项工作流能力使用的关键非核心节点如下：
+八项工作流能力使用的关键非核心节点如下：
 
 | 能力 | 必需节点类 |
 | --- | --- |

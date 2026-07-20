@@ -453,7 +453,7 @@ class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
             "1girl, red dress",
         )
 
-    async def test_invalid_provider_output_retries_once_then_accepts_pic(self) -> None:
+    async def test_invalid_protocol_retries_once_then_accepts_pic(self) -> None:
         director = self._director()
 
         class Context:
@@ -462,7 +462,7 @@ class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
             async def llm_generate(self, **_kwargs: object) -> object:
                 self.calls += 1
                 output = (
-                    "All chat models failed: EmptyModelOutputError"
+                    "not a valid drawing protocol"
                     if self.calls == 1
                     else '<pic prompt="1girl, red dress">'
                 )
@@ -500,11 +500,11 @@ class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
         context = Context()
         with self.assertRaises(PromptDirectorError) as raised:
             await director.generate_instruction(context, object(), "draw")
-        self.assertEqual(context.calls, 2)
+        self.assertEqual(context.calls, 1)
         self.assertTrue(raised.exception.fatal)
         self.assertNotIn("private-secret", raised.exception.detail)
         self.assertNotIn("response_id=", raised.exception.detail)
-        self.assertIn("provider_output_error", raised.exception.detail)
+        self.assertEqual(raised.exception.detail, "all_models_failed")
 
 
 if __name__ == "__main__":

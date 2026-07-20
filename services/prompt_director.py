@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.4.1
+AstrBot Comfy Anima 插件 v1.4.2
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.4.1
-日期: 2026-07-20
+版本: 1.4.2
+日期: 2026-07-21
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from typing import Any
 
 from ..core.lora import LORA_TAG_PATTERN
 from ..models import PluginSettings
+from .provider_response import response_error_code, response_text
 
 
 _PIC_TAG_RE = re.compile(
@@ -350,7 +351,14 @@ class PromptDirector:
         first_error: PromptDirectorError | None = None
         for attempt in range(2):
             try:
-                completion = getattr(response, "completion_text", None)
+                provider_error = response_error_code(response)
+                if provider_error:
+                    raise PromptDirectorError(
+                        "绘图 Provider 没有返回可用结果",
+                        provider_error,
+                        fatal=True,
+                    )
+                completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
                     raise PromptDirectorError(
                         "绘图模型没有返回有效提示词",
@@ -363,6 +371,13 @@ class PromptDirector:
                 )
                 return instruction, provider_id
             except PromptDirectorError as exc:
+                if exc.detail in {
+                    "error_role",
+                    "all_models_failed",
+                    "no_choices",
+                    "provider_error",
+                }:
+                    raise
                 if attempt == 1:
                     detail = exc.detail or exc.user_message
                     if first_error is not None and not detail:
@@ -489,7 +504,14 @@ class PromptDirector:
             ) from exc
         for attempt in range(2):
             try:
-                completion = getattr(response, "completion_text", None)
+                provider_error = response_error_code(response)
+                if provider_error:
+                    raise PromptDirectorError(
+                        "重绘 Provider 没有返回可用结果",
+                        provider_error,
+                        fatal=True,
+                    )
+                completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
                     raise PromptDirectorError(
                         "LLM 没有返回有效重绘提示词",
@@ -506,6 +528,13 @@ class PromptDirector:
                     )
                 return instructions[0], provider_id
             except PromptDirectorError as exc:
+                if exc.detail in {
+                    "error_role",
+                    "all_models_failed",
+                    "no_choices",
+                    "provider_error",
+                }:
+                    raise
                 if attempt == 1:
                     raise PromptDirectorError(
                         "重绘模型连续两次没有返回可用的 <edit> 提示词，已停止且不会提交 ComfyUI",

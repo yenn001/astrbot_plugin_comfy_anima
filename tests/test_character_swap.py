@@ -529,6 +529,111 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "character_suggestion")
 
+    def test_no_character_lora_ignores_duplicate_target_lora_files(self) -> None:
+        rice_a = _record(
+            "characters/rice_shower_a.safetensors",
+            "米浴",
+            "rice-a",
+            triggers=("rice_shower_(umamusume)",),
+            source_work="赛马娘",
+        )
+        rice_b = _record(
+            "characters/rice_shower_b.safetensors",
+            "米浴",
+            "rice-b",
+            triggers=("rice_shower_(umamusume)",),
+            source_work="赛马娘",
+        )
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "Denia",
+                "米浴",
+                use_target_lora=False,
+            ),
+            positive_prompt="1girl, denia_wuwa, black hair, standing",
+            negative_prompt="",
+            records=(*self.records, rice_a, rice_b),
+            fallback_target_tags=("rice_shower_(umamusume)", "brown hair"),
+        )
+
+        self.assertIsNone(preparation.target_record)
+        self.assertIn(preparation.target_metadata_record, (rice_a, rice_b))
+        self.assertEqual(preparation.target_trigger_words, ("rice_shower_(umamusume)",))
+
+    def test_no_character_lora_keeps_cross_identity_alias_ambiguous(self) -> None:
+        first = _record(
+            "characters/alex_game_a.safetensors",
+            "Alex A",
+            "alex-a",
+            triggers=("alex_a_(game_a)",),
+            source_work="Game A",
+        )
+        second = _record(
+            "characters/alex_game_b.safetensors",
+            "Alex B",
+            "alex-b",
+            triggers=("alex_b_(game_b)",),
+            source_work="Game B",
+        )
+        first_entry = _semantic_entry(first, "阿历克斯")
+        second_entry = _semantic_entry(second, "阿历克斯")
+        planner = CharacterSwapPlanner(
+            LoraSemanticIndex(
+                entries={
+                    first_entry.identity_key: first_entry,
+                    second_entry.identity_key: second_entry,
+                }
+            )
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            planner.prepare(
+                CharacterSwapRequest(
+                    "Denia",
+                    "阿历克斯",
+                    use_target_lora=False,
+                ),
+                positive_prompt="1girl, denia_wuwa, black hair, standing",
+                negative_prompt="",
+                records=(*self.records, first, second),
+                fallback_target_tags=("alex_a_(game_a)",),
+            )
+
+        self.assertEqual(raised.exception.code, "ambiguous_character")
+
+    def test_qualified_character_name_survives_finalize(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "Denia",
+                "Hat Kid",
+                use_target_lora=False,
+            ),
+            positive_prompt="1girl, denia_wuwa, black hair, standing, masterpiece",
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=("hat_kid_(a_hat_in_time)", "brown hair"),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1, 2],
+                    pose_action_ids=[3],
+                    style_quality_ids=[0, 4],
+                    target_appearance_trigger_ids=[1],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+        plan = self.planner.finalize(
+            preparation,
+            classification,
+        )
+
+        self.assertIn("hat_kid_(a_hat_in_time)", plan.prompt)
+        self.assertNotIn("characters/kallen", [item.name for item in plan.loras])
+
     def test_semantic_fallback_injects_only_identity_and_appearance(self) -> None:
         preparation = self.planner.prepare(
             CharacterSwapRequest("Denia", "Unknown Hero", use_target_lora=False),

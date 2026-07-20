@@ -33,6 +33,7 @@ from .lora_semantic import (
     SemanticEntry,
     semantic_source_fingerprint,
 )
+from .provider_response import response_text as _provider_response_text
 
 
 SWAP_MODE_KEEP_OUTFIT = "keep-outfit"
@@ -142,6 +143,41 @@ _APPEARANCE_MARKERS = (
     "角",
     "翅",
     "尾",
+)
+_GENERIC_IDENTITY_QUALIFIERS = frozenset(
+    {"character", "fiction", "game", "original", "series", "work"}
+)
+_CONCEPT_DESCRIPTOR_TOKENS = frozenset(
+    {
+        "black",
+        "blonde",
+        "blue",
+        "brown",
+        "casual",
+        "dark",
+        "formal",
+        "green",
+        "grey",
+        "gray",
+        "long",
+        "maid",
+        "military",
+        "orange",
+        "pink",
+        "purple",
+        "red",
+        "school",
+        "short",
+        "silver",
+        "traditional",
+        "white",
+        "yellow",
+        *(
+            marker
+            for marker in (*_APPEARANCE_MARKERS, *_OBVIOUS_OUTFIT_MARKERS)
+            if marker.isascii() and marker.isalpha()
+        ),
+    }
 )
 _NON_CHARACTER_REQUEST_MARKERS = (
     "背景",
@@ -366,6 +402,305 @@ def _dedupe_text(values: Iterable[Any]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _semantic_identity_anchor_candidate(value: str) -> bool:
+    """Validate an LLM-only identity anchor without LoRA filename heuristics.
+
+    Qualified Danbooru character tags may legitimately contain words such as
+    ``hat`` or ``eyes`` in the proper name.  The shared LoRA trigger heuristic
+    intentionally rejects those substrings, so pure semantic planning permits
+    the stricter ``name_(work)`` shape while still rejecting generic subjects.
+    """
+
+    folded = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    key = _prompt_term_key(folded)
+    if not key or key in _GENERIC_NON_IDENTITY_KEYS:
+        return False
+    if is_character_identity_trigger_candidate(folded):
+        return True
+    qualified = re.fullmatch(
+        r"(?P<name>[a-z0-9][a-z0-9_.' /&+\-:]{1,63})_?"
+        r"\((?P<work>[a-z0-9][a-z0-9_.' /&+\-:]{1,63})\)",
+        folded,
+    )
+    if qualified is None:
+        return False
+    work_key = _prompt_term_key(qualified.group("work"))
+    if work_key in _GENERIC_IDENTITY_QUALIFIERS:
+        return False
+    name_tokens = tuple(
+        token
+        for token in re.split(r"[^a-z0-9]+", qualified.group("name"))
+        if token
+    )
+    if name_tokens and all(
+        token in _CONCEPT_DESCRIPTOR_TOKENS for token in name_tokens
+    ):
+        return False
+    return True
+
+
+def _trusted_identity_signature(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex,
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    names = {
+        _identity_key(value)
+        for value in _split_names(record.character_name)
+        if _identity_key(value)
+    }
+    works = {
+        _identity_key(value)
+        for value in _split_names(record.source_work)
+        if _identity_key(value)
+    }
+    entry = semantic_index.entry_for(record)
+    if _entry_is_fresh(entry, record):
+        assert entry is not None
+        for field_name, target in (
+            ("character_names", names),
+            ("source_works", works),
+        ):
+            for fact in entry.effective_facts(field_name):
+                if fact.source in {"manual", "observed"} or (
+                    fact.confidence >= 0.85 and entry.analysis_confidence >= 0.85
+                ):
+                    key = _identity_key(fact.value)
+                    if key:
+                        target.add(key)
+    triggers = {
+        _prompt_term_key(value)
+        for value in _target_trigger_candidates(record)
+        if _semantic_identity_anchor_candidate(value)
+        and "(" in unicodedata.normalize("NFKC", value)
+    }
+    return frozenset(names), frozenset(works), frozenset(triggers)
+
+
+def _records_share_proven_identity(
+    records: Sequence[LoraRecord],
+    semantic_index: LoraSemanticIndex,
+) -> bool:
+    signatures = [
+        _trusted_identity_signature(record, semantic_index) for record in records
+    ]
+    if len(signatures) < 2:
+        return True
+    shared_names = set(signatures[0][0])
+    shared_works = set(signatures[0][1])
+    shared_triggers = set(signatures[0][2])
+    for names, works, triggers in signatures[1:]:
+        shared_names &= set(names)
+        shared_works &= set(works)
+        shared_triggers &= set(triggers)
+    return bool(shared_triggers or (shared_names and shared_works))
+
+
+def normalize_semantic_identity_payload(
+    payload: Mapping[str, Any],
+) -> tuple[tuple[str, ...], float, int]:
+    """Canonicalize safe, common semantic-identity JSON response shapes."""
+
+    active: Mapping[str, Any] = payload
+    for _depth in range(2):
+        nested = next(
+            (
+                active.get(key)
+                for key in ("data", "result", "output")
+                if isinstance(active.get(key), Mapping)
+            ),
+            None,
+        )
+        if not isinstance(nested, Mapping):
+            break
+        active = nested
+
+    canonical = next(
+        (
+            active.get(key)
+            for key in (
+                "canonical_identity_tag",
+                "identity_tag",
+                "character_tag",
+                "canonical_tag",
+            )
+            if isinstance(active.get(key), str) and str(active.get(key)).strip()
+        ),
+        "",
+    )
+    raw_tags = next(
+        (
+            active.get(key)
+            for key in ("identity_tags", "character_tags", "tags")
+            if active.get(key) is not None
+        ),
+        None,
+    )
+    if isinstance(raw_tags, str):
+        raw_tags = [
+            item.strip()
+            for item in re.split(r"[,;\n]+", raw_tags)
+            if item.strip()
+        ]
+    if raw_tags is None:
+        raw_tags = []
+    if not isinstance(raw_tags, list):
+        raise CharacterSwapError(
+            "纯语义身份 Tags 字段格式无效",
+            code="semantic_target_tag_type",
+        )
+
+    appearance = next(
+        (
+            active.get(key)
+            for key in ("appearance_tags", "stable_appearance_tags")
+            if active.get(key) is not None
+        ),
+        [],
+    )
+    if isinstance(appearance, str):
+        appearance = [
+            item.strip()
+            for item in re.split(r"[,;\n]+", appearance)
+            if item.strip()
+        ]
+    if not isinstance(appearance, list):
+        raise CharacterSwapError(
+            "纯语义稳定外观 Tags 字段格式无效",
+            code="semantic_target_tag_type",
+        )
+    combined: list[Any] = []
+    if canonical:
+        combined.append(canonical)
+    combined.extend(raw_tags)
+    combined.extend(appearance)
+    if not 1 <= len(combined) <= 16:
+        raise CharacterSwapError(
+            "纯语义身份 Tags 数量必须为 1 到 16 项",
+            code="semantic_target_tag_count",
+        )
+
+    confidence_raw = next(
+        (
+            active.get(key)
+            for key in ("confidence", "score", "certainty")
+            if active.get(key) is not None
+        ),
+        None,
+    )
+    if isinstance(confidence_raw, bool):
+        raise CharacterSwapError(
+            "纯语义身份置信度格式无效",
+            code="semantic_target_confidence_invalid",
+        )
+    percent = False
+    if isinstance(confidence_raw, str):
+        value = confidence_raw.strip()
+        percent = value.endswith("%")
+        if percent:
+            value = value[:-1].strip()
+        try:
+            confidence = float(value)
+        except ValueError as exc:
+            raise CharacterSwapError(
+                "纯语义身份置信度格式无效",
+                code="semantic_target_confidence_invalid",
+            ) from exc
+    elif isinstance(confidence_raw, (int, float)):
+        confidence = float(confidence_raw)
+    else:
+        raise CharacterSwapError(
+            "纯语义身份置信度格式无效",
+            code="semantic_target_confidence_invalid",
+        )
+    if not math.isfinite(confidence):
+        raise CharacterSwapError(
+            "纯语义身份置信度格式无效",
+            code="semantic_target_confidence_invalid",
+        )
+    if percent or 2.0 <= confidence <= 100.0:
+        confidence /= 100.0
+    if not 0.0 <= confidence <= 1.0:
+        raise CharacterSwapError(
+            "纯语义身份置信度超出范围",
+            code="semantic_target_confidence_invalid",
+        )
+    if confidence < 0.8:
+        raise CharacterSwapError(
+            "绘图模型对目标角色身份不够确定，请补充作品名或英文角色名",
+            code="semantic_target_low_confidence",
+        )
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for index, raw_tag in enumerate(combined):
+        if not isinstance(raw_tag, str):
+            raise CharacterSwapError(
+                "纯语义身份 Tag 必须为字符串",
+                code="semantic_target_tag_type",
+            )
+        tag = unicodedata.normalize("NFKC", raw_tag)
+        tag = re.sub(r"\\([()\[\]{}])", r"\1", tag)
+        tag = re.sub(r"\s+", " ", tag).strip(" ,")
+        folded_tag = tag.casefold()
+        if any(ord(char) < 32 or ord(char) > 126 for char in tag):
+            raise CharacterSwapError(
+                "纯语义身份 Tag 必须使用 ASCII 英文 Danbooru Tags",
+                code="semantic_target_non_ascii",
+            )
+        if (
+            not tag
+            or len(tag) > 80
+            or "," in tag
+            or not re.fullmatch(r"[A-Za-z0-9_().'\-:/&+ ]+", tag)
+            or re.search(
+                r"(?:^|\s)(?:BREAK|AND)(?:\s|$)|"
+                r"(?:embedding|wildcard|lora)\s*:|__|"
+                r"https?://|\\|\.\.|\.(?:safetensors|ckpt|pt|bin)$|"
+                r"(?:ignore|disregard|override|follow|obey).{0,24}"
+                r"(?:instruction|rule|prompt)|"
+                r"^(?:assistant|developer|system|user)\s*:",
+                tag,
+                re.IGNORECASE,
+            )
+            or "<" in tag
+            or ">" in tag
+        ):
+            raise CharacterSwapError(
+                "纯语义身份 Tag 未通过安全校验",
+                code="semantic_target_unsafe_tag",
+            )
+        if folded_tag not in seen:
+            seen.add(folded_tag)
+            tags.append(tag)
+        if index > 0 and "(" in tag and _semantic_identity_anchor_candidate(tag):
+            raise CharacterSwapError(
+                "稳定外观 Tags 中不能混入第二个角色身份锚点",
+                code="semantic_target_multiple_identity",
+            )
+    if not tags or not _semantic_identity_anchor_candidate(tags[0]):
+        raise CharacterSwapError(
+            "纯语义身份首项不是可验证的角色身份锚点",
+            code="semantic_target_identity_anchor",
+        )
+
+    recognized_fields = {
+        "canonical_identity_tag",
+        "identity_tag",
+        "character_tag",
+        "canonical_tag",
+        "identity_tags",
+        "character_tags",
+        "tags",
+        "appearance_tags",
+        "stable_appearance_tags",
+        "confidence",
+        "score",
+        "certainty",
+    }
+    ignored_field_count = len(set(active) - recognized_fields)
+    return tuple(tags), confidence, ignored_field_count
+
+
 def _split_names(value: Any) -> tuple[str, ...]:
     return _dedupe_text(_SPLIT_NAME_RE.split(_clean_text(value)))
 
@@ -536,6 +871,7 @@ def resolve_character_record(
     semantic_index: LoraSemanticIndex,
     *,
     role_label: str = "目标",
+    allow_equivalent_variants: bool = False,
 ) -> LoraRecord:
     """Resolve a character only from exact, provenance-aware identity evidence."""
 
@@ -632,6 +968,15 @@ def resolve_character_record(
         for item in finalists
     }
     if len(unique) != 1:
+        finalist_records = tuple(item[1] for item in finalists)
+        if allow_equivalent_variants and _records_share_proven_identity(
+            finalist_records,
+            semantic_index,
+        ):
+            return sorted(
+                finalist_records,
+                key=lambda record: _canonical_key(record.name),
+            )[0]
         names = "、".join(item[1].name for item in finalists[:5])
         raise CharacterSwapError(
             f"{role_label}角色“{query}”命中多个 LoRA：{names}；请使用完整精确文件名",
@@ -779,15 +1124,25 @@ class CharacterSwapPlanner:
                 request.target_query,
                 self._semantic_index,
                 role_label="目标",
+                allow_equivalent_variants=not request.use_target_lora,
             )
         except CharacterSwapError as exc:
-            # Suggestions and ambiguity are never bypassed by pure-Tags mode.
-            # Only a true miss may use separately validated semantic candidates.
-            if (
-                exc.code != "character_not_found"
-                or explicit_target
-                or not fallback_target_tags
-            ):
+            # Pure semantic mode intentionally does not select a target LoRA file.
+            # Multiple LoRA variants of the same requested character therefore do
+            # not authorize or block the operation; the separately generated and
+            # classified identity tags are the execution authority.  A typo
+            # suggestion and explicit file/path requests still fail closed.
+            semantic_metadata_optional = (
+                not request.use_target_lora
+                and not explicit_target
+                and exc.code == "character_not_found"
+            )
+            legacy_missing_fallback = (
+                exc.code == "character_not_found"
+                and not explicit_target
+                and bool(fallback_target_tags)
+            )
+            if not (semantic_metadata_optional or legacy_missing_fallback):
                 raise
         target = target_metadata if request.use_target_lora else None
         if (
@@ -1210,16 +1565,10 @@ explanations."""
                     code="semantic_target_identity_unverified",
                 )
             target_trigger = preparation.target_trigger_words[trigger_id]
-            folded_target = unicodedata.normalize(
-                "NFKC",
-                target_trigger,
-            ).casefold()
             target_key = _prompt_term_key(target_trigger)
             if (
-                not is_character_identity_trigger_candidate(target_trigger)
+                not _semantic_identity_anchor_candidate(target_trigger)
                 or target_key in _GENERIC_NON_IDENTITY_KEYS
-                or any(marker in folded_target for marker in _APPEARANCE_MARKERS)
-                or any(marker in folded_target for marker in _OBVIOUS_OUTFIT_MARKERS)
             ):
                 raise CharacterSwapError(
                     "分类模型选择了通用、外观或服装词作为目标身份触发词",
@@ -1723,23 +2072,7 @@ def fit_canvas_to_aspect_ratio(
 
 
 def response_text(response: Any) -> str:
-    if isinstance(response, str):
-        return response
-    if isinstance(response, Mapping):
-        for key in ("completion_text", "text", "content"):
-            value = response.get(key)
-            if isinstance(value, str):
-                return value
-        if "identity_tags" in response and "confidence" in response:
-            try:
-                return json.dumps(response, ensure_ascii=False)
-            except (TypeError, ValueError, RecursionError):
-                return ""
-    for attribute in ("completion_text", "text", "content"):
-        value = getattr(response, attribute, None)
-        if isinstance(value, str):
-            return value
-    return ""
+    return _provider_response_text(response)
 
 
 __all__ = [
@@ -1752,6 +2085,7 @@ __all__ = [
     "SWAP_MODE_KEEP_OUTFIT",
     "SWAP_MODE_TARGET_OUTFIT",
     "fit_canvas_to_aspect_ratio",
+    "normalize_semantic_identity_payload",
     "parse_character_swap_request",
     "parse_natural_character_swap",
     "resolve_character_record",

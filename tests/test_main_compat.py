@@ -2289,13 +2289,17 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
-    def _plugin(self, response_text: str):
+    def _plugin(self, response_text):
         calls = []
+        responses = list(response_text) if isinstance(response_text, tuple) else [response_text]
 
         class Context:
             async def llm_generate(self, **kwargs):
                 calls.append(kwargs)
-                return types.SimpleNamespace(completion_text=response_text)
+                response = responses[min(len(calls) - 1, len(responses) - 1)]
+                if isinstance(response, str):
+                    return types.SimpleNamespace(completion_text=response)
+                return response
 
         class Director:
             @staticmethod
@@ -2351,6 +2355,200 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider, "semantic-provider")
         self.assertEqual(tags, ("rice_shower_(umamusume)", "brown hair"))
         self.assertNotIn(id(event), plugin._internal_llm_events)
+
+    async def test_structured_schema_percent_confidence_and_danbooru_escapes(self) -> None:
+        plugin, _calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": r"rice_shower_\(umamusume\)",
+                    "appearance_tags": ["brown hair", "purple eyes"],
+                    "confidence": "95%",
+                }
+            )
+        )
+
+        tags, _provider = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(
+            tags,
+            ("rice_shower_(umamusume)", "brown hair", "purple eyes"),
+        )
+
+    async def test_nested_result_chain_json_component_is_accepted(self) -> None:
+        response = types.SimpleNamespace(
+            role="assistant",
+            result_chain=[
+                {
+                    "type": "json",
+                    "data": {
+                        "identity_tag": "rice_shower_(umamusume)",
+                        "appearance_tags": ["brown hair"],
+                        "confidence": 95,
+                    },
+                }
+            ],
+        )
+        plugin, _calls = self._plugin(response)
+
+        tags, _provider = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(tags, ("rice_shower_(umamusume)", "brown hair"))
+
+    async def test_message_history_uses_only_last_assistant_answer(self) -> None:
+        response = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        '{"identity_tag":"wrong_character_(wrong_work)",'
+                        '"appearance_tags":[],"confidence":0.99}'
+                    ),
+                },
+                {
+                    "role": "reasoning",
+                    "content": "hidden intermediate text",
+                },
+                {
+                    "role": "assistant",
+                    "content": (
+                        '{"identity_tag":"rice_shower_(umamusume)",'
+                        '"appearance_tags":["brown hair"],"confidence":0.95}'
+                    ),
+                },
+            ]
+        }
+        plugin, _calls = self._plugin(response)
+
+        tags, _provider = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(tags[0], "rice_shower_(umamusume)")
+
+    async def test_openai_choices_message_content_is_accepted(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            '{"identity_tag":"rice_shower_(umamusume)",'
+                            '"appearance_tags":[],"confidence":95.5}'
+                        ),
+                    }
+                }
+            ]
+        }
+        plugin, _calls = self._plugin(response)
+
+        tags, _provider = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(tags, ("rice_shower_(umamusume)",))
+
+    async def test_nested_error_role_overrides_visible_json(self) -> None:
+        response = {
+            "messages": [
+                {"role": "err", "content": "private upstream error"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        '{"identity_tag":"rice_shower_(umamusume)",'
+                        '"appearance_tags":[],"confidence":0.95}'
+                    ),
+                },
+            ]
+        }
+        plugin, _calls = self._plugin(response)
+
+        with self.assertRaises(self.main.CharacterSwapError) as raised:
+            await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "赛马娘的米浴",
+            )
+
+        self.assertEqual(raised.exception.code, "semantic_target_provider_error")
+
+    async def test_provider_error_role_is_reported_without_schema_misdiagnosis(self) -> None:
+        plugin, calls = self._plugin(
+            types.SimpleNamespace(
+                role="err",
+                completion_text="all_models_failed: private upstream detail",
+            )
+        )
+
+        with self.assertRaises(self.main.CharacterSwapError) as raised:
+            await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "赛马娘的米浴",
+            )
+
+        self.assertEqual(raised.exception.code, "semantic_target_provider_error")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("private", str(raised.exception.details))
+
+    async def test_low_confidence_stops_without_confidence_laundering_retry(self) -> None:
+        plugin, calls = self._plugin(
+            '{"canonical_identity_tag":"unknown_character_(work)",'
+            '"appearance_tags":[],"confidence":0.6}'
+        )
+
+        with self.assertRaises(self.main.CharacterSwapError) as raised:
+            await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "冷门角色",
+            )
+
+        self.assertEqual(raised.exception.code, "semantic_target_low_confidence")
+        self.assertEqual(len(calls), 1)
+
+    async def test_qualified_identity_name_may_contain_appearance_word(self) -> None:
+        plugin, _calls = self._plugin(
+            '{"canonical_identity_tag":"hat_kid_(a_hat_in_time)",'
+            '"appearance_tags":[],"confidence":0.92}'
+        )
+
+        tags, _provider = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "Hat Kid",
+        )
+
+        self.assertEqual(tags, ("hat_kid_(a_hat_in_time)",))
+
+    async def test_generic_qualified_concepts_and_second_identity_are_rejected(self) -> None:
+        invalid_responses = (
+            '{"identity_tag":"red_dress_(fiction)",'
+            '"appearance_tags":[],"confidence":0.95}',
+            '{"identity_tag":"target_character_(real_game)",'
+            '"appearance_tags":["other_character_(other_game)"],'
+            '"confidence":0.95}',
+        )
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                plugin, _calls = self._plugin(response)
+                with self.assertRaises(self.main.CharacterSwapError):
+                    await plugin._generate_semantic_target_tags(
+                        object(),
+                        self.main.GenerationJob("u", "swap", 0.0),
+                        "Target",
+                    )
 
     async def test_internal_llm_event_guard_is_active_during_provider_call(self) -> None:
         seen = []

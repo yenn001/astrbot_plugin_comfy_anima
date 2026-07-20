@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.3.1
+AstrBot Comfy Anima 插件 v1.4.2
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.3.1
-日期: 2026-07-20
+版本: 1.4.2
+日期: 2026-07-21
 """
 
 from dataclasses import dataclass, field
