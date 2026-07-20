@@ -43,6 +43,22 @@ class UpscaleBinding:
 
 
 @dataclass(frozen=True)
+class ControlBinding:
+    mode: str
+    apply_node_id: str
+    model_input: str = "model"
+    image_input: str = "image"
+    strength_input: str = "strength"
+    start_input: str = "start_percent"
+    end_input: str = "end_percent"
+    preprocessor_node_id: str = ""
+    preprocessor_image_input: str = "image"
+    default_strength: float = 1.0
+    default_start_percent: float | None = None
+    default_end_percent: float | None = None
+
+
+@dataclass(frozen=True)
 class OutputVariant:
     preferred_node_ids: tuple[str, ...]
     prune_node_ids: tuple[str, ...] = ()
@@ -62,6 +78,8 @@ class WorkflowProfile:
     samplers: tuple[SamplerBinding, ...] = ()
     input_image: InputBinding | None = None
     mask_image: InputBinding | None = None
+    control_model_target: InputBinding | None = None
+    controls: Mapping[str, ControlBinding] = field(default_factory=dict)
     upscale: UpscaleBinding | None = None
     output_variants: Mapping[str, OutputVariant] = field(default_factory=dict)
     default_output_variant: str = "base"
@@ -171,9 +189,15 @@ def load_workflow_profile(
     if not isinstance(bindings, Mapping):
         raise WorkflowProfileError("bindings must be an object")
     task_type = str(payload.get("task_type") or "text_to_image").strip()
-    if task_type not in {"text_to_image", "upscale", "inpaint"}:
+    if task_type not in {
+        "text_to_image",
+        "upscale",
+        "inpaint",
+        "img2img",
+        "control_generation",
+    }:
         raise WorkflowProfileError(
-            "task_type must be text_to_image, upscale or inpaint"
+            "task_type must be text_to_image, upscale, inpaint, img2img or control_generation"
         )
 
     seed_raw = bindings.get("seed", [])
@@ -246,6 +270,84 @@ def load_workflow_profile(
             ),
         )
 
+    controls_raw = bindings.get("controls", {})
+    if not isinstance(controls_raw, Mapping):
+        raise WorkflowProfileError("bindings.controls must be an object")
+    controls: dict[str, ControlBinding] = {}
+    for raw_mode, item in controls_raw.items():
+        mode = _clean_id(raw_mode, "control mode")
+        if mode not in {"pose", "depth", "lineart", "reference"}:
+            raise WorkflowProfileError(f"unsupported control mode: {mode}")
+        if not isinstance(item, Mapping):
+            raise WorkflowProfileError(f"controls.{mode} must be an object")
+        try:
+            strength = float(item.get("default_strength", 1.0))
+            raw_start_percent = item.get(
+                "default_start_percent", item.get("start_percent")
+            )
+            raw_end_percent = item.get(
+                "default_end_percent", item.get("end_percent")
+            )
+            start_percent = (
+                None if raw_start_percent is None else float(raw_start_percent)
+            )
+            end_percent = (
+                None if raw_end_percent is None else float(raw_end_percent)
+            )
+        except (TypeError, ValueError) as exc:
+            raise WorkflowProfileError(
+                f"controls.{mode} strength and guidance range must be numeric"
+            ) from exc
+        if not 0.0 <= strength <= 10.0:
+            raise WorkflowProfileError(
+                f"controls.{mode}.default_strength must be between 0 and 10"
+            )
+        effective_start = 0.0 if start_percent is None else start_percent
+        effective_end = 1.0 if end_percent is None else end_percent
+        if not 0.0 <= effective_start <= effective_end <= 1.0:
+            raise WorkflowProfileError(
+                f"controls.{mode} guidance range must satisfy 0 <= start <= end <= 1"
+            )
+        controls[mode] = ControlBinding(
+            mode=mode,
+            apply_node_id=_clean_id(
+                item.get("apply_node_id"),
+                f"controls.{mode}.apply_node_id",
+            ),
+            model_input=_clean_id(
+                item.get("model_input") or "model",
+                f"controls.{mode}.model_input",
+            ),
+            image_input=_clean_id(
+                item.get("image_input") or "image",
+                f"controls.{mode}.image_input",
+            ),
+            strength_input=_clean_id(
+                item.get("strength_input") or "strength",
+                f"controls.{mode}.strength_input",
+            ),
+            start_input=_clean_id(
+                item.get("start_input") or "start_percent",
+                f"controls.{mode}.start_input",
+            ),
+            end_input=_clean_id(
+                item.get("end_input") or "end_percent",
+                f"controls.{mode}.end_input",
+            ),
+            preprocessor_node_id=_clean_id(
+                item.get("preprocessor_node_id") or "",
+                f"controls.{mode}.preprocessor_node_id",
+                allow_empty=True,
+            ),
+            preprocessor_image_input=_clean_id(
+                item.get("preprocessor_image_input") or "image",
+                f"controls.{mode}.preprocessor_image_input",
+            ),
+            default_strength=strength,
+            default_start_percent=start_percent,
+            default_end_percent=end_percent,
+        )
+
     variants_raw = payload.get("output_variants")
     if not isinstance(variants_raw, Mapping) or not variants_raw:
         raise WorkflowProfileError("output_variants must be a non-empty object")
@@ -272,7 +374,12 @@ def load_workflow_profile(
         prompt=_binding(
             bindings.get("positive_prompt"),
             "positive_prompt",
-            required=task_type in {"text_to_image", "inpaint"},
+            required=task_type in {
+                "text_to_image",
+                "inpaint",
+                "img2img",
+                "control_generation",
+            },
         ),
         negative=_binding(bindings.get("negative_prompt"), "negative_prompt"),
         unet=_binding(bindings.get("unet"), "unet"),
@@ -286,8 +393,18 @@ def load_workflow_profile(
         seed_bindings=seeds,
         resolution=resolution,
         samplers=tuple(samplers),
-        input_image=_binding(bindings.get("input_image"), "input_image"),
+        input_image=_binding(
+            bindings.get("input_image"),
+            "input_image",
+            required=task_type == "img2img",
+        ),
         mask_image=_binding(bindings.get("mask_image"), "mask_image"),
+        control_model_target=_binding(
+            bindings.get("control_model_target"),
+            "control_model_target",
+            required=task_type == "control_generation",
+        ),
+        controls=controls,
         upscale=upscale,
         output_variants=variants,
         default_output_variant=_clean_id(
@@ -301,6 +418,7 @@ def load_workflow_profile(
 
 __all__ = [
     "InputBinding",
+    "ControlBinding",
     "OutputVariant",
     "ResolutionBinding",
     "SamplerBinding",

@@ -6,7 +6,9 @@ from typing import Optional
 
 from ..models import PluginSettings
 from .workflow import (
+    ControlWorkflowBuilder,
     ImageWorkflowBuilder,
+    Img2ImgWorkflowBuilder,
     InpaintWorkflowBuilder,
     WorkflowBuilder,
     WorkflowError,
@@ -154,7 +156,7 @@ class WorkflowRegistry:
                     error = (
                         ""
                         if selectable
-                        else "旧版兼容工作流仅用于回滚，不能设为六管线默认入口"
+                        else "旧版兼容工作流仅用于回滚，不能设为正式默认入口"
                     )
                 elif profile.task_type == "upscale":
                     ImageWorkflowBuilder(entry.path, selected_settings)
@@ -164,6 +166,17 @@ class WorkflowRegistry:
                     InpaintWorkflowBuilder(entry.path, selected_settings)
                     selectable = False
                     error = "重绘工作流请通过 /重绘 使用，不能设为当前生图工作流"
+                elif profile.task_type == "img2img":
+                    Img2ImgWorkflowBuilder(entry.path, selected_settings)
+                    selectable = False
+                    error = (
+                        "Img2img workflows require an input image and cannot be "
+                        "selected as the default text-to-image workflow"
+                    )
+                elif profile.task_type == "control_generation":
+                    ControlWorkflowBuilder(entry.path, selected_settings)
+                    selectable = False
+                    error = "底图控制工作流请通过 /底图控制 使用，不能设为默认文生图"
                 else:
                     raise WorkflowRegistryError("不支持的工作流任务类型")
                 result.append(
@@ -246,6 +259,11 @@ class WorkflowRegistry:
             overrides["output_node_ids"] = [normalized_output]
 
         selected_settings = replace(self._settings, **overrides)
+        profile = load_workflow_profile(entry.path, selected_settings)
+        if profile.task_type == "img2img":
+            raise WorkflowRegistryError(
+                "Img2img workflows cannot be selected as the default text-to-image workflow"
+            )
         builder = WorkflowBuilder(entry.path, selected_settings)
         return WorkflowSelection(
             entry=entry,

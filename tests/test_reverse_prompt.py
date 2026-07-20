@@ -18,6 +18,55 @@ from ..services.reverse_prompt import (
 
 
 class ReversePromptParserTests(unittest.TestCase):
+    def test_control_generation_request_carries_complete_source_context(self) -> None:
+        result = ReversePromptResult(
+            positive_tags="1girl, black hair, white dress, standing",
+            negative_tags="text, watermark",
+            composition="full body, eye level, centered subject",
+            scene_description_zh="雨夜街道，人物站在路灯下",
+            characters=(
+                ReverseCharacter("sample heroine", "sample work", 0.86),
+            ),
+            style_notes="warm cinematic lighting, painterly anime rendering",
+            uncertain_terms=("exact character identity", "artist identity"),
+        )
+
+        request = result.control_generation_request(
+            "把白裙换成红色晚礼服，构图和姿势保持不变",
+            ("pose", "depth"),
+        )
+
+        self.assertIn("Anima 底图控制生成", request)
+        self.assertIn("用户的最终画面要求是最高优先级", request)
+        self.assertIn("pose, depth", request)
+        self.assertIn(result.positive_tags, request)
+        self.assertIn(result.negative_tags, request)
+        self.assertIn(result.composition, request)
+        self.assertIn(result.scene_description_zh, request)
+        self.assertIn(result.style_notes, request)
+        self.assertIn("sample heroine (sample work), confidence=0.86", request)
+        self.assertIn("exact character identity, artist identity", request)
+        self.assertIn("把白裙换成红色晚礼服", request)
+        self.assertIn("不得自动套用默认风格001", request)
+        self.assertIn("不得包含 pose、depth、lineart、reference", request)
+        self.assertIn("不得把待确认身份写成事实", request)
+
+    def test_control_generation_request_rejects_missing_valid_modes(self) -> None:
+        result = ReversePromptResult(positive_tags="1girl, portrait")
+
+        with self.assertRaisesRegex(ValueError, "at least one valid mode"):
+            result.control_generation_request("draw a portrait", ("unknown", ""))
+
+    def test_control_generation_request_deduplicates_modes_in_source_order(self) -> None:
+        result = ReversePromptResult(positive_tags="1girl, portrait")
+
+        request = result.control_generation_request(
+            "keep the silhouette and recolor the drawing",
+            ["lineart", "pose", "lineart"],
+        )
+
+        self.assertIn("插件已锁定的底图约束模式：lineart, pose。", request)
+
     def test_semantic_redraw_request_encodes_delta_and_mode_contract(self) -> None:
         result = ReversePromptResult(
             positive_tags="1girl, school uniform, standing, classroom",

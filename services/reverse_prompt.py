@@ -179,6 +179,83 @@ class ReversePromptResult:
         parts.append("不要把待确认身份当成事实；需要角色 LoRA 时必须查询实时清单。")
         return "\n".join(parts)
 
+    def control_generation_request(
+        self,
+        supplement: str,
+        modes: tuple[str, ...] | list[str],
+    ) -> str:
+        """Build a complete director request for image-controlled generation.
+
+        Source analysis remains observational evidence. The user's requested final
+        appearance has priority, while selected control modes are execution
+        constraints that must not leak as workflow jargon into the visual prompt.
+        """
+
+        allowed_modes = ("pose", "depth", "lineart", "reference")
+        normalized_modes = tuple(
+            dict.fromkeys(
+                str(mode or "").strip().casefold()
+                for mode in modes
+                if str(mode or "").strip().casefold() in allowed_modes
+            )
+        )
+        if not normalized_modes:
+            raise ValueError("control generation requires at least one valid mode")
+
+        characters = "none observed"
+        if self.characters:
+            characters = "; ".join(
+                (
+                    item.name
+                    + (f" ({item.source_work})" if item.source_work else "")
+                    + f", confidence={item.confidence:.2f}"
+                )
+                for item in self.characters
+            )
+        uncertain = ", ".join(self.uncertain_terms) or "none"
+        parts = [
+            "任务类型：Anima 底图控制生成。最终只输出一个 pic 绘图提示词，不得输出 edit。",
+            (
+                "用户的最终画面要求是最高优先级的视觉目标。除已锁定的底图约束外，"
+                "原图反推信息只作为可观察事实与连续性参考；若原图旧内容与用户明确的新要求冲突，"
+                "必须删除或替换旧内容，不得把新旧服装、发型、场景、表情或配色同时保留。"
+            ),
+            (
+                "插件已锁定的底图约束模式："
+                + ", ".join(normalized_modes)
+                + "。不得违背这些模式所约束的姿势、空间结构、轮廓或参考外观；"
+                "但最终 prompt 只能描述完成后的画面，不得包含 pose、depth、lineart、reference、"
+                "ControlNet、LLLite、preprocessor、sampler、workflow、模型文件名、节点 ID 或其他控制节点术语。"
+            ),
+            f"原图可观察正面 Tags：{self.positive_tags}",
+            f"原图构图：{self.composition or '未提供'}",
+            f"原图场景说明：{self.scene_description_zh or '未提供'}",
+            f"原图画风与色彩观察：{self.style_notes or '未提供'}",
+            (
+                "原图角色候选（仅作检索线索，不得越过实时清单或置信度当成确定身份）："
+                + characters
+            ),
+            "原图待确认项（不得当成事实）：" + uncertain,
+        ]
+        if self.negative_tags:
+            parts.append(f"原图反推负面 Tags：{self.negative_tags}")
+        parts.extend(
+            [
+                f"用户最终画面要求：{supplement.strip()}",
+                (
+                    "用户未明确点名风格组合时，不得自动套用默认风格001或任何其他保存风格；"
+                    "应保留与用户要求及锁定约束兼容的原图画风观察。只有用户明确指定风格组合时，"
+                    "才允许查询并应用该组合。需要 LoRA 时必须查询本次实时清单，不得猜测文件名或触发词。"
+                ),
+                (
+                    "最终提示词必须是完成态的英文 Anima tags 与简短画面描述。"
+                    "不得写 change、replace、edit、redraw、keep、preserve、source image、reference image "
+                    "等操作过程词，也不得把待确认身份写成事实。"
+                ),
+            ]
+        )
+        return "\n".join(parts)
+
     def semantic_redraw_request(
         self,
         supplement: str,

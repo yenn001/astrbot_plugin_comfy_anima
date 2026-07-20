@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.2.2
+AstrBot Comfy Anima 插件 v1.3.1
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.2.2
-日期: 2026-07-19
+版本: 1.3.1
+日期: 2026-07-20
 """
 
 from dataclasses import dataclass, field
@@ -663,6 +663,12 @@ class GenerationOptions:
     inpaint_mode: str = ""
     semantic_redraw_mode: str = ""
     denoise: Optional[float] = None
+    control_modes: tuple[str, ...] = ()
+    semantic_required_positive_alias_groups: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ] = ()
+    semantic_forbidden_positive_terms: tuple[str, ...] = ()
+    semantic_preserved_positive_terms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -232,8 +232,9 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "base - Anima 原图",
             "rtx - Anima 原图 + RTX 高清放大",
             "iterative - Anima 原图 + 迭代采样放大",
-            "4 个独立图片操作",
+            "5 个独立图片操作",
             "/放大 [倍率]",
+            "/底图控制 <要求> [--m p|d|l|r]",
             "/改图 <要求> --mode preserve|balanced|free",
             "/重绘 <要求> --mode quick",
             "/重绘 <要求> --mode lanpaint",
@@ -255,8 +256,9 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "1. base - 只生成 Anima 原图，不放大",
             "2. rtx - Anima 原图生成后执行 RTX 高清放大",
             "3. iterative - Anima 原图生成后执行迭代采样放大",
-            "4 个独立图片操作（不属于生图管线切换）",
+            "5 个独立图片操作（不属于生图管线切换）",
             "/放大 [倍率]",
+            "/底图控制 <要求> [--m p|d|l|r]",
             "--mode preserve|balanced|free",
             "--mode quick",
             "--mode lanpaint",
@@ -432,6 +434,177 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0].target_query, "赛马娘的米浴")
         self.assertFalse(captured[0].use_target_lora)
 
+    async def test_control_command_infers_pose_depth_without_reference(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+        plugin._find_requested_style_preset = (
+            lambda text: "风格001-1" if "风格001-1" in text else ""
+        )
+
+        async def handle(_event, options):
+            captured.append(options)
+            yield "CONTROL_PROGRESS"
+            yield "CONTROL_IMAGE"
+
+        plugin._handle_control_draw = handle
+
+        class Event:
+            message_str = "/底图控制 构图和姿势不变，用风格001-1 画出来。"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_control_draw(Event())]
+
+        self.assertEqual(replies, ["CONTROL_PROGRESS", "CONTROL_IMAGE"])
+        self.assertEqual(captured[0].control_modes, ("pose", "depth"))
+        self.assertEqual(captured[0].lora_preset, "风格001-1")
+
+    async def test_control_command_explicit_modes_override_natural_text(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+        plugin._find_requested_style_preset = lambda _text: "风格001-1"
+
+        async def handle(_event, options):
+            captured.append(options)
+            yield "CONTROL_IMAGE"
+
+        plugin._handle_control_draw = handle
+
+        class Event:
+            message_str = (
+                "/底图控制 构图和姿势不变，用风格001-1画出来 --m r"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_control_draw(Event())]
+
+        self.assertEqual(replies, ["CONTROL_IMAGE"])
+        self.assertEqual(captured[0].control_modes, ("reference",))
+
+    async def test_reverse_draw_can_reuse_one_image_for_pose_depth_control(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            Image.new("RGB", (640, 960), "white").save(image_path)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._director = object()
+            plugin._control_workflow_builder = object()
+            plugin._control_initialization_error = ""
+            plugin._initialization_error = ""
+            plugin._director_error = ""
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._find_requested_style_preset = (
+                lambda text: "风格001-1" if "风格001-1" in text else ""
+            )
+            collect_count = 0
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    nonlocal collect_count
+                    collect_count += 1
+                    return image_path
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        types.SimpleNamespace(
+                            negative_tags="old outfit",
+                            drawing_request=lambda requirement: (
+                                f"image facts; request={requirement}"
+                            ),
+                        ),
+                        "vision-provider",
+                    )
+
+            uploads = []
+
+            class Client:
+                @staticmethod
+                async def upload_image(path):
+                    uploads.append(path)
+                    return types.SimpleNamespace(workflow_value="input/control.png")
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+            plugin._client = Client()
+
+            async def directed(_event, request):
+                self.assertIn("image facts", request)
+                return (
+                    types.SimpleNamespace(
+                        prompt="1girl, dynamic pose",
+                        negative_prompt="bad anatomy",
+                        pipeline="base",
+                    ),
+                    "director-provider",
+                )
+
+            plugin._generate_directed_instruction = directed
+            executed = []
+
+            async def execute_job(
+                _job,
+                options,
+                _event,
+                *,
+                control_image_name="",
+                img2img_image_name="",
+            ):
+                self.assertFalse(img2img_image_name)
+                executed.append((options, control_image_name))
+                paths = GeneratedImagePaths()
+                paths.append(Path("output.png"))
+                return paths, 42, options.prompt, "", None
+
+            plugin._execute_job = execute_job
+
+            async def run_auxiliary(_event, _label, operation):
+                return await operation(
+                    self.main.GenerationJob("tester", "reverse draw", 0.0)
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._schedule_cleanup = lambda _paths: None
+
+            class Event:
+                message_str = (
+                    "/反推画图 构图和姿势不变，用风格001-1画出来 "
+                    "--size 512x512"
+                )
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(collect_count, 1)
+        self.assertEqual(uploads, [image_path])
+        self.assertEqual(len(executed), 1)
+        options, control_image_name = executed[0]
+        self.assertEqual(options.control_modes, ("pose", "depth"))
+        self.assertEqual(options.lora_preset, "风格001-1")
+        self.assertEqual((options.width, options.height), (512, 512))
+        self.assertEqual(control_image_name, "input/control.png")
+        self.assertTrue(any("pose + depth" in item for item in replies))
+        self.assertEqual(replies[-1], "IMAGE_RESULT")
+
     async def test_natural_upscale_routes_existing_image_without_llm(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.settings = types.SimpleNamespace(rtx_scale=2.0)
@@ -598,6 +771,173 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         replies = [item async for item in plugin.cmd_inpaint(Event())]
         self.assertEqual(replies, ["COMBINED_SWAP"])
 
+    async def test_reverse_draw_without_control_uses_true_img2img(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            Image.new("RGB", (640, 960), "white").save(image_path)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._img2img_workflow_builder = object()
+            plugin._director = object()
+            plugin._initialization_error = ""
+            plugin._director_error = ""
+            plugin._img2img_initialization_error = ""
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._find_requested_style_preset = lambda _text: ""
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return image_path
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        types.SimpleNamespace(
+                            negative_tags="old outfit",
+                            drawing_request=lambda requirement: (
+                                f"source facts; request={requirement}"
+                            ),
+                        ),
+                        "vision-provider",
+                    )
+
+            class Client:
+                @staticmethod
+                async def upload_image(_path):
+                    return types.SimpleNamespace(workflow_value="input/img2img.png")
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+            plugin._client = Client()
+
+            async def directed(_event, _request):
+                return (
+                    self.main.PictureInstruction(
+                        "1girl, red evening dress",
+                        "old outfit",
+                        "base",
+                    ),
+                    "director-provider",
+                )
+
+            plugin._generate_directed_instruction = directed
+            captured = {}
+
+            async def execute_job(
+                _job,
+                options,
+                _event,
+                *,
+                img2img_image_name="",
+            ):
+                captured["options"] = options
+                captured["img2img_image_name"] = img2img_image_name
+                paths = GeneratedImagePaths()
+                paths.append(Path("output.png"))
+                return paths, 42, options.prompt, "", None
+
+            plugin._execute_job = execute_job
+
+            async def run_auxiliary(_event, _label, operation):
+                return await operation(
+                    self.main.GenerationJob("tester", "reverse draw", 0.0)
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._schedule_cleanup = lambda _paths: None
+
+            class Event:
+                message_str = "/反推画图 换成红色晚礼服"
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(captured["img2img_image_name"], "input/img2img.png")
+        self.assertEqual(captured["options"].denoise, 0.55)
+        self.assertTrue(captured["options"].suppress_default_style)
+        self.assertIn("IMAGE_RESULT", replies)
+
+    async def test_control_job_builds_source_aware_director_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            Image.new("RGB", (640, 960), "white").save(source)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_prompt_llm=True,
+                enable_reverse_prompt=True,
+            )
+            plugin.context = object()
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return source
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        ReversePromptResult(
+                            positive_tags="1girl, black coat, standing, rainy street",
+                            composition="full body, centered",
+                            scene_description_zh="雨夜街道",
+                        ),
+                        "vision-provider",
+                    )
+
+            class Client:
+                @staticmethod
+                async def upload_image(_path):
+                    return types.SimpleNamespace(workflow_value="input/control.png")
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+            plugin._client = Client()
+            captured = {}
+
+            async def execute(
+                _job,
+                options,
+                _event,
+                *,
+                control_image_name="",
+            ):
+                captured["options"] = options
+                captured["control_image_name"] = control_image_name
+                return GeneratedImagePaths(), 1, options.prompt, "", None
+
+            plugin._execute_job = execute
+            await plugin._execute_control_job(
+                self.main.GenerationJob("tester", "control", time.monotonic()),
+                object(),
+                self.main.GenerationOptions(
+                    prompt="换成红色晚礼服，构图不变",
+                    control_modes=("pose", "depth"),
+                ),
+            )
+
+        effective = captured["options"]
+        self.assertIn("1girl, black coat", effective.prompt)
+        self.assertIn("换成红色晚礼服", effective.prompt)
+        self.assertTrue(effective.suppress_default_style)
+        self.assertEqual(captured["control_image_name"], "input/control.png")
+
     async def test_semantic_redraw_preserves_source_ratio_and_applies_delta(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.png"
@@ -611,9 +951,15 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 show_llm_prompt=False,
             )
             plugin.context = object()
-            plugin._client = object()
+            class Client:
+                @staticmethod
+                async def upload_image(_path):
+                    return types.SimpleNamespace(workflow_value="input/source.png")
+
+            plugin._client = Client()
             plugin._workflow_builder = object()
             plugin._pipeline_builders = {}
+            plugin._img2img_workflow_builder = object()
             plugin._director = object()
             plugin._initialization_error = None
             plugin._director_error = None
@@ -660,8 +1006,15 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             plugin._generate_directed_instruction = direct
 
-            async def execute(_job, options, _event):
+            async def execute(
+                _job,
+                options,
+                _event,
+                *,
+                img2img_image_name="",
+            ):
                 captured["options"] = options
+                captured["img2img_image_name"] = img2img_image_name
                 paths = GeneratedImagePaths()
                 paths.append(output)
                 paths.elapsed_seconds = 1.25
@@ -701,6 +1054,9 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         effective = captured["options"]
+        self.assertEqual(captured["img2img_image_name"], "input/source.png")
+        self.assertEqual(effective.denoise, 0.64)
+        self.assertEqual(effective.steps, 16)
         self.assertEqual(effective.width % 64, 0)
         self.assertEqual(effective.height % 64, 0)
         self.assertAlmostEqual(effective.width / effective.height, 2.0, delta=0.15)
@@ -808,7 +1164,11 @@ class AuxiliaryImageTaskFailureTests(unittest.IsolatedAsyncioTestCase):
             plugin._task_store = store
             plugin._client = object()
             plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._control_workflow_builder = None
+            plugin._img2img_workflow_builder = object()
             plugin._director = object()
+            plugin._initialization_error = ""
             plugin._director_error = ""
             plugin._generation_slots = asyncio.Semaphore(1)
             plugin.settings = self.main.PluginSettings.from_mapping(
@@ -874,6 +1234,11 @@ class ReverseDrawAccessTests(unittest.IsolatedAsyncioTestCase):
             plugin._workflow_builder = object()
             plugin._director = object()
             plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._pipeline_builders = {}
+            plugin._control_workflow_builder = None
+            plugin._img2img_workflow_builder = object()
+            plugin._initialization_error = ""
+            plugin._director_error = ""
             plugin._extract_command_text = lambda *_args, **_kwargs: "safe request"
             plugin._extract_resolution_request = lambda _text: (512, 512)
             plugin._find_requested_style_preset = lambda _text: ""
@@ -1606,6 +1971,39 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "astrbot_plugin_comfy_anima.services.lora_catalog"
         )
 
+    async def test_execute_job_rejects_provider_error_before_submit(self) -> None:
+        submit_calls = 0
+
+        class Client:
+            @staticmethod
+            async def submit(_workflow):
+                nonlocal submit_calls
+                submit_calls += 1
+                raise AssertionError("submit must not be reached")
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._client = Client()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+        job = self.main.GenerationJob("u", "semantic redraw", 0.0)
+
+        with self.assertRaises(self.main.WorkflowError) as raised:
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(
+                    prompt=(
+                        "All chat models failed: EmptyModelOutputError: "
+                        "OpenAI completion has no choices. response_id=private"
+                    ),
+                    use_prompt_llm=False,
+                ),
+                object(),
+            )
+
+        self.assertIn("安全闸门", str(raised.exception))
+        self.assertEqual(submit_calls, 0)
+
     async def test_execute_job_locks_style_and_adds_role_aware_triggers(self) -> None:
         records = (
             self.catalog_module.LoraRecord(
@@ -2038,6 +2436,8 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         plugin._active_workflow_name = "anima_api.json"
         plugin._active_jobs = {}
         plugin._pipeline_builders = {}
+        plugin._control_workflow_builder = None
+        plugin._control_initialization_error = ""
         plugin._workflow_switch_lock = asyncio.Lock()
         plugin._initialization_error = None
         return plugin
@@ -2053,7 +2453,14 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [item["capability_id"] for item in result["tool_items"]],
-            ["standalone_rtx", "semantic_redraw", "quick", "lanpaint"],
+            [
+                "standalone_rtx",
+                "control",
+                "img2img",
+                "semantic_redraw",
+                "quick",
+                "lanpaint",
+            ],
         )
         self.assertTrue(all(item["selectable"] for item in result["generation_items"]))
         self.assertTrue(all(not item["selectable"] for item in result["tool_items"]))
@@ -2061,6 +2468,8 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
             [item["command"] for item in result["tool_items"]],
             [
                 "/放大",
+                "/底图控制 <要求> [--m p|d|l|r]",
+                "/改图 or /反推画图",
                 "/改图 <要求> --mode preserve|balanced|free",
                 "/重绘 <要求> --mode quick",
                 "/重绘 <要求> --mode lanpaint",
@@ -2116,7 +2525,7 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
 
-    async def test_six_pipeline_dependency_check_uses_live_object_info(self) -> None:
+    async def test_workflow_dependency_check_uses_live_object_info(self) -> None:
         plugin = self._plugin()
         filenames = (
             "anima_base_api.json",
@@ -2125,6 +2534,7 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
             "rtx_upscale_api.json",
             "anima_inpaint_crop_api.json",
             "anima_lanpaint_api.json",
+            "anima_control_api.json",
         )
         class_types = set()
         for filename in filenames:
@@ -2149,6 +2559,25 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
                 "VAELoader": {
                     "input": {"required": {"vae_name": [["qwen_image_vae.safetensors"], {}]}}
                 },
+                "AnimaLLLiteApply": {
+                    "input": {
+                        "required": {
+                            "lllite_name": [[
+                                "Anima/anima-lllite-pose-1.safetensors",
+                                "Anima/anima-lllite-depth-1.safetensors",
+                                "Anima/anima-lllite-lineart-1.safetensors",
+                                "Anima/anima-lllite-any-test-like-v2.safetensors",
+                            ], {}]
+                        }
+                    }
+                },
+                "DepthAnythingV2Preprocessor": {
+                    "input": {
+                        "optional": {
+                            "ckpt_name": [["depth_anything_v2_vitl.pth"], {}]
+                        }
+                    }
+                },
             }
         )
 
@@ -2158,7 +2587,7 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
 
         plugin._client = Client()
         result = await plugin.web_ui_check_workflows()
-        self.assertEqual(result["ready_count"], 6)
+        self.assertEqual(result["ready_count"], 8)
 
         object_info.pop("LanPaint_MaskBlend")
         degraded = await plugin.web_ui_check_workflows()

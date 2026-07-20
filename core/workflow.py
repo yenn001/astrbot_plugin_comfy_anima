@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.2.2
+AstrBot Comfy Anima 插件 v1.3.1
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.2.2
-日期: 2026-07-19
+版本: 1.3.1
+日期: 2026-07-20
 """
 
 import copy
@@ -19,6 +19,12 @@ from typing import Any
 
 from ..constants import MAX_CFG, MAX_IMAGE_SIDE, MAX_SEED, MAX_STEPS, MIN_IMAGE_SIDE
 from ..models import GenerationOptions, PluginSettings
+from .command_aliases import (
+    CONTEXT_GENERATION,
+    CONTEXT_INPAINT,
+    CONTEXT_SEMANTIC_REDRAW,
+    normalize_command_aliases,
+)
 from .lora import inject_loras
 from .workflow_profiles import (
     InputBinding,
@@ -69,7 +75,11 @@ class WorkflowBuilder:
 
     def _validate_required_nodes(self) -> None:
         """验证生成必需的节点及输入字段。"""
-        if self._profile.task_type != "text_to_image":
+        if self._profile.task_type not in {
+            "text_to_image",
+            "img2img",
+            "control_generation",
+        }:
             raise WorkflowError("当前工作流不是生图工作流")
         binding = self._profile.prompt
         if binding is None:
@@ -317,6 +327,159 @@ class WorkflowBuilder:
         return workflow, seed, preferred_nodes
 
 
+class Img2ImgWorkflowBuilder(WorkflowBuilder):
+    """Build a true Anima img2img workflow from one uploaded source image.
+
+    Unlike reverse-prompt redraw, the source pixels are always resized, VAE
+    encoded, and connected directly to the primary sampler latent input.
+    """
+
+    _PIPELINE_LAYOUT = {
+        "base": {
+            "preferred": ("88",),
+            "prune": ("100", "101", "102", "103", "458", "552"),
+        },
+        "rtx": {
+            "preferred": ("458",),
+            "prune": ("88", "100", "101", "102", "103"),
+        },
+        "iterative": {
+            "preferred": ("103",),
+            "prune": ("88", "458", "552"),
+        },
+    }
+
+    def __init__(self, workflow_path: Path, settings: PluginSettings):
+        super().__init__(workflow_path, settings)
+        profile = self.profile
+        if profile.profile_id != "anima_img2img" or profile.input_image is None:
+            raise WorkflowError("current workflow is not the bundled Anima img2img workflow")
+        if profile.task_type != "img2img":
+            raise WorkflowError("Anima img2img manifest must declare task_type img2img")
+
+        required_nodes = {
+            "8",
+            "11",
+            "12",
+            "15",
+            "19",
+            "44",
+            "45",
+            "88",
+            "100",
+            "101",
+            "102",
+            "103",
+            "458",
+            "462",
+            "500",
+            "501",
+            "502",
+            "552",
+        }
+        missing = sorted(required_nodes - set(self._template))
+        if missing:
+            raise WorkflowError(
+                "Anima img2img workflow is missing nodes: " + ", ".join(missing)
+            )
+        expected_links = {
+            ("501", "image"): ["500", 0],
+            ("502", "pixels"): ["501", 0],
+            ("502", "vae"): ["15", 0],
+            ("19", "latent_image"): ["502", 0],
+            ("19", "positive"): ["11", 0],
+            ("19", "negative"): ["12", 0],
+        }
+        for (node_id, input_name), expected in expected_links.items():
+            node = self._template.get(node_id)
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            actual = inputs.get(input_name) if isinstance(inputs, dict) else None
+            if actual != expected:
+                raise WorkflowError(
+                    f"Anima img2img node {node_id}.{input_name} must be {expected}"
+                )
+        if any(
+            node.get("class_type") == "EmptyLatentImage"
+            for node in self._template.values()
+            if isinstance(node, dict)
+        ):
+            raise WorkflowError("Anima img2img workflow must not use EmptyLatentImage")
+
+    def build(
+        self,
+        image_name: str,
+        options: GenerationOptions,
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        """Build an img2img request and select base, RTX, or iterative output."""
+
+        normalized_image_name = str(image_name or "").strip()
+        if not normalized_image_name:
+            raise WorkflowError("img2img source image is required")
+
+        workflow, seed, _ = super().build(options)
+        input_binding = self.profile.input_image
+        assert input_binding is not None
+        self._set_input(
+            workflow,
+            input_binding.node_id,
+            input_binding.input_name,
+            normalized_image_name,
+        )
+
+        # Reassert the pixel-to-latent chain on every build. This prevents a
+        # custom manifest or stale template from silently falling back to an
+        # empty text-to-image latent.
+        self._set_input(workflow, "501", "image", ["500", 0])
+        self._set_input(workflow, "502", "pixels", ["501", 0])
+        self._set_input(workflow, "502", "vae", ["15", 0])
+        self._set_input(workflow, "19", "latent_image", ["502", 0])
+
+        pipeline = str(
+            options.pipeline
+            or getattr(self._settings, "default_generation_pipeline", "base")
+            or "base"
+        ).strip().casefold()
+        layout = self._PIPELINE_LAYOUT.get(pipeline)
+        if layout is None:
+            raise WorkflowError(f"Anima img2img does not support pipeline: {pipeline}")
+
+        if pipeline == "iterative":
+            iterative_node = workflow.get("101")
+            iterative_inputs = (
+                iterative_node.get("inputs")
+                if isinstance(iterative_node, dict)
+                else None
+            )
+            if isinstance(iterative_inputs, dict):
+                iterative_inputs["upscale_factor"] = self._settings.iterative_scale
+                iterative_inputs["steps"] = self._settings.iterative_steps
+            iterative_sampler = workflow.get("100")
+            iterative_sampler_inputs = (
+                iterative_sampler.get("inputs")
+                if isinstance(iterative_sampler, dict)
+                else None
+            )
+            if isinstance(iterative_sampler_inputs, dict):
+                # The second-stage upscale sampler is intentionally isolated
+                # from the primary img2img redraw strength. A high/free redraw
+                # denoise belongs only to sampler 19 and must not destabilize
+                # the iterative refinement pass.
+                iterative_sampler_inputs["denoise"] = self._settings.iterative_denoise
+
+        for node_id in layout["prune"]:
+            workflow.pop(node_id, None)
+        return workflow, seed, list(layout["preferred"])
+
+    def build_img2img(
+        self,
+        image_name: str,
+        options: GenerationOptions,
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        """Compatibility alias with the control/inpaint builder naming style."""
+
+        return self.build(image_name, options)
+
+
 class ImageWorkflowBuilder:
     """Build a standalone image-processing workflow such as RTX upscale."""
 
@@ -368,6 +531,201 @@ class ImageWorkflowBuilder:
         for node_id in variant.prune_node_ids:
             workflow.pop(node_id, None)
         return workflow, list(variant.preferred_node_ids)
+
+
+class ControlWorkflowBuilder(WorkflowBuilder):
+    """Build one Anima LLLite image-controlled generation workflow."""
+
+    _CONTROL_ORDER = ("pose", "depth", "lineart", "reference")
+
+    def __init__(self, workflow_path: Path, settings: PluginSettings):
+        super().__init__(workflow_path, settings)
+        profile = self.profile
+        if (
+            profile.task_type != "control_generation"
+            or profile.input_image is None
+            or profile.control_model_target is None
+            or set(profile.controls) != set(self._CONTROL_ORDER)
+        ):
+            raise WorkflowError("当前工作流不是完整的 Anima 底图控制工作流")
+        required_nodes = {
+            profile.input_image.node_id,
+            profile.control_model_target.node_id,
+        }
+        control_image_node_id = str(
+            profile.defaults.get("control_image_node_id")
+            or profile.input_image.node_id
+        ).strip()
+        if not control_image_node_id:
+            raise WorkflowError("底图控制工作流缺少控制图输出节点")
+        required_nodes.add(control_image_node_id)
+        for binding in profile.controls.values():
+            required_nodes.add(binding.apply_node_id)
+            if binding.preprocessor_node_id:
+                required_nodes.add(binding.preprocessor_node_id)
+        missing = sorted(node_id for node_id in required_nodes if node_id not in self._template)
+        if missing:
+            raise WorkflowError("底图控制工作流缺少节点: " + ", ".join(missing))
+
+    @staticmethod
+    def _mode_strength(default_strength: float, mode_count: int) -> float:
+        """Reduce competing controls conservatively while preserving single-mode fidelity."""
+
+        factor = 1.0 if mode_count <= 2 else (0.85 if mode_count == 3 else 0.75)
+        return round(max(0.0, min(10.0, default_strength * factor)), 4)
+
+    def build_control(
+        self,
+        image_name: str,
+        options: GenerationOptions,
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        modes = tuple(
+            mode
+            for mode in self._CONTROL_ORDER
+            if mode in set(options.control_modes)
+        )
+        if not modes:
+            raise WorkflowError("底图控制至少需要 pose、depth、lineart 或 reference 之一")
+        unknown = sorted(set(options.control_modes) - set(self._CONTROL_ORDER))
+        if unknown:
+            raise WorkflowError("未知底图控制模式: " + ", ".join(unknown))
+
+        workflow, seed, preferred_nodes = super().build(options)
+        profile = self.profile
+        source = profile.input_image
+        target = profile.control_model_target
+        assert source is not None and target is not None
+        self._set_input(workflow, source.node_id, source.input_name, image_name)
+        control_image_node_id = str(
+            profile.defaults.get("control_image_node_id") or source.node_id
+        ).strip()
+        control_image_node = workflow.get(control_image_node_id)
+        control_image_inputs = (
+            control_image_node.get("inputs")
+            if isinstance(control_image_node, dict)
+            else None
+        )
+        width = options.width or self._settings.default_width
+        height = options.height or self._settings.default_height
+        if isinstance(control_image_inputs, dict):
+            if "width" in control_image_inputs:
+                control_image_inputs["width"] = width
+            if "height" in control_image_inputs:
+                control_image_inputs["height"] = height
+        control_image_link: list[Any] = [control_image_node_id, 0]
+
+        base_model: list[Any]
+        if not profile.lora_node_id:
+            raise WorkflowError("底图控制工作流缺少动态 LoRA 节点")
+        base_model = [profile.lora_node_id, 0]
+        previous_model = base_model
+        selected = set(modes)
+        for mode in self._CONTROL_ORDER:
+            binding = profile.controls[mode]
+            if mode not in selected:
+                workflow.pop(binding.apply_node_id, None)
+                if binding.preprocessor_node_id:
+                    workflow.pop(binding.preprocessor_node_id, None)
+                continue
+            image_link: list[Any] = control_image_link
+            if binding.preprocessor_node_id:
+                self._set_input(
+                    workflow,
+                    binding.preprocessor_node_id,
+                    binding.preprocessor_image_input,
+                    control_image_link,
+                )
+                preprocessor = workflow.get(binding.preprocessor_node_id)
+                preprocessor_inputs = (
+                    preprocessor.get("inputs")
+                    if isinstance(preprocessor, dict)
+                    else None
+                )
+                if isinstance(preprocessor_inputs, dict) and "resolution" in preprocessor_inputs:
+                    requested_resolution = max(width, height)
+                    preprocessor_inputs["resolution"] = min(
+                        2048,
+                        max(512, int(round(requested_resolution / 64) * 64)),
+                    )
+                image_link = [binding.preprocessor_node_id, 0]
+            self._set_input(
+                workflow,
+                binding.apply_node_id,
+                binding.model_input,
+                previous_model,
+            )
+            self._set_input(
+                workflow,
+                binding.apply_node_id,
+                binding.image_input,
+                image_link,
+            )
+            self._set_input(
+                workflow,
+                binding.apply_node_id,
+                binding.strength_input,
+                self._mode_strength(binding.default_strength, len(modes)),
+            )
+            apply_node = workflow.get(binding.apply_node_id)
+            apply_inputs = (
+                apply_node.get("inputs") if isinstance(apply_node, dict) else None
+            )
+            if isinstance(apply_inputs, dict):
+                if (
+                    binding.default_start_percent is not None
+                    and binding.start_input in apply_inputs
+                ):
+                    apply_inputs[binding.start_input] = binding.default_start_percent
+                if (
+                    binding.default_end_percent is not None
+                    and binding.end_input in apply_inputs
+                ):
+                    apply_inputs[binding.end_input] = binding.default_end_percent
+            previous_model = [binding.apply_node_id, 0]
+
+        self._set_input(workflow, target.node_id, target.input_name, previous_model)
+        pipeline = str(
+            options.pipeline
+            or getattr(self._settings, "default_generation_pipeline", "rtx")
+            or "rtx"
+        ).strip().casefold()
+        if pipeline == "base":
+            for node_id in ("100", "101", "102", "103", "458", "552"):
+                workflow.pop(node_id, None)
+            preferred_nodes = ["88"]
+        elif pipeline == "rtx":
+            for node_id in ("88", "100", "101", "102", "103"):
+                workflow.pop(node_id, None)
+            preferred_nodes = ["458"]
+        elif pipeline == "iterative":
+            for node_id in ("88", "458", "552"):
+                workflow.pop(node_id, None)
+            self._set_input(workflow, "100", "model", previous_model)
+            iterative_node = workflow.get("101")
+            iterative_inputs = (
+                iterative_node.get("inputs")
+                if isinstance(iterative_node, dict)
+                else None
+            )
+            if isinstance(iterative_inputs, dict):
+                iterative_inputs["upscale_factor"] = self._settings.iterative_scale
+                iterative_inputs["steps"] = self._settings.iterative_steps
+            iterative_sampler = workflow.get("100")
+            iterative_sampler_inputs = (
+                iterative_sampler.get("inputs")
+                if isinstance(iterative_sampler, dict)
+                else None
+            )
+            if isinstance(iterative_sampler_inputs, dict):
+                iterative_sampler_inputs["denoise"] = (
+                    options.denoise
+                    if options.denoise is not None
+                    else self._settings.iterative_denoise
+                )
+            preferred_nodes = ["103"]
+        else:
+            raise WorkflowError(f"底图控制不支持生成管线: {pipeline}")
+        return workflow, seed, preferred_nodes
 
 
 class InpaintWorkflowBuilder:
@@ -507,6 +865,14 @@ def parse_generation_options(
         tokens = shlex.split(command_text, posix=True)
     except ValueError as exc:
         raise ValueError(f"参数引号不完整: {exc}") from exc
+    alias_context = {
+        "generation": CONTEXT_GENERATION,
+        "inpaint": CONTEXT_INPAINT,
+        "semantic_redraw": CONTEXT_SEMANTIC_REDRAW,
+    }.get(mode_context)
+    if alias_context is None:
+        raise ValueError(f"未知参数解析上下文: {mode_context}")
+    tokens = list(normalize_command_aliases(tokens, context=alias_context))
 
     prompt_parts: list[str] = []
     negative_prompt = ""
@@ -522,6 +888,7 @@ def parse_generation_options(
     inpaint_mode = ""
     semantic_redraw_mode = ""
     denoise = None
+    control_modes: list[str] = []
     index = 0
 
     def require_value(option: str) -> str:
@@ -624,6 +991,16 @@ def parse_generation_options(
                 inpaint_mode = aliases.get(raw_mode, "")
                 if not inpaint_mode:
                     raise ValueError("--mode 仅支持 quick 或 lanpaint")
+        elif token == "--control-mode":
+            if mode_context != "generation":
+                raise ValueError("--control-mode 只用于底图控制生成")
+            control_mode = require_value(token).strip().casefold()
+            if control_mode not in {"pose", "depth", "lineart", "reference"}:
+                raise ValueError(
+                    "--control-mode 仅支持 pose、depth、lineart 或 reference"
+                )
+            if control_mode not in control_modes:
+                control_modes.append(control_mode)
         elif token == "--upscale":
             enable_upscale = True
         elif token == "--no-upscale":
@@ -658,4 +1035,5 @@ def parse_generation_options(
         inpaint_mode=inpaint_mode,
         semantic_redraw_mode=semantic_redraw_mode,
         denoise=denoise,
+        control_modes=tuple(control_modes),
     )

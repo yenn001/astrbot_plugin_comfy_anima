@@ -17,6 +17,10 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from ..core.command_aliases import (
+    CONTEXT_CHARACTER_SWAP,
+    normalize_command_aliases,
+)
 from ..core.lora import LoraWorkflowError, canonical_lora_name, extract_lora_selections
 from ..models import LoraIdentityExpectation, LoraSelection
 from .lora_catalog import LoraRecord
@@ -1510,7 +1514,12 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
 
     head, separator, tags = str(command_text or "").partition("|")
     try:
-        tokens = shlex.split(head.strip(), posix=True)
+        tokens = list(
+            normalize_command_aliases(
+                shlex.split(head.strip(), posix=True),
+                context=CONTEXT_CHARACTER_SWAP,
+            )
+        )
     except ValueError as exc:
         raise CharacterSwapError(
             f"参数引号不完整：{exc}",

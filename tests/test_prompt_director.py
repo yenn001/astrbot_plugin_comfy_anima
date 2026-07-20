@@ -402,5 +402,110 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wait_timeouts, [120])
 
 
+class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _director() -> PromptDirector:
+        reference = (
+            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+        )
+        return PromptDirector(
+            reference,
+            PluginSettings.from_mapping(
+                {"prompt_llm_provider_id": "test-provider"}
+            ),
+        )
+
+    def test_provider_error_markers_are_never_accepted_as_prompt(self) -> None:
+        samples = (
+            "All chat models failed: EmptyModelOutputError: OpenAI completion has no choices. response_id=private",
+            "EmptyModelOutputError",
+            "OpenAI completion has no choices",
+            "ProviderError: failed",
+            "APIError: failed",
+            "AuthenticationError: failed",
+            "RateLimitError: failed",
+            "TimeoutError: failed",
+            '<pic prompt="All chat models failed: EmptyModelOutputError">',
+            '{"prompt":"OpenAI completion has no choices, response_id=private"}',
+        )
+        for sample in samples:
+            with self.subTest(sample=sample), self.assertRaises(PromptDirectorError):
+                PromptDirector.extract_instruction(sample)
+
+        self.assertEqual(
+            PromptDirector.extract_instruction(
+                '<pic prompt="1girl, error screen motif, glitch art">'
+            ).prompt,
+            "1girl, error screen motif, glitch art",
+        )
+
+    def test_strict_protocol_rejects_plain_english_fallback(self) -> None:
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector.extract_instruction(
+                "Final prompt: 1girl, red dress",
+                strict_protocol=True,
+            )
+        self.assertEqual(
+            PromptDirector.extract_instruction(
+                '<pic prompt="1girl, red dress">',
+                strict_protocol=True,
+            ).prompt,
+            "1girl, red dress",
+        )
+
+    async def test_invalid_provider_output_retries_once_then_accepts_pic(self) -> None:
+        director = self._director()
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                output = (
+                    "All chat models failed: EmptyModelOutputError"
+                    if self.calls == 1
+                    else '<pic prompt="1girl, red dress">'
+                )
+                return type("Response", (), {"completion_text": output})()
+
+        context = Context()
+        instruction, provider_id = await director.generate_instruction(
+            context,
+            object(),
+            "draw",
+        )
+        self.assertEqual(context.calls, 2)
+        self.assertEqual(provider_id, "test-provider")
+        self.assertEqual(instruction.prompt, "1girl, red dress")
+
+    async def test_two_invalid_outputs_fail_closed_with_sanitized_detail(self) -> None:
+        director = self._director()
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": (
+                            "All chat models failed: EmptyModelOutputError: "
+                            "OpenAI completion has no choices. response_id=private-secret"
+                        )
+                    },
+                )()
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_instruction(context, object(), "draw")
+        self.assertEqual(context.calls, 2)
+        self.assertTrue(raised.exception.fatal)
+        self.assertNotIn("private-secret", raised.exception.detail)
+        self.assertNotIn("response_id=", raised.exception.detail)
+        self.assertIn("provider_output_error", raised.exception.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

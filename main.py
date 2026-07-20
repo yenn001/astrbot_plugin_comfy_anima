@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.2.2
+AstrBot Comfy Anima 插件 v1.4.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,11 +8,12 @@ AstrBot Comfy Anima 插件 v1.2.2
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.2.2
-日期: 2026-07-19
+版本: 1.4.1
+日期: 2026-07-20
 """
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -49,7 +50,9 @@ from .core.lora import (
     extract_lora_selections,
 )
 from .core.workflow import (
+    ControlWorkflowBuilder,
     ImageWorkflowBuilder,
+    Img2ImgWorkflowBuilder,
     InpaintWorkflowBuilder,
     WorkflowBuilder,
     WorkflowError,
@@ -75,6 +78,12 @@ from .services.character_swap import (
     response_text as character_swap_response_text,
 )
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
+from .services.control_modes import (
+    CONTROL_MODES,
+    extract_command_control_modes,
+    extract_natural_control_modes,
+    looks_like_control_request,
+)
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
 from .services.lora_retrieval import LoraHybridSearchService
 from .services.lora_analysis import (
@@ -128,6 +137,11 @@ from .services.reverse_prompt import (
     ReversePromptService,
     parse_json_object_with_strategy,
 )
+from .services.semantic_edit import (
+    build_semantic_edit_contract,
+    semantic_redraw_parameters,
+    validate_semantic_prompt,
+)
 from .services.unet_catalog import UnetCatalogError, UnetCatalogService
 from .services.task_store import TaskStore, TaskStoreError
 from .services.web_ui import WebUiActionError, WebUiError, WebUiService
@@ -144,6 +158,8 @@ AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）
 - “把这张图放大/超分/高清化”是独立 RTX 图片工具，不是 rtx 生图管线；不要输出 pic 或 edit，交给插件的现有图片放大路由。
 - “用 RTX 画一张/画完再放大”才是 Anima 的 rtx 生图管线；“只出底图/不要放大”用 base；“迭代放大/二次采样/细节重构”用 iterative。
 - “把图里的手修好、把这里改成红裙、重画那块区域”属于现有图片修改意图；有有效遮罩时输出 edit。edit.prompt 只写遮罩内最终应出现什么，不写“修改、替换、这里、遮罩”等操作词。
+- 用户提供一张底图并明确要求参考姿势、空间构图/深度、线稿上色或外观画风时，属于 Anima 底图控制生成。控制模式由插件确定性解析，LLM 只描述最终画面，不得把 pose/depth/lineart/reference、ControlNet、节点名或模型文件名写进视觉 Tags。
+- Pose 控制人体姿态；Depth 控制空间结构、前后关系和透视布局，不等于景深；Lineart 用线稿/草图约束轮廓并生成上色后的最终图；Reference 是较柔和的外观、配色、画风和整体观感参考，不保证精确复刻身份或姿势。
 - 无蒙版整图重绘会先反推原图再重新生成，不能声称像素级保持；用户未要求改变的身份、姿势、镜头、构图和场景按 preserve/balanced/free 模式处理。
 - “把图中 A 角色换成 B 角色并保持场景”属于语义换角，由插件专用路由处理；不要擅自退化为普通 pic 或局部 edit。
 - 只有人物身份 A→B 才是换角；“把泳装换成礼服、把背景换成夜景、把发型换成长发”是属性改图。若用户同时要求“把 A 换成 B 并穿新衣”，保留为一个组合换角任务，不要丢弃服装覆盖要求。
@@ -344,6 +360,10 @@ class ComfyAnimaPlugin(Star):
             else None
         )
         self._upscale_workflow_builder: Optional[ImageWorkflowBuilder] = None
+        self._control_workflow_builder: Optional[ControlWorkflowBuilder] = None
+        self._control_initialization_error = ""
+        self._img2img_workflow_builder: Optional[Img2ImgWorkflowBuilder] = None
+        self._img2img_initialization_error = ""
         self._pipeline_builders: dict[str, WorkflowBuilder] = {}
         self._pipeline_initialization_errors: dict[str, str] = {}
         self._inpaint_builders: dict[str, InpaintWorkflowBuilder] = {}
@@ -475,6 +495,26 @@ class ComfyAnimaPlugin(Star):
                     f"[{PLUGIN_NAME}] generation pipeline {pipeline} unavailable: "
                     f"{pipeline_exc}"
                 )
+        try:
+            self._control_workflow_builder = ControlWorkflowBuilder(
+                workflow_dir / "anima_control_api.json",
+                self.settings,
+            )
+        except (OSError, ValueError, WorkflowError) as control_exc:
+            self._control_initialization_error = str(control_exc)
+            logger.warning(
+                f"[{PLUGIN_NAME}] Anima control workflow unavailable: {control_exc}"
+            )
+        try:
+            self._img2img_workflow_builder = Img2ImgWorkflowBuilder(
+                workflow_dir / "anima_img2img_api.json",
+                self.settings,
+            )
+        except (OSError, ValueError, WorkflowError) as img2img_exc:
+            self._img2img_initialization_error = str(img2img_exc)
+            logger.warning(
+                f"[{PLUGIN_NAME}] Anima img2img workflow unavailable: {img2img_exc}"
+            )
         if self.settings.enable_inpaint:
             for mode in ("quick", "lanpaint"):
                 try:
@@ -1001,6 +1041,141 @@ class ComfyAnimaPlugin(Star):
             # As with natural_language_draw, stop only after all yielded replies.
             event.stop_event()
 
+    @filter.command("底图控制")
+    async def cmd_control_draw(
+        self,
+        event: AstrMessageEvent,
+        request_text: str = "",
+    ) -> AsyncGenerator[Any, None]:
+        """Generate with one source image and explicit Anima control modes."""
+
+        command_text = self._extract_command_text(
+            event.message_str,
+            request_text,
+            command="底图控制",
+        )
+        try:
+            options = parse_generation_options(
+                command_text,
+                mode_context="generation",
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        mode_source = "explicit"
+        if not options.control_modes:
+            inferred_modes = extract_command_control_modes(options.prompt)
+            if inferred_modes:
+                options = replace(options, control_modes=inferred_modes)
+                mode_source = "command_scoped"
+        if not options.control_modes:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 用法: /底图控制 <画面要求> --m p|d|l|r\n"
+                "可组合：--m p d，或直接说“构图和姿势不变”"
+            )
+            return
+        if not options.lora_preset:
+            style_preset = self._find_requested_style_preset(command_text)
+            if style_preset:
+                options = replace(options, lora_preset=style_preset)
+        logger.info(
+            f"[{PLUGIN_NAME}] control modes parsed: "
+            f"modes={list(options.control_modes)}, source={mode_source}"
+        )
+        async for response in self._handle_control_draw(event, options):
+            yield response
+
+    @filter.command("控制画图")
+    async def cmd_control_draw_alias(
+        self,
+        event: AstrMessageEvent,
+        request_text: str = "",
+    ) -> AsyncGenerator[Any, None]:
+        """Chinese command alias for /底图控制."""
+
+        command_text = self._extract_command_text(
+            event.message_str,
+            request_text,
+            command="控制画图",
+        )
+        try:
+            options = parse_generation_options(
+                command_text,
+                mode_context="generation",
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        mode_source = "explicit"
+        if not options.control_modes:
+            inferred_modes = extract_command_control_modes(options.prompt)
+            if inferred_modes:
+                options = replace(options, control_modes=inferred_modes)
+                mode_source = "command_scoped"
+        if not options.control_modes:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 用法: /控制画图 <画面要求> --m p|d|l|r\n"
+                "也可以直接说“构图和姿势不变”"
+            )
+            return
+        if not options.lora_preset:
+            style_preset = self._find_requested_style_preset(command_text)
+            if style_preset:
+                options = replace(options, lora_preset=style_preset)
+        logger.info(
+            f"[{PLUGIN_NAME}] control modes parsed: "
+            f"modes={list(options.control_modes)}, source={mode_source}"
+        )
+        async for response in self._handle_control_draw(event, options):
+            yield response
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=28)
+    async def natural_language_control_draw(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[Any, None]:
+        """Route one-image pose/depth/lineart/reference generation requests."""
+
+        message = str(event.message_str or "").strip()
+        if (
+            not self.settings.enable_natural_draw
+            or not message
+            or message.startswith(("/", "／"))
+            or parse_natural_character_swap(message) is not None
+            or self._looks_like_inpaint_request(message)
+            or not looks_like_control_request(message)
+        ):
+            return
+        modes = extract_natural_control_modes(message)
+        if not modes:
+            return
+        if not await self._image_input.has_any(event):
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 底图控制需要在同一条消息发送一张图片，"
+                "或回复一张图片后再描述姿势、构图、线稿或参考要求。"
+            )
+            event.stop_event()
+            return
+        try:
+            width, height = self._extract_resolution_request(message)
+            pipeline = self._extract_pipeline_request(message)
+            options = GenerationOptions(
+                prompt=message,
+                width=width,
+                height=height,
+                pipeline=pipeline,
+                lora_preset=self._find_requested_style_preset(message),
+                use_prompt_llm=True,
+                control_modes=modes,
+            )
+            async for response in self._handle_control_draw(event, options):
+                yield response
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 底图控制参数错误: {exc}")
+        finally:
+            event.stop_event()
+
     @filter.command("改图")
     async def cmd_semantic_redraw(
         self,
@@ -1080,7 +1255,7 @@ class ComfyAnimaPlugin(Star):
             command="重绘",
         )
         try:
-            options = parse_generation_options(command_text)
+            options = parse_generation_options(command_text, mode_context="inpaint")
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
             return
@@ -1395,6 +1570,38 @@ class ComfyAnimaPlugin(Star):
             async for response in self._handle_character_swap(event, swap_request):
                 yield response
             return
+        # `/反推画图` historically allows an empty supplement.  Append a
+        # private parser sentinel so the normal generation option parser can
+        # still accept option-only forms such as `--m p d`, then remove it
+        # before any Provider, policy or prompt work sees the request.
+        reverse_sentinel = "__astrbot_reverse_source__"
+        try:
+            parsed_options = parse_generation_options(
+                f"{supplement} {reverse_sentinel}".strip(),
+                mode_context="generation",
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        reverse_requirement = re.sub(
+            rf"(?:^|\s){re.escape(reverse_sentinel)}(?:\s|$)",
+            " ",
+            parsed_options.prompt,
+        ).strip()
+        control_mode_source = "explicit"
+        control_modes = parsed_options.control_modes
+        if not control_modes:
+            control_modes = extract_command_control_modes(reverse_requirement)
+            control_mode_source = "command_scoped" if control_modes else "none"
+        parsed_options = replace(
+            parsed_options,
+            prompt=reverse_requirement,
+            control_modes=control_modes,
+        )
+        logger.info(
+            f"[{PLUGIN_NAME}] reverse draw control modes parsed: "
+            f"modes={list(control_modes)}, source={control_mode_source}"
+        )
         if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
             yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
             return
@@ -1402,22 +1609,45 @@ class ComfyAnimaPlugin(Star):
             not self._client
             or (not self._workflow_builder and not self._pipeline_builders)
             or not self._director
+            or (bool(control_modes) and not self._control_workflow_builder)
+            or (
+                not control_modes
+                and not getattr(self, "_img2img_workflow_builder", None)
+            )
         ):
+            component_error = (
+                getattr(self, "_control_initialization_error", "")
+                if control_modes
+                and getattr(self, "_control_initialization_error", "")
+                else getattr(self, "_img2img_initialization_error", "")
+                or getattr(self, "_initialization_error", "")
+                or getattr(self, "_director_error", "")
+                or "未知错误"
+            )
             yield event.plain_result(
                 f"{MessageEmoji.ERROR} 反推画图组件未就绪: "
-                f"{self._initialization_error or self._director_error or '未知错误'}"
+                f"{component_error}"
             )
             return
-        access_error = self._access_error(event, supplement, check_sensitive=bool(supplement))
+        access_error = self._access_error(
+            event,
+            reverse_requirement,
+            check_sensitive=bool(reverse_requirement),
+        )
         if access_error:
             yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
             return
         try:
-            width, height = self._extract_resolution_request(supplement)
+            width, height = parsed_options.width, parsed_options.height
+            if width is None or height is None:
+                width, height = self._extract_resolution_request(reverse_requirement)
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
             return
-        style_preset = self._find_requested_style_preset(supplement)
+        style_preset = (
+            parsed_options.lora_preset
+            or self._find_requested_style_preset(reverse_requirement)
+        )
 
         async def operation(job: GenerationJob) -> tuple[Any, str, Any, str, str]:
             image_path: Optional[Path] = None
@@ -1429,7 +1659,11 @@ class ComfyAnimaPlugin(Star):
                     "input",
                     "输入图片校验完成，准备执行反推画图链路。",
                     "reverse_draw_input_ready",
-                    details={"bytes": image_path.stat().st_size},
+                    details={
+                        "bytes": image_path.stat().st_size,
+                        "control_modes": list(control_modes),
+                        "control_mode_source": control_mode_source,
+                    },
                 )
                 job.state = "reverse_prompting"
                 self._record_image_task_phase(
@@ -1462,7 +1696,7 @@ class ComfyAnimaPlugin(Star):
                         self.context,
                         event,
                         image_path,
-                        supplement,
+                        reverse_requirement,
                         reverse_progress,
                     )
                 job.state = "directing"
@@ -1473,11 +1707,23 @@ class ComfyAnimaPlugin(Star):
                     "reverse_draw_director_started",
                     details={"reverse_provider_id": reverse_provider},
                 )
-                instruction, director_provider = (
-                    await self._generate_directed_instruction(
-                        event,
-                        reverse_result.drawing_request(supplement),
+                director_request = reverse_result.drawing_request(
+                    reverse_requirement
+                )
+                if control_modes:
+                    director_request = (
+                        "Anima image-controlled generation. The plugin has "
+                        "already locked these control modes: "
+                        f"{', '.join(control_modes)}. Do not write control-mode "
+                        "names, ControlNet operations or node/model names into "
+                        "the visual tags. Preserve the requested source-image "
+                        "constraints while describing the desired final image. "
+                        "Reverse analysis and user request: "
+                        + director_request
                     )
+                instruction, director_provider = await self._generate_directed_instruction(
+                    event,
+                    director_request,
                 )
                 final_prompt = instruction.prompt
                 directed_negative = instruction.negative_prompt
@@ -1487,30 +1733,102 @@ class ComfyAnimaPlugin(Star):
                 negative_prompt = ", ".join(
                     part
                     for part in (
+                        parsed_options.negative_prompt.strip(" ,"),
                         reverse_result.negative_tags.strip(" ,"),
                         directed_negative.strip(" ,"),
                     )
                     if part
                 )
+                target_width, target_height = width, height
+                control_image_name = ""
+                img2img_image_name = ""
+                if control_modes:
+                    if target_width is None or target_height is None:
+                        with Image.open(image_path) as source_image:
+                            source_width, source_height = source_image.size
+                        target_width, target_height = fit_canvas_to_aspect_ratio(
+                            source_width,
+                            source_height,
+                        )
+                    job.state = "uploading"
+                    self._record_image_task_phase(
+                        job,
+                        "upload",
+                        "反推完成，正在上传同一张底图并接入 Anima 控制网。",
+                        "reverse_control_image_upload_started",
+                        details={
+                            "control_modes": list(control_modes),
+                            "target_width": target_width,
+                            "target_height": target_height,
+                        },
+                    )
+                    uploaded = await self._client.upload_image(image_path)
+                    control_image_name = uploaded.workflow_value
+                else:
+                    if target_width is None or target_height is None:
+                        with Image.open(image_path) as source_image:
+                            source_width, source_height = source_image.size
+                        target_width, target_height = fit_canvas_to_aspect_ratio(
+                            source_width,
+                            source_height,
+                        )
+                    job.state = "uploading"
+                    self._record_image_task_phase(
+                        job,
+                        "upload",
+                        "The reverse source is being uploaded for true img2img.",
+                        "reverse_img2img_upload_started",
+                        details={
+                            "target_width": target_width,
+                            "target_height": target_height,
+                            "denoise": (
+                                parsed_options.denoise
+                                if parsed_options.denoise is not None
+                                else 0.55
+                            ),
+                        },
+                    )
+                    uploaded = await self._client.upload_image(image_path)
+                    img2img_image_name = uploaded.workflow_value
+                conditioning_kwargs = {}
+                if control_image_name:
+                    conditioning_kwargs["control_image_name"] = control_image_name
+                if img2img_image_name:
+                    conditioning_kwargs["img2img_image_name"] = img2img_image_name
                 generated = await self._execute_job(
                     job,
-                    GenerationOptions(
+                    replace(
+                        parsed_options,
                         prompt=final_prompt,
                         negative_prompt=negative_prompt,
-                        pipeline=instruction.pipeline,
-                        width=width,
-                        height=height,
+                        pipeline=parsed_options.pipeline or instruction.pipeline,
+                        width=target_width,
+                        height=target_height,
                         lora_preset=style_preset,
+                        denoise=(
+                            parsed_options.denoise
+                            if parsed_options.denoise is not None
+                            else (None if control_modes else 0.55)
+                        ),
                         use_prompt_llm=False,
+                        suppress_default_style=(not bool(style_preset)),
                     ),
                     event,
+                    **conditioning_kwargs,
                 )
                 self._record_image_task_phase(
                     job,
                     "comfyui",
-                    "Anima 与可选 RTX 生成链路完成，图片已下载。",
+                    (
+                        "反推、Anima 控制网与可选 RTX 生成链路完成，图片已下载。"
+                        if control_modes
+                        else "Anima 与可选 RTX 生成链路完成，图片已下载。"
+                    ),
                     "reverse_draw_output_ready",
-                    details={"director_provider_id": director_provider},
+                    details={
+                        "director_provider_id": director_provider,
+                        "control_modes": list(control_modes),
+                    },
                 )
                 return (
                     reverse_result,
@@ -1523,9 +1841,15 @@ class ComfyAnimaPlugin(Star):
                 if image_path is not None:
                     image_path.unlink(missing_ok=True)
 
-        yield event.plain_result(
-            f"{MessageEmoji.DRAW} 正在反推图片、整理 Anima 提示词并生成……"
-        )
+        if control_modes:
+            yield event.plain_result(
+                f"{MessageEmoji.DRAW} 正在反推图片、整理 Anima 提示词并执行 "
+                f"{' + '.join(control_modes)} 控制生成……"
+            )
+        else:
+            yield event.plain_result(
+                f"{MessageEmoji.DRAW} 正在反推图片、整理 Anima 提示词并生成……"
+            )
         try:
             (
                 _reverse_result,
@@ -1561,7 +1885,9 @@ class ComfyAnimaPlugin(Star):
         if self.settings.show_llm_prompt:
             yield event.plain_result(
                 f"{MessageEmoji.INFO} 反推模型: {reverse_provider}\n"
-                f"分镜模型: {director_provider}\n最终提示词: {final_prompt}"
+                f"分镜模型: {director_provider}\n"
+                f"控制模式: {', '.join(control_modes) if control_modes else '无'}\n"
+                f"最终提示词: {final_prompt}"
             )
         yield self._make_image_result(event, image_paths, seed, forward=False)
         self._schedule_cleanup(image_paths)
@@ -1682,10 +2008,9 @@ class ComfyAnimaPlugin(Star):
         if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
             yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
             return
-        pipeline_builders = getattr(self, "_pipeline_builders", {})
         if (
             not self._client
-            or (not getattr(self, "_workflow_builder", None) and not pipeline_builders)
+            or not getattr(self, "_img2img_workflow_builder", None)
             or not self._director
         ):
             yield event.plain_result(
@@ -1773,6 +2098,10 @@ class ComfyAnimaPlugin(Star):
                         ),
                         reverse_progress,
                     )
+                edit_contract = build_semantic_edit_contract(
+                    requirement,
+                    str(getattr(reverse_result, "positive_tags", "")),
+                )
                 job.state = "directing"
                 self._record_image_task_phase(
                     job,
@@ -1799,6 +2128,47 @@ class ComfyAnimaPlugin(Star):
                         director_request,
                     )
                 )
+                contract_issues = edit_contract.validate(instruction.prompt)
+                if contract_issues:
+                    self._record_image_task_phase(
+                        job,
+                        "director",
+                        "首次改图提示词没有完整落实语义合同，正在执行一次定向修复。",
+                        "semantic_redraw_contract_repair_started",
+                        details={
+                            "issue_codes": list(contract_issues),
+                            "issue_count": len(contract_issues),
+                            "required_concept_count": len(
+                                edit_contract.required_positive
+                            ),
+                            "removed_source_term_count": len(
+                                edit_contract.removed_source_terms
+                            ),
+                            "preserved_source_term_count": len(
+                                edit_contract.preserved_source_terms
+                            ),
+                        },
+                        level="WARNING",
+                    )
+                    repair_request = (
+                        director_request
+                        + "\n\n"
+                        + edit_contract.repair_instruction(contract_issues)
+                    )
+                    instruction, director_provider = (
+                        await self._generate_directed_instruction(
+                            event,
+                            repair_request,
+                        )
+                    )
+                    contract_issues = edit_contract.validate(instruction.prompt)
+                    if contract_issues:
+                        raise PromptDirectorError(
+                            "改图导演连续两次未能落实新增、删除或保留要求，已停止且不会提交 ComfyUI",
+                            "semantic_contract_invalid:"
+                            + ",".join(contract_issues),
+                            fatal=True,
+                        )
                 final_prompt = instruction.prompt
                 final_access_error = self._access_error(event, final_prompt)
                 if final_access_error:
@@ -1809,10 +2179,32 @@ class ComfyAnimaPlugin(Star):
                         str(getattr(reverse_result, "negative_tags", "")).strip(" ,"),
                         options.negative_prompt.strip(" ,"),
                         instruction.negative_prompt.strip(" ,"),
+                        ", ".join(edit_contract.required_negative_terms),
                     )
                     if part
                 )
                 selected_pipeline = options.pipeline or instruction.pipeline
+                denoise, steps, edit_magnitude = semantic_redraw_parameters(
+                    requirement,
+                    mode,
+                    explicit_denoise=options.denoise,
+                    explicit_steps=options.steps,
+                )
+                job.state = "uploading"
+                self._record_image_task_phase(
+                    job,
+                    "upload",
+                    "The source image is being uploaded for pixel-connected img2img.",
+                    "semantic_redraw_img2img_upload_started",
+                    details={
+                        "mode": mode,
+                        "denoise": denoise,
+                        "steps": steps,
+                        "edit_magnitude": edit_magnitude,
+                        "denoise_explicit": options.denoise is not None,
+                    },
+                )
+                uploaded = await self._client.upload_image(image_path)
                 generated = await self._execute_job(
                     job,
                     replace(
@@ -1822,10 +2214,31 @@ class ComfyAnimaPlugin(Star):
                         pipeline=selected_pipeline,
                         width=width,
                         height=height,
+                        steps=steps,
+                        denoise=denoise,
                         use_prompt_llm=False,
                         suppress_default_style=(not bool(options.lora_preset)),
+                        suppressed_prompt_terms=tuple(
+                            dict.fromkeys(
+                                (
+                                    *options.suppressed_prompt_terms,
+                                    *edit_contract.suppressed_prompt_terms,
+                                )
+                            )
+                        ),
+                        semantic_required_positive_alias_groups=tuple(
+                            (concept.code, concept.aliases)
+                            for concept in edit_contract.required_positive
+                        ),
+                        semantic_forbidden_positive_terms=(
+                            edit_contract.removed_source_terms
+                        ),
+                        semantic_preserved_positive_terms=(
+                            edit_contract.preserved_source_terms
+                        ),
                     ),
                     event,
+                    img2img_image_name=uploaded.workflow_value,
                 )
                 self._record_image_task_phase(
                     job,
@@ -1908,6 +2321,102 @@ class ComfyAnimaPlugin(Star):
         yield event.chain_result(components)
         self._schedule_cleanup(image_paths)
 
+    async def _handle_control_draw(
+        self,
+        event: AstrMessageEvent,
+        options: GenerationOptions,
+    ) -> AsyncGenerator[Any, None]:
+        """Validate and execute one Anima image-controlled generation task."""
+
+        if not options.prompt.strip():
+            yield event.plain_result(f"{MessageEmoji.ERROR} 请说明要生成的最终画面")
+            return
+        if len(options.prompt) > self.settings.max_prompt_length:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 画面要求不能超过 "
+                f"{self.settings.max_prompt_length} 字符"
+            )
+            return
+        unknown = sorted(set(options.control_modes) - set(CONTROL_MODES))
+        if unknown:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 未知底图控制模式: {', '.join(unknown)}"
+            )
+            return
+        if not options.control_modes:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 请至少选择 pose、depth、lineart 或 reference"
+            )
+            return
+        access_error = self._access_error(event, options.prompt)
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        if not self._client or not self._control_workflow_builder:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} Anima 底图控制工作流未就绪: "
+                f"{self._control_initialization_error or self._initialization_error or '未知错误'}"
+            )
+            return
+        if options.use_prompt_llm is not False and not self._director:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} LLM 分镜模块不可用: {self._director_error or '未知错误'}"
+            )
+            return
+
+        async def operation(
+            job: GenerationJob,
+        ) -> tuple[list[Path], int, str, str, Optional[str]]:
+            return await self._execute_control_job(job, event, options)
+
+        mode_labels = {
+            "pose": "Pose 姿势",
+            "depth": "Depth 空间",
+            "lineart": "Lineart 线稿",
+            "reference": "Reference 外观",
+        }
+        modes_text = " + ".join(mode_labels[mode] for mode in options.control_modes)
+        yield event.plain_result(
+            f"{MessageEmoji.DRAW} 正在读取底图、刷新 LoRA，并执行 {modes_text} 控制生成……"
+        )
+        try:
+            image_paths, seed, final_prompt, provider_id, warning = (
+                await self._run_auxiliary_job(event, "control draw", operation)
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except (IncomingImageError, PromptDirectorError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            yield event.plain_result(f"{MessageEmoji.ERROR} 底图控制准备失败: {message}")
+            return
+        except (ComfyClientError, WorkflowError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] control draw failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 底图控制生成失败: {message}")
+            return
+        if warning:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {warning}")
+        if self.settings.show_llm_prompt and provider_id:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 分镜模型: {provider_id}\n"
+                f"控制模式: {', '.join(options.control_modes)}\n"
+                f"最终提示词: {final_prompt}"
+            )
+        components = [
+            Comp.Plain(
+                self._control_summary(
+                    image_paths,
+                    seed,
+                    options.control_modes,
+                    options.pipeline or self.settings.default_generation_pipeline,
+                )
+            ),
+            *(Comp.Image.fromFileSystem(path) for path in image_paths),
+        ]
+        yield event.chain_result(components)
+        self._schedule_cleanup(image_paths)
+
     async def _handle_inpaint(
         self,
         event: AstrMessageEvent,
@@ -1951,7 +2460,16 @@ class ComfyAnimaPlugin(Star):
             return
 
         async def operation(job: GenerationJob) -> tuple[Any, int, str, str, str]:
-            return await self._execute_inpaint_job(job, event, options)
+            return await self._execute_inpaint_job(
+                job,
+                event,
+                replace(
+                    options,
+                    suppress_default_style=(
+                        options.suppress_default_style or not bool(options.lora_preset)
+                    ),
+                ),
+            )
 
         yield event.plain_result(
             f"{MessageEmoji.DRAW} 正在校验原图与遮罩、刷新 LoRA 并执行局部重绘……"
@@ -1998,7 +2516,7 @@ class ComfyAnimaPlugin(Star):
             event.message_str, prompt, command="draw"
         )
         try:
-            options = parse_generation_options(command_text)
+            options = parse_generation_options(command_text, mode_context="generation")
             detected_width, detected_height = self._extract_resolution_request(
                 options.prompt
             )
@@ -2015,6 +2533,11 @@ class ComfyAnimaPlugin(Star):
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+
+        if options.control_modes:
+            async for response in self._handle_control_draw(event, options):
+                yield response
             return
 
         if len(options.prompt) > self.settings.max_prompt_length:
@@ -2193,7 +2716,7 @@ class ComfyAnimaPlugin(Star):
         """按序号热切换工作流及可选输入、输出节点。"""
         if input_id or output_id:
             yield event.plain_result(
-                f"{MessageEmoji.ERROR} 六管线工作流由 manifest 固定节点，"
+                f"{MessageEmoji.ERROR} 正式工作流由 manifest 固定节点，"
                 "不再接受 input_id/output_id 临时覆盖"
             )
             return
@@ -2215,7 +2738,12 @@ class ComfyAnimaPlugin(Star):
         if not self.settings.enable_lock_command:
             yield event.plain_result(f"{MessageEmoji.WARNING} 锁定命令已在配置中关闭")
             return
-        normalized = state.strip().lower()
+        normalized = {
+            "1": "on",
+            "0": "off",
+            "s": "status",
+            "st": "status",
+        }.get(state.strip().lower(), state.strip().lower())
         if normalized not in {"on", "off", "status"}:
             yield event.plain_result(
                 f"{MessageEmoji.ERROR} 用法: /comfy_lock on|off|status"
@@ -2310,6 +2838,8 @@ class ComfyAnimaPlugin(Star):
         new_pipeline_builders: dict[str, WorkflowBuilder] = {}
         new_inpaint_builders: dict[str, InpaintWorkflowBuilder] = {}
         new_upscale_builder: Optional[ImageWorkflowBuilder] = None
+        new_control_builder: Optional[ControlWorkflowBuilder] = None
+        new_img2img_builder: Optional[Img2ImgWorkflowBuilder] = None
         try:
             workflow_path = new_settings.resolve_workflow_path(self.plugin_dir)
             new_builder = WorkflowBuilder(workflow_path, new_settings)
@@ -2354,6 +2884,17 @@ class ComfyAnimaPlugin(Star):
                 new_settings.resolve_upscale_workflow_path(self.plugin_dir),
                 new_settings,
             )
+            workflow_dir = Path(new_settings.workflow_dir).expanduser()
+            if not workflow_dir.is_absolute():
+                workflow_dir = self.plugin_dir / workflow_dir
+            new_control_builder = ControlWorkflowBuilder(
+                workflow_dir / "anima_control_api.json",
+                new_settings,
+            )
+            new_img2img_builder = Img2ImgWorkflowBuilder(
+                workflow_dir / "anima_img2img_api.json",
+                new_settings,
+            )
         except (OSError, ValueError, WorkflowError) as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} UNET 模型切换失败: {exc}")
             return
@@ -2372,6 +2913,10 @@ class ComfyAnimaPlugin(Star):
         self._inpaint_initialization_errors = {}
         self._upscale_workflow_builder = new_upscale_builder
         self._upscale_initialization_error = ""
+        self._control_workflow_builder = new_control_builder
+        self._control_initialization_error = ""
+        self._img2img_workflow_builder = new_img2img_builder
+        self._img2img_initialization_error = ""
         workflow_dir = Path(new_settings.workflow_dir).expanduser()
         if not workflow_dir.is_absolute():
             workflow_dir = self.plugin_dir / workflow_dir
@@ -2402,7 +2947,11 @@ class ComfyAnimaPlugin(Star):
         if not group_id:
             yield event.plain_result(f"{MessageEmoji.ERROR} 此命令只能在群聊中使用")
             return
-        normalized = level.strip().lower()
+        normalized = {
+            "n": "none",
+            "l": "lite",
+            "f": "full",
+        }.get(level.strip().lower(), level.strip().lower())
         if normalized not in {"none", "lite", "full"}:
             current = self._access_controller.get_filter_level(group_id).value
             yield event.plain_result(
@@ -2471,13 +3020,13 @@ class ComfyAnimaPlugin(Star):
         index = 2
         while index < len(tokens):
             token = tokens[index]
-            if token in {"--trigger", "--triggers"}:
+            if token in {"--trigger", "--triggers", "--t"}:
                 if index + 1 >= len(tokens):
                     yield event.plain_result(f"{MessageEmoji.ERROR} {token} 缺少参数")
                     return
                 index += 1
                 trigger_words = tokens[index]
-            elif token in {"--description", "--desc"}:
+            elif token in {"--description", "--desc", "--d"}:
                 if index + 1 >= len(tokens):
                     yield event.plain_result(f"{MessageEmoji.ERROR} {token} 缺少参数")
                     return
@@ -2810,20 +3359,22 @@ class ComfyAnimaPlugin(Star):
 自然语言选择: “只要原图/不放大”、“RTX 高清放大”、“迭代放大/细节重构”
 未指定时使用 WebUI 当前默认生图管线。
 
-4 个独立图片操作（不属于生图管线切换）:
+5 个独立图片操作（不属于生图管线切换）:
 1. /放大 [倍率] - 放大用户发送或引用的图片，不经过 Anima 生图
-2. /改图 <要求> --mode preserve|balanced|free - 无需蒙版，理解原图后重新生成整张图
-3. /重绘 <要求> --mode quick - Quick Inpaint Crop，小范围快速修改
-4. /重绘 <要求> --mode lanpaint - LanPaint 多轮精细重绘，适合复杂结构
+2. /底图控制 <要求> [--m p|d|l|r] - Pose、Depth、Lineart、Reference，可组合或自然推断
+3. /改图 <要求> --mode preserve|balanced|free - 无需蒙版，理解原图后重新生成整张图
+4. /重绘 <要求> --mode quick - LanPaint Fast，小范围快速修改
+5. /重绘 <要求> --mode lanpaint - LanPaint 多轮精细重绘，适合复杂结构
 明确局部/遮罩或指定 quick|lanpaint 时需提供同尺寸遮罩；普通整图换衣、换背景会自动转入 /改图。
 
 /反推 [关注点] - 发送或引用图片，返回结构化 Anima 提示词
-/反推画图 [补充要求] - 反推后直接调用 Anima 生图
+/反推画图 [补充要求] [--m p|d|l|r] - 反推后可直接接 Anima 控制生成
 /换角色 A -> B [选项] - 引用单图进行单角色语义换角
 /换角色 A -> B [选项] | <完整 Tags> - 对现有 Tags 语义换角
 /换角色会先刷新并精确查找目标角色 LoRA；完全未命中时改用普通语义 Tags。
 --no-character-lora / --no-lora - 强制不加载目标角色 LoRA，仅用语义 Tags；只支持 keep-outfit
 /画图与 /画图no 可追加 --preset <序号|名称> 及 --pipeline <管线>
+短参数: --p b|r|i、--sz、--st、--sd、--c、--n、--pr；底图控制用 --m p d 等组合。
 
 管理员:
 /comfy_ls - 列出工作流
@@ -2918,7 +3469,7 @@ think 控制块内容会被自动忽略。"""
     @anima.command("help")
     async def cmd_help(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         """显示插件帮助。"""
-        help_text = f"""📖 Comfy Anima 插件 v{PLUGIN_VERSION}｜六管线功能
+        help_text = f"""📖 Comfy Anima 插件 v{PLUGIN_VERSION}｜底图控制增强版
 ━━━━━━━━━━━━
 /anima draw <提示词> [--pipeline base|rtx|iterative] - 生成图片
 /anima prompt <剧情> - 仅预览 LLM 分镜提示词
@@ -2934,10 +3485,11 @@ iterative - Anima 原图 + 迭代采样放大
 自然语言也可说“只要原图/不放大”、“RTX 高清放大”或“迭代放大/细节重构”。
 未指定时使用 WebUI 当前默认管线。
 
-4 个独立图片操作:
+5 个独立图片操作:
 /放大 [倍率] - 独立 RTX 图片放大，不经过 Anima 生图
+/底图控制 <要求> [--m p|d|l|r] - 一张图控制姿势、空间、线稿或外观，可组合或自然推断
 /改图 <要求> --mode preserve|balanced|free - 无蒙版整图语义重绘
-/重绘 <要求> --mode quick - Quick Inpaint Crop 快速局部重绘
+/重绘 <要求> --mode quick - LanPaint Fast 快速局部重绘
 /重绘 <要求> --mode lanpaint - LanPaint 多轮精细重绘
 明确局部/遮罩或指定 quick|lanpaint 时需提供同尺寸遮罩；普通整图换衣、换背景会自动转入 /改图。
 
@@ -2945,7 +3497,7 @@ QQ快捷指令:
 /画图 <英文 Tag> [--pipeline base|rtx|iterative] - 合并转发
 /画图no <英文 Tag> [--pipeline base|rtx|iterative] - 直接图片
 /反推 [关注点] - 在线图片反推
-/反推画图 [补充要求] - 反推并生成
+/反推画图 [补充要求] [--m p|d|l|r] - 反推并可接底图控制生成
 /改图 [要求] - 无蒙版整图修改；支持换衣、换背景、换表情或重新画一张
 /换角色 A -> B [选项] - 单图语义换角
 /换角色 A -> B [选项] | <完整 Tags> - Tags 语义换角
@@ -2961,6 +3513,8 @@ QQ快捷指令:
 --upscale / --no-upscale
 --llm / --raw
 --preset "风格001或自定义名称"
+短写: --p b|r|i、--sz、--st、--sd、--c、--n、--pr、--l、--r
+底图控制: --m p|d|l|r；支持 --m p d、--m p --m d；省略时按命令正文推断
 
 换角专用选项（写在 | 之前）:
 --mode keep-outfit|target-outfit
@@ -2976,6 +3530,10 @@ QQ快捷指令:
 /anima draw 她在雨夜回头看向镜头 --pipeline rtx --seed 123
 /anima draw 用风格001画达妮娅，不放大
 /anima draw 1girl, white hair, blue eyes --raw --pipeline iterative --preset 风格001
+/底图控制 画成雨夜中的角色 --m p d --p r
+/底图控制 构图和姿势不变，用风格001-1画出来
+/底图控制 按线稿完成上色 --m l --p b
+/反推画图 构图和姿势不变，换成雨夜礼服 --m p d --p r
 /改图 把衣服换成红色晚礼服，其他内容保持不变 --mode preserve
 /改图 参考原图重新画一张夜景版本 --mode free
 /重绘 把遮罩区域的衣服改成红裙 --mode quick
@@ -3917,7 +4475,7 @@ QQ快捷指令:
     ) -> AsyncGenerator[Any, None]:
         """处理 `/画图` 与 `/画图no` 的共享直接出图流程。"""
         try:
-            parsed_options = parse_generation_options(prompt)
+            parsed_options = parse_generation_options(prompt, mode_context="generation")
             prompt = parsed_options.prompt
             width, height = parsed_options.width, parsed_options.height
             if width is None or height is None:
@@ -3932,6 +4490,20 @@ QQ快捷指令:
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        if parsed_options.control_modes:
+            async for response in self._handle_control_draw(
+                event,
+                replace(
+                    parsed_options,
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    lora_preset=preset_name,
+                    use_prompt_llm=False,
+                ),
+            ):
+                yield response
             return
         prompt = prompt.strip()
         if not prompt:
@@ -4119,6 +4691,38 @@ QQ快捷指令:
         )
 
     @staticmethod
+    def _control_summary(
+        image_paths: list[Path],
+        seed: int,
+        modes: tuple[str, ...],
+        pipeline: str,
+    ) -> str:
+        elapsed = max(
+            0.0,
+            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
+        )
+        gpu_name = str(
+            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
+        )
+        mode_labels = {
+            "pose": "Pose",
+            "depth": "Depth",
+            "lineart": "Lineart",
+            "reference": "Reference",
+        }
+        pipeline_label = {
+            "base": "原图",
+            "rtx": "RTX",
+            "iterative": "迭代",
+        }.get(str(pipeline).casefold(), str(pipeline))
+        return (
+            f"{MessageEmoji.SUCCESS} 底图控制生成完成｜"
+            f"模式: {' + '.join(mode_labels.get(mode, mode) for mode in modes)}｜"
+            f"管线: {pipeline_label}｜Seed: {seed}\n"
+            f"生成耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+        )
+
+    @staticmethod
     def _inpaint_summary(image_paths: list[Path], seed: int, mode: str) -> str:
         elapsed = max(
             0.0,
@@ -4155,7 +4759,8 @@ QQ快捷指令:
             f"{MessageEmoji.SUCCESS} 整图语义重绘完成｜模式: {mode_label}｜"
             f"Seed: {seed}｜图片: {len(image_paths)} 张\n"
             f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}\n"
-            "说明: 本结果是整张图片重新生成，不是像素级局部修改。"
+            "说明: 原图像素已接入 Anima img2img；不是蒙版局部修改，"
+            "保真程度由模式与 denoise 决定。"
         )
 
     def _access_error(
@@ -4297,11 +4902,6 @@ QQ快捷指令:
         )
         if options.use_prompt_llm is False:
             raise ValueError("整图改图必须使用图片反推与 LLM 语义规划，不支持 --raw")
-        if options.denoise is not None:
-            raise ValueError(
-                "当前整图改图属于语义重新生成，--denoise 不是改图强度；"
-                "真正的整图 img2img 强度将在独立工作流中提供"
-            )
         detected_width, detected_height = self._extract_resolution_request(options.prompt)
         detected_pipeline = self._extract_pipeline_request(options.prompt)
         return replace(
@@ -4644,6 +5244,36 @@ QQ快捷指令:
                     "error": self._inpaint_initialization_errors.get(mode, ""),
                 }
             )
+        pipeline_rows.append(
+            {
+                "id": "img2img",
+                "role": "img2img",
+                "ready": self._img2img_workflow_builder is not None,
+                "default": False,
+                "profile_id": (
+                    self._img2img_workflow_builder.profile.profile_id
+                    if self._img2img_workflow_builder
+                    else ""
+                ),
+                "display_name": "Anima whole-image img2img",
+                "error": self._img2img_initialization_error,
+            }
+        )
+        pipeline_rows.append(
+            {
+                "id": "control",
+                "role": "control_generation",
+                "ready": self._control_workflow_builder is not None,
+                "default": False,
+                "profile_id": (
+                    self._control_workflow_builder.profile.profile_id
+                    if self._control_workflow_builder
+                    else ""
+                ),
+                "display_name": "Anima 底图控制生成",
+                "error": self._control_initialization_error,
+            }
+        )
         pipeline_rows.append(
             {
                 "id": "standalone_rtx",
@@ -6434,8 +7064,10 @@ QQ快捷指令:
         active = str(self._active_workflow_name or "").casefold()
         labels = {
             "text_to_image": "生图",
+            "img2img": "整图 img2img",
             "upscale": "独立放大",
             "inpaint": "局部重绘",
+            "control_generation": "底图控制生成",
             "orchestration": "整图语义重绘",
             "invalid": "不可用",
         }
@@ -6454,6 +7086,16 @@ QQ快捷指令:
             },
         }
         tool_profiles = {
+            "anima_img2img": {
+                "capability_id": "img2img",
+                "command": "/改图 or /反推画图",
+                "summary": "Pixel-connected whole-image Anima img2img for source-faithful redraw.",
+            },
+            "anima_control": {
+                "capability_id": "control",
+                "command": "/底图控制 <要求> [--m p|d|l|r]",
+                "summary": "使用一张底图控制姿势、空间结构、线稿轮廓或外观画风。",
+            },
             "rtx_upscale": {
                 "capability_id": "standalone_rtx",
                 "command": "/放大",
@@ -6462,7 +7104,7 @@ QQ快捷指令:
             "anima_inpaint_crop": {
                 "capability_id": "quick",
                 "command": "/重绘 <要求> --mode quick",
-                "summary": "Quick Inpaint Crop，适合边界清晰的小范围修改。",
+                "summary": "LanPaint Fast，适合边界清晰的小范围快速修改。",
             },
             "anima_lanpaint": {
                 "capability_id": "lanpaint",
@@ -6499,6 +7141,14 @@ QQ快捷指令:
                     "_inpaint_builders",
                     {},
                 )
+            elif capability_id == "control":
+                runtime_ready = (
+                    getattr(self, "_control_workflow_builder", None) is not None
+                )
+            elif capability_id == "img2img":
+                runtime_ready = (
+                    getattr(self, "_img2img_workflow_builder", None) is not None
+                )
             else:
                 runtime_ready = descriptor.task_type != "invalid"
             status = (
@@ -6534,10 +7184,7 @@ QQ快捷指令:
             and getattr(self, "_reverse_prompt", None) is not None
             and getattr(self, "_director", None) is not None
             and getattr(self, "_client", None) is not None
-            and (
-                getattr(self, "_workflow_builder", None) is not None
-                or bool(getattr(self, "_pipeline_builders", {}))
-            )
+            and getattr(self, "_img2img_workflow_builder", None) is not None
         )
         items.append(
             {
@@ -6585,6 +7232,8 @@ QQ快捷指令:
                 by_capability[capability_id]
                 for capability_id in (
                     "standalone_rtx",
+                    "control",
+                    "img2img",
                     "semantic_redraw",
                     "quick",
                     "lanpaint",
@@ -6594,7 +7243,7 @@ QQ快捷指令:
         }
 
     async def web_ui_check_workflows(self) -> dict[str, Any]:
-        """Check all six shipped roles against live ComfyUI nodes and model choices."""
+        """Check all shipped roles against live ComfyUI nodes and model choices."""
 
         if self._client is None:
             raise WebUiActionError("ComfyUI 客户端未就绪")
@@ -6607,10 +7256,18 @@ QQ快捷指令:
             node = object_info.get(node_type)
             if not isinstance(node, Mapping):
                 return None
-            required = node.get("input", {}).get("required", {})
-            if not isinstance(required, Mapping) or input_name not in required:
+            input_schema = node.get("input", {})
+            if not isinstance(input_schema, Mapping):
                 return None
-            raw = required.get(input_name)
+            required = input_schema.get("required", {})
+            optional = input_schema.get("optional", {})
+            raw = None
+            if isinstance(required, Mapping):
+                raw = required.get(input_name)
+            if raw is None and isinstance(optional, Mapping):
+                raw = optional.get(input_name)
+            if raw is None:
+                return None
             values = raw[0] if isinstance(raw, list) and raw else []
             return {str(value) for value in values} if isinstance(values, list) else None
 
@@ -6619,6 +7276,11 @@ QQ快捷指令:
             "CLIPLoader": choices("CLIPLoader", "clip_name"),
             "VAELoader": choices("VAELoader", "vae_name"),
             "CLIPLoader.type": choices("CLIPLoader", "type"),
+            "AnimaLLLiteApply": choices("AnimaLLLiteApply", "lllite_name"),
+            "DepthAnythingV2Preprocessor": choices(
+                "DepthAnythingV2Preprocessor",
+                "ckpt_name",
+            ),
         }
         roles = (
             (
@@ -6657,6 +7319,16 @@ QQ快捷指令:
                     "lanpaint",
                 ),
             ),
+            (
+                "img2img",
+                "img2img",
+                self._workflow_registry.workflow_dir / "anima_img2img_api.json",
+            ),
+            (
+                "control",
+                "control_generation",
+                self._workflow_registry.workflow_dir / "anima_control_api.json",
+            ),
         )
         items = []
         for role, task_type, path in roles:
@@ -6683,6 +7355,8 @@ QQ快捷指令:
                     "UNETLoader": "unet_name",
                     "CLIPLoader": "clip_name",
                     "VAELoader": "vae_name",
+                    "AnimaLLLiteApply": "lllite_name",
+                    "DepthAnythingV2Preprocessor": "ckpt_name",
                 }
                 for node in workflow.values():
                     if not isinstance(node, Mapping):
@@ -6867,6 +7541,13 @@ QQ快捷指令:
                 new_settings.resolve_workflow_path(self.plugin_dir),
                 new_settings,
             )
+            workflow_dir = Path(new_settings.workflow_dir).expanduser()
+            if not workflow_dir.is_absolute():
+                workflow_dir = self.plugin_dir / workflow_dir
+            new_img2img_builder = Img2ImgWorkflowBuilder(
+                workflow_dir / "anima_img2img_api.json",
+                new_settings,
+            )
             new_pipeline_builders = {
                 pipeline: WorkflowBuilder(
                     new_settings.resolve_pipeline_workflow_path(
@@ -6895,18 +7576,29 @@ QQ快捷指令:
                 new_settings.resolve_upscale_workflow_path(self.plugin_dir),
                 new_settings,
             )
+            workflow_dir = Path(new_settings.workflow_dir).expanduser()
+            if not workflow_dir.is_absolute():
+                workflow_dir = self.plugin_dir / workflow_dir
+            new_control_builder = ControlWorkflowBuilder(
+                workflow_dir / "anima_control_api.json",
+                new_settings,
+            )
         except (OSError, ValueError, WorkflowError) as exc:
             raise WebUiActionError(f"UNET 模型无法应用到全部工作流：{exc}") from exc
         if not self._persist_config("unet_model_name", selected.name):
             raise WebUiActionError("UNET 模型保存失败")
         self.settings = new_settings
         self._workflow_builder = new_legacy_builder
+        self._img2img_workflow_builder = new_img2img_builder
+        self._img2img_initialization_error = ""
         self._pipeline_builders = new_pipeline_builders
         self._pipeline_initialization_errors = {}
         self._inpaint_builders = new_inpaint_builders
         self._inpaint_initialization_errors = {}
         self._upscale_workflow_builder = new_upscale_builder
         self._upscale_initialization_error = ""
+        self._control_workflow_builder = new_control_builder
+        self._control_initialization_error = ""
         self._workflow_registry = WorkflowRegistry(
             self._workflow_registry.workflow_dir,
             new_settings,
@@ -7139,6 +7831,7 @@ QQ快捷指令:
                 "RTX upscale": "rtx_upscale",
                 "character swap": "character_swap",
                 "inpaint": "inpaint",
+                "control draw": "control_generation",
             }.get(label, "image_tool")
             if self._task_store is not None:
                 job.task_run_id = self._task_store.create_task(
@@ -7253,7 +7946,7 @@ QQ快捷指令:
         details: Optional[dict[str, Any]] = None,
         level: str = "INFO",
     ) -> None:
-        if self._task_store is None or not job.task_run_id:
+        if getattr(self, "_task_store", None) is None or not job.task_run_id:
             return
         self._task_store.append_event(
             job.task_run_id,
@@ -7350,6 +8043,135 @@ QQ快捷指令:
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
             raise
+        finally:
+            if source is not None:
+                source.unlink(missing_ok=True)
+
+    async def _execute_control_job(
+        self,
+        job: GenerationJob,
+        event: AstrMessageEvent,
+        options: GenerationOptions,
+    ) -> tuple[list[Path], int, str, str, Optional[str]]:
+        """Upload one source image, preserve its aspect ratio, then generate."""
+
+        assert self._client is not None
+        source: Optional[Path] = None
+        try:
+            job.state = "reading_image"
+            source = await self._image_input.collect_one(event)
+
+            def source_size() -> tuple[int, int]:
+                assert source is not None
+                with Image.open(source) as image:
+                    return image.size
+
+            source_width, source_height = await asyncio.to_thread(source_size)
+            width, height = options.width, options.height
+            if width is None or height is None:
+                width, height = fit_canvas_to_aspect_ratio(
+                    source_width,
+                    source_height,
+                )
+            self._record_image_task_phase(
+                job,
+                "input",
+                "底图已校验，正在按原图宽高比准备 Anima 控制画布。",
+                "control_input_ready",
+                details={
+                    "bytes": source.stat().st_size,
+                    "source_width": source_width,
+                    "source_height": source_height,
+                    "target_width": width,
+                    "target_height": height,
+                    "control_modes": list(options.control_modes),
+                },
+            )
+            use_llm = (
+                self.settings.enable_prompt_llm
+                if options.use_prompt_llm is None
+                else options.use_prompt_llm
+            )
+            effective_options = replace(
+                options,
+                width=width,
+                height=height,
+                suppress_default_style=(
+                    options.suppress_default_style or not bool(options.lora_preset)
+                ),
+            )
+            if (
+                use_llm
+                and self.settings.enable_reverse_prompt
+                and self._reverse_prompt is not None
+            ):
+                job.state = "reverse_prompting"
+                self._record_image_task_phase(
+                    job,
+                    "provider",
+                    "The control source is being analyzed before prompt direction.",
+                    "control_reverse_started",
+                    details={"control_modes": list(options.control_modes)},
+                )
+
+                def control_reverse_progress(
+                    message: str,
+                    event_code: str,
+                    details: Mapping[str, Any],
+                ) -> None:
+                    self._record_image_task_phase(
+                        job,
+                        "provider",
+                        message,
+                        event_code,
+                        details=dict(details),
+                        level=(
+                            "WARNING"
+                            if event_code == "reverse_response_invalid"
+                            else "INFO"
+                        ),
+                    )
+
+                async with self._generation_slots:
+                    reverse_result, reverse_provider = await self._reverse_prompt.reverse(
+                        self.context,
+                        event,
+                        source,
+                        (
+                            "Analyze the source exactly as shown for image control. "
+                            "Do not apply the requested future change during analysis."
+                        ),
+                        control_reverse_progress,
+                    )
+                effective_options = replace(
+                    effective_options,
+                    prompt=reverse_result.control_generation_request(
+                        options.prompt,
+                        options.control_modes,
+                    ),
+                )
+                self._record_image_task_phase(
+                    job,
+                    "provider",
+                    "Source-aware control context is ready for the drawing director.",
+                    "control_reverse_ready",
+                    details={"reverse_provider_id": reverse_provider},
+                )
+            job.state = "uploading"
+            uploaded = await self._client.upload_image(source)
+            self._record_image_task_phase(
+                job,
+                "upload",
+                "底图已上传，准备刷新 LoRA 并构建控制生成工作流。",
+                "control_image_uploaded",
+                details={"control_modes": list(options.control_modes)},
+            )
+            return await self._execute_job(
+                job,
+                effective_options,
+                event,
+                control_image_name=uploaded.workflow_value,
+            )
         finally:
             if source is not None:
                 source.unlink(missing_ok=True)
@@ -7628,12 +8450,17 @@ QQ快捷指令:
         job: GenerationJob,
         options: GenerationOptions,
         event: AstrMessageEvent,
+        *,
+        control_image_name: str = "",
+        img2img_image_name: str = "",
     ) -> tuple[list[Path], int, str, str, Optional[str]]:
         """占用并发槽，提交任务、等待结果并下载图片。"""
         assert self._client is not None
         pipeline_builders = getattr(self, "_pipeline_builders", {})
         if self._workflow_builder is None and not pipeline_builders:
             raise WorkflowError("没有可用的 Anima 生成工作流")
+        if control_image_name and img2img_image_name:
+            raise WorkflowError("control and img2img conditioning cannot be combined")
         started_at = time.monotonic()
         image_paths = GeneratedImagePaths()
         effective_prompt = options.prompt
@@ -7641,6 +8468,22 @@ QQ快捷指令:
         director_negative = ""
         director_pipeline = ""
         director_warning: Optional[str] = None
+        provider_error_code = PromptDirector.provider_error_code(effective_prompt)
+        if provider_error_code:
+            self._record_image_task_phase(
+                job,
+                "director",
+                "最终提示词被安全闸门拒绝，任务未提交 ComfyUI。",
+                "prompt_director_output_rejected",
+                details={
+                    "error_code": provider_error_code,
+                    "output_chars": len(str(effective_prompt or "")),
+                },
+                level="ERROR",
+            )
+            raise WorkflowError(
+                "绘图模型 Provider 调用失败，安全闸门已阻止错误文本进入工作流"
+            )
         try:
             async with self._generation_slots:
                 use_llm = (
@@ -7655,15 +8498,32 @@ QQ快捷指令:
                             raise PromptDirectorError(
                                 "LLM 分镜模块不可用", self._director_error or ""
                             )
+                        director_request = options.prompt
+                        if options.control_modes:
+                            director_request = (
+                                "Anima image-controlled generation. The plugin has "
+                                "already locked these control modes: "
+                                f"{', '.join(options.control_modes)}. "
+                                "Do not write control-mode names or workflow operations "
+                                "into the visual tags. Describe the desired final image, "
+                                "and do not contradict the locked pose/depth/lineart "
+                                "geometry. User request: "
+                                + options.prompt
+                            )
                         instruction, provider_id = await self._generate_directed_instruction(
                             event,
-                            options.prompt,
+                            director_request,
                         )
                         effective_prompt = instruction.prompt
                         director_negative = instruction.negative_prompt
                         director_pipeline = instruction.pipeline
                     except PromptDirectorError as exc:
-                        if exc.fatal or not self.settings.prompt_llm_fallback:
+                        if (
+                            exc.fatal
+                            or options.control_modes
+                            or bool(img2img_image_name)
+                            or not self.settings.prompt_llm_fallback
+                        ):
                             raise
                         director_warning = exc.user_message
                         logger.warning(
@@ -7673,6 +8533,14 @@ QQ快捷指令:
                 job.state = "building"
                 try:
                     job.state = "refreshing_lora"
+                    if options.control_modes:
+                        self._record_image_task_phase(
+                            job,
+                            "lora",
+                            "正在执行底图控制规划前的 LoRA Manager 与 ComfyUI 强制刷新。",
+                            "control_lora_refresh_started",
+                            details={"control_modes": list(options.control_modes)},
+                        )
                     await self._refresh_lora_manager_before("生成图片前注入 LoRA")
                     job.state = "building"
                     clean_prompt, parsed_loras = extract_lora_selections(
@@ -7838,6 +8706,19 @@ QQ快捷指令:
                         suppressed_terms=options.suppressed_prompt_terms,
                     )
                     clean_prompt = trigger_plan.prompt
+                    semantic_issues = validate_semantic_prompt(
+                        clean_prompt,
+                        required_groups=(
+                            options.semantic_required_positive_alias_groups
+                        ),
+                        forbidden_terms=options.semantic_forbidden_positive_terms,
+                        preserved_terms=options.semantic_preserved_positive_terms,
+                    )
+                    if semantic_issues:
+                        raise LoraWorkflowError(
+                            "LoRA 注入后的最终提示词违反语义改图合同："
+                            + ", ".join(semantic_issues)
+                        )
                     if trigger_plan.added:
                         logger.info(
                             f"[{PLUGIN_NAME}] 已按最新 LoRA 元数据补充触发词: "
@@ -7850,6 +8731,11 @@ QQ快捷指令:
                         )
                     if not clean_prompt:
                         raise LoraWorkflowError("移除 LoRA 标签后绘图提示词为空")
+                    provider_error_code = PromptDirector.provider_error_code(clean_prompt)
+                    if provider_error_code:
+                        raise LoraWorkflowError(
+                            "绘图模型 Provider 错误文本已被提交前安全闸门阻止"
+                        )
                     if len(clean_prompt) > self.settings.max_prompt_length:
                         raise LoraWorkflowError(
                             "应用组合触发词后的提示词不能超过 "
@@ -7881,8 +8767,30 @@ QQ快捷指令:
                     options,
                     director_pipeline,
                 )
+                effective_options = replace(
+                    effective_options,
+                    pipeline=requested_pipeline,
+                )
                 builder = pipeline_builders.get(requested_pipeline)
                 active_pipeline = requested_pipeline
+                if options.control_modes:
+                    if not control_image_name:
+                        raise WorkflowError("底图控制任务缺少已上传的参考图片")
+                    builder = self._control_workflow_builder
+                    active_pipeline = f"control:{requested_pipeline}"
+                    if builder is None:
+                        raise WorkflowError(
+                            "底图控制工作流不可用: "
+                            f"{self._control_initialization_error or '工作流未初始化'}"
+                        )
+                if img2img_image_name:
+                    builder = getattr(self, "_img2img_workflow_builder", None)
+                    active_pipeline = f"img2img:{requested_pipeline}"
+                    if builder is None:
+                        raise WorkflowError(
+                            "Anima img2img workflow is unavailable: "
+                            f"{getattr(self, '_img2img_initialization_error', '') or 'builder not initialized'}"
+                        )
                 if builder is None:
                     if pipeline_builders or options.pipeline:
                         error = getattr(
@@ -7902,10 +8810,106 @@ QQ快捷指令:
                 logger.info(
                     f"[{PLUGIN_NAME}] generation pipeline selected: {active_pipeline}"
                 )
-                workflow, seed, preferred_nodes = builder.build(effective_options)
+                if options.control_modes:
+                    assert isinstance(builder, ControlWorkflowBuilder)
+                    workflow, seed, preferred_nodes = builder.build_control(
+                        control_image_name,
+                        effective_options,
+                    )
+                    self._record_image_task_phase(
+                        job,
+                        "workflow",
+                        "Anima 底图控制工作流已构建，模式链与输出管线均已确定。",
+                        "control_workflow_ready",
+                        details={
+                            "control_modes": list(options.control_modes),
+                            "pipeline": requested_pipeline,
+                            "output_nodes": preferred_nodes,
+                        },
+                    )
+                elif img2img_image_name:
+                    assert isinstance(builder, Img2ImgWorkflowBuilder)
+                    workflow, seed, preferred_nodes = builder.build_img2img(
+                        img2img_image_name,
+                        effective_options,
+                    )
+                else:
+                    workflow, seed, preferred_nodes = builder.build(effective_options)
+                profile = getattr(builder, "profile", None)
+                prompt_binding = getattr(profile, "prompt", None)
+                prompt_sha = hashlib.sha256(
+                    clean_prompt.encode("utf-8")
+                ).hexdigest()[:12]
+                conditioning_type = (
+                    "control"
+                    if options.control_modes
+                    else ("img2img" if img2img_image_name else "txt2img")
+                )
+                sampler_parameters = []
+                for sampler in getattr(profile, "samplers", ()):
+                    node = workflow.get(sampler.node_id)
+                    inputs = node.get("inputs") if isinstance(node, dict) else None
+                    if isinstance(inputs, dict):
+                        sampler_parameters.append(
+                            {
+                                "node_id": sampler.node_id,
+                                "steps": inputs.get(sampler.steps_input),
+                                "cfg": inputs.get(sampler.cfg_input),
+                                "denoise": inputs.get(sampler.denoise_input),
+                            }
+                        )
+                control_parameters = []
+                if options.control_modes:
+                    for mode in options.control_modes:
+                        binding = getattr(profile, "controls", {}).get(mode)
+                        node = workflow.get(binding.apply_node_id) if binding else None
+                        inputs = node.get("inputs") if isinstance(node, dict) else None
+                        if binding and isinstance(inputs, dict):
+                            control_parameters.append(
+                                {
+                                    "mode": mode,
+                                    "strength": inputs.get(binding.strength_input),
+                                    "start": inputs.get(binding.start_input),
+                                    "end": inputs.get(binding.end_input),
+                                }
+                            )
+                self._record_image_task_phase(
+                    job,
+                    "workflow",
+                    "The final workflow payload has been verified before submission.",
+                    "workflow_payload_ready",
+                    details={
+                        "conditioning_type": conditioning_type,
+                        "profile_id": getattr(profile, "profile_id", "legacy_or_test"),
+                        "pipeline": requested_pipeline,
+                        "positive_node_id": (
+                            prompt_binding.node_id if prompt_binding else ""
+                        ),
+                        "positive_input": (
+                            prompt_binding.input_name if prompt_binding else ""
+                        ),
+                        "prompt_chars": len(clean_prompt),
+                        "prompt_sha256": prompt_sha,
+                        "negative_chars": len(combined_negative),
+                        "lora_count": len(dynamic_loras),
+                        "denoise": effective_options.denoise,
+                        "control_modes": list(options.control_modes),
+                        "control_parameters": control_parameters,
+                        "samplers": sampler_parameters,
+                        "output_nodes": preferred_nodes,
+                    },
+                )
                 job.state = "submitting"
                 job.prompt_id = await self._client.submit(workflow)
                 job.state = "generating"
+                if options.control_modes:
+                    self._record_image_task_phase(
+                        job,
+                        "comfyui",
+                        "底图控制任务已提交，正在等待 ComfyUI 生成输出。",
+                        "control_generation_waiting",
+                        details={"pipeline": requested_pipeline},
+                    )
                 references = await self._client.wait_for_images(
                     job.prompt_id, preferred_nodes
                 )
@@ -7923,6 +8927,14 @@ QQ快捷指令:
                         f"[{PLUGIN_NAME}] unable to read ComfyUI GPU model: {exc}"
                     )
                 job.state = "completed"
+                if options.control_modes:
+                    self._record_image_task_phase(
+                        job,
+                        "download",
+                        "底图控制输出已下载并完成 GPU 与耗时统计。",
+                        "control_output_ready",
+                        details={"image_count": len(image_paths)},
+                    )
                 return (
                     image_paths,
                     seed,

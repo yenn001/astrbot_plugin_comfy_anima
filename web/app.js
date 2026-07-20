@@ -742,6 +742,11 @@ function renderWorkflowTools() {
       command: "/放大",
       summary: "放大用户提供的图片，不经过 Anima 生图。",
     },
+    control: {
+      title: "Anima 底图控制",
+      command: "/底图控制 <要求> [--m p|d|l|r]",
+      summary: "一张底图可控制 Pose、Depth、Lineart 或 Reference，并支持组合。",
+    },
     semantic_redraw: {
       title: "无蒙版整图改图",
       command: "/改图 <要求> --mode preserve|balanced|free",
@@ -759,6 +764,7 @@ function renderWorkflowTools() {
     },
   };
   const profileCapabilities = {
+    anima_control: "control",
     rtx_upscale: "standalone_rtx",
     anima_inpaint_crop: "quick",
     anima_lanpaint: "lanpaint",
@@ -807,7 +813,7 @@ function renderWorkflowTools() {
   if (!toolWorkflowItems.length) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
-    empty.textContent = "未发现整图改图、RTX 独立放大、Quick Inpaint 或 LanPaint 能力。";
+    empty.textContent = "未发现底图控制、整图改图、RTX 独立放大、Quick Inpaint 或 LanPaint 能力。";
     host.append(empty);
   }
 }

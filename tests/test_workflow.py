@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from ..core.workflow import (
+    ControlWorkflowBuilder,
     ImageWorkflowBuilder,
     InpaintWorkflowBuilder,
     WorkflowBuilder,
@@ -492,6 +493,86 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
                 workflow["462"]["inputs"]["loras"]["__value__"][0]["name"],
                 "characters/hero",
             )
+
+    def test_control_builder_chains_selected_modes_and_prunes_the_rest(self) -> None:
+        settings = PluginSettings.from_mapping({"default_generation_pipeline": "rtx"})
+        builder = ControlWorkflowBuilder(
+            self.plugin_dir / "workflow" / "anima_control_api.json",
+            settings,
+        )
+        workflow, seed, preferred = builder.build_control(
+            "incoming/control.png",
+            GenerationOptions(
+                prompt="1girl, running",
+                seed=77,
+                width=512,
+                height=512,
+                pipeline="rtx",
+                control_modes=("pose", "depth"),
+                dynamic_loras=(LoraSelection("characters/hero", 0.7),),
+                lora_injection_mode="replace",
+            ),
+        )
+        self.assertEqual(seed, 77)
+        self.assertEqual(preferred, ["458"])
+        self.assertEqual(workflow["500"]["inputs"]["image"], "incoming/control.png")
+        self.assertEqual(workflow["501"]["inputs"]["width"], 512)
+        self.assertEqual(workflow["501"]["inputs"]["height"], 512)
+        self.assertEqual(workflow["511"]["inputs"]["model"], ["462", 0])
+        self.assertEqual(workflow["521"]["inputs"]["model"], ["511", 0])
+        self.assertEqual(workflow["19"]["inputs"]["model"], ["521", 0])
+        self.assertNotIn("530", workflow)
+        self.assertNotIn("531", workflow)
+        self.assertNotIn("540", workflow)
+        self.assertNotIn("88", workflow)
+        self.assertNotIn("100", workflow)
+        self.assertEqual(
+            workflow["462"]["inputs"]["loras"]["__value__"][0]["name"],
+            "characters/hero",
+        )
+
+    def test_control_builder_supports_reference_and_iterative_output(self) -> None:
+        settings = PluginSettings.from_mapping(
+            {
+                "iterative_scale": 1.6,
+                "iterative_steps": 4,
+                "iterative_denoise": 0.31,
+            }
+        )
+        builder = ControlWorkflowBuilder(
+            self.plugin_dir / "workflow" / "anima_control_api.json",
+            settings,
+        )
+        workflow, _, preferred = builder.build_control(
+            "incoming/reference.png",
+            GenerationOptions(
+                prompt="1girl",
+                pipeline="iterative",
+                control_modes=("reference",),
+            ),
+        )
+        self.assertEqual(preferred, ["103"])
+        self.assertEqual(workflow["540"]["inputs"]["image"], ["501", 0])
+        self.assertEqual(workflow["19"]["inputs"]["model"], ["540", 0])
+        self.assertEqual(workflow["100"]["inputs"]["model"], ["540", 0])
+        self.assertEqual(workflow["101"]["inputs"]["upscale_factor"], 1.6)
+        self.assertEqual(workflow["101"]["inputs"]["steps"], 4)
+        self.assertEqual(workflow["100"]["inputs"]["denoise"], 0.31)
+        self.assertNotIn("510", workflow)
+        self.assertNotIn("520", workflow)
+        self.assertNotIn("530", workflow)
+
+    def test_generation_short_aliases_and_control_modes_are_parsed(self) -> None:
+        result = parse_generation_options(
+            "1girl --p r --m p d --sz 512x512 --st 8 --c 5 --pr 风格2",
+            mode_context="generation",
+        )
+        self.assertEqual(result.pipeline, "rtx")
+        self.assertEqual(result.control_modes, ("pose", "depth"))
+        self.assertEqual((result.width, result.height), (512, 512))
+        self.assertEqual(result.steps, 8)
+        self.assertEqual(result.cfg, 5.0)
+        self.assertEqual(result.lora_preset, "风格2")
 
 
 if __name__ == "__main__":

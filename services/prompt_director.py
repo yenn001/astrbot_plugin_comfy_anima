@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.2.2
+AstrBot Comfy Anima 插件 v1.4.1
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.2.2
-日期: 2026-07-19
+版本: 1.4.1
+日期: 2026-07-20
 """
 
 import asyncio
@@ -50,6 +50,38 @@ _MODE_ATTR_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 
+_PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "all_models_failed",
+        re.compile(r"\ball chat models failed\b", flags=re.IGNORECASE),
+    ),
+    (
+        "empty_model_output",
+        re.compile(r"\bEmptyModelOutputError\b", flags=re.IGNORECASE),
+    ),
+    (
+        "completion_without_choices",
+        re.compile(r"\bcompletion has no choices\b", flags=re.IGNORECASE),
+    ),
+    (
+        "provider_response_id",
+        re.compile(r"\bresponse_id\s*=", flags=re.IGNORECASE),
+    ),
+    (
+        "provider_exception",
+        re.compile(
+            r"^\s*(?:(?:provider|openai|anthropic|gemini|api|http)\s*"
+            r"(?:error|exception|failed|failure)|ProviderError|APIError|"
+            r"AuthenticationError|RateLimitError|TimeoutError)\s*[:：]",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
+        "provider_traceback",
+        re.compile(r"^\s*traceback\s*\(", flags=re.IGNORECASE),
+    ),
+)
+
 
 RUNTIME_OVERRIDE = """
 你是 ComfyUI Anima 单图分镜导演。用户已经明确要求绘图，因此不要判断是否需要插图。
@@ -77,10 +109,11 @@ RUNTIME_OVERRIDE = """
 19. 只有元数据明确指出旧服装词时，才把少量互斥旧服装词写入 negative；不得把角色名、作品名、脸、发色、瞳色、体型等身份词放入 negative。无法可靠区分时宁可省略 negative，不得猜测。
 20. 按“明确用户要求 > 当前剧情连续性 > 本次工具元数据 > 一般推断”解决冲突；去掉同义重复，只保留一个镜头、一个主要动作方向和一套服装。
 21. pipeline 只按用户明确意图选择：原图/不放大/base 使用 base；RTX/高清放大使用 rtx；迭代放大/细节重构/二次采样使用 iterative。用户未指定时省略 pipeline 属性，由插件采用 WebUI 当前默认值。不得把 pipeline 词写进 prompt。
-22. 本调用是生图或已明确标记的整图语义重绘分镜，不得输出 edit 标签。局部重绘由插件的独立遮罩重绘协议处理。
-23. 区分“生成后放大”和“放大已有图片”：前者可选择 rtx 生图管线，后者属于独立 RTX 图片工具，不能伪造成 pic。区分“新画一个穿红裙的角色”、无蒙版整图重绘和遮罩局部重绘：普通生图与整图语义重绘输出 pic；只有原图与有效遮罩齐全的局部修改才输出 edit。整图语义重绘会由插件明确标记，必须承认它是重新生成而非像素级修改。
-24. 先在内部锁定唯一操作类型，再规划提示词。不要把 base、rtx、iterative、quick、lanpaint、放大倍率、遮罩位置或“修改/替换/重绘”等操作指令写进视觉 prompt。
-25. 当用户内容明确标记“无蒙版整图语义重绘”时，未明确指定风格组合就不得自动套用默认风格001；应使用反推得到的可观察画风和色调。只有用户明确点名风格组合时才查询并应用对应预设。
+22. 若请求来自底图控制生成，pose/depth/lineart/reference 已由插件锁定。你只描述最终画面，不得把控制模式名、ControlNet、LLLite、预处理器、节点名或模型文件名写进 prompt。Pose 约束姿态，Depth 约束空间结构，Lineart 描述上色后的成图，Reference 只作柔和外观与画风参考。
+23. 本调用是生图或已明确标记的整图语义重绘分镜，不得输出 edit 标签。局部重绘由插件的独立遮罩重绘协议处理。
+24. 区分“生成后放大”和“放大已有图片”：前者可选择 rtx 生图管线，后者属于独立 RTX 图片工具，不能伪造成 pic。区分“新画一个穿红裙的角色”、无蒙版整图重绘和遮罩局部重绘：普通生图与整图语义重绘输出 pic；只有原图与有效遮罩齐全的局部修改才输出 edit。整图语义重绘会由插件明确标记，必须承认它是重新生成而非像素级修改。
+25. 先在内部锁定唯一操作类型，再规划提示词。不要把 base、rtx、iterative、quick、lanpaint、放大倍率、遮罩位置或“修改/替换/重绘”等操作指令写进视觉 prompt。
+26. 当用户内容明确标记“无蒙版整图语义重绘”时，未明确指定风格组合就不得自动套用默认风格001；应使用反推得到的可观察画风和色调。只有用户明确点名风格组合时才查询并应用对应预设。
 """.strip()
 
 
@@ -247,7 +280,7 @@ class PromptDirector:
         uses_lora_tools = tools is not None
         tool_call_timeout = 0
         request_timeout = self._settings.prompt_llm_timeout
-        try:
+        async def invoke(active_prompt: str) -> Any:
             if uses_lora_tools:
                 if not hasattr(context, "tool_loop_agent"):
                     raise PromptDirectorError(
@@ -260,7 +293,7 @@ class PromptDirector:
                     context.tool_loop_agent(
                         event=event,
                         chat_provider_id=provider_id,
-                        prompt=user_prompt,
+                        prompt=active_prompt,
                         system_prompt=kwargs["system_prompt"],
                         tools=tools,
                         max_steps=self._settings.lora_tool_max_steps,
@@ -270,15 +303,25 @@ class PromptDirector:
                 )
             elif hasattr(context, "llm_generate"):
                 response = await asyncio.wait_for(
-                    context.llm_generate(chat_provider_id=provider_id, **kwargs),
+                    context.llm_generate(
+                        chat_provider_id=provider_id,
+                        **{**kwargs, "prompt": active_prompt},
+                    ),
                     timeout=self._settings.prompt_llm_timeout,
                 )
             else:
                 provider = self._get_legacy_provider(context, event, provider_id)
                 response = await asyncio.wait_for(
-                    provider.text_chat(contexts=[], **kwargs),
+                    provider.text_chat(
+                        contexts=[],
+                        **{**kwargs, "prompt": active_prompt},
+                    ),
                     timeout=self._settings.prompt_llm_timeout,
                 )
+            return response
+
+        try:
+            response = await invoke(user_prompt)
         except asyncio.TimeoutError as exc:
             if uses_lora_tools:
                 raise PromptDirectorError(
@@ -304,20 +347,60 @@ class PromptDirector:
                 "LLM 分镜调用失败", f"provider={provider_id}, error={exc}"
             ) from exc
 
-        try:
-            completion = getattr(response, "completion_text", None)
-            if not isinstance(completion, str) or not completion.strip():
-                raise PromptDirectorError("LLM 没有返回有效提示词")
-            instruction = self.extract_instruction(completion)
-        except PromptDirectorError as exc:
-            if uses_lora_tools:
-                raise PromptDirectorError(
-                    "LoRA 工具分镜结果无效，已停止本次绘图",
-                    exc.detail or exc.user_message,
-                    fatal=True,
-                ) from exc
-            raise
-        return instruction, provider_id
+        first_error: PromptDirectorError | None = None
+        for attempt in range(2):
+            try:
+                completion = getattr(response, "completion_text", None)
+                if not isinstance(completion, str) or not completion.strip():
+                    raise PromptDirectorError(
+                        "绘图模型没有返回有效提示词",
+                        "empty_completion",
+                        fatal=True,
+                    )
+                instruction = self.extract_instruction(
+                    completion,
+                    strict_protocol=True,
+                )
+                return instruction, provider_id
+            except PromptDirectorError as exc:
+                if attempt == 1:
+                    detail = exc.detail or exc.user_message
+                    if first_error is not None and not detail:
+                        detail = first_error.detail or first_error.user_message
+                    raise PromptDirectorError(
+                        (
+                            "LoRA 工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI"
+                            if uses_lora_tools
+                            else "绘图模型连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI"
+                        ),
+                        detail,
+                        fatal=True,
+                    ) from exc
+                first_error = exc
+                repair_prompt = (
+                    user_prompt
+                    + "\n\nYour previous response was invalid. Return exactly one "
+                    '<pic prompt="English Anima tags"> tag and nothing else. '
+                    "Do not return an error message, explanation, Markdown or plain text."
+                )
+                try:
+                    response = await invoke(repair_prompt)
+                except asyncio.TimeoutError as retry_exc:
+                    raise PromptDirectorError(
+                        "绘图模型修复重试超时，已停止且不会提交 ComfyUI",
+                        "repair_timeout",
+                        fatal=True,
+                    ) from retry_exc
+                except PromptDirectorError:
+                    raise
+                except Exception as retry_exc:
+                    raise PromptDirectorError(
+                        "绘图模型修复重试失败，已停止且不会提交 ComfyUI",
+                        f"provider={provider_id}, error_type={type(retry_exc).__name__}",
+                        fatal=True,
+                    ) from retry_exc
+
+        raise AssertionError("unreachable")
 
     async def generate_edit_instruction(
         self, context: Any, event: Any, scene_text: str, tools: Any = None
@@ -347,7 +430,8 @@ class PromptDirector:
             if tools is not None
             else self._settings.prompt_llm_timeout
         )
-        try:
+
+        async def invoke(active_prompt: str) -> Any:
             if tools is not None:
                 if not hasattr(context, "tool_loop_agent"):
                     raise PromptDirectorError(
@@ -358,7 +442,7 @@ class PromptDirector:
                     context.tool_loop_agent(
                         event=event,
                         chat_provider_id=provider_id,
-                        prompt=user_prompt,
+                        prompt=active_prompt,
                         system_prompt=system_prompt,
                         tools=tools,
                         max_steps=self._settings.lora_tool_max_steps,
@@ -370,7 +454,7 @@ class PromptDirector:
                 response = await asyncio.wait_for(
                     context.llm_generate(
                         chat_provider_id=provider_id,
-                        prompt=user_prompt,
+                        prompt=active_prompt,
                         system_prompt=system_prompt,
                         temperature=min(2.0, self._settings.prompt_llm_temperature),
                         max_tokens=self._settings.prompt_llm_max_tokens,
@@ -382,13 +466,17 @@ class PromptDirector:
                 response = await asyncio.wait_for(
                     provider.text_chat(
                         contexts=[],
-                        prompt=user_prompt,
+                        prompt=active_prompt,
                         system_prompt=system_prompt,
                         temperature=min(2.0, self._settings.prompt_llm_temperature),
                         max_tokens=self._settings.prompt_llm_max_tokens,
                     ),
                     timeout=request_timeout,
                 )
+            return response
+
+        try:
+            response = await invoke(user_prompt)
         except asyncio.TimeoutError as exc:
             raise PromptDirectorError("LLM 重绘规划超时", fatal=tools is not None) from exc
         except PromptDirectorError:
@@ -399,13 +487,48 @@ class PromptDirector:
                 f"provider={provider_id}, error={exc}",
                 fatal=tools is not None,
             ) from exc
-        completion = getattr(response, "completion_text", None)
-        if not isinstance(completion, str) or not completion.strip():
-            raise PromptDirectorError("LLM 没有返回有效重绘提示词")
-        instructions = self.extract_edit_instructions(completion, max_edits=1)
-        if not instructions:
-            raise PromptDirectorError("LLM 没有返回合法 edit 标签")
-        return instructions[0], provider_id
+        for attempt in range(2):
+            try:
+                completion = getattr(response, "completion_text", None)
+                if not isinstance(completion, str) or not completion.strip():
+                    raise PromptDirectorError(
+                        "LLM 没有返回有效重绘提示词",
+                        "empty_edit_completion",
+                        fatal=True,
+                    )
+                self.reject_provider_error_output(completion)
+                instructions = self.extract_edit_instructions(completion, max_edits=1)
+                if not instructions:
+                    raise PromptDirectorError(
+                        "LLM 没有返回合法 edit 标签",
+                        "invalid_edit_protocol",
+                        fatal=True,
+                    )
+                return instructions[0], provider_id
+            except PromptDirectorError as exc:
+                if attempt == 1:
+                    raise PromptDirectorError(
+                        "重绘模型连续两次没有返回可用的 <edit> 提示词，已停止且不会提交 ComfyUI",
+                        exc.detail or exc.user_message,
+                        fatal=True,
+                    ) from exc
+                repair_prompt = (
+                    user_prompt
+                    + "\n\nYour previous response was invalid. Return exactly one "
+                    '<edit prompt="English Anima tags" mode="quick|lanpaint"> tag '
+                    "and nothing else. Do not return an error message, explanation, "
+                    "Markdown or plain text."
+                )
+                try:
+                    response = await invoke(repair_prompt)
+                except asyncio.TimeoutError as retry_exc:
+                    raise PromptDirectorError(
+                        "重绘模型修复重试超时，已停止且不会提交 ComfyUI",
+                        "edit_repair_timeout",
+                        fatal=True,
+                    ) from retry_exc
+
+        raise AssertionError("unreachable")
 
     async def _resolve_provider_id(self, context: Any, event: Any) -> str:
         """优先使用配置模型，否则使用当前会话模型。"""
@@ -453,9 +576,14 @@ class PromptDirector:
         return PromptDirector.extract_instruction(model_output).prompt
 
     @staticmethod
-    def extract_instruction(model_output: str) -> PictureInstruction:
+    def extract_instruction(
+        model_output: str,
+        *,
+        strict_protocol: bool = False,
+    ) -> PictureInstruction:
         """Extract one positive prompt and an optional negative prompt."""
         text = PromptDirector._remove_think_content(model_output).strip()
+        PromptDirector.reject_provider_error_output(text)
         instructions = PromptDirector.extract_pic_instructions(text, max_prompts=1)
         if instructions:
             return instructions[0]
@@ -472,6 +600,12 @@ class PromptDirector:
                     negative_prompt = parsed["negative_prompt"]
         except json.JSONDecodeError:
             pass
+        if not prompt and strict_protocol:
+            raise PromptDirectorError(
+                "绘图模型没有返回合法的 <pic> 标签或结构化 JSON",
+                "invalid_picture_protocol",
+                fatal=True,
+            )
         if not prompt:
             cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text)
             cleaned = re.sub(
@@ -706,6 +840,7 @@ class PromptDirector:
     def _normalize_prompt(prompt: str) -> str:
         """规范化并校验一条英文绘图提示词。"""
         prompt = html.unescape(prompt)
+        PromptDirector.reject_provider_error_output(prompt)
         prompt = re.sub(r"\s*[\r\n]+\s*", ", ", prompt)
         prompt = re.sub(r"(?:,\s*){2,}", ", ", prompt)
         prompt = re.sub(r"\s{2,}", " ", prompt).strip(" ,")
@@ -719,6 +854,29 @@ class PromptDirector:
         if "<pic" in prompt.lower() or "</pic" in prompt.lower():
             raise PromptDirectorError("LLM 返回了嵌套或损坏的 pic 标签")
         return prompt
+
+    @staticmethod
+    def provider_error_code(model_output: Any) -> str:
+        """Return a stable code when Provider failure prose leaked as model output."""
+
+        text = str(model_output or "").strip()
+        for code, pattern in _PROVIDER_ERROR_PATTERNS:
+            if pattern.search(text):
+                return code
+        return ""
+
+    @staticmethod
+    def reject_provider_error_output(model_output: Any) -> None:
+        """Fail closed without persisting or logging the raw Provider response."""
+
+        text = str(model_output or "")
+        code = PromptDirector.provider_error_code(text)
+        if code:
+            raise PromptDirectorError(
+                "绘图模型 Provider 调用失败，已停止且不会提交 ComfyUI",
+                f"provider_output_error:{code}:chars={len(text)}",
+                fatal=True,
+            )
 
     @staticmethod
     def _normalize_negative_prompt(prompt: str) -> str:

@@ -23,15 +23,18 @@ CATEGORY_ALIASES = {
     "角色": PRESET_CATEGORY_CHARACTER,
     "人物": PRESET_CATEGORY_CHARACTER,
     "character": PRESET_CATEGORY_CHARACTER,
+    "c": PRESET_CATEGORY_CHARACTER,
     "风格": PRESET_CATEGORY_ARTIST_STYLE,
     "画师": PRESET_CATEGORY_ARTIST_STYLE,
     "画风": PRESET_CATEGORY_ARTIST_STYLE,
     "style": PRESET_CATEGORY_ARTIST_STYLE,
     "artist": PRESET_CATEGORY_ARTIST_STYLE,
     "artist_style": PRESET_CATEGORY_ARTIST_STYLE,
+    "s": PRESET_CATEGORY_ARTIST_STYLE,
     "混合": PRESET_CATEGORY_MIXED,
     "组合": PRESET_CATEGORY_MIXED,
     "mixed": PRESET_CATEGORY_MIXED,
+    "m": PRESET_CATEGORY_MIXED,
 }
 
 CATEGORY_LABELS = {
@@ -135,7 +138,7 @@ class LoraPreset:
 def normalize_category(value: str, *, allow_auto: bool = False) -> str:
     """把中文或英文分类名转换为内部分类。"""
     normalized = str(value or "").strip().casefold()
-    if allow_auto and normalized in {"", "auto", "自动"}:
+    if allow_auto and normalized in {"", "auto", "自动", "au"}:
         return "auto"
     category = CATEGORY_ALIASES.get(normalized, normalized)
     if category not in PRESET_CATEGORIES:
