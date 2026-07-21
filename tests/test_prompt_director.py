@@ -401,6 +401,66 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(wait_timeouts, [120])
 
+    async def test_function_call_plan_is_parsed_without_visible_text(self) -> None:
+        director = self._director(structured_director_mode="function_call")
+        output_tools = object()
+
+        class Context:
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.tools = kwargs.get("tools")
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "tools_call_name": "emit_anima_plan_v1",
+                        "tools_call_args": {
+                            "positive_tags": "1girl, orange sunset",
+                            "negative_tags": "lowres",
+                            "pipeline": "base",
+                        },
+                    },
+                )()
+
+        context = Context()
+        instruction, provider_id = await director.generate_instruction(
+            context,
+            object(),
+            "draw a girl at sunset",
+            output_tools=output_tools,
+        )
+
+        self.assertIs(context.tools, output_tools)
+        self.assertEqual(provider_id, "test-provider")
+        self.assertEqual(instruction.prompt, "1girl, orange sunset")
+        self.assertEqual(instruction.negative_prompt, "lowres")
+        self.assertEqual(instruction.pipeline, "base")
+
+    async def test_auto_mode_falls_back_when_context_rejects_tools_kwarg(self) -> None:
+        director = self._director(structured_director_mode="auto")
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.calls += 1
+                if "tools" in kwargs:
+                    raise TypeError("tools unsupported")
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="1girl, portrait">'},
+                )()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw a portrait",
+            output_tools=object(),
+        )
+        self.assertEqual(context.calls, 2)
+        self.assertEqual(instruction.prompt, "1girl, portrait")
+
 
 class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

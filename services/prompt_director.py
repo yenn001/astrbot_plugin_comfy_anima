@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.4.2
+AstrBot Comfy Anima 插件 v1.5.0
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.4.2
+版本: 1.5.0
 日期: 2026-07-21
 """
 
@@ -21,6 +21,10 @@ from typing import Any
 from ..core.lora import LORA_TAG_PATTERN
 from ..models import PluginSettings
 from .provider_response import response_error_code, response_text
+from .structured_provider import (
+    StructuredProviderError,
+    extract_structured_payload,
+)
 
 
 _PIC_TAG_RE = re.compile(
@@ -262,18 +266,44 @@ class PromptDirector:
         return instruction.prompt, provider_id, instruction.negative_prompt
 
     async def generate_instruction(
-        self, context: Any, event: Any, scene_text: str, tools: Any = None
+        self,
+        context: Any,
+        event: Any,
+        scene_text: str,
+        tools: Any = None,
+        output_tools: Any = None,
     ) -> tuple[PictureInstruction, str]:
         """Generate one validated picture instruction including its pipeline."""
 
         provider_id = await self._resolve_provider_id(context, event)
+        structured_mode = str(
+            getattr(self._settings, "structured_director_mode", "auto") or "auto"
+        ).casefold()
         user_prompt = (
             "请把下面的剧情或画面需求导演成一张图。只返回规定的 pic 标签。\n\n"
             f"用户内容：\n{scene_text.strip()}"
         )
+        if output_tools is not None:
+            user_prompt += (
+                "\n\nUse the emit_anima_plan_v1 function exactly once. Put the final "
+                "English Anima tags in positive_tags; do not add prose."
+            )
+        elif structured_mode == "json":
+            user_prompt += (
+                "\n\nReturn exactly one JSON object with positive_tags, negative_tags "
+                "and pipeline fields."
+            )
+        system_prompt = self._system_prompt()
+        if output_tools is not None:
+            system_prompt += (
+                "\n\nRuntime structured-output override: for this request only, call "
+                "emit_anima_plan_v1 exactly once instead of printing a <pic> tag. "
+                "This changes only the transport format; all Anima prompt, safety, "
+                "LoRA and pipeline rules above remain mandatory."
+            )
         kwargs = {
             "prompt": user_prompt,
-            "system_prompt": self._system_prompt(),
+            "system_prompt": system_prompt,
             "temperature": min(2.0, self._settings.prompt_llm_temperature),
             "max_tokens": self._settings.prompt_llm_max_tokens,
         }
@@ -303,13 +333,28 @@ class PromptDirector:
                     timeout=request_timeout,
                 )
             elif hasattr(context, "llm_generate"):
-                response = await asyncio.wait_for(
-                    context.llm_generate(
-                        chat_provider_id=provider_id,
-                        **{**kwargs, "prompt": active_prompt},
-                    ),
-                    timeout=self._settings.prompt_llm_timeout,
-                )
+                llm_kwargs = {**kwargs, "prompt": active_prompt}
+                if output_tools is not None:
+                    llm_kwargs["tools"] = output_tools
+                try:
+                    response = await asyncio.wait_for(
+                        context.llm_generate(
+                            chat_provider_id=provider_id,
+                            **llm_kwargs,
+                        ),
+                        timeout=self._settings.prompt_llm_timeout,
+                    )
+                except TypeError:
+                    if output_tools is None or structured_mode != "auto":
+                        raise
+                    llm_kwargs.pop("tools", None)
+                    response = await asyncio.wait_for(
+                        context.llm_generate(
+                            chat_provider_id=provider_id,
+                            **llm_kwargs,
+                        ),
+                        timeout=self._settings.prompt_llm_timeout,
+                    )
             else:
                 provider = self._get_legacy_provider(context, event, provider_id)
                 response = await asyncio.wait_for(
@@ -358,6 +403,51 @@ class PromptDirector:
                         provider_error,
                         fatal=True,
                     )
+                if output_tools is not None or structured_mode in {
+                    "function_call",
+                    "json",
+                }:
+                    try:
+                        structured = extract_structured_payload(
+                            response,
+                            expected_tool_name="emit_anima_plan_v1",
+                            allow_json_fallback=(structured_mode != "function_call"),
+                        )
+                    except StructuredProviderError as structured_exc:
+                        if structured_mode == "function_call":
+                            raise PromptDirectorError(
+                                "绘图模型没有返回合法的结构化 Function Call",
+                                structured_exc.code,
+                                fatal=True,
+                            ) from structured_exc
+                    else:
+                        payload = structured.arguments
+                        positive = payload.get("positive_tags", payload.get("prompt", ""))
+                        negative = payload.get(
+                            "negative_tags",
+                            payload.get("negative_prompt", payload.get("negative", "")),
+                        )
+                        pipeline = payload.get("pipeline", "")
+                        if not isinstance(positive, str) or not positive.strip():
+                            raise PromptDirectorError(
+                                "结构化分镜缺少 positive_tags",
+                                "missing_positive_tags",
+                                fatal=True,
+                            )
+                        if not isinstance(negative, str) or not isinstance(pipeline, str):
+                            raise PromptDirectorError(
+                                "结构化分镜字段类型无效",
+                                "invalid_structured_fields",
+                                fatal=True,
+                            )
+                        return (
+                            PictureInstruction(
+                                prompt=self._normalize_prompt(positive),
+                                negative_prompt=self._normalize_negative_prompt(negative),
+                                pipeline=self._normalize_pipeline(pipeline),
+                            ),
+                            provider_id,
+                        )
                 completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
                     raise PromptDirectorError(
@@ -394,9 +484,14 @@ class PromptDirector:
                 first_error = exc
                 repair_prompt = (
                     user_prompt
-                    + "\n\nYour previous response was invalid. Return exactly one "
-                    '<pic prompt="English Anima tags"> tag and nothing else. '
-                    "Do not return an error message, explanation, Markdown or plain text."
+                    + (
+                        "\n\nYour previous response was invalid. Call "
+                        "emit_anima_plan_v1 exactly once with valid JSON arguments."
+                        if output_tools is not None
+                        else "\n\nYour previous response was invalid. Return exactly one "
+                        '<pic prompt="English Anima tags"> tag and nothing else. '
+                        "Do not return an error message, explanation, Markdown or plain text."
+                    )
                 )
                 try:
                     response = await invoke(repair_prompt)
@@ -621,12 +716,16 @@ class PromptDirector:
         parsed: Any = None
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict) and isinstance(parsed.get("prompt"), str):
-                prompt = parsed["prompt"]
+            if isinstance(parsed, dict) and isinstance(
+                parsed.get("prompt", parsed.get("positive_tags")), str
+            ):
+                prompt = parsed.get("prompt", parsed.get("positive_tags", ""))
                 if isinstance(parsed.get("negative"), str):
                     negative_prompt = parsed["negative"]
                 elif isinstance(parsed.get("negative_prompt"), str):
                     negative_prompt = parsed["negative_prompt"]
+                elif isinstance(parsed.get("negative_tags"), str):
+                    negative_prompt = parsed["negative_tags"]
         except json.JSONDecodeError:
             pass
         if not prompt and strict_protocol:

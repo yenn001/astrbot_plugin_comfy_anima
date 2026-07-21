@@ -1,11 +1,11 @@
 """
-AstrBot Comfy Anima 插件 v1.4.2
+AstrBot Comfy Anima 插件 v1.5.0
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.4.2
+版本: 1.5.0
 日期: 2026-07-21
 """
 
@@ -218,6 +218,13 @@ class PluginSettings:
     lora_rerank_top_n: int = 8
     lora_retrieval_timeout: int = 30
     lora_tool_max_steps: int = 4
+    enable_task_lora_snapshot: bool = True
+    lora_snapshot_max_age: int = 300
+    enable_parallel_preflight: bool = True
+    provider_max_concurrent_jobs: int = 4
+    enable_local_intent_router: bool = True
+    structured_director_mode: str = "auto"
+    enable_layered_lora_retrieval: bool = True
     lora_loader_node_id: str = "462"
     dynamic_lora_mode: str = "append"
     max_dynamic_loras: int = 3
@@ -486,6 +493,32 @@ class PluginSettings:
                 _as_int(data.get("lora_retrieval_timeout"), 30, 3),
             ),
             lora_tool_max_steps=_as_int(data.get("lora_tool_max_steps"), 4, 1),
+            enable_task_lora_snapshot=_as_bool(
+                data.get("enable_task_lora_snapshot"), True
+            ),
+            lora_snapshot_max_age=min(
+                1800,
+                _as_int(data.get("lora_snapshot_max_age"), 300, 15),
+            ),
+            enable_parallel_preflight=_as_bool(
+                data.get("enable_parallel_preflight"), True
+            ),
+            provider_max_concurrent_jobs=min(
+                32,
+                _as_int(data.get("provider_max_concurrent_jobs"), 4, 1),
+            ),
+            enable_local_intent_router=_as_bool(
+                data.get("enable_local_intent_router"), True
+            ),
+            structured_director_mode=(
+                str(data.get("structured_director_mode", "auto")).strip().lower()
+                if str(data.get("structured_director_mode", "auto")).strip().lower()
+                in {"auto", "function_call", "json", "legacy"}
+                else "auto"
+            ),
+            enable_layered_lora_retrieval=_as_bool(
+                data.get("enable_layered_lora_retrieval"), True
+            ),
             lora_loader_node_id=str(data.get("lora_loader_node_id", "462")).strip()
             or "462",
             dynamic_lora_mode=(
@@ -723,3 +756,5 @@ class GenerationJob:
     state: str = "queued"
     task_run_id: str = ""
     failed_stage: str = ""
+    lora_snapshot: Any = None
+    prefetched_gpu_name: str = ""

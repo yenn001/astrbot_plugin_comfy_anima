@@ -110,11 +110,20 @@ class LoraHybridSearchService:
             return records[:effective_limit]
 
         exact, exact_kind = self._exact_matches(records, clean_query)
-        if len(exact) == 1 and exact_kind in {"path", "basename"}:
+        trusted_exact_kinds = {"path", "basename"}
+        if bool(
+            getattr(self._settings, "enable_layered_lora_retrieval", True)
+        ):
+            trusted_exact_kinds.add("alias")
+        if len(exact) == 1 and exact_kind in trusted_exact_kinds:
             self.last_diagnostics.update(mode="exact", exact_kind=exact_kind)
             return exact[:effective_limit]
 
-        lexical_ranked = LoraCatalogService.rank_records(records, clean_query)
+        lexical_records = self._category_filtered_records(records, clean_query)
+        lexical_ranked = LoraCatalogService.rank_records(
+            lexical_records,
+            clean_query,
+        )
         lexical = tuple(record for _score, record in lexical_ranked)
         if not bool(getattr(self._settings, "enable_lora_hybrid_search", False)):
             return self._stable_union(exact, lexical)[:effective_limit]
@@ -182,7 +191,16 @@ class LoraHybridSearchService:
             )
             if remainder:
                 try:
-                    remainder = await self._rerank(rerank_provider, query, remainder)
+                    rerank_budget = min(16, len(remainder))
+                    reranked = await self._rerank(
+                        rerank_provider,
+                        query,
+                        remainder[:rerank_budget],
+                    )
+                    remainder = self._stable_union(
+                        reranked,
+                        remainder[rerank_budget:],
+                    )
                     self.last_diagnostics["rerank_used"] = True
                 except Exception as exc:
                     self.last_diagnostics["rerank_fallback"] = type(exc).__name__
@@ -192,6 +210,30 @@ class LoraHybridSearchService:
         self.last_diagnostics["mode"] = "hybrid"
         self.last_diagnostics["candidate_count"] = len(candidates)
         return candidates[:limit]
+
+    @staticmethod
+    def _category_filtered_records(
+        records: tuple[LoraRecord, ...],
+        query: str,
+    ) -> tuple[LoraRecord, ...]:
+        """Narrow lexical recall only when the user states a category intent."""
+
+        folded = str(query or "").casefold()
+        wanted: set[str] = set()
+        if re.search(r"角色|人物|character|identity", folded):
+            wanted.update({"character", "角色"})
+        if re.search(r"画师|风格|artist|style|aesthetic", folded):
+            wanted.update({"artist", "style", "画师", "风格"})
+        if re.search(r"加速|提速|蒸馏|lightning|turbo|hyper|lcm|utility", folded):
+            wanted.update({"utility", "acceleration", "功能", "加速"})
+        if not wanted:
+            return records
+        filtered = tuple(
+            record
+            for record in records
+            if any(token in str(record.category or "").casefold() for token in wanted)
+        )
+        return filtered or records
 
     def _find_embedding_provider(self) -> Any:
         identifier = str(
@@ -417,7 +459,7 @@ class LoraHybridSearchService:
             if path_matches:
                 return path_matches, "path"
 
-        identity_query = _normalized_identity(query)
+        identity_query = _normalized_identity(canonical_query or query)
         basename_matches: list[LoraRecord] = []
         alias_matches: list[LoraRecord] = []
         for record in records:

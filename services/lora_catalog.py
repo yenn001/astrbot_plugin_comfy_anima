@@ -1632,7 +1632,11 @@ class LoraCatalogService:
         return tuple(sorted(unique.values(), key=lambda item: item.name.casefold()))
 
     async def resolve_selections_with_records(
-        self, selections: tuple[LoraSelection, ...], strict: bool = True
+        self,
+        selections: tuple[LoraSelection, ...],
+        strict: bool = True,
+        *,
+        records: Optional[tuple[LoraRecord, ...]] = None,
     ) -> tuple[tuple[LoraSelection, ...], dict[str, LoraRecord]]:
         """Resolve loadable names and return their latest authoritative records.
 
@@ -1643,7 +1647,11 @@ class LoraCatalogService:
         """
         if not selections:
             return (), {}
-        records = await self._get_records(force_refresh=False)
+        records = (
+            tuple(records)
+            if records is not None
+            else await self._get_records(force_refresh=False)
+        )
         index = {
             canonical_lora_name(record.name).casefold(): record for record in records
         }
@@ -1735,12 +1743,17 @@ class LoraCatalogService:
         return tuple(resolved), resolved_records
 
     async def resolve_selections(
-        self, selections: tuple[LoraSelection, ...], strict: bool = True
+        self,
+        selections: tuple[LoraSelection, ...],
+        strict: bool = True,
+        *,
+        records: Optional[tuple[LoraRecord, ...]] = None,
     ) -> tuple[LoraSelection, ...]:
         """把 LLM 名称解析为清单中的真实名称。"""
         resolved, _ = await self.resolve_selections_with_records(
             selections,
             strict=strict,
+            records=records,
         )
         return resolved
 

@@ -448,6 +448,23 @@
     "type": "int",
     "default": 4
   },
+  "enable_task_lora_snapshot": {
+    "description": "任务内复用 LoRA 规划快照",
+    "type": "bool",
+    "hint": "同一任务的多次 LoRA 工具查询只强制刷新一次；提交前仍会再次强刷并校验已选文件",
+    "default": true
+  },
+  "lora_snapshot_max_age": {
+    "description": "LoRA 规划快照最长复用时间（秒）",
+    "type": "int",
+    "default": 300
+  },
+  "enable_layered_lora_retrieval": {
+    "description": "启用 LoRA 分层检索",
+    "type": "bool",
+    "hint": "优先精确路径、文件名和唯一可信别名；只有歧义时才调用 Embedding 与 Rerank",
+    "default": true
+  },
   "lora_loader_node_id": {
     "description": "动态 LoRA 注入节点 ID",
     "type": "string",
@@ -653,6 +670,31 @@
     "type": "int",
     "hint": "显存有限时建议保持 1",
     "default": 1
+  },
+  "provider_max_concurrent_jobs": {
+    "description": "LLM/反推模型最大并发准备数",
+    "type": "int",
+    "hint": "只限制反推、分镜与分类模型；不会占用 ComfyUI 生成并发槽",
+    "default": 4
+  },
+  "enable_parallel_preflight": {
+    "description": "并行执行安全的出图准备步骤",
+    "type": "bool",
+    "hint": "并行预取 GPU 信息，并在底图控制中并行上传图片与反推",
+    "default": true
+  },
+  "enable_local_intent_router": {
+    "description": "启用本地优先绘图意图解析",
+    "type": "bool",
+    "hint": "普通绘图不再无条件进入 LoRA 工具循环；明确角色、未知风格或 LoRA 请求才查询资产",
+    "default": true
+  },
+  "structured_director_mode": {
+    "description": "绘图导演结构化输出模式",
+    "type": "string",
+    "options": ["auto", "function_call", "json", "legacy"],
+    "hint": "auto 优先 Function Calling 并兼容 JSON/<pic>；function_call 为严格模式",
+    "default": "auto"
   },
   "user_cooldown": {
     "description": "用户冷却时间（秒）",

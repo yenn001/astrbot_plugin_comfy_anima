@@ -133,6 +133,75 @@ class LoraHybridSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embedding.calls, [])
         self.assertEqual(rerank.calls, [])
 
+    async def test_unique_basename_and_trusted_alias_skip_both_providers(self):
+        for query in ("denia.safetensors", "trusted-denia-alias"):
+            with self.subTest(query=query):
+                embedding = FakeEmbeddingProvider(lambda _text: [1.0, 0.0, 0.0])
+                rerank = FakeRerankProvider(identity_rerank)
+                records = (
+                    LoraRecord(
+                        "characters/denia.safetensors",
+                        aliases=("trusted-denia-alias", "Denia"),
+                    ),
+                    LoraRecord("styles/denia-lighting.safetensors"),
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    service = LoraHybridSearchService(
+                        make_settings(),
+                        make_context(embedding, rerank),
+                        cache_path=Path(directory) / "vectors.json",
+                    )
+                    result = await service.search(records, query, limit=5)
+
+                self.assertEqual(result, (records[0],))
+                self.assertEqual(embedding.calls, [])
+                self.assertEqual(rerank.calls, [])
+
+    async def test_ambiguous_alias_does_not_short_circuit_hybrid_ranking(self):
+        embedding = FakeEmbeddingProvider(lambda _text: [1.0, 0.0, 0.0])
+        rerank = FakeRerankProvider(identity_rerank)
+        records = (
+            LoraRecord("characters/denia-v1.safetensors", aliases=("Denia",)),
+            LoraRecord("characters/denia-v2.safetensors", aliases=("Denia",)),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = LoraHybridSearchService(
+                make_settings(),
+                make_context(embedding, rerank),
+                cache_path=Path(directory) / "vectors.json",
+            )
+            result = await service.search(records, "Denia", limit=5)
+
+        self.assertEqual(set(result), set(records))
+        self.assertTrue(embedding.calls)
+        self.assertNotEqual(service.last_diagnostics.get("mode"), "exact")
+
+    async def test_unique_semantic_alias_skips_embedding_and_rerank(self):
+        embedding = FakeEmbeddingProvider(lambda _text: [1.0, 0.0, 0.0])
+        rerank = FakeRerankProvider(identity_rerank)
+        records = (
+            LoraRecord(
+                "characters/rice_shower.safetensors",
+                character_name="Rice Shower",
+                aliases=("米浴", "赛马娘米浴"),
+            ),
+            LoraRecord("styles/rice_watercolor.safetensors"),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = LoraHybridSearchService(
+                make_settings(enable_layered_lora_retrieval=True),
+                make_context(embedding, rerank),
+                cache_path=Path(directory) / "vectors.json",
+            )
+            result = await service.search(records, "赛马娘米浴", limit=5)
+
+        self.assertEqual(result, (records[0],))
+        self.assertEqual(service.last_diagnostics.get("exact_kind"), "alias")
+        self.assertEqual(embedding.calls, [])
+        self.assertEqual(rerank.calls, [])
+
     async def test_embedding_recalls_semantic_match_outside_lexical_results(self):
         query = "scarlet swordswoman"
 

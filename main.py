@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.4.2
+AstrBot Comfy Anima 插件 v1.5.0
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.4.2
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.4.2
+版本: 1.5.0
 日期: 2026-07-21
 """
 
@@ -19,6 +19,7 @@ import re
 import shlex
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncGenerator, Mapping, Optional
@@ -86,6 +87,7 @@ from .services.control_modes import (
 )
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
 from .services.lora_retrieval import LoraHybridSearchService
+from .services.lora_snapshot import LoraOperationSnapshot, record_identity
 from .services.lora_analysis import (
     LoraAnalysisError,
     LoraAnalysisPipeline,
@@ -187,6 +189,10 @@ WEB_UI_EDITABLE_FIELDS = (
     "rtx_scale",
     "rtx_quality",
     "max_concurrent_jobs",
+    "provider_max_concurrent_jobs",
+    "enable_parallel_preflight",
+    "enable_local_intent_router",
+    "structured_director_mode",
     "user_cooldown",
     "send_generation_notice",
     "enable_prompt_llm",
@@ -221,6 +227,9 @@ WEB_UI_EDITABLE_FIELDS = (
     "lora_embedding_top_k",
     "lora_rerank_top_n",
     "lora_retrieval_timeout",
+    "enable_task_lora_snapshot",
+    "lora_snapshot_max_age",
+    "enable_layered_lora_retrieval",
     "strict_lora_validation",
     "default_block_level",
     "group_whitelist",
@@ -341,6 +350,11 @@ class ComfyAnimaPlugin(Star):
         self._workflow_switch_lock = asyncio.Lock()
         self._lora_preset_transaction_lock = asyncio.Lock()
         self._generation_slots = asyncio.Semaphore(self.settings.max_concurrent_jobs)
+        self._provider_slots = asyncio.Semaphore(
+            self.settings.provider_max_concurrent_jobs
+        )
+        self._lora_operation_snapshots: dict[int, LoraOperationSnapshot] = {}
+        self._lora_snapshot_locks: dict[int, asyncio.Lock] = {}
         self._last_request_at: dict[str, float] = {}
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._self_reload_tasks: set[asyncio.Task[Any]] = set()
@@ -637,7 +651,10 @@ class ComfyAnimaPlugin(Star):
         if not self._lora_catalog:
             return "LoRA Manager is unavailable. Stop this LoRA drawing request."
         try:
-            records = await self._refresh_lora_manager_before("LLM 查询 LoRA")
+            records = await self._refresh_lora_for_task(
+                "LLM 查询 LoRA",
+                event=event,
+            )
             effective_limit = max(
                 1,
                 min(int(limit), self.settings.lora_max_results),
@@ -707,7 +724,10 @@ class ComfyAnimaPlugin(Star):
             detail(boolean): 是否返回组合说明。
         """
         try:
-            await self._refresh_lora_manager_before("LLM 查询 LoRA 组合")
+            records = await self._refresh_lora_for_task(
+                "LLM 查询 LoRA 组合",
+                event=event,
+            )
             presets = self._lora_presets.list_presets(
                 keyword=keyword,
                 category=category,
@@ -717,10 +737,19 @@ class ComfyAnimaPlugin(Star):
             assert self._lora_catalog is not None
             for preset in presets:
                 try:
-                    await self._lora_catalog.resolve_selections(
-                        preset.selections,
-                        strict=True,
-                    )
+                    try:
+                        await self._lora_catalog.resolve_selections(
+                            preset.selections,
+                            strict=True,
+                            records=records,
+                        )
+                    except TypeError as compatibility_exc:
+                        if "records" not in str(compatibility_exc):
+                            raise
+                        await self._lora_catalog.resolve_selections(
+                            preset.selections,
+                            strict=True,
+                        )
                 except LoraCatalogError:
                     invalid_names.append(preset.name)
                 else:
@@ -741,6 +770,35 @@ class ComfyAnimaPlugin(Star):
                 f"LoRA preset query unavailable: {message}. "
                 "Stop this LoRA drawing request."
             )
+
+    @filter.llm_tool(name="emit_anima_plan_v1")
+    async def emit_anima_plan_v1(
+        self,
+        event: AstrMessageEvent,
+        positive_tags: str,
+        negative_tags: str = "",
+        pipeline: str = "",
+    ) -> str:
+        """Emit one structured Anima drawing plan.
+
+        Args:
+            positive_tags(string): Final English Anima/Danbooru tags only.
+            negative_tags(string): Optional English negative tags.
+            pipeline(string): Optional base, rtx or iterative pipeline.
+        """
+
+        # This tool normally appears as a Provider function call and is parsed
+        # without execution.  Returning a compact value keeps older AstrBot
+        # tool-loop implementations safe if they execute it anyway.
+        return json.dumps(
+            {
+                "positive_tags": str(positive_tags or ""),
+                "negative_tags": str(negative_tags or ""),
+                "pipeline": str(pipeline or ""),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
 
     @filter.llm_tool(name="save_anima_lora_style")
     async def save_anima_lora_style(
@@ -1410,6 +1468,7 @@ class ComfyAnimaPlugin(Star):
             yield self._make_image_result(event, image_paths, seed, forward=False)
             self._schedule_cleanup(image_paths)
         finally:
+            self._clear_lora_operation_snapshot(event)
             # AstrBot v4.26 会在异步生成器每次 yield 后检查 stopped 状态。
             # 必须等当前处理器完全结束后再阻止默认 LLM，否则只会发出进度提示。
             event.stop_event()
@@ -1498,7 +1557,7 @@ class ComfyAnimaPlugin(Star):
                         ),
                     )
 
-                async with self._generation_slots:
+                async with self._provider_slot():
                     result, provider_id = await self._reverse_prompt.reverse(
                         self.context,
                         event,
@@ -1691,7 +1750,7 @@ class ComfyAnimaPlugin(Star):
                         ),
                     )
 
-                async with self._generation_slots:
+                async with self._provider_slot():
                     reverse_result, reverse_provider = await self._reverse_prompt.reverse(
                         self.context,
                         event,
@@ -2085,7 +2144,7 @@ class ComfyAnimaPlugin(Star):
                         ),
                     )
 
-                async with self._generation_slots:
+                async with self._provider_slot():
                     reverse_result, reverse_provider = await self._reverse_prompt.reverse(
                         self.context,
                         event,
@@ -3618,7 +3677,7 @@ QQ快捷指令:
                 try:
                     if hasattr(self.context, "llm_generate"):
                         response = await asyncio.wait_for(
-                            self.context.llm_generate(
+                            self._llm_generate_limited(
                                 chat_provider_id=provider_id,
                                 prompt=user_prompt + retry_suffix,
                                 system_prompt=system_prompt,
@@ -3859,7 +3918,7 @@ QQ快捷指令:
                 attempt_started = loop.time()
                 try:
                     response = await asyncio.wait_for(
-                        self.context.llm_generate(
+                        self._llm_generate_limited(
                             chat_provider_id=provider_id,
                             prompt=retry_prompt,
                             system_prompt=system_prompt,
@@ -4113,7 +4172,7 @@ QQ快捷指令:
                             ),
                         )
 
-                    async with self._generation_slots:
+                    async with self._provider_slot():
                         reverse_result, reverse_provider = (
                             await self._reverse_prompt.reverse(
                                 self.context,
@@ -4252,7 +4311,10 @@ QQ快捷指令:
                     "正在强制刷新 LoRA Manager 与 ComfyUI 当前可加载清单。",
                     "character_swap_lora_refresh_started",
                 )
-                records = await self._refresh_lora_manager_before("语义换角规划前")
+                records = await self._refresh_lora_for_task(
+                    "语义换角规划前",
+                    event=event,
+                )
                 self._record_image_task_phase(
                     job,
                     "lora_refresh",
@@ -4606,12 +4668,24 @@ QQ快捷指令:
             self._internal_llm_events = internal_events
         internal_events.add(event_key)
         try:
-            return await self._director.generate_instruction(
-                self.context,
-                event,
-                scene_text,
-                tools=self._get_lora_tool_set(),
+            lora_tools = (
+                self._get_lora_tool_set()
+                if self._scene_needs_lora_tools(scene_text)
+                else None
             )
+            output_tools = (
+                self._get_director_output_tool_set()
+                if lora_tools is None
+                else None
+            )
+            async with self._provider_slot():
+                return await self._director.generate_instruction(
+                    self.context,
+                    event,
+                    scene_text,
+                    tools=lora_tools,
+                    output_tools=output_tools,
+                )
         finally:
             internal_events.discard(event_key)
 
@@ -4625,14 +4699,66 @@ QQ快捷指令:
         event_key = id(event)
         self._internal_llm_events.add(event_key)
         try:
-            return await self._director.generate_edit_instruction(
-                self.context,
-                event,
-                scene_text,
-                tools=self._get_lora_tool_set(),
+            lora_tools = (
+                self._get_lora_tool_set()
+                if self._scene_needs_lora_tools(scene_text)
+                else None
             )
+            async with self._provider_slot():
+                return await self._director.generate_edit_instruction(
+                    self.context,
+                    event,
+                    scene_text,
+                    tools=lora_tools,
+                )
         finally:
             self._internal_llm_events.discard(event_key)
+
+    def _scene_needs_lora_tools(self, scene_text: str) -> bool:
+        """Use the expensive tool loop only when local evidence needs assets."""
+
+        if not self.settings.enable_lora_tool:
+            return False
+        if not self.settings.enable_local_intent_router:
+            return True
+        source = str(scene_text or "")
+        folded = source.casefold()
+        if re.search(r"<\s*lora\s*:", source, flags=re.IGNORECASE):
+            return True
+        if re.search(r"\b(?:lora|lycoris|locon)\b|洛拉", folded):
+            return True
+
+        # A known saved style is resolved locally and therefore does not need
+        # the LLM to enumerate the whole library.  Unknown style identifiers do.
+        if re.search(r"(?:使用|用|套用|采用|切换到?)\s*[\"'“”‘’]?\s*风格", source):
+            if self._find_requested_style_preset(source):
+                return False
+            return True
+
+        candidates: set[str] = set()
+        for preset in self._lora_presets.presets:
+            if preset.category not in {
+                PRESET_CATEGORY_CHARACTER,
+                PRESET_CATEGORY_MIXED,
+            }:
+                continue
+            candidates.add(preset.name)
+        semantic_index = getattr(self, "_semantic_index", None)
+        for entry in getattr(semantic_index, "entries", {}).values():
+            if not getattr(entry, "present", True):
+                continue
+            for field_name in ("character_names", "aliases"):
+                try:
+                    candidates.update(entry.effective_values(field_name))
+                except (AttributeError, LoraSemanticError):
+                    continue
+        for candidate in sorted(candidates, key=len, reverse=True):
+            token = str(candidate or "").strip().casefold()
+            if len(token) < 2 or token in {"角色", "人物", "风格", "画师"}:
+                continue
+            if token in folded:
+                return True
+        return False
 
     def _get_lora_tool_set(self) -> Any:
         """构造只读的 LoRA 清单与保存组合查询工具集。"""
@@ -4653,6 +4779,30 @@ QQ快捷指令:
             return ToolSet(tools) if tools else None
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] 无法构造 LoRA 工具集: {exc}")
+            return None
+
+    def _get_director_output_tool_set(self) -> Any:
+        """Build the single non-executed Function Calling output schema."""
+
+        mode = self.settings.structured_director_mode
+        if mode in {"legacy", "json"}:
+            return None
+        try:
+            from astrbot.core.agent.tool import ToolSet
+
+            manager = self.context.get_llm_tool_manager()
+            tool = manager.get_func("emit_anima_plan_v1")
+            return ToolSet([tool]) if tool is not None else None
+        except Exception as exc:
+            if mode == "function_call":
+                raise PromptDirectorError(
+                    "当前 AstrBot 无法构造结构化分镜工具",
+                    type(exc).__name__,
+                    fatal=True,
+                ) from exc
+            logger.warning(
+                f"[{PLUGIN_NAME}] structured director tool unavailable: {type(exc).__name__}"
+            )
             return None
 
     def _make_image_result(
@@ -6389,7 +6539,7 @@ QQ快捷指令:
         try:
             if hasattr(self.context, "llm_generate"):
                 return await asyncio.wait_for(
-                    self.context.llm_generate(
+                    self._llm_generate_limited(
                         chat_provider_id=provider_id,
                         **kwargs,
                     ),
@@ -7807,6 +7957,7 @@ QQ快捷指令:
         try:
             return await job.task
         finally:
+            self._clear_lora_operation_snapshot(event)
             async with self._jobs_lock:
                 if self._active_jobs.get(user_id) is job:
                     self._active_jobs.pop(user_id, None)
@@ -7946,6 +8097,7 @@ QQ快捷指令:
         try:
             return await job.task
         finally:
+            self._clear_lora_operation_snapshot(event)
             async with self._jobs_lock:
                 if self._active_jobs.get(user_id) is job:
                     self._active_jobs.pop(user_id, None)
@@ -7971,6 +8123,91 @@ QQ快捷指令:
             details=details,
         )
 
+    @asynccontextmanager
+    async def _unbounded_preparation(self) -> AsyncGenerator[None, None]:
+        """Keep legacy indentation while allowing preparation to run concurrently."""
+
+        yield
+
+    def _provider_slot(self) -> asyncio.Semaphore:
+        """Return a lazy Provider semaphore for lightweight compatibility tests."""
+
+        slot = getattr(self, "_provider_slots", None)
+        if slot is None:
+            settings = getattr(self, "settings", None)
+            maximum = max(
+                1,
+                int(getattr(settings, "provider_max_concurrent_jobs", 4) or 4),
+            )
+            slot = asyncio.Semaphore(maximum)
+            self._provider_slots = slot
+        return slot
+
+    def _generation_slot(self) -> asyncio.Semaphore:
+        slot = getattr(self, "_generation_slots", None)
+        if slot is None:
+            settings = getattr(self, "settings", None)
+            maximum = max(1, int(getattr(settings, "max_concurrent_jobs", 1) or 1))
+            slot = asyncio.Semaphore(maximum)
+            self._generation_slots = slot
+        return slot
+
+    def _parallel_preflight_enabled(self) -> bool:
+        return bool(
+            getattr(
+                getattr(self, "settings", None),
+                "enable_parallel_preflight",
+                False,
+            )
+        )
+
+    async def _llm_generate_limited(self, **kwargs: Any) -> Any:
+        """Run direct AstrBot Provider calls under the preparation semaphore."""
+
+        async with self._provider_slot():
+            return await self.context.llm_generate(**kwargs)
+
+    async def _submit_wait_download(
+        self,
+        job: GenerationJob,
+        workflow: Mapping[str, Any],
+        preferred_nodes: list[str] | tuple[str, ...],
+        image_paths: GeneratedImagePaths,
+        *,
+        active_state: str,
+        submitted_callback: Any = None,
+    ) -> None:
+        """Limit only the GPU/Comfy execution phase, not LLM preparation."""
+
+        assert self._client is not None
+        async with self._generation_slot():
+            job.state = "submitting"
+            job.prompt_id = await self._client.submit(dict(workflow))
+            job.state = active_state
+            if callable(submitted_callback):
+                submitted_callback()
+            references = await self._client.wait_for_images(
+                job.prompt_id,
+                preferred_nodes,
+            )
+            job.state = "downloading"
+            job_dir = self._temp_dir / job.prompt_id
+            for reference in references:
+                image_paths.append(
+                    await self._client.download_image(reference, job_dir)
+                )
+
+    async def _safe_gpu_name(self) -> str:
+        if self._client is None:
+            return ""
+        try:
+            return str(await self._client.gpu_name() or "")
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] unable to prefetch ComfyUI GPU model: {type(exc).__name__}"
+            )
+            return ""
+
     async def _execute_upscale_job(
         self,
         job: GenerationJob,
@@ -7983,6 +8220,11 @@ QQ快捷指令:
         source: Optional[Path] = None
         image_paths = GeneratedImagePaths()
         started_at = time.monotonic()
+        gpu_task = (
+            asyncio.create_task(self._safe_gpu_name())
+            if self._parallel_preflight_enabled()
+            else None
+        )
         try:
             job.state = "reading_image"
             source = await self._image_input.collect_one(event)
@@ -7993,7 +8235,7 @@ QQ快捷指令:
                 "input_image_ready",
                 details={"bytes": source.stat().st_size},
             )
-            async with self._generation_slots:
+            async with self._unbounded_preparation():
                 job.state = "uploading"
                 self._record_image_task_phase(
                     job,
@@ -8015,35 +8257,29 @@ QQ快捷指令:
                     scale=scale,
                     quality=self.settings.rtx_quality,
                 )
-                job.state = "submitting"
-                job.prompt_id = await self._client.submit(workflow)
-                job.state = "upscaling"
-                self._record_image_task_phase(
-                    job,
-                    "comfyui",
-                    "RTX 工作流已提交，正在等待 ComfyUI 输出。",
-                    "rtx_generation_waiting",
-                )
-                references = await self._client.wait_for_images(
-                    job.prompt_id,
-                    preferred_nodes,
-                )
-                job.state = "downloading"
-                job_dir = self._temp_dir / job.prompt_id
-                for reference in references:
-                    image_paths.append(
-                        await self._client.download_image(reference, job_dir)
+                def upscale_submitted() -> None:
+                    self._record_image_task_phase(
+                        job,
+                        "comfyui",
+                        "RTX 工作流已提交，正在等待 ComfyUI 输出。",
+                        "rtx_generation_waiting",
                     )
+
+                await self._submit_wait_download(
+                    job,
+                    workflow,
+                    preferred_nodes,
+                    image_paths,
+                    active_state="upscaling",
+                    submitted_callback=upscale_submitted,
+                )
                 image_paths.elapsed_seconds = max(
                     0.0,
                     time.monotonic() - started_at,
                 )
-                try:
-                    image_paths.gpu_name = await self._client.gpu_name()
-                except Exception as exc:
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] unable to read ComfyUI GPU model: {exc}"
-                    )
+                image_paths.gpu_name = (
+                    await gpu_task if gpu_task is not None else await self._safe_gpu_name()
+                ) or "未知 GPU"
                 job.state = "completed"
                 self._record_image_task_phase(
                     job,
@@ -8054,6 +8290,9 @@ QQ快捷指令:
                 )
                 return image_paths
         except Exception:
+            if gpu_task is not None and not gpu_task.done():
+                gpu_task.cancel()
+                await asyncio.gather(gpu_task, return_exceptions=True)
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
             raise
@@ -8071,6 +8310,7 @@ QQ快捷指令:
 
         assert self._client is not None
         source: Optional[Path] = None
+        upload_task: Optional[asyncio.Task[Any]] = None
         try:
             job.state = "reading_image"
             source = await self._image_input.collect_one(event)
@@ -8114,6 +8354,8 @@ QQ快捷指令:
                     options.suppress_default_style or not bool(options.lora_preset)
                 ),
             )
+            if self._parallel_preflight_enabled():
+                upload_task = asyncio.create_task(self._client.upload_image(source))
             if (
                 use_llm
                 and self.settings.enable_reverse_prompt
@@ -8146,7 +8388,7 @@ QQ快捷指令:
                         ),
                     )
 
-                async with self._generation_slots:
+                async with self._provider_slot():
                     reverse_result, reverse_provider = await self._reverse_prompt.reverse(
                         self.context,
                         event,
@@ -8172,7 +8414,11 @@ QQ快捷指令:
                     details={"reverse_provider_id": reverse_provider},
                 )
             job.state = "uploading"
-            uploaded = await self._client.upload_image(source)
+            uploaded = (
+                await upload_task
+                if upload_task is not None
+                else await self._client.upload_image(source)
+            )
             self._record_image_task_phase(
                 job,
                 "upload",
@@ -8187,6 +8433,9 @@ QQ快捷指令:
                 control_image_name=uploaded.workflow_value,
             )
         finally:
+            if upload_task is not None and not upload_task.done():
+                upload_task.cancel()
+                await asyncio.gather(upload_task, return_exceptions=True)
             if source is not None:
                 source.unlink(missing_ok=True)
 
@@ -8195,10 +8444,14 @@ QQ快捷指令:
         options: GenerationOptions,
         effective_prompt: str,
         director_negative: str,
+        event: AstrMessageEvent,
     ) -> GenerationOptions:
         """Resolve presets, exact LoRAs and trigger words for one redraw."""
 
-        await self._refresh_lora_manager_before("局部重绘前解析 LoRA")
+        snapshot_records = await self._refresh_lora_for_task(
+            "局部重绘前解析 LoRA",
+            event=event,
+        )
         clean_prompt, parsed_loras = extract_lora_selections(
             effective_prompt,
             max_loras=self.settings.max_total_dynamic_loras,
@@ -8217,10 +8470,23 @@ QQ快捷指令:
                 if self.settings.strict_lora_validation:
                     raise LoraCatalogError("LoRA 清单工具未启用，无法严格校验动态 LoRA")
                 return deduplicate_selections(selections)
-            resolved, records = await self._lora_catalog.resolve_selections_with_records(
-                selections,
-                strict=self.settings.strict_lora_validation,
-            )
+            try:
+                resolved, records = (
+                    await self._lora_catalog.resolve_selections_with_records(
+                        selections,
+                        strict=self.settings.strict_lora_validation,
+                        records=snapshot_records,
+                    )
+                )
+            except TypeError as compatibility_exc:
+                if "records" not in str(compatibility_exc):
+                    raise
+                resolved, records = (
+                    await self._lora_catalog.resolve_selections_with_records(
+                        selections,
+                        strict=self.settings.strict_lora_validation,
+                    )
+                )
             resolved_records.update(records)
             return deduplicate_selections(resolved)
 
@@ -8297,26 +8563,47 @@ QQ快捷指令:
         return await self._freshen_dynamic_loras_before_submit(
             effective,
             "局部重绘提交前复核 LoRA",
+            event=event,
         )
 
     async def _freshen_dynamic_loras_before_submit(
         self,
         options: GenerationOptions,
         action: str,
+        *,
+        event: Optional[AstrMessageEvent] = None,
     ) -> GenerationOptions:
         """Force a second live refresh and exact re-resolution before submission."""
 
-        await self._refresh_lora_manager_before(action)
+        planning_snapshot = self._lora_snapshot_for_event(event)
+        latest_records = await self._refresh_lora_for_task(
+            action,
+            event=event,
+            force=True,
+        )
         if not options.dynamic_loras:
             return options
         if not self._lora_catalog:
             if self.settings.strict_lora_validation:
                 raise WorkflowError("提交前无法访问最新 LoRA 清单")
             return options
-        resolved, records = await self._lora_catalog.resolve_selections_with_records(
-            options.dynamic_loras,
-            strict=True,
-        )
+        try:
+            resolved, records = (
+                await self._lora_catalog.resolve_selections_with_records(
+                    options.dynamic_loras,
+                    strict=True,
+                    records=latest_records,
+                )
+            )
+        except TypeError as compatibility_exc:
+            if "records" not in str(compatibility_exc):
+                raise
+            resolved, records = (
+                await self._lora_catalog.resolve_selections_with_records(
+                    options.dynamic_loras,
+                    strict=True,
+                )
+            )
         before = tuple(
             canonical_lora_name(selection.name).casefold()
             for selection in options.dynamic_loras
@@ -8326,6 +8613,23 @@ QQ快捷指令:
         )
         if before != after:
             raise WorkflowError("LoRA 在任务规划后发生变化，已停止提交，请重新发起")
+        if planning_snapshot is not None:
+            previous_by_name = {
+                record_identity(record)[0]: record
+                for record in planning_snapshot.records
+            }
+            for selection in resolved:
+                key = canonical_lora_name(selection.name).casefold()
+                previous = previous_by_name.get(key)
+                current = records.get(key)
+                if previous is None or current is None:
+                    raise WorkflowError(
+                        "LoRA 清单在规划与提交之间发生变化，请重新发起任务"
+                    )
+                if record_identity(previous)[1:] != record_identity(current)[1:]:
+                    raise WorkflowError(
+                        f"LoRA 在规划后发生内容或元数据变化：{selection.name}"
+                    )
         for expectation in options.lora_identity_expectations:
             record = records.get(canonical_lora_name(expectation.name).casefold())
             if record is None:
@@ -8352,6 +8656,11 @@ QQ快捷指令:
         pair = None
         image_paths = GeneratedImagePaths()
         started_at = time.monotonic()
+        gpu_task = (
+            asyncio.create_task(self._safe_gpu_name())
+            if self._parallel_preflight_enabled()
+            else None
+        )
         try:
             job.state = "reading_image"
             pair = await self._image_input.collect_inpaint_pair(event)
@@ -8366,7 +8675,7 @@ QQ快捷指令:
                     "mask_source": pair.mask_source,
                 },
             )
-            async with self._generation_slots:
+            async with self._unbounded_preparation():
                 effective_prompt = options.prompt
                 director_negative = ""
                 provider_id = ""
@@ -8396,6 +8705,7 @@ QQ快捷指令:
                     replace(options, inpaint_mode=mode),
                     effective_prompt,
                     director_negative,
+                    event,
                 )
                 final_access_error = self._access_error(
                     event,
@@ -8416,31 +8726,27 @@ QQ快捷指令:
                     uploaded_mask.workflow_value,
                     effective_options,
                 )
-                job.state = "submitting"
-                job.prompt_id = await self._client.submit(workflow)
-                job.state = "inpainting"
-                self._record_image_task_phase(
-                    job,
-                    "comfyui",
-                    f"{mode} 重绘工作流已提交，正在等待遮罩区域输出。",
-                    "inpaint_waiting",
-                    details={"mode": mode},
-                )
-                references = await self._client.wait_for_images(
-                    job.prompt_id,
-                    preferred_nodes,
-                )
-                job.state = "downloading"
-                job_dir = self._temp_dir / job.prompt_id
-                for reference in references:
-                    image_paths.append(
-                        await self._client.download_image(reference, job_dir)
+                def inpaint_submitted() -> None:
+                    self._record_image_task_phase(
+                        job,
+                        "comfyui",
+                        f"{mode} 重绘工作流已提交，正在等待遮罩区域输出。",
+                        "inpaint_waiting",
+                        details={"mode": mode},
                     )
+
+                await self._submit_wait_download(
+                    job,
+                    workflow,
+                    preferred_nodes,
+                    image_paths,
+                    active_state="inpainting",
+                    submitted_callback=inpaint_submitted,
+                )
                 image_paths.elapsed_seconds = max(0.0, time.monotonic() - started_at)
-                try:
-                    image_paths.gpu_name = await self._client.gpu_name()
-                except Exception as exc:
-                    logger.warning(f"[{PLUGIN_NAME}] unable to read ComfyUI GPU model: {exc}")
+                image_paths.gpu_name = (
+                    await gpu_task if gpu_task is not None else await self._safe_gpu_name()
+                ) or "未知 GPU"
                 job.state = "completed"
                 self._record_image_task_phase(
                     job,
@@ -8451,6 +8757,9 @@ QQ快捷指令:
                 )
                 return image_paths, seed, effective_options.prompt, provider_id, mode
         except Exception:
+            if gpu_task is not None and not gpu_task.done():
+                gpu_task.cancel()
+                await asyncio.gather(gpu_task, return_exceptions=True)
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
             raise
@@ -8477,6 +8786,11 @@ QQ快捷指令:
             raise WorkflowError("control and img2img conditioning cannot be combined")
         started_at = time.monotonic()
         image_paths = GeneratedImagePaths()
+        gpu_task = (
+            asyncio.create_task(self._safe_gpu_name())
+            if self._parallel_preflight_enabled()
+            else None
+        )
         effective_prompt = options.prompt
         provider_id = ""
         director_negative = ""
@@ -8499,7 +8813,7 @@ QQ快捷指令:
                 "绘图模型 Provider 调用失败，安全闸门已阻止错误文本进入工作流"
             )
         try:
-            async with self._generation_slots:
+            async with self._unbounded_preparation():
                 use_llm = (
                     self.settings.enable_prompt_llm
                     if options.use_prompt_llm is None
@@ -8555,7 +8869,10 @@ QQ快捷指令:
                             "control_lora_refresh_started",
                             details={"control_modes": list(options.control_modes)},
                         )
-                    await self._refresh_lora_manager_before("生成图片前注入 LoRA")
+                    snapshot_records = await self._refresh_lora_for_task(
+                        "生成图片前注入 LoRA",
+                        event=event,
+                    )
                     job.state = "building"
                     clean_prompt, parsed_loras = extract_lora_selections(
                         effective_prompt,
@@ -8579,12 +8896,23 @@ QQ快捷指令:
                                     "LoRA 清单工具未启用，无法严格校验动态 LoRA"
                                 )
                             return deduplicate_selections(selections)
-                        resolved, records = (
-                            await self._lora_catalog.resolve_selections_with_records(
-                                selections,
-                                strict=self.settings.strict_lora_validation,
+                        try:
+                            resolved, records = (
+                                await self._lora_catalog.resolve_selections_with_records(
+                                    selections,
+                                    strict=self.settings.strict_lora_validation,
+                                    records=snapshot_records,
+                                )
                             )
-                        )
+                        except TypeError as compatibility_exc:
+                            if "records" not in str(compatibility_exc):
+                                raise
+                            resolved, records = (
+                                await self._lora_catalog.resolve_selections_with_records(
+                                    selections,
+                                    strict=self.settings.strict_lora_validation,
+                                )
+                            )
                         resolved_records.update(records)
                         return deduplicate_selections(resolved)
 
@@ -8776,6 +9104,7 @@ QQ快捷指令:
                 effective_options = await self._freshen_dynamic_loras_before_submit(
                     effective_options,
                     "生成图片提交前复核 LoRA",
+                    event=event,
                 )
                 requested_pipeline = self._resolve_generation_pipeline(
                     options,
@@ -8913,33 +9242,28 @@ QQ快捷指令:
                         "output_nodes": preferred_nodes,
                     },
                 )
-                job.state = "submitting"
-                job.prompt_id = await self._client.submit(workflow)
-                job.state = "generating"
-                if options.control_modes:
-                    self._record_image_task_phase(
-                        job,
-                        "comfyui",
-                        "底图控制任务已提交，正在等待 ComfyUI 生成输出。",
-                        "control_generation_waiting",
-                        details={"pipeline": requested_pipeline},
-                    )
-                references = await self._client.wait_for_images(
-                    job.prompt_id, preferred_nodes
+                def generation_submitted() -> None:
+                    if options.control_modes:
+                        self._record_image_task_phase(
+                            job,
+                            "comfyui",
+                            "底图控制任务已提交，正在等待 ComfyUI 生成输出。",
+                            "control_generation_waiting",
+                            details={"pipeline": requested_pipeline},
+                        )
+
+                await self._submit_wait_download(
+                    job,
+                    workflow,
+                    preferred_nodes,
+                    image_paths,
+                    active_state="generating",
+                    submitted_callback=generation_submitted,
                 )
-                job.state = "downloading"
-                job_dir = self._temp_dir / job.prompt_id
-                for reference in references:
-                    image_paths.append(
-                        await self._client.download_image(reference, job_dir)
-                    )
                 image_paths.elapsed_seconds = max(0.0, time.monotonic() - started_at)
-                try:
-                    image_paths.gpu_name = await self._client.gpu_name()
-                except Exception as exc:
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] unable to read ComfyUI GPU model: {exc}"
-                    )
+                image_paths.gpu_name = (
+                    await gpu_task if gpu_task is not None else await self._safe_gpu_name()
+                ) or "未知 GPU"
                 job.state = "completed"
                 if options.control_modes:
                     self._record_image_task_phase(
@@ -8958,6 +9282,9 @@ QQ快捷指令:
                 )
         except asyncio.CancelledError:
             job.state = "cancelled"
+            if gpu_task is not None and not gpu_task.done():
+                gpu_task.cancel()
+                await asyncio.gather(gpu_task, return_exceptions=True)
             if job.prompt_id:
                 await self._client.cancel(job.prompt_id)
             for image_path in image_paths:
@@ -8966,18 +9293,112 @@ QQ快捷指令:
         except Exception:
             job.failed_stage = job.failed_stage or job.state
             job.state = "failed"
+            if gpu_task is not None and not gpu_task.done():
+                gpu_task.cancel()
+                await asyncio.gather(gpu_task, return_exceptions=True)
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
             raise
 
-    async def _refresh_lora_manager_before(self, action: str) -> tuple[Any, ...]:
-        """所有 LoRA 操作的统一强制刷新门禁。"""
+    def _lora_snapshot_for_event(
+        self,
+        event: Optional[AstrMessageEvent],
+    ) -> Optional[LoraOperationSnapshot]:
+        if event is None:
+            return None
+        return getattr(self, "_lora_operation_snapshots", {}).get(id(event))
+
+    def _clear_lora_operation_snapshot(
+        self,
+        event: Optional[AstrMessageEvent],
+    ) -> None:
+        if event is None:
+            return
+        key = id(event)
+        snapshots = getattr(self, "_lora_operation_snapshots", None)
+        locks = getattr(self, "_lora_snapshot_locks", None)
+        if snapshots is None:
+            return
+        snapshots.pop(key, None)
+        lock = locks.get(key) if locks is not None else None
+        if lock is None or not lock.locked():
+            if locks is not None:
+                locks.pop(key, None)
+
+    async def _refresh_lora_for_task(
+        self,
+        action: str,
+        *,
+        event: Optional[AstrMessageEvent],
+        force: bool = False,
+    ) -> tuple[Any, ...]:
+        """Call the snapshot-aware gate with legacy test/extension compatibility."""
+
+        try:
+            return await self._refresh_lora_manager_before(
+                action,
+                event=event,
+                force=force,
+            )
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument" not in message:
+                raise
+            return await self._refresh_lora_manager_before(action)
+
+    async def _refresh_lora_manager_before(
+        self,
+        action: str,
+        *,
+        event: Optional[AstrMessageEvent] = None,
+        force: bool = False,
+    ) -> tuple[Any, ...]:
+        """Refresh once for planning, reuse it, and force-refresh for submit."""
         if not self._lora_catalog:
             raise LoraCatalogError("LoRA Manager 清单服务未启用，已停止后续 LoRA 操作")
+
+        settings = getattr(self, "settings", None)
+        snapshot_enabled = bool(
+            getattr(settings, "enable_task_lora_snapshot", False)
+            and event is not None
+            and not force
+        )
+        if snapshot_enabled:
+            key = id(event)
+            snapshots = getattr(self, "_lora_operation_snapshots", None)
+            if snapshots is None:
+                snapshots = {}
+                self._lora_operation_snapshots = snapshots
+            locks = getattr(self, "_lora_snapshot_locks", None)
+            if locks is None:
+                locks = {}
+                self._lora_snapshot_locks = locks
+            lock = locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                snapshot = snapshots.get(key)
+                if (
+                    snapshot is not None
+                    and snapshot.age()
+                    <= int(getattr(settings, "lora_snapshot_max_age", 300) or 300)
+                ):
+                    logger.info(
+                        f"[{PLUGIN_NAME}] {action}: reused task LoRA snapshot "
+                        f"records={len(snapshot.records)}, age={snapshot.age():.2f}s"
+                    )
+                    return snapshot.records
+                records = await self._lora_catalog.refresh_for_operation()
+                snapshot = LoraOperationSnapshot.capture(records)
+                snapshots[key] = snapshot
+                logger.info(
+                    f"[{PLUGIN_NAME}] {action}: captured task LoRA snapshot "
+                    f"records={len(records)}, fingerprint={snapshot.fingerprint[:12]}"
+                )
+                return snapshot.records
+
         records = await self._lora_catalog.refresh_for_operation()
         logger.info(
-            f"[{PLUGIN_NAME}] {action}：LoRA Manager 强制刷新完成，"
-            f"最新可加载文件 {len(records)} 个"
+            f"[{PLUGIN_NAME}] {action}: LoRA Manager force refresh completed, "
+            f"loadable_records={len(records)}, final_check={force}"
         )
         return records
 
