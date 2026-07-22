@@ -174,6 +174,10 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertIsNone(tool.handler)
         self.assertEqual(tool.parameters["required"], ["positive_tags"])
         self.assertFalse(tool.parameters["additionalProperties"])
+        self.assertIn(
+            "natural-language scene sentence",
+            tool.parameters["properties"]["positive_tags"]["description"],
+        )
 
     def test_visible_pic_result_reaches_generation_job(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.2
+AstrBot Comfy Anima 插件 v1.5.3
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.5.2
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.2
+版本: 1.5.3
 日期: 2026-07-21
 """
 
@@ -152,7 +152,7 @@ from .services.web_ui import WebUiActionError, WebUiError, WebUiService
 AUTO_DRAW_CONTROL_PROTOCOL = """
 AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）：
 - 先把用户目标归入唯一操作：从文字新生成图片、无蒙版整图语义重绘、修改现有图片的遮罩区域、语义换角、仅放大现有图片。不要因为都与图片有关就一律输出 pic。
-- 普通生图最终使用 `<pic prompt="英文 Anima tags" pipeline="base|rtx|iterative">`；negative 属性可选。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
+- 普通生图最终使用 `<pic prompt="英文 Anima 混合提示词" pipeline="base|rtx|iterative">`；negative 属性可选。prompt 必须先写有序 Danbooru/Anima tags，再用英文句号分隔一句简短自然语言画面描述。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
 - 只有用户明确要求修改已提供图片的遮罩区域时，才使用 `<edit prompt="遮罩区域目标英文 tags" mode="quick|lanpaint">`；negative 属性可选。quick 适合快速小范围修改，lanpaint 适合复杂结构和精细多轮重绘。
 - `<pic>` 与 `<edit>` 互斥；不要同时输出。不要在 `<think>` 内输出控制标签。
 - edit 不能创建或猜测遮罩。缺少原图或同尺寸遮罩时，不输出 edit，并请用户补充：白色/透明区域重绘，黑色区域保留。
@@ -4780,7 +4780,11 @@ QQ快捷指令:
                     "properties": {
                         "positive_tags": {
                             "type": "string",
-                            "description": "Final English Anima/Danbooru tags.",
+                            "description": (
+                                "Final English hybrid Anima prompt: ordered Danbooru "
+                                "tags, then a period, then one concise natural-language "
+                                "scene sentence inside this same string."
+                            ),
                             "minLength": 1,
                         },
                         "negative_tags": {

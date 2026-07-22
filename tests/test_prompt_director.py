@@ -213,6 +213,9 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("detail=true", system_prompt)
         self.assertIn("1️⃣Lora堆（默认）", system_prompt)
         self.assertIn("English natural-language description", system_prompt)
+        self.assertIn("18 至 45 个英文单词", system_prompt)
+        self.assertIn("双重编码", system_prompt)
+        self.assertIn("sea foam curls around her sandaled feet", system_prompt)
         self.assertIn("不可变身份", system_prompt)
         self.assertIn("0.55 至 0.75", system_prompt)
         self.assertIn('negative="..."', system_prompt)
@@ -434,6 +437,48 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(instruction.prompt, "1girl, orange sunset")
         self.assertEqual(instruction.negative_prompt, "lowres")
         self.assertEqual(instruction.pipeline, "base")
+
+    async def test_function_call_request_requires_hybrid_prompt_inside_arguments(
+        self,
+    ) -> None:
+        director = self._director(structured_director_mode="function_call")
+
+        class Context:
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.kwargs = kwargs
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "tools_call_name": ["emit_anima_plan_v1"],
+                        "tools_call_args": [
+                            {
+                                "positive_tags": (
+                                    "1girl, squatting, beach, night. "
+                                    "She squats in the moonlit shallows."
+                                ),
+                                "negative_tags": "",
+                                "pipeline": "base",
+                            }
+                        ],
+                    },
+                )()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw a beach scene",
+            output_tools=object(),
+        )
+
+        request_prompt = str(context.kwargs["prompt"])
+        system_prompt = str(context.kwargs["system_prompt"])
+        self.assertIn("ordered Danbooru/Anima tags", request_prompt)
+        self.assertIn("sentence belongs inside positive_tags", request_prompt)
+        self.assertNotIn("do not add prose", request_prompt)
+        self.assertIn("18 至 45 个英文单词", system_prompt)
+        self.assertIn("moonlit shallows", instruction.prompt)
 
     async def test_astrbot_parallel_function_call_lists_continue_generation(self) -> None:
         director = self._director(structured_director_mode="function_call")

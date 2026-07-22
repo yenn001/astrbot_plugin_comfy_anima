@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.5.2
+AstrBot Comfy Anima 插件 v1.5.3
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.5.2
+版本: 1.5.3
 日期: 2026-07-21
 """
 
@@ -94,7 +94,12 @@ RUNTIME_OVERRIDE = """
 角色外观连续性与生成稳定性。参考规范用于指导你的导演思路，但本次调用的输出协议覆盖参考规范：
 
 1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅当用户明确指定生成管线时增加 `pipeline="base|rtx|iterative"`；仅在确有需要时增加可选的 `negative="..."` 属性，`prompt` 属性始终必需。
-2. prompt 必须是单行英文：先写 Anima tags，最后用英文句号分隔一句简短自然语言画面描述；negative 也必须是单行英文 tags。
+2. prompt 必须是单行英文混合提示词：先写紧凑、有序的 Anima/Danbooru tags，再用英文句号分隔一句自然语言画面描述；这句话属于 prompt 本身，不是额外回复。negative 仍是单行英文 tags。
+   - 标签块负责离散可控事实：人数、角色、作品、可见外观、服装、动作、表情、镜头、场景和光线。
+   - 末句负责标签不擅长表达的关系：主体怎样动作、手中物体、接触点、衣料状态、前后空间、环境互动和主光方向。
+   - 末句使用现在时和主动表达，通常 18 至 45 个英文单词；简单肖像可更短。可以有意识地复述 3 至 6 个最重要锚点，但不要把全部 tags 改写成流水账。
+   - 末句不得加入标签块或用户需求中没有的新人物、服装、道具、动作、身体特征、场景或剧情结果；不得使用 `the image shows`、质量口号、操作指令、角色扮演台词或第二个句子。
+   - 复杂动作优先用 `while`、`as`、`around`、`over`、`beneath`、`through` 等关系词，把姿势、道具和环境组成一个可视场面。若视线、动作或镜头互相冲突，先在标签块中裁决，再让末句与最终标签完全一致。
 3. 普通标签使用自然空格和半角逗号；不得改写工具返回的 LoRA 文件名或 trigger words。
 4. 默认不添加质量词或安全词；只有用户明确要求时才加入。
 5. 只保留单图所需的信息，避免互相矛盾的姿势、镜头和身体方向。
@@ -286,7 +291,10 @@ class PromptDirector:
         if output_tools is not None:
             user_prompt += (
                 "\n\nUse the emit_anima_plan_v1 function exactly once. Put the final "
-                "English Anima tags in positive_tags; do not add prose."
+                "English hybrid Anima prompt in positive_tags: ordered Danbooru/Anima "
+                "tags, then a period, then one concise present-tense scene sentence. "
+                "The sentence belongs inside positive_tags; do not add any text outside "
+                "the function arguments."
             )
         elif structured_mode == "json":
             user_prompt += (
@@ -486,10 +494,13 @@ class PromptDirector:
                     user_prompt
                     + (
                         "\n\nYour previous response was invalid. Call "
-                        "emit_anima_plan_v1 exactly once with valid JSON arguments."
+                        "emit_anima_plan_v1 exactly once with valid JSON arguments. "
+                        "positive_tags must contain ordered English tags followed by a "
+                        "period and one concise natural-language scene sentence."
                         if output_tools is not None
                         else "\n\nYour previous response was invalid. Return exactly one "
-                        '<pic prompt="English Anima tags"> tag and nothing else. '
+                        '<pic prompt="English Anima tags. One concise scene sentence."> '
+                        "tag and nothing else. "
                         "Do not return an error message, explanation, Markdown or plain text."
                     )
                 )

@@ -89,6 +89,11 @@ bedroom, classroom, city street, concert stage, spotlight, crowd, night sky
 10. 自然语言描述
 - 必须在所有标签之后加入自然语言描述。
 - 自然语言描述前必须使用英文句号分隔。
+- 自然语言描述与标签块共同构成最终正面提示词，不是额外解释。
+- 标签块描述离散事实；自然语言描述负责动作方向、手持物、接触点、衣料状态、空间前后关系、环境互动和光线关系。
+- 使用现在时、主动语态和一个完整句子，通常 18 至 45 个英文单词；简单肖像可以更短。
+- 可以复述 3 至 6 个最重要的主体、服装、动作、道具、场景或光线锚点，但不要逐项翻译所有标签。
+- 不要使用 `the image shows`、质量口号、操作说明、角色台词或第二个句子；不要加入标签和用户描述中不存在的新事实。
 - 示例：
 1girl, hatsune miku, vocaloid, long hair, blue eyes, twintails, smile, standing, concert stage. A cheerful idol is standing on a brightly lit concert stage.
 
