@@ -218,6 +218,78 @@ def _append_tool_call_list(
         result.append(_tool_candidate(item, source=f"{source}[{index}]"))
 
 
+def _append_astrbot_tool_calls(
+    result: list[_ToolCallCandidate],
+    names: Any,
+    arguments: Any,
+) -> None:
+    """Append AstrBot's native tool-call fields.
+
+    AstrBot 4.26.x exposes ``LLMResponse.tools_call_name`` and
+    ``LLMResponse.tools_call_args`` as parallel lists.  Older/plugin-local
+    adapters used scalar values, so both representations are accepted, but
+    mixed scalar/list values and mismatched list lengths fail closed.
+    """
+
+    names_is_list = isinstance(names, Sequence) and not isinstance(
+        names, (str, bytes, bytearray)
+    )
+    args_is_list = isinstance(arguments, Sequence) and not isinstance(
+        arguments, (str, bytes, bytearray, Mapping)
+    )
+
+    if names_is_list or args_is_list:
+        if not (names_is_list and args_is_list):
+            raise _error(
+                "AstrBot Provider 工具调用字段类型不一致",
+                "malformed_astrbot_tool_call",
+            )
+        if len(names) != len(arguments):
+            raise _error(
+                "AstrBot Provider 工具调用名称与参数数量不一致",
+                "malformed_astrbot_tool_call",
+            )
+        for index, (name, call_args) in enumerate(zip(names, arguments)):
+            if not isinstance(name, str) or not _TOOL_NAME_RE.fullmatch(name.strip()):
+                raise _error(
+                    "Provider 工具调用名称无效",
+                    "invalid_tool_name",
+                )
+            if call_args is None:
+                raise _error(
+                    "Provider 工具调用缺少参数",
+                    "missing_tool_arguments",
+                )
+            result.append(
+                _ToolCallCandidate(
+                    name=name.strip(),
+                    arguments=_arguments_object(
+                        call_args,
+                        source=f"astrbot.tools_call_args[{index}]",
+                    ),
+                    source=f"astrbot.tools_call[{index}]",
+                )
+            )
+        return
+
+    if names in (None, "") and arguments in (None, ""):
+        return
+    if not isinstance(names, str) or arguments is None:
+        raise _error(
+            "AstrBot Provider 工具调用字段不完整",
+            "malformed_astrbot_tool_call",
+        )
+    if not _TOOL_NAME_RE.fullmatch(names.strip()):
+        raise _error("Provider 工具调用名称无效", "invalid_tool_name")
+    result.append(
+        _ToolCallCandidate(
+            name=names.strip(),
+            arguments=_arguments_object(arguments, source="astrbot.tools_call_args"),
+            source="astrbot.tools_call",
+        )
+    )
+
+
 def _collect_tool_calls(response: Any) -> list[_ToolCallCandidate]:
     calls: list[_ToolCallCandidate] = []
 
@@ -226,24 +298,7 @@ def _collect_tool_calls(response: Any) -> list[_ToolCallCandidate]:
     astrbot_name = _field(response, "tools_call_name")
     astrbot_args = _field(response, "tools_call_args")
     if has_astrbot_name or has_astrbot_args:
-        if astrbot_name in (None, "") and astrbot_args in (None, ""):
-            pass
-        elif not isinstance(astrbot_name, str) or astrbot_args is None:
-            raise _error(
-                "AstrBot Provider 工具调用字段不完整",
-                "malformed_astrbot_tool_call",
-            )
-        else:
-            calls.append(
-                _ToolCallCandidate(
-                    name=astrbot_name.strip(),
-                    arguments=_arguments_object(
-                        astrbot_args,
-                        source="astrbot.tools_call_args",
-                    ),
-                    source="astrbot.tools_call",
-                )
-            )
+        _append_astrbot_tool_calls(calls, astrbot_name, astrbot_args)
 
     if _has_field(response, "tool_calls"):
         _append_tool_call_list(

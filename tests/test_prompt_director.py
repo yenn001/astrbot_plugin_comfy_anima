@@ -435,6 +435,43 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(instruction.negative_prompt, "lowres")
         self.assertEqual(instruction.pipeline, "base")
 
+    async def test_astrbot_parallel_function_call_lists_continue_generation(self) -> None:
+        director = self._director(structured_director_mode="function_call")
+        output_tools = object()
+
+        class Context:
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.tools = kwargs.get("tools")
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": "",
+                        "tools_call_name": ["emit_anima_plan_v1"],
+                        "tools_call_args": [
+                            {
+                                "positive_tags": "1girl, red dress, city night",
+                                "negative_tags": "lowres, bad anatomy",
+                                "pipeline": "rtx",
+                            }
+                        ],
+                    },
+                )()
+
+        context = Context()
+        instruction, provider_id = await director.generate_instruction(
+            context,
+            object(),
+            "draw a girl in a red dress at night",
+            output_tools=output_tools,
+        )
+
+        self.assertIs(context.tools, output_tools)
+        self.assertEqual(provider_id, "test-provider")
+        self.assertEqual(instruction.prompt, "1girl, red dress, city night")
+        self.assertEqual(instruction.negative_prompt, "lowres, bad anatomy")
+        self.assertEqual(instruction.pipeline, "rtx")
+
     async def test_auto_mode_falls_back_when_context_rejects_tools_kwarg(self) -> None:
         director = self._director(structured_director_mode="auto")
 

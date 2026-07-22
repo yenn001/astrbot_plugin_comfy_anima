@@ -26,6 +26,62 @@ class StructuredProviderTests(unittest.TestCase):
         self.assertEqual(parsed.source, "astrbot.tools_call")
         self.assertEqual(parsed.arguments["identity"], "rice_shower_(umamusume)")
 
+    def test_astrbot_llm_response_parallel_tool_lists(self) -> None:
+        response = types.SimpleNamespace(
+            tools_call_name=["emit_anima_plan_v1"],
+            tools_call_args=[
+                {
+                    "positive_tags": "1girl, portrait",
+                    "negative_tags": "lowres",
+                    "pipeline": "base",
+                }
+            ],
+        )
+
+        parsed = extract_structured_payload(
+            response,
+            expected_tool_name="emit_anima_plan_v1",
+        )
+
+        self.assertEqual(parsed.tool_name, "emit_anima_plan_v1")
+        self.assertEqual(parsed.source, "astrbot.tools_call[0]")
+        self.assertEqual(parsed.arguments["positive_tags"], "1girl, portrait")
+
+    def test_astrbot_parallel_tool_lists_support_multiple_mirrored_calls(self) -> None:
+        response = {
+            "tools_call_name": [EXPECTED, EXPECTED],
+            "tools_call_args": [
+                {"identity": "a_(work)"},
+                {"identity": "a_(work)"},
+            ],
+        }
+
+        parsed = extract_structured_payload(response, expected_tool_name=EXPECTED)
+
+        self.assertEqual(parsed.arguments, {"identity": "a_(work)"})
+
+    def test_astrbot_parallel_tool_lists_must_have_matching_lengths(self) -> None:
+        with self.assertRaises(StructuredProviderError) as raised:
+            extract_structured_payload(
+                {
+                    "tools_call_name": [EXPECTED],
+                    "tools_call_args": [],
+                },
+                expected_tool_name=EXPECTED,
+            )
+        self.assertEqual(raised.exception.code, "malformed_astrbot_tool_call")
+
+    def test_astrbot_parallel_tool_lists_reject_mixed_shapes(self) -> None:
+        with self.assertRaises(StructuredProviderError) as raised:
+            extract_structured_payload(
+                {
+                    "tools_call_name": [EXPECTED],
+                    "tools_call_args": {"identity": "a_(work)"},
+                },
+                expected_tool_name=EXPECTED,
+            )
+        self.assertEqual(raised.exception.code, "malformed_astrbot_tool_call")
+
     def test_mapping_tool_calls_function_envelope(self) -> None:
         response = {
             "tool_calls": [

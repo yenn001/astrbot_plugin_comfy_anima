@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.0
+AstrBot Comfy Anima 插件 v1.5.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.5.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.0
+版本: 1.5.1
 日期: 2026-07-21
 """
 
