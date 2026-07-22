@@ -118,6 +118,109 @@ class MainCompatibilityTests(unittest.TestCase):
     def test_main_module_imports_with_documented_api_surface(self) -> None:
         self.assertTrue(hasattr(self.main, "ComfyAnimaPlugin"))
 
+    def test_director_output_tool_is_request_local_not_globally_registered(self) -> None:
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(
+            '@filter.llm_tool(name="emit_anima_plan_v1")',
+            source,
+        )
+
+        class FunctionTool:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class ToolSet:
+            def __init__(self, tools):
+                self.tools = list(tools)
+
+        core_module = types.ModuleType("astrbot.core")
+        agent_module = types.ModuleType("astrbot.core.agent")
+        tool_module = types.ModuleType("astrbot.core.agent.tool")
+        tool_module.FunctionTool = FunctionTool
+        tool_module.ToolSet = ToolSet
+        module_names = (
+            "astrbot.core",
+            "astrbot.core.agent",
+            "astrbot.core.agent.tool",
+        )
+        previous = {name: sys.modules.get(name) for name in module_names}
+        sys.modules.update(
+            {
+                "astrbot.core": core_module,
+                "astrbot.core.agent": agent_module,
+                "astrbot.core.agent.tool": tool_module,
+            }
+        )
+        try:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(structured_director_mode="auto")
+            plugin.context = types.SimpleNamespace(
+                get_llm_tool_manager=lambda: self.fail(
+                    "request-local output schema must not read the global tool manager"
+                )
+            )
+
+            tool_set = plugin._get_director_output_tool_set()
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertEqual(len(tool_set.tools), 1)
+        tool = tool_set.tools[0]
+        self.assertEqual(tool.name, "emit_anima_plan_v1")
+        self.assertIsNone(tool.handler)
+        self.assertEqual(tool.parameters["required"], ["positive_tags"])
+        self.assertFalse(tool.parameters["additionalProperties"])
+
+    def test_visible_pic_result_reaches_generation_job(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            max_auto_images_per_reply=1,
+            enable_inpaint=False,
+        )
+        plugin._director = types.SimpleNamespace(
+            parse_picture_response=lambda *_args, **_kwargs: types.SimpleNamespace(
+                text="",
+                prompts=("1girl, portrait",),
+                negative_prompts=("lowres",),
+                pipelines=("base",),
+                edits=(),
+            )
+        )
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+        calls = []
+
+        async def run_job(event, options):
+            calls.append((event, options))
+            return [Path("generated.png")], 123, options.prompt, "", "base"
+
+        plugin._run_job = run_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<pic prompt="1girl, portrait" pipeline="base">')]
+        )
+        event = types.SimpleNamespace(
+            message_str="请画一张肖像",
+            get_result=lambda: result,
+        )
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1].prompt, "1girl, portrait")
+        self.assertEqual(calls[0][1].negative_prompt, "lowres")
+        self.assertEqual(calls[0][1].pipeline, "base")
+        self.assertIn(("image", "generated.png"), result.chain)
+
     def test_natural_draw_detection_is_conservative(self) -> None:
         detector = self.main.ComfyAnimaPlugin._looks_like_draw_request
         self.assertTrue(detector("帮我画一个雨夜里的猫娘"))
@@ -1754,6 +1857,8 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("save_anima_lora_style", request.system_prompt)
         self.assertIn("STYLE_SAVE_COMMITTED", request.system_prompt)
         self.assertIn("不得用 shell", request.system_prompt)
+        self.assertIn("普通对话绝对不要调用或提及它", request.system_prompt)
+        self.assertIn("最终可见回复中输出合法 `<pic>`", request.system_prompt)
 
 
 class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):

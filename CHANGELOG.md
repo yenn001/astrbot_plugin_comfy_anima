@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-07-22
+
+### 普通对话自动绘图续流修复
+
+- 修复 `emit_anima_plan_v1` 被注册到 AstrBot 全局 Tool Manager 后，普通对话 Agent 把它当作真实工具执行、消费 JSON 结果并继续回复文字，导致 ComfyUI 从未收到生成任务的问题。
+- `emit_anima_plan_v1` 现在只在插件内部绘图导演的单次 `llm_generate()` 请求中动态构造为不可执行 Function Calling Schema，不再出现在普通聊天工具列表。
+- 普通对话控制协议新增私有工具隔离约束：需要生图时必须输出最终可见 `<pic>` 标签，由结果装饰器接管并提交 ComfyUI。
+- 新增全局注册泄漏回归，确保内部 Schema 不读取全局 Tool Manager，并继续保留 v1.5.1 的 AstrBot 并行列表解析兼容。
+
 ## [1.5.1] - 2026-07-22
 
 ### AstrBot 原生 Function Call 续流修复

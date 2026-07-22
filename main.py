@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.1
+AstrBot Comfy Anima 插件 v1.5.2
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.5.1
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.1
+版本: 1.5.2
 日期: 2026-07-21
 """
 
@@ -166,6 +166,7 @@ AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）
 - “把图中 A 角色换成 B 角色并保持场景”属于语义换角，由插件专用路由处理；不要擅自退化为普通 pic 或局部 edit。
 - 只有人物身份 A→B 才是换角；“把泳装换成礼服、把背景换成夜景、把发型换成长发”是属性改图。若用户同时要求“把 A 换成 B 并穿新衣”，保留为一个组合换角任务，不要丢弃服装覆盖要求。
 - LoRA 文件名只能来自本次工具返回；插件会在提交前强制刷新并复核 LoRA Manager 与 ComfyUI。
+- `emit_anima_plan_v1` 是插件内部绘图导演的私有输出协议，不是普通对话工具。普通对话绝对不要调用或提及它；需要生图时必须在最终可见回复中输出合法 `<pic>` 标签，等待插件接管并真正提交 ComfyUI。
 """.strip()
 
 PIPELINE_PROFILE_MAP = {
@@ -770,35 +771,6 @@ class ComfyAnimaPlugin(Star):
                 f"LoRA preset query unavailable: {message}. "
                 "Stop this LoRA drawing request."
             )
-
-    @filter.llm_tool(name="emit_anima_plan_v1")
-    async def emit_anima_plan_v1(
-        self,
-        event: AstrMessageEvent,
-        positive_tags: str,
-        negative_tags: str = "",
-        pipeline: str = "",
-    ) -> str:
-        """Emit one structured Anima drawing plan.
-
-        Args:
-            positive_tags(string): Final English Anima/Danbooru tags only.
-            negative_tags(string): Optional English negative tags.
-            pipeline(string): Optional base, rtx or iterative pipeline.
-        """
-
-        # This tool normally appears as a Provider function call and is parsed
-        # without execution.  Returning a compact value keeps older AstrBot
-        # tool-loop implementations safe if they execute it anyway.
-        return json.dumps(
-            {
-                "positive_tags": str(positive_tags or ""),
-                "negative_tags": str(negative_tags or ""),
-                "pipeline": str(pipeline or ""),
-            },
-            ensure_ascii=True,
-            separators=(",", ":"),
-        )
 
     @filter.llm_tool(name="save_anima_lora_style")
     async def save_anima_lora_style(
@@ -4782,17 +4754,50 @@ QQ快捷指令:
             return None
 
     def _get_director_output_tool_set(self) -> Any:
-        """Build the single non-executed Function Calling output schema."""
+        """Build a request-local, non-executable Function Calling schema.
+
+        This tool must never be registered in AstrBot's global Tool Manager.
+        Global registration makes the ordinary conversation agent execute the
+        schema as a real tool, consume its JSON result, and continue with a
+        text reply instead of allowing the auto-draw result decorator to see a
+        ``<pic>`` tag and submit ComfyUI.
+        """
 
         mode = self.settings.structured_director_mode
         if mode in {"legacy", "json"}:
             return None
         try:
-            from astrbot.core.agent.tool import ToolSet
+            from astrbot.core.agent.tool import FunctionTool, ToolSet
 
-            manager = self.context.get_llm_tool_manager()
-            tool = manager.get_func("emit_anima_plan_v1")
-            return ToolSet([tool]) if tool is not None else None
+            tool = FunctionTool(
+                name="emit_anima_plan_v1",
+                description=(
+                    "Private output transport for one internal Anima prompt-director "
+                    "request. Return the final drawing plan exactly once."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "positive_tags": {
+                            "type": "string",
+                            "description": "Final English Anima/Danbooru tags.",
+                            "minLength": 1,
+                        },
+                        "negative_tags": {
+                            "type": "string",
+                            "description": "Optional English negative tags.",
+                        },
+                        "pipeline": {
+                            "type": "string",
+                            "description": "Optional base, rtx or iterative pipeline.",
+                        },
+                    },
+                    "required": ["positive_tags"],
+                    "additionalProperties": False,
+                },
+                handler=None,
+            )
+            return ToolSet([tool])
         except Exception as exc:
             if mode == "function_call":
                 raise PromptDirectorError(
