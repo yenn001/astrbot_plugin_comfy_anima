@@ -225,6 +225,82 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertEqual(calls[0][1].pipeline, "base")
         self.assertIn(("image", "generated.png"), result.chain)
 
+    def test_direct_draw_llm_flag_reaches_generation_job(self) -> None:
+        async def run_case(command_text: str, expected: bool) -> None:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=6000,
+                send_generation_notice=False,
+                show_llm_prompt=False,
+            )
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = (
+                lambda _event, _paths, _seed, *, forward: ("image", forward)
+            )
+            captured = []
+
+            async def run_job(_event, options):
+                captured.append(options)
+                return (
+                    [Path("generated.png")],
+                    123,
+                    "1girl, beach. She stands beside the sea.",
+                    "director" if options.use_prompt_llm else "",
+                    None,
+                )
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(plain_result=lambda text: text)
+
+            replies = [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    command_text,
+                    forward=False,
+                )
+            ]
+
+            self.assertEqual(len(captured), 1)
+            self.assertIs(captured[0].use_prompt_llm, expected)
+            self.assertEqual(replies[-1], ("image", False))
+
+        asyncio.run(run_case("蓝发少女在海边看烟花 --llm", True))
+        asyncio.run(run_case("1girl, blue hair, beach", False))
+
+    def test_direct_draw_explicit_llm_requires_director(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+        plugin._director = None
+        plugin._director_error = "provider missing"
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "画一名少女 --llm",
+                    forward=True,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("LLM 提示词优化不可用", replies[0])
+        self.assertIn("provider missing", replies[0])
+
     def test_natural_draw_detection_is_conservative(self) -> None:
         detector = self.main.ComfyAnimaPlugin._looks_like_draw_request
         self.assertTrue(detector("帮我画一个雨夜里的猫娘"))
@@ -370,6 +446,12 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "--mode quick",
             "--mode lanpaint",
             "--no-character-lora / --no-lora",
+            "/画图 <英文 Tag或画面描述> [--llm]",
+            "/画图no <英文 Tag或画面描述> [--llm]",
+            "默认按原始 Tags 执行",
+            "--llm / --l 启用“有序 Tags + 一句英文场景描述”优化",
+            "--raw / --no-llm 明确保持原样",
+            "/画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, help_text)

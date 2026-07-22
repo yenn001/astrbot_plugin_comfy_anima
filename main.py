@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.3
+AstrBot Comfy Anima 插件 v1.5.4
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.5.3
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.3
+版本: 1.5.4
 日期: 2026-07-21
 """
 
@@ -1462,7 +1462,7 @@ class ComfyAnimaPlugin(Star):
     async def cmd_draw_direct(
         self, event: AstrMessageEvent, prompt: str = ""
     ) -> AsyncGenerator[Any, None]:
-        """直接使用英文 Tag，并以普通 QQ 图片消息发送。"""
+        """直接使用 Tags，或显式启用 LLM 优化后以普通 QQ 图片消息发送。"""
         command_text = self._extract_command_text(
             event.message_str, prompt, command="画图no"
         )
@@ -3379,8 +3379,11 @@ class ComfyAnimaPlugin(Star):
             f"""📖 ComfyUI 绘图帮助｜v{PLUGIN_VERSION} 管线版
 ━━━━━━━━━━━━
 自然语言生图: 帮我画一个……
-/画图 <英文 Tag> [参数] - 合并转发图片
-/画图no <英文 Tag> [参数] - 直接发送图片
+/画图 <英文 Tag或画面描述> [--llm] [参数] - 合并转发图片
+/画图no <英文 Tag或画面描述> [--llm] [参数] - 直接发送图片
+默认按原始 Tags 执行；--llm / --l 启用“有序 Tags + 一句英文场景描述”优化。
+--raw / --no-llm 明确保持原样，不调用绘图导演。
+示例: /画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx
 
 3 个可选生图管线（先由 Anima 生成）:
 1. base - 只生成 Anima 原图，不放大
@@ -3404,7 +3407,7 @@ class ComfyAnimaPlugin(Star):
 /换角色 A -> B [选项] | <完整 Tags> - 对现有 Tags 语义换角
 /换角色会先刷新并精确查找目标角色 LoRA；完全未命中时改用普通语义 Tags。
 --no-character-lora / --no-lora - 强制不加载目标角色 LoRA，仅用语义 Tags；只支持 keep-outfit
-/画图与 /画图no 可追加 --preset <序号|名称> 及 --pipeline <管线>
+/画图与 /画图no 可追加 --llm、--preset <序号|名称> 及 --pipeline <管线>
 短参数: --p b|r|i、--sz、--st、--sd、--c、--n、--pr；底图控制用 --m p d 等组合。
 
 管理员:
@@ -3525,8 +3528,8 @@ iterative - Anima 原图 + 迭代采样放大
 明确局部/遮罩或指定 quick|lanpaint 时需提供同尺寸遮罩；普通整图换衣、换背景会自动转入 /改图。
 
 QQ快捷指令:
-/画图 <英文 Tag> [--pipeline base|rtx|iterative] - 合并转发
-/画图no <英文 Tag> [--pipeline base|rtx|iterative] - 直接图片
+/画图 <英文 Tag或画面描述> [--llm] [--pipeline base|rtx|iterative] - 合并转发
+/画图no <英文 Tag或画面描述> [--llm] [--pipeline base|rtx|iterative] - 直接图片
 /反推 [关注点] - 在线图片反推
 /反推画图 [补充要求] [--m p|d|l|r] - 反推并可接底图控制生成
 /改图 [要求] - 无蒙版整图修改；支持换衣、换背景、换表情或重新画一张
@@ -3561,6 +3564,8 @@ QQ快捷指令:
 /anima draw 她在雨夜回头看向镜头 --pipeline rtx --seed 123
 /anima draw 用风格001画达妮娅，不放大
 /anima draw 1girl, white hair, blue eyes --raw --pipeline iterative --preset 风格001
+/画图 一名蓝发少女在海边浅水中拿着烟花 --llm --p r
+/画图no 1girl, blue hair, portrait --raw --p b
 /底图控制 画成雨夜中的角色 --m p d --p r
 /底图控制 构图和姿势不变，用风格001-1画出来
 /底图控制 按线稿完成上色 --m l --p b
@@ -4539,6 +4544,12 @@ QQ快捷指令:
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
             return
+        use_prompt_llm = parsed_options.use_prompt_llm is True
+        if use_prompt_llm and not self._director:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} LLM 提示词优化不可用: {self._director_error}"
+            )
+            return
         if parsed_options.control_modes:
             async for response in self._handle_control_draw(
                 event,
@@ -4548,7 +4559,7 @@ QQ快捷指令:
                     width=width,
                     height=height,
                     lora_preset=preset_name,
-                    use_prompt_llm=False,
+                    use_prompt_llm=use_prompt_llm,
                 ),
             ):
                 yield response
@@ -4556,7 +4567,9 @@ QQ快捷指令:
         prompt = prompt.strip()
         if not prompt:
             command = "/画图" if forward else "/画图no"
-            yield event.plain_result(f"{MessageEmoji.ERROR} 用法: {command} <英文 Tag>")
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 用法: {command} <英文 Tag或画面描述> [--llm]"
+            )
             return
         if len(prompt) > self.settings.max_prompt_length:
             yield event.plain_result(
@@ -4574,13 +4587,24 @@ QQ快捷指令:
             )
             return
         if self.settings.send_generation_notice:
-            yield event.plain_result(f"{MessageEmoji.DRAW} 已提交 ComfyUI，请稍候……")
+            notice = (
+                "正在使用绘图导演优化提示词并生成……"
+                if use_prompt_llm
+                else "已提交 ComfyUI，请稍候……"
+            )
+            yield event.plain_result(f"{MessageEmoji.DRAW} {notice}")
         try:
-            image_paths, seed, _, _, _ = await self._run_job(
+            (
+                image_paths,
+                seed,
+                effective_prompt,
+                provider_id,
+                director_warning,
+            ) = await self._run_job(
                 event,
                 GenerationOptions(
                     prompt=prompt,
-                    use_prompt_llm=False,
+                    use_prompt_llm=use_prompt_llm,
                     lora_preset=preset_name,
                     width=width,
                     height=height,
@@ -4601,6 +4625,15 @@ QQ快捷指令:
             message = getattr(exc, "user_message", str(exc))
             yield event.plain_result(f"{MessageEmoji.ERROR} 生成失败: {message}")
             return
+        if director_warning:
+            yield event.plain_result(
+                f"{MessageEmoji.WARNING} {director_warning}，已改用原始提示词"
+            )
+        if self.settings.show_llm_prompt and provider_id:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 提示词优化模型: {provider_id}\n"
+                f"最终提示词: {effective_prompt}"
+            )
         yield self._make_image_result(event, image_paths, seed, forward=forward)
         self._schedule_cleanup(image_paths)
 

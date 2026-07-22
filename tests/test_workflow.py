@@ -574,6 +574,24 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
         self.assertEqual(result.cfg, 5.0)
         self.assertEqual(result.lora_preset, "风格2")
 
+    def test_generation_llm_and_raw_switches_are_explicit(self) -> None:
+        optimized = parse_generation_options(
+            "蓝发少女在海边看烟花 --llm",
+            mode_context="generation",
+        )
+        short_optimized = parse_generation_options(
+            "蓝发少女在海边看烟花 --l",
+            mode_context="generation",
+        )
+        raw = parse_generation_options(
+            "1girl, blue hair --raw",
+            mode_context="generation",
+        )
+
+        self.assertTrue(optimized.use_prompt_llm)
+        self.assertTrue(short_optimized.use_prompt_llm)
+        self.assertFalse(raw.use_prompt_llm)
+
 
 if __name__ == "__main__":
     unittest.main()
