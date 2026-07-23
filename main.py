@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.6
+AstrBot Comfy Anima 插件 v1.5.7
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.5.6
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.6
+版本: 1.5.7
 日期: 2026-07-21
 """
 
@@ -7481,7 +7481,14 @@ QQ快捷指令:
             if raw is None:
                 return None
             values = raw[0] if isinstance(raw, list) and raw else []
-            return {str(value) for value in values} if isinstance(values, list) else None
+            return (
+                {
+                    str(value).strip().replace("\\", "/")
+                    for value in values
+                }
+                if isinstance(values, list)
+                else None
+            )
 
         model_choices = {
             "UNETLoader": choices("UNETLoader", "unet_name"),
@@ -7581,17 +7588,21 @@ QQ快捷指令:
                     model_name = str(inputs.get(input_name) or "").strip()
                     if node_type == "UNETLoader" and self.settings.unet_model_name:
                         model_name = self.settings.unet_model_name
+                    model_choice = model_name.replace("\\", "/")
                     available = model_choices.get(node_type)
                     if model_name and available is None:
                         missing_models.append(f"{node_type}:choices-unavailable")
-                    elif model_name and model_name not in available:
+                    elif model_name and model_choice not in available:
                         missing_models.append(f"{node_type}:{model_name}")
                     if node_type == "CLIPLoader":
                         clip_type = str(inputs.get("type") or "").strip()
                         type_choices = model_choices.get("CLIPLoader.type")
                         if clip_type and type_choices is None:
                             missing_models.append("CLIPLoader.type:choices-unavailable")
-                        elif clip_type and clip_type not in type_choices:
+                        elif (
+                            clip_type
+                            and clip_type.replace("\\", "/") not in type_choices
+                        ):
                             missing_models.append(f"CLIPLoader.type:{clip_type}")
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 local_error = str(exc)

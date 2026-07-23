@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [1.5.7] - 2026-07-23
+
+### Windows ComfyUI 控制模型依赖检查修复
+
+- 修复 `.34` Windows ComfyUI 将 ControlNet 子目录模型枚举为 `Anima\\文件名`，而插件工作流使用 `Anima/文件名` 时被错误标记为四个 LLLite 模型缺失的问题。
+- 工作流依赖检查现在统一模型枚举和工作流输入中的目录分隔符后再比较；不会更改实际提交给 ComfyUI 的工作流模型名。
+- 已确认 `.34` 的四个目标文件真实存在于 `models/controlnet/Anima/`，`ComfyUI-Anima-LLLite` 节点正常导入，并且 ComfyUI `folder_paths` 对正斜杠和反斜杠都能解析到同一文件。
+- 增加 Windows 反斜杠 `object_info` 模型枚举回归测试。
+
 ## [1.5.6] - 2026-07-23
 
 ### Danbooru Tags 撇号与转义字符解析修复

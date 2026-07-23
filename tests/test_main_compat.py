@@ -2997,10 +2997,10 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
                     "input": {
                         "required": {
                             "lllite_name": [[
-                                "Anima/anima-lllite-pose-1.safetensors",
-                                "Anima/anima-lllite-depth-1.safetensors",
-                                "Anima/anima-lllite-lineart-1.safetensors",
-                                "Anima/anima-lllite-any-test-like-v2.safetensors",
+                                "Anima\\anima-lllite-pose-1.safetensors",
+                                "Anima\\anima-lllite-depth-1.safetensors",
+                                "Anima\\anima-lllite-lineart-1.safetensors",
+                                "Anima\\anima-lllite-any-test-like-v2.safetensors",
                             ], {}]
                         }
                     }
@@ -3022,6 +3022,9 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         plugin._client = Client()
         result = await plugin.web_ui_check_workflows()
         self.assertEqual(result["ready_count"], 8)
+        control = next(item for item in result["items"] if item["id"] == "control")
+        self.assertEqual(control["status"], "ready")
+        self.assertEqual(control["missing_models"], [])
 
         object_info.pop("LanPaint_MaskBlend")
         degraded = await plugin.web_ui_check_workflows()
