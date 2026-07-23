@@ -592,6 +592,34 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
         self.assertTrue(short_optimized.use_prompt_llm)
         self.assertFalse(raw.use_prompt_llm)
 
+    def test_generation_parser_preserves_danbooru_apostrophes_and_escapes(
+        self,
+    ) -> None:
+        result = parse_generation_options(
+            r"风格1011 kei \(blue archive\), kei \(student\) \(blue archive\), "
+            r"1girl, foot focus, worm's eye view --l",
+            mode_context="generation",
+        )
+
+        self.assertTrue(result.use_prompt_llm)
+        self.assertIn(r"kei \(blue archive\)", result.prompt)
+        self.assertIn("worm's eye view", result.prompt)
+
+    def test_generation_parser_allows_apostrophe_inside_quoted_option_value(
+        self,
+    ) -> None:
+        result = parse_generation_options(
+            'portrait --negative "artist\'s signature, bad hands" --preset "风格 1"'
+        )
+
+        self.assertEqual(result.prompt, "portrait")
+        self.assertEqual(result.negative_prompt, "artist's signature, bad hands")
+        self.assertEqual(result.lora_preset, "风格 1")
+
+    def test_generation_parser_still_rejects_unclosed_explicit_quote(self) -> None:
+        with self.assertRaisesRegex(ValueError, "参数引号不完整"):
+            parse_generation_options('portrait --negative "bad hands')
+
 
 if __name__ == "__main__":
     unittest.main()

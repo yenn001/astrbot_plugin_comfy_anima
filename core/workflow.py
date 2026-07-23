@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.5.5
+AstrBot Comfy Anima 插件 v1.5.6
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.5.5
+版本: 1.5.6
 日期: 2026-07-21
 """
 
@@ -36,6 +36,29 @@ from .workflow_profiles import (
 
 class WorkflowError(ValueError):
     """工作流格式或节点映射无效。"""
+
+
+def _split_generation_command_tokens(command_text: str) -> list[str]:
+    """Split command options without treating prompt apostrophes as shell quotes.
+
+    Danbooru/Anima tags commonly contain English possessives such as
+    ``worm's eye view``. POSIX shlex treats the apostrophe in that bare token as
+    an opening quote and raises ``No closing quotation``. Non-POSIX mode keeps
+    apostrophes and backslashes literal while still grouping values wrapped in
+    matching single or double quotes.
+    """
+
+    try:
+        raw_tokens = shlex.split(command_text, posix=False)
+    except ValueError as exc:
+        raise ValueError(f"参数引号不完整: {exc}") from exc
+    tokens: list[str] = []
+    for token in raw_tokens:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
+            tokens.append(token[1:-1])
+        else:
+            tokens.append(token)
+    return tokens
 
 
 class WorkflowBuilder:
@@ -861,10 +884,7 @@ def parse_generation_options(
     ``semantic_redraw`` 时，`--mode` 改为解析 preserve/balanced/free。
     含空格的负面词需要使用引号。
     """
-    try:
-        tokens = shlex.split(command_text, posix=True)
-    except ValueError as exc:
-        raise ValueError(f"参数引号不完整: {exc}") from exc
+    tokens = _split_generation_command_tokens(command_text)
     alias_context = {
         "generation": CONTEXT_GENERATION,
         "inpaint": CONTEXT_INPAINT,

@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-07-23
+
+### Danbooru Tags 撇号与转义字符解析修复
+
+- 修复 `/画图`、`/画图no`、`/anima draw` 及复用生成参数解析器的命令把 `worm's eye view`、`bird's-eye view` 等 Tag 中英文撇号误判为未闭合 shell 引号的问题。
+- 参数 tokenizer 改为保留裸文本中的单引号和反斜杠，因此 `kei \(blue archive\)` 等 Danbooru 转义写法不再被改写。
+- 仍支持 `--negative "bad hands, text"`、`--preset "风格 1"` 等成对引号参数，并继续拒绝真正未闭合的显式引号。
+- 增加用户原始命令形态、带撇号参数值和未闭合引号回归测试。
+
 ## [1.5.5] - 2026-07-23
 
 ### `/画图 --llm` 协议兼容修复
