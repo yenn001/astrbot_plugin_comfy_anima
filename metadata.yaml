@@ -1,5 +1,5 @@
 name: astrbot_plugin_comfy_anima
 desc: Anima 专用 ComfyUI 底图控制、三管线绘图、整图改图、遮罩重绘、语义换角、LoRA 管理、UNET 切换和 LLM 分镜
 author: Yen
-version: 1.5.4
+version: 1.5.5
 repo: "https://github.com/yenn001/astrbot_plugin_comfy_anima"

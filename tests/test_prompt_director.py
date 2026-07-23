@@ -543,6 +543,53 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.calls, 2)
         self.assertEqual(instruction.prompt, "1girl, portrait")
 
+    async def test_auto_mode_repair_drops_ignored_output_tool_and_uses_pic(self) -> None:
+        director = self._director(structured_director_mode="auto")
+        output_tools = object()
+
+        class Context:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.calls.append(dict(kwargs))
+                if len(self.calls) == 1:
+                    return type(
+                        "Response",
+                        (),
+                        {"completion_text": "Here is the optimized drawing prompt."},
+                    )()
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": (
+                            '<pic prompt="1girl, blue hair, beach, night. '
+                            'She watches the waves under moonlight." pipeline="rtx">'
+                        )
+                    },
+                )()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw a blue-haired girl at the beach",
+            output_tools=output_tools,
+        )
+
+        self.assertEqual(len(context.calls), 2)
+        self.assertIs(context.calls[0]["tools"], output_tools)
+        self.assertNotIn("tools", context.calls[1])
+        self.assertNotIn(
+            "Runtime structured-output override",
+            str(context.calls[1]["system_prompt"]),
+        )
+        self.assertIn("Return exactly one", str(context.calls[1]["prompt"]))
+        self.assertIn("<pic prompt=", str(context.calls[1]["prompt"]))
+        self.assertEqual(instruction.pipeline, "rtx")
+        self.assertIn("She watches the waves", instruction.prompt)
+
 
 class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

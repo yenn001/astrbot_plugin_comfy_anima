@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-07-23
+
+### `/画图 --llm` 协议兼容修复
+
+- 修复 `structured_director_mode=auto` 在 Provider 忽略 Function Calling 时，第二次修复仍重复携带同一输出工具、从而连续触发 `invalid_picture_protocol` 的问题。
+- 首次 Function Call 无法解析时，第二次请求会移除输出工具和临时 Function Calling 覆盖，改用严格的单一 `<pic>` 标签协议；安全校验仍然保持失败关闭。
+- `/画图` 与 `/画图no` 现在会捕获 `PromptDirectorError` 并返回可读的中文错误，不再让 AstrBot 把内部错误码显示成处理函数异常。
+- 增加自动协议降级与命令层异常边界回归测试。
+
 ## [1.5.4] - 2026-07-23
 
 ### `/画图 --llm` 可选提示词优化

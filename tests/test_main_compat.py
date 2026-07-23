@@ -301,6 +301,51 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertIn("LLM 提示词优化不可用", replies[0])
         self.assertIn("provider missing", replies[0])
 
+    def test_direct_draw_reports_prompt_protocol_failure_without_handler_crash(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_prompt_length=6000,
+            send_generation_notice=False,
+            show_llm_prompt=False,
+        )
+        plugin._director = object()
+        plugin._director_error = ""
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        async def run_job(_event, _options):
+            raise self.main.PromptDirectorError(
+                "绘图模型连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI",
+                "invalid_picture_protocol",
+                fatal=True,
+            )
+
+        plugin._run_job = run_job
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "画一名少女 --llm",
+                    forward=True,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("提示词优化失败", replies[0])
+        self.assertIn("连续两次", replies[0])
+        self.assertNotIn("invalid_picture_protocol", replies[0])
+
     def test_natural_draw_detection_is_conservative(self) -> None:
         detector = self.main.ComfyAnimaPlugin._looks_like_draw_request
         self.assertTrue(detector("帮我画一个雨夜里的猫娘"))

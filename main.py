@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.4
+AstrBot Comfy Anima 插件 v1.5.5
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.5.4
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.4
+版本: 1.5.5
 日期: 2026-07-21
 """
 
@@ -1449,7 +1449,7 @@ class ComfyAnimaPlugin(Star):
     async def cmd_draw_forward(
         self, event: AstrMessageEvent, prompt: str = ""
     ) -> AsyncGenerator[Any, None]:
-        """直接使用英文 Tag，并以 QQ 合并转发发送图片。"""
+        """直接使用 Tags，或显式启用 LLM 优化后以 QQ 合并转发发送图片。"""
         command_text = self._extract_command_text(
             event.message_str, prompt, command="画图"
         )
@@ -4619,6 +4619,12 @@ QQ快捷指令:
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except PromptDirectorError as exc:
+            logger.error(f"[{PLUGIN_NAME}] 直接出图提示词优化失败: {exc}", exc_info=True)
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 提示词优化失败: {exc.user_message}"
+            )
             return
         except (ComfyClientError, WorkflowError) as exc:
             logger.error(f"[{PLUGIN_NAME}] 直接出图失败: {exc}", exc_info=True)

@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.5.4
+AstrBot Comfy Anima 插件 v1.5.5
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.5.4
+版本: 1.5.5
 日期: 2026-07-21
 """
 
@@ -284,10 +284,11 @@ class PromptDirector:
         structured_mode = str(
             getattr(self._settings, "structured_director_mode", "auto") or "auto"
         ).casefold()
-        user_prompt = (
+        base_user_prompt = (
             "请把下面的剧情或画面需求导演成一张图。只返回规定的 pic 标签。\n\n"
             f"用户内容：\n{scene_text.strip()}"
         )
+        user_prompt = base_user_prompt
         if output_tools is not None:
             user_prompt += (
                 "\n\nUse the emit_anima_plan_v1 function exactly once. Put the final "
@@ -301,7 +302,8 @@ class PromptDirector:
                 "\n\nReturn exactly one JSON object with positive_tags, negative_tags "
                 "and pipeline fields."
             )
-        system_prompt = self._system_prompt()
+        base_system_prompt = self._system_prompt()
+        system_prompt = base_system_prompt
         if output_tools is not None:
             system_prompt += (
                 "\n\nRuntime structured-output override: for this request only, call "
@@ -319,7 +321,12 @@ class PromptDirector:
         uses_lora_tools = tools is not None
         tool_call_timeout = 0
         request_timeout = self._settings.prompt_llm_timeout
-        async def invoke(active_prompt: str) -> Any:
+        async def invoke(
+            active_prompt: str,
+            *,
+            include_output_tools: bool = True,
+        ) -> Any:
+            use_output_tools = include_output_tools and output_tools is not None
             if uses_lora_tools:
                 if not hasattr(context, "tool_loop_agent"):
                     raise PromptDirectorError(
@@ -341,8 +348,14 @@ class PromptDirector:
                     timeout=request_timeout,
                 )
             elif hasattr(context, "llm_generate"):
-                llm_kwargs = {**kwargs, "prompt": active_prompt}
-                if output_tools is not None:
+                llm_kwargs = {
+                    **kwargs,
+                    "prompt": active_prompt,
+                    "system_prompt": (
+                        system_prompt if use_output_tools else base_system_prompt
+                    ),
+                }
+                if use_output_tools:
                     llm_kwargs["tools"] = output_tools
                 try:
                     response = await asyncio.wait_for(
@@ -353,9 +366,17 @@ class PromptDirector:
                         timeout=self._settings.prompt_llm_timeout,
                     )
                 except TypeError:
-                    if output_tools is None or structured_mode != "auto":
+                    if not use_output_tools or structured_mode != "auto":
                         raise
                     llm_kwargs.pop("tools", None)
+                    llm_kwargs["prompt"] = (
+                        base_user_prompt
+                        + "\n\nReturn exactly one "
+                        '<pic prompt="English Anima tags. One concise scene sentence."> '
+                        "tag and nothing else. Do not return Markdown, explanation or "
+                        "plain conversational text."
+                    )
+                    llm_kwargs["system_prompt"] = base_system_prompt
                     response = await asyncio.wait_for(
                         context.llm_generate(
                             chat_provider_id=provider_id,
@@ -490,9 +511,19 @@ class PromptDirector:
                         fatal=True,
                     ) from exc
                 first_error = exc
+                auto_protocol_fallback = (
+                    output_tools is not None and structured_mode == "auto"
+                )
                 repair_prompt = (
-                    user_prompt
+                    (base_user_prompt if auto_protocol_fallback else user_prompt)
                     + (
+                        "\n\nYour previous response was invalid. Return exactly one "
+                        '<pic prompt="English Anima tags. One concise scene sentence." '
+                        'negative="optional English negative tags" '
+                        'pipeline="base|rtx|iterative"> tag and nothing else. '
+                        "Do not return an error message, explanation, Markdown or plain text."
+                        if auto_protocol_fallback
+                        else
                         "\n\nYour previous response was invalid. Call "
                         "emit_anima_plan_v1 exactly once with valid JSON arguments. "
                         "positive_tags must contain ordered English tags followed by a "
@@ -505,7 +536,10 @@ class PromptDirector:
                     )
                 )
                 try:
-                    response = await invoke(repair_prompt)
+                    response = await invoke(
+                        repair_prompt,
+                        include_output_tools=not auto_protocol_fallback,
+                    )
                 except asyncio.TimeoutError as retry_exc:
                     raise PromptDirectorError(
                         "绘图模型修复重试超时，已停止且不会提交 ComfyUI",
