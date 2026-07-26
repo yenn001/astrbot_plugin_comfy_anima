@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from ..models import PluginSettings
 from ..services.lora_downloader import (
     CivitaiUrlError,
+    LoraDownloadError,
     LoraDownloadService,
     parse_civitai_model_url,
 )
@@ -65,12 +66,23 @@ class CivitaiUrlTests(unittest.TestCase):
 
 
 class _FakeCatalog:
-    def __init__(self, events: list[str], result: str = "清单已刷新"):
+    def __init__(
+        self,
+        events: list[str],
+        result: str = "清单已刷新",
+        *,
+        fail_on_call: Optional[int] = None,
+    ):
         self.events = events
         self.result = result
+        self.fail_on_call = fail_on_call
+        self.calls = 0
 
     async def refresh_summary(self) -> str:
+        self.calls += 1
         self.events.append("catalog")
+        if self.calls == self.fail_on_call:
+            raise LoraDownloadError("双源清单刷新失败")
         return self.result
 
 
@@ -82,6 +94,9 @@ class _FakeDownloader(LoraDownloadService):
         item_pages: list[list[dict[str, Any]]],
         metadata_result: tuple[bool, str] = (True, "元数据已更新"),
         catalog: Optional[_FakeCatalog] = None,
+        download_payload: Optional[dict[str, Any]] = None,
+        scan_fail_on_call: Optional[int] = None,
+        list_fail_on_call: Optional[int] = None,
     ):
         settings = PluginSettings.from_mapping(
             {
@@ -93,6 +108,12 @@ class _FakeDownloader(LoraDownloadService):
         self.versions = versions
         self.item_pages = list(item_pages)
         self.metadata_result = metadata_result
+        self.download_payload = download_payload or {"success": True}
+        self.scan_fail_on_call = scan_fail_on_call
+        self.list_fail_on_call = list_fail_on_call
+        self.scan_calls = 0
+        self.list_calls = 0
+        self.metadata_paths: list[str] = []
         super().__init__(settings, catalog or _FakeCatalog(self.events))
 
     async def _fetch_versions(self, model_id: int) -> list[dict[str, Any]]:
@@ -100,7 +121,10 @@ class _FakeDownloader(LoraDownloadService):
         return self.versions
 
     async def _fetch_manager_items(self) -> list[dict[str, Any]]:
+        self.list_calls += 1
         self.events.append("list")
+        if self.list_calls == self.list_fail_on_call:
+            raise LoraDownloadError("Manager 清单读取失败")
         if not self.item_pages:
             return []
         return self.item_pages.pop(0)
@@ -112,13 +136,17 @@ class _FakeDownloader(LoraDownloadService):
         download_id: str,
     ) -> dict[str, Any]:
         self.events.append("download-complete")
-        return {"success": True, "download_id": download_id}
+        return {**self.download_payload, "download_id": download_id}
 
     async def _scan_manager(self) -> None:
+        self.scan_calls += 1
         self.events.append("scan")
+        if self.scan_calls == self.scan_fail_on_call:
+            raise LoraDownloadError("Manager 扫描失败")
 
     async def _fetch_civitai_metadata(self, file_path: str) -> tuple[bool, str]:
         self.events.append("metadata")
+        self.metadata_paths.append(file_path)
         return self.metadata_result
 
 
@@ -163,6 +191,7 @@ class LoraDownloadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             downloader.events,
             [
+                "catalog",
                 "scan",
                 "versions",
                 "list",
@@ -202,8 +231,112 @@ class LoraDownloadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("download-complete", downloader.events)
         self.assertEqual(
             downloader.events,
-            ["scan", "versions", "list", "metadata", "catalog"],
+            ["catalog", "scan", "versions", "list", "metadata", "catalog"],
         )
+
+    async def test_download_stops_when_fresh_dual_source_catalog_fails(self) -> None:
+        downloader = _FakeDownloader(
+            versions=[_version(20, "2026-06-01T00:00:00Z", "新版")],
+            item_pages=[[]],
+        )
+        downloader._catalog = _FakeCatalog(
+            downloader.events,
+            fail_on_call=1,
+        )
+
+        with self.assertRaises(LoraDownloadError) as raised:
+            await downloader.download_from_url(
+                "https://civitai.com/models/123?modelVersionId=20"
+            )
+
+        self.assertIn("下载前刷新", raised.exception.user_message)
+        self.assertEqual(downloader.events, ["catalog"])
+
+    async def test_post_download_scan_failure_is_not_ready(self) -> None:
+        downloader = _FakeDownloader(
+            versions=[_version(20, "2026-06-01T00:00:00Z", "新版")],
+            item_pages=[[]],
+            scan_fail_on_call=2,
+        )
+
+        with self.assertRaises(LoraDownloadError) as raised:
+            await downloader.download_from_url(
+                "https://civitai.com/models/123?modelVersionId=20"
+            )
+
+        self.assertIn("当前未就绪", raised.exception.user_message)
+        self.assertNotIn("metadata", downloader.events)
+        self.assertEqual(
+            downloader.events,
+            ["catalog", "scan", "versions", "list", "download-complete", "scan"],
+        )
+
+    async def test_post_download_list_failure_is_not_ready(self) -> None:
+        downloader = _FakeDownloader(
+            versions=[_version(20, "2026-06-01T00:00:00Z", "新版")],
+            item_pages=[[]],
+            list_fail_on_call=2,
+        )
+
+        with self.assertRaises(LoraDownloadError) as raised:
+            await downloader.download_from_url(
+                "https://civitai.com/models/123?modelVersionId=20"
+            )
+
+        self.assertIn("当前未就绪", raised.exception.user_message)
+        self.assertNotIn("metadata", downloader.events)
+
+    async def test_download_response_file_path_cannot_bypass_fresh_list(self) -> None:
+        raw_path = "E:/ComfyUI/models/loras/unverified.safetensors"
+        downloader = _FakeDownloader(
+            versions=[_version(20, "2026-06-01T00:00:00Z", "新版")],
+            item_pages=[[], []],
+            download_payload={"success": True, "file_path": raw_path},
+        )
+
+        with self.assertRaises(LoraDownloadError) as raised:
+            await downloader.download_from_url(
+                "https://civitai.com/models/123?modelVersionId=20"
+            )
+
+        self.assertIn("未找到唯一精确文件", raised.exception.user_message)
+        self.assertEqual(downloader.metadata_paths, [])
+
+    async def test_success_uses_only_unique_exact_refreshed_file(self) -> None:
+        target = _item(123, 20)
+        downloader = _FakeDownloader(
+            versions=[_version(20, "2026-06-01T00:00:00Z", "新版")],
+            item_pages=[[], [_item(999, 77), target]],
+        )
+
+        result = await downloader.download_from_url(
+            "https://civitai.com/models/123?modelVersionId=20"
+        )
+
+        self.assertTrue(result.downloaded)
+        self.assertEqual(result.file_path, target["file_path"])
+        self.assertEqual(downloader.metadata_paths, [target["file_path"]])
+
+    async def test_ambiguous_exact_files_stop_before_metadata(self) -> None:
+        first = _item(123, 20)
+        second = {
+            **_item(123, 20),
+            "file_name": "duplicate-model-20",
+            "file_path": "E:/ComfyUI/models/loras/duplicate-model-20.safetensors",
+        }
+        downloader = _FakeDownloader(
+            versions=[_version(20, "2026-06-01T00:00:00Z", "新版")],
+            item_pages=[[first, second]],
+        )
+
+        with self.assertRaises(LoraDownloadError) as raised:
+            await downloader.download_from_url(
+                "https://civitai.com/models/123?modelVersionId=20"
+            )
+
+        self.assertIn("多个精确匹配文件", raised.exception.user_message)
+        self.assertNotIn("metadata", downloader.events)
+        self.assertNotIn("download-complete", downloader.events)
 
     async def test_download_payload_uses_manager_default_paths(self) -> None:
         settings = PluginSettings.from_mapping(

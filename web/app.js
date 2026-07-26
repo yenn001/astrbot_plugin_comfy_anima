@@ -34,6 +34,22 @@ let taskDetailLoading = false;
 let activeTaskRestoreChecked = false;
 let currentLoraDetailName = "";
 let currentUiTheme = "workshop";
+let promptStatusData = null;
+let experimentalProfileItems = [];
+let promptActiveTab = "composer";
+let promptAssetItems = [];
+let promptAssetPage = 1;
+let promptAssetPages = 1;
+let promptAssetFingerprint = "";
+let promptLabBatch = null;
+let promptLabSelection = "";
+let promptLabUseComposerBase = true;
+let loraViewMode = "table";
+let loraGalleryItems = [];
+let loraGalleryPage = 1;
+let loraGalleryPages = 1;
+let loraGalleryFingerprint = "";
+let loraPreviewObserver = null;
 const taskLatestEvents = new Map();
 const volatilePreferences = new Map();
 const volatileSessionPreferences = new Map();
@@ -48,6 +64,7 @@ const panelTitles = {
   models: "UNET 模型",
   tasks: "任务中心",
   console: "运行控制台",
+  prompt: "提示词工坊",
 };
 
 const consoleCategoryLabels = {
@@ -139,6 +156,13 @@ const taskTypeLabels = {
   semantic_redraw: "整图语义重绘",
   rtx_upscale: "RTX 放大",
   inpaint: "遮罩局部重绘",
+  danbooru_index_update: "Danbooru 索引更新",
+  prompt_diagnostic: "提示词诊断",
+  prompt_asset_import: "视觉素材导入",
+  prompt_asset_remote_import: "视觉素材远程更新",
+  prompt_asset_local_sync: "本地素材同步",
+  prompt_lab_generate: "Prompt Lab 候选",
+  lora_visual_warmup: "LoRA 缩略图预热",
 };
 
 const activeTaskStatuses = new Set(["queued", "running"]);
@@ -169,6 +193,9 @@ const numberFields = new Set([
   "sampler_steps_override",
   "web_ui_port",
   "web_ui_session_ttl",
+  "prompt_diagnostics_capacity",
+  "danbooru_index_timeout",
+  "danbooru_index_max_size_mb",
 ]);
 
 const booleanFields = new Set([
@@ -178,6 +205,9 @@ const booleanFields = new Set([
   "enable_prompt_llm",
   "enable_natural_draw",
   "enable_llm_pic_trigger",
+  "enable_prompt_composer_v2",
+  "enable_prompt_diagnostics",
+  "prompt_diagnostics_include_content",
   "enable_reverse_prompt",
   "enable_reverse_json_formatter",
   "enable_reverse_json_repair_retry",
@@ -1640,7 +1670,8 @@ async function refreshLoras() {
   try {
     const data = await api("/api/loras/refresh", {method: "POST"});
     showToast(data.message);
-    await searchLoras(null);
+    if (loraViewMode === "gallery") await loadLoraGallery({quiet: true});
+    else await searchLoras(null);
   } catch (error) {
     showToast(error.message, true);
   } finally {
@@ -2708,14 +2739,1429 @@ async function clearConsoleLogs() {
   }
 }
 
+function promptValueList(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  if (value === null || value === undefined || value === "") return [];
+  return [String(value).trim()].filter(Boolean);
+}
+
+function promptNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function promptTimestamp(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 10_000_000_000 ? numeric : numeric * 1000)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", {hour12: false});
+}
+
+function promptStatusPart(data, ...keys) {
+  for (const key of keys) {
+    const value = data?.[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  }
+  return {};
+}
+
+function promptDiagnosticItems(data) {
+  if (Array.isArray(data?.diagnostics)) return data.diagnostics;
+  const diagnostics = promptStatusPart(data, "diagnostics", "memory_diagnostics");
+  for (const value of [
+    diagnostics.items,
+    diagnostics.records,
+    diagnostics.recent,
+    data?.recent_diagnostics,
+    data?.diagnostic_items,
+  ]) {
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+
+function appendPromptValueList(container, values, emptyText = "无") {
+  const items = promptValueList(values);
+  if (!items.length) {
+    const empty = document.createElement("span");
+    empty.className = "prompt-empty-value";
+    empty.textContent = emptyText;
+    container.append(empty);
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "prompt-token-list";
+  for (const value of items) list.append(chip(value));
+  container.append(list);
+}
+
+function promptResultSection(title, values, {wide = false, code = false, emptyText = "无"} = {}) {
+  const section = document.createElement("section");
+  section.className = `prompt-result-section${wide ? " wide" : ""}${code ? " code-section" : ""}`;
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  section.append(heading);
+  if (code) {
+    const pre = document.createElement("pre");
+    pre.textContent = String(values || emptyText);
+    section.append(pre);
+  } else {
+    appendPromptValueList(section, values, emptyText);
+  }
+  return section;
+}
+
+function renderPromptDiagnosticHistory(items) {
+  const container = document.querySelector("#prompt-diagnostic-history");
+  container.replaceChildren();
+  const records = Array.isArray(items) ? items : [];
+  if (!records.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state compact-empty";
+    empty.textContent = "暂无诊断记录。";
+    container.append(empty);
+    return;
+  }
+  for (const record of records.slice(0, 24)) {
+    const article = document.createElement("article");
+    article.className = "prompt-history-item";
+    const head = document.createElement("div");
+    head.className = "prompt-history-head";
+    const title = document.createElement("strong");
+    const identifier = String(record.diagnostic_id || record.id || "diagnostic");
+    title.textContent = `${record.source || "runtime"} · ${identifier.slice(0, 10)}`;
+    const time = document.createElement("time");
+    time.textContent = promptTimestamp(record.created_at || record.timestamp);
+    head.append(title, time);
+    const summary = document.createElement("p");
+    const warnings = promptNumber(
+      record.validation_warning_count,
+      promptValueList(record.validation_warnings || record.warnings).length,
+    );
+    const conflicts = promptNumber(
+      record.conflict_count,
+      promptValueList(record.conflicts).length,
+    );
+    const unknown = promptNumber(
+      record.unknown_tag_count,
+      promptValueList(record.unknown_tags).length,
+    );
+    const adaptive = promptNumber(
+      record.adaptive_negative_count,
+      promptValueList(record.adaptive_negative_added).length,
+    );
+    summary.textContent = `冲突 ${conflicts} · 未知 ${unknown} · 警告 ${warnings} · 动态负面 ${adaptive}`;
+    article.append(head, summary);
+    container.append(article);
+  }
+}
+
+function renderPromptStatus(data) {
+  promptStatusData = data || {};
+  const composer = promptStatusPart(data, "composer", "prompt_composer");
+  const index = promptStatusPart(data, "danbooru", "danbooru_index", "index");
+  const diagnostics = promptStatusPart(data, "diagnostics", "memory_diagnostics");
+  const settings = bootstrapData?.settings || {};
+  const composerEnabled = composer.enabled ?? data?.enable_prompt_composer_v2 ?? settings.enable_prompt_composer_v2;
+  const negativeMode = composer.adaptive_negative_mode || data?.adaptive_negative_mode || settings.adaptive_negative_mode || "off";
+  const validationMode = composer.validation_mode || data?.danbooru_validation_mode || settings.danbooru_validation_mode || "off";
+  const effectiveValidationMode = composer.effective_validation_mode || validationMode;
+  const validationLabel = composer.guarded_degraded_to_report
+    ? `${validationMode}->${effectiveValidationMode}`
+    : validationMode;
+  const indexReady = Boolean(index.ready);
+  const tagCount = promptNumber(index.tag_count ?? index.tags);
+  const aliasCount = promptNumber(index.alias_count ?? index.aliases);
+  const diagnosticItems = promptDiagnosticItems(data);
+  const diagnosticCount = promptNumber(
+    diagnostics.count ?? diagnostics.size ?? composer.count,
+    diagnosticItems.length,
+  );
+  const diagnosticCapacity = promptNumber(
+    diagnostics.capacity ?? diagnostics.max_items ?? composer.capacity ?? data?.prompt_diagnostics_capacity,
+    settings.prompt_diagnostics_capacity || 0,
+  );
+
+  document.querySelector("#prompt-composer-state").textContent = composerEnabled ? "ON" : "OFF";
+  document.querySelector("#prompt-composer-detail").textContent = `负面词 ${negativeMode} · 校验 ${validationLabel}`;
+  document.querySelector("#prompt-index-state").textContent = indexReady ? "READY" : "EMPTY";
+  document.querySelector("#prompt-index-detail").textContent = indexReady
+    ? `${tagCount.toLocaleString()} Tags · ${aliasCount.toLocaleString()} Aliases`
+    : (index.error || "尚未导入本地索引");
+  document.querySelector("#prompt-diagnostic-count").textContent = diagnosticCount.toLocaleString();
+  document.querySelector("#prompt-diagnostic-capacity").textContent = diagnosticCapacity
+    ? `内存上限 ${diagnosticCapacity} 条 · 重载清空`
+    : "仅保存在内存";
+  document.querySelector("#prompt-index-badge").textContent = indexReady ? "READY" : "NOT READY";
+  document.querySelector("#prompt-index-tags").textContent = tagCount.toLocaleString();
+  document.querySelector("#prompt-index-aliases").textContent = aliasCount.toLocaleString();
+  document.querySelector("#prompt-index-revision").textContent = index.revision || index.version || "—";
+  document.querySelector("#prompt-index-updated").textContent = promptTimestamp(index.imported_at || index.updated_at);
+  document.querySelector("#prompt-index-source").textContent = index.source || index.url || settings.danbooru_index_url || "尚未配置或导入";
+  const categories = index.category_counts || index.categories || {};
+  document.querySelector("#prompt-index-categories").textContent = Object.keys(categories).length
+    ? Object.entries(categories).map(([name, count]) => `${name} ${promptNumber(count).toLocaleString()}`).join(" · ")
+    : "—";
+  document.querySelector("#prompt-index-status").textContent = index.error
+    ? `索引状态异常：${index.error}`
+    : (indexReady ? "本地索引可用；更新失败时仍会保留当前版本。" : "尚无可用索引；可先在设置中填写数据源 URL。 ");
+  renderPromptDiagnosticHistory(diagnosticItems);
+}
+
+function renderPromptDiagnostic(data) {
+  const result = data?.result || data?.composed || data || {};
+  const layers = Object.keys(promptStatusPart(result, "layers", "prompt_layers")).length
+    ? promptStatusPart(result, "layers", "prompt_layers")
+    : promptStatusPart(data, "layers", "prompt_layers");
+  const diagnostics = Object.keys(promptStatusPart(result, "diagnostics", "diagnostic")).length
+    ? promptStatusPart(result, "diagnostics", "diagnostic")
+    : promptStatusPart(data, "diagnostics", "diagnostic");
+  const identifier = String(result.diagnostic_id || diagnostics.diagnostic_id || data?.diagnostic_id || "");
+  const positive = result.positive_prompt || result.positive || result.prompt || "";
+  const negative = result.negative_prompt || result.negative || "";
+  const container = document.querySelector("#prompt-diagnostic-result");
+  container.replaceChildren();
+  document.querySelector("#prompt-result-id").textContent = identifier ? identifier.slice(0, 12) : "LOCAL RESULT";
+
+  container.append(
+    promptResultSection("最终正面提示词", positive, {wide: true, code: true, emptyText: "后端未返回完整内容；请检查“诊断包含完整提示词”设置。"}),
+    promptResultSection("最终负面提示词", negative, {wide: true, code: true, emptyText: "无负面提示词"}),
+    promptResultSection("LoRA 控制层", layers.lora_tags || result.lora_tags, {emptyText: "没有 LoRA 控制标签"}),
+    promptResultSection("硬 Tags", layers.hard_tags || result.hard_tags, {emptyText: "没有可分离的硬 Tags"}),
+    promptResultSection("视觉短语", layers.visual_phrases || result.visual_phrases, {emptyText: "没有柔性视觉短语"}),
+    promptResultSection("场景关系句", layers.scene_sentence || result.scene_sentence, {wide: true, code: true, emptyText: "没有识别到场景关系句"}),
+    promptResultSection("重复项已移除", diagnostics.duplicates_removed || result.duplicates_removed),
+    promptResultSection("冲突与丢弃", [
+      ...promptValueList(diagnostics.conflicts || result.conflicts),
+      ...promptValueList(diagnostics.discarded_tags || result.discarded_tags),
+    ]),
+    promptResultSection("自适应负面词", diagnostics.adaptive_negative_added || result.adaptive_negative_added),
+    promptResultSection("Danbooru 警告", [
+      ...promptValueList(diagnostics.unknown_tags || result.unknown_tags),
+      ...promptValueList(diagnostics.validation_warnings || result.validation_warnings),
+    ]),
+  );
+}
+
+async function loadPromptStatus({quiet = false} = {}) {
+  try {
+    const data = await api("/api/prompt/status");
+    renderPromptStatus(data);
+    return data;
+  } catch (error) {
+    document.querySelector("#prompt-index-status").textContent = `提示词状态读取失败：${error.message}`;
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+function renderExperimentalProfiles(data) {
+  const items = Array.isArray(data) ? data : (data?.items || data?.profiles || data?.results || []);
+  experimentalProfileItems = Array.isArray(items) ? items : [];
+  const readyCount = experimentalProfileItems.filter((item) => item.ready).length;
+  document.querySelector("#prompt-experiment-count").textContent = readyCount.toLocaleString();
+  const container = document.querySelector("#prompt-experiment-list");
+  container.replaceChildren();
+  if (!experimentalProfileItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state compact-empty";
+    empty.textContent = "没有返回实验能力定义。";
+    container.append(empty);
+    return;
+  }
+  for (const item of experimentalProfileItems) {
+    const article = document.createElement("article");
+    article.className = `prompt-experiment-item ${item.ready ? "ready" : "blocked"}`;
+    const head = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = item.label || item.name || item.id || "实验能力";
+    const badge = document.createElement("span");
+    badge.className = "ticket-tag";
+    badge.textContent = item.ready ? "READY" : "BLOCKED";
+    head.append(title, badge);
+    const missing = promptValueList(item.missing_nodes || item.missing);
+    const required = promptValueList(item.required_nodes || item.required);
+    const detail = document.createElement("p");
+    detail.textContent = missing.length
+      ? `缺少节点：${missing.join("、")}`
+      : (required.length ? `节点合同：${required.join("、")}` : "未声明节点合同");
+    article.append(head, detail);
+    const notes = promptValueList(item.notes);
+    if (notes.length) {
+      const note = document.createElement("small");
+      note.textContent = notes.join(" ");
+      article.append(note);
+    }
+    container.append(article);
+  }
+}
+
+async function loadExperimentalProfiles({quiet = false} = {}) {
+  const status = document.querySelector("#prompt-experiment-status");
+  status.textContent = "正在读取 ComfyUI 实验能力…";
+  try {
+    const data = await api("/api/experiments/check");
+    renderExperimentalProfiles(data);
+    status.textContent = data.message || "检查只读取实时节点与调度器，不会修改 ComfyUI。";
+    return data;
+  } catch (error) {
+    status.textContent = `实验能力检查失败：${error.message}`;
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+async function loadPromptWorkbench({quiet = false} = {}) {
+  await loadPromptStatus({quiet});
+  if (promptActiveTab === "assets") await loadPromptAssets({quiet});
+  if (promptActiveTab === "diagnostics") await loadExperimentalProfiles({quiet});
+}
+
+async function diagnosePrompt(event) {
+  event.preventDefault();
+  const button = document.querySelector("#prompt-diagnose");
+  const positive = document.querySelector("#prompt-diagnostic-positive").value.trim();
+  const negative = document.querySelector("#prompt-diagnostic-negative").value.trim();
+  const status = document.querySelector("#prompt-diagnostic-status");
+  if (!positive) {
+    status.textContent = "请先输入正面提示词。";
+    document.querySelector("#prompt-diagnostic-positive").focus();
+    return;
+  }
+  setBusy(button, true, "正在诊断…");
+  status.textContent = "正在执行本地分层、冲突与标签检查…";
+  try {
+    const data = await api("/api/prompt/diagnose", {
+      method: "POST",
+      body: JSON.stringify({prompt: positive, negative_prompt: negative}),
+    });
+    renderPromptDiagnostic(data);
+    status.textContent = data.message || "本地诊断完成；未调用 LLM，未提交 ComfyUI。";
+    await loadPromptStatus({quiet: true});
+  } catch (error) {
+    status.textContent = `诊断失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function clearPromptDiagnostics() {
+  if (!(await confirmAction(
+    "清空当前插件进程中的提示词诊断记录？此操作不会删除任务、日志或 Danbooru 索引。",
+    {title: "清空内存诊断", confirmLabel: "确认清空", danger: false},
+  ))) return;
+  const button = document.querySelector("#prompt-diagnostics-clear");
+  setBusy(button, true, "正在清空…");
+  try {
+    const data = await api("/api/prompt/diagnostics", {method: "DELETE"});
+    renderPromptDiagnosticHistory([]);
+    document.querySelector("#prompt-diagnostic-count").textContent = "0";
+    showToast(data.message || "内存提示词诊断已清空");
+    await loadPromptStatus({quiet: true});
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function updateDanbooruIndex() {
+  if (!(await confirmAction(
+    "从全局设置中的数据源 URL 下载并原子更新本地 Danbooru 索引？失败时会保留当前版本。",
+    {title: "更新 Danbooru 索引", confirmLabel: "开始更新", danger: false},
+  ))) return;
+  const button = document.querySelector("#prompt-index-update");
+  const status = document.querySelector("#prompt-index-status");
+  setBusy(button, true, "正在更新…");
+  status.textContent = "正在下载、校验并构建本地索引，请勿重复提交…";
+  try {
+    const data = await api("/api/danbooru/update", {method: "POST"});
+    status.textContent = data.message || "Danbooru 索引更新完成。";
+    showToast(status.textContent);
+    await loadPromptStatus({quiet: true});
+  } catch (error) {
+    status.textContent = `索引更新失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+const promptSlotNames = [
+  "lora",
+  "identity",
+  "appearance",
+  "clothing",
+  "pose",
+  "camera",
+  "background",
+  "lighting",
+  "style",
+  "visual_phrases",
+  "relation",
+  "negative",
+];
+
+const promptAssetTypeLabels = {
+  character: "角色",
+  clothing: "服装",
+  pose: "姿势",
+  background: "背景",
+  artist: "画师 / 风格",
+};
+
+const promptAssetSlotMap = {
+  character: "identity",
+  clothing: "clothing",
+  pose: "pose",
+  background: "background",
+  artist: "style",
+};
+
+function splitPromptField(value) {
+  return String(value || "")
+    .split(/\r?\n|,\s*/u)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function readPromptSlots() {
+  const slots = {};
+  for (const name of promptSlotNames) {
+    slots[name] = document.querySelector(`[data-slot-input="${name}"]`).value.trim();
+  }
+  slots.scene_sentence = slots.relation;
+  return slots;
+}
+
+function readPromptLockedSlots() {
+  return [...document.querySelectorAll("[data-slot-lock]:checked")]
+    .map((input) => input.dataset.slotLock)
+    .filter((name) => promptSlotNames.includes(name));
+}
+
+function promptLayersFromSlots(slots = readPromptSlots()) {
+  return {
+    lora: splitPromptField(slots.lora),
+    identity: splitPromptField(slots.identity),
+    appearance: splitPromptField(slots.appearance),
+    clothing: splitPromptField(slots.clothing),
+    pose: splitPromptField(slots.pose),
+    camera: splitPromptField(slots.camera),
+    background: splitPromptField(slots.background),
+    lighting: splitPromptField(slots.lighting),
+    style: splitPromptField(slots.style),
+    relation: String(slots.relation || "").trim(),
+  };
+}
+
+function compositionParts(data) {
+  const confirmed = data?.confirmed && typeof data.confirmed === "object" ? data.confirmed : null;
+  const root = confirmed || data?.composed || data?.result || data || {};
+  const nestedLayers = promptStatusPart(root, "layers", "prompt_layers");
+  const nestedDiagnostics = promptStatusPart(root, "diagnostics", "diagnostic");
+  const layers = Object.keys(nestedLayers).length
+    ? nestedLayers
+    : promptStatusPart(data, "layers", "prompt_layers");
+  const diagnostics = Object.keys(nestedDiagnostics).length
+    ? nestedDiagnostics
+    : promptStatusPart(data, "diagnostics", "diagnostic");
+  return {root, layers, diagnostics};
+}
+
+function renderCompositionProof(containerSelector, badgeSelector, data, badgeText = "COMPOSED") {
+  const container = document.querySelector(containerSelector);
+  const badge = document.querySelector(badgeSelector);
+  const {root, layers, diagnostics} = compositionParts(data);
+  const positive = root.positive_prompt || root.positive || root.prompt || "";
+  const negative = root.negative_prompt || root.negative || "";
+  container.replaceChildren(
+    promptResultSection("最终正面提示词", positive, {wide: true, code: true, emptyText: "后端未返回正面提示词"}),
+    promptResultSection("最终负面提示词", negative, {wide: true, code: true, emptyText: "无负面提示词"}),
+    promptResultSection("LoRA 控制", layers.lora_tags || root.lora_tags, {emptyText: "无 LoRA"}),
+    promptResultSection("硬 Tags", layers.hard_tags || root.hard_tags, {emptyText: "无硬 Tags"}),
+    promptResultSection("视觉短语", layers.visual_phrases || root.visual_phrases, {emptyText: "无视觉短语"}),
+    promptResultSection("场景关系句", layers.scene_sentence || root.scene_sentence, {wide: true, code: true, emptyText: "无场景关系句"}),
+    promptResultSection("冲突 / 警告", [
+      ...promptValueList(diagnostics.conflicts || root.conflicts),
+      ...promptValueList(diagnostics.validation_warnings || diagnostics.warnings || root.warnings),
+    ]),
+    promptResultSection("去重 / 丢弃", [
+      ...promptValueList(diagnostics.duplicates_removed || root.duplicates_removed),
+      ...promptValueList(diagnostics.discarded_tags || root.discarded_terms),
+    ]),
+  );
+  badge.textContent = badgeText;
+}
+
+async function composePromptSlots(event) {
+  event.preventDefault();
+  const button = document.querySelector("#prompt-compose-slots");
+  const status = document.querySelector("#prompt-slot-status");
+  const slots = readPromptSlots();
+  const hasContent = promptSlotNames.some((name) => slots[name]);
+  if (!hasContent) {
+    status.textContent = "请先填写至少一个槽位。";
+    document.querySelector("#prompt-slot-identity").focus();
+    return;
+  }
+  setBusy(button, true, "正在组合…");
+  status.textContent = "正在按 LoRA → 硬 Tags → 视觉短语 → 场景句组合并校验…";
+  try {
+    const data = await api("/api/prompt/compose-slots", {
+      method: "POST",
+      body: JSON.stringify({
+        slots,
+        locked_slots: readPromptLockedSlots(),
+        negative_prompt: slots.negative,
+        source: "web_prompt_composer",
+      }),
+    });
+    renderCompositionProof("#prompt-compose-result", "#prompt-compose-badge", data);
+    status.textContent = data.message || "组合完成；结果仍是草稿，没有提交 ComfyUI。";
+  } catch (error) {
+    status.textContent = `组合失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function clearUnlockedPromptSlots() {
+  const locked = new Set(readPromptLockedSlots());
+  for (const name of promptSlotNames) {
+    if (!locked.has(name)) document.querySelector(`[data-slot-input="${name}"]`).value = "";
+  }
+  document.querySelector("#prompt-slot-status").textContent = "已清空未锁定槽位。";
+}
+
+function switchPromptTab(name, {focus = false, load = true} = {}) {
+  const allowed = new Set(["composer", "assets", "lab", "diagnostics"]);
+  promptActiveTab = allowed.has(name) ? name : "composer";
+  writePreference("comfy-anima-prompt-tab", promptActiveTab);
+  for (const button of document.querySelectorAll("[data-prompt-tab]")) {
+    const active = button.dataset.promptTab === promptActiveTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    if (active && focus) button.focus();
+  }
+  for (const page of document.querySelectorAll(".prompt-subpage")) {
+    const active = page.id === `prompt-page-${promptActiveTab}`;
+    page.classList.toggle("active", active);
+    page.hidden = !active;
+  }
+  if (!load || currentPanel !== "prompt") return;
+  if (promptActiveTab === "assets") loadPromptAssets({quiet: true});
+  if (promptActiveTab === "diagnostics") loadExperimentalProfiles({quiet: true});
+}
+
+function initializePromptSubnav() {
+  switchPromptTab(readPreference("comfy-anima-prompt-tab", "composer"), {load: false});
+  document.querySelector("#prompt-workbench-tabs").addEventListener("keydown", (event) => {
+    if (!new Set(["ArrowLeft", "ArrowRight", "Home", "End"]).has(event.key)) return;
+    const buttons = [...document.querySelectorAll("[data-prompt-tab]")];
+    const current = buttons.findIndex((button) => button.dataset.promptTab === promptActiveTab);
+    let next = current;
+    if (event.key === "ArrowLeft") next = (current - 1 + buttons.length) % buttons.length;
+    if (event.key === "ArrowRight") next = (current + 1) % buttons.length;
+    if (event.key === "Home") next = 0;
+    if (event.key === "End") next = buttons.length - 1;
+    event.preventDefault();
+    switchPromptTab(buttons[next].dataset.promptTab, {focus: true});
+  });
+}
+
+function promptAssetDisplayName(item) {
+  return String(item?.name_zh || item?.name_en || item?.label || item?.asset_id || "未命名素材");
+}
+
+function promptAssetProvenance(item) {
+  return item?.provenance && typeof item.provenance === "object" && !Array.isArray(item.provenance)
+    ? item.provenance
+    : {};
+}
+
+function promptAssetCard(item) {
+  const article = document.createElement("article");
+  article.className = "prompt-asset-card";
+  article.dataset.assetId = String(item.asset_id || "");
+  const head = document.createElement("header");
+  const heading = document.createElement("div");
+  const label = document.createElement("span");
+  label.className = "mono-label";
+  label.textContent = promptAssetTypeLabels[item.asset_type] || item.asset_type || "素材";
+  const title = document.createElement("h3");
+  title.textContent = promptAssetDisplayName(item);
+  heading.append(label, title);
+  const favorite = document.createElement("button");
+  favorite.className = "asset-favorite-button";
+  favorite.type = "button";
+  favorite.setAttribute("aria-pressed", String(Boolean(item.favorite)));
+  favorite.setAttribute("aria-label", item.favorite ? "取消收藏" : "收藏素材");
+  favorite.textContent = item.favorite ? "★" : "☆";
+  favorite.addEventListener("click", () => setPromptAssetFavorite(item, favorite));
+  head.append(heading, favorite);
+
+  const tags = document.createElement("div");
+  tags.className = "prompt-asset-tags";
+  const tagValues = promptValueList(item.tags);
+  for (const value of tagValues.slice(0, 8)) tags.append(chip(value));
+  if (tagValues.length > 8) tags.append(chip(`+${tagValues.length - 8}`, "neutral"));
+  if (!tagValues.length) {
+    const empty = document.createElement("span");
+    empty.className = "muted";
+    empty.textContent = "没有 Tags";
+    tags.append(empty);
+  }
+
+  const provenance = promptAssetProvenance(item);
+  const facts = document.createElement("dl");
+  facts.className = "prompt-asset-facts";
+  for (const [name, value] of [
+    ["来源", provenance.source || provenance.dataset || "未声明"],
+    ["许可", provenance.license || provenance.spdx || "未声明"],
+    ["版本", provenance.version || provenance.revision || "—"],
+  ]) {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = name;
+    detail.textContent = String(value);
+    row.append(term, detail);
+    facts.append(row);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "prompt-asset-actions";
+  const add = document.createElement("button");
+  add.className = "primary";
+  add.type = "button";
+  add.textContent = "加入构图台";
+  add.addEventListener("click", () => addPromptAssetToComposer(item));
+  actions.append(add);
+  if (item.is_custom) {
+    const edit = document.createElement("button");
+    edit.className = "secondary";
+    edit.type = "button";
+    edit.textContent = "编辑";
+    edit.addEventListener("click", () => editPromptCustomAsset(item));
+    actions.append(edit);
+  }
+  article.append(head, tags, facts, actions);
+  return article;
+}
+
+function renderPromptAssets(data) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  promptAssetItems = items;
+  promptAssetPage = Math.max(1, Number(data?.page || promptAssetPage || 1));
+  promptAssetPages = Math.max(1, Number(data?.pages || 1));
+  promptAssetFingerprint = String(data?.fingerprint || data?.library_fingerprint || promptAssetFingerprint || "");
+  const grid = document.querySelector("#prompt-asset-grid");
+  grid.replaceChildren(...items.map(promptAssetCard));
+  document.querySelector("#prompt-asset-empty").hidden = items.length > 0;
+  document.querySelector("#prompt-asset-page").textContent = `第 ${promptAssetPage} / ${promptAssetPages} 页 · ${Number(data?.total || items.length).toLocaleString()} 项`;
+  document.querySelector("#prompt-asset-prev").disabled = promptAssetPage <= 1;
+  document.querySelector("#prompt-asset-next").disabled = promptAssetPage >= promptAssetPages;
+}
+
+async function loadPromptAssetStatus({quiet = false} = {}) {
+  try {
+    const data = await api("/api/prompt-assets/status");
+    document.querySelector("#prompt-asset-count").textContent = Number(data.asset_count || data.total || 0).toLocaleString();
+    document.querySelector("#prompt-asset-favorite-count").textContent = Number(data.favorite_count || 0).toLocaleString();
+    document.querySelector("#prompt-asset-custom-count").textContent = Number(data.custom_count || 0).toLocaleString();
+    document.querySelector("#prompt-asset-imported-at").textContent = promptTimestamp(data.last_import_at);
+    promptAssetFingerprint = String(data.fingerprint || data.last_import_sha256 || promptAssetFingerprint || "");
+    return data;
+  } catch (error) {
+    if (!quiet) showToast(error.message, true);
+    document.querySelector("#prompt-asset-status").textContent = `素材库状态读取失败：${error.message}`;
+    return null;
+  }
+}
+
+function renderPromptAssetFacetOptions(selector, values) {
+  const datalist = document.querySelector(selector);
+  const options = (Array.isArray(values) ? values : []).map((item) => {
+    const option = document.createElement("option");
+    option.value = String(item?.value || "");
+    option.label = `${Number(item?.count || 0).toLocaleString()} 项`;
+    return option;
+  }).filter((option) => option.value);
+  datalist.replaceChildren(...options);
+}
+
+async function loadPromptAssetFacets({quiet = false} = {}) {
+  const assetType = document.querySelector("#prompt-asset-type").value;
+  const customOnly = assetType === "__custom__";
+  try {
+    const data = await api("/api/prompt-assets/facets", {
+      method: "POST",
+      body: JSON.stringify({
+        asset_type: customOnly ? "" : assetType,
+        source: document.querySelector("#prompt-asset-source").value.trim(),
+        favorite_only: document.querySelector("#prompt-asset-favorites-only").checked,
+        custom_only: customOnly ? true : null,
+        limit: 200,
+      }),
+    });
+    if (data.fingerprint) promptAssetFingerprint = String(data.fingerprint);
+    renderPromptAssetFacetOptions("#prompt-asset-category-options", data.categories);
+    renderPromptAssetFacetOptions("#prompt-asset-trait-options", data.traits);
+    return data;
+  } catch (error) {
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+async function searchPromptAssets(event = null, {quiet = false} = {}) {
+  if (event) event.preventDefault();
+  const status = document.querySelector("#prompt-asset-status");
+  const assetType = document.querySelector("#prompt-asset-type").value;
+  const customOnly = assetType === "__custom__";
+  const libraryType = customOnly ? "" : assetType;
+  status.textContent = "正在读取分页素材…";
+  try {
+    const data = await api("/api/prompt-assets/search", {
+      method: "POST",
+      body: JSON.stringify({
+        query: document.querySelector("#prompt-asset-query").value.trim(),
+        asset_type: libraryType,
+        categories: splitPromptField(document.querySelector("#prompt-asset-categories").value),
+        traits: splitPromptField(document.querySelector("#prompt-asset-traits").value),
+        tags: splitPromptField(document.querySelector("#prompt-asset-tags").value),
+        source: document.querySelector("#prompt-asset-source").value.trim(),
+        favorite_only: document.querySelector("#prompt-asset-favorites-only").checked,
+        custom_only: customOnly ? true : null,
+        page: promptAssetPage,
+        page_size: Number(document.querySelector("#prompt-asset-page-size").value),
+      }),
+    });
+    renderPromptAssets(data);
+    status.textContent = `当前页 ${promptAssetItems.length} 项；只把分页结果放入 DOM。`;
+    return data;
+  } catch (error) {
+    renderPromptAssets({items: [], page: 1, pages: 1});
+    status.textContent = `素材搜索失败：${error.message}`;
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+async function loadPromptAssets({quiet = false} = {}) {
+  await Promise.all([
+    loadPromptAssetStatus({quiet}),
+    loadPromptAssetFacets({quiet}),
+    searchPromptAssets(null, {quiet}),
+  ]);
+}
+
+async function syncLocalPromptAssets() {
+  const button = document.querySelector("#prompt-assets-sync-local");
+  const status = document.querySelector("#prompt-asset-status");
+  setBusy(button, true, "正在同步…");
+  status.textContent = "正在强制刷新 LoRA Manager，并把最新语义索引与已保存预设转换为本地视觉素材…";
+  try {
+    const data = await api("/api/prompt-assets/sync-local", {method: "POST", body: JSON.stringify({})});
+    status.textContent = data.message || `本地素材同步完成，本次 ${Number(data.synced || data.count || 0).toLocaleString()} 项。`;
+    promptAssetPage = 1;
+    await loadPromptAssets({quiet: true});
+  } catch (error) {
+    status.textContent = `本地素材同步失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function setPromptAssetFavorite(item, button) {
+  setBusy(button, true, "…");
+  try {
+    const favorite = !Boolean(item.favorite);
+    const data = await api("/api/prompt-assets/favorite", {
+      method: "PUT",
+      body: JSON.stringify({asset_id: item.asset_id, favorite}),
+    });
+    item.favorite = data.favorite ?? favorite;
+    button.textContent = item.favorite ? "★" : "☆";
+    button.setAttribute("aria-pressed", String(Boolean(item.favorite)));
+    button.setAttribute("aria-label", item.favorite ? "取消收藏" : "收藏素材");
+    await loadPromptAssetStatus({quiet: true});
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+    button.textContent = item.favorite ? "★" : "☆";
+  }
+}
+
+function addPromptAssetToComposer(item) {
+  const slot = promptAssetSlotMap[item.asset_type] || "visual_phrases";
+  const input = document.querySelector(`[data-slot-input="${slot}"]`);
+  const values = promptValueList(item.tags);
+  if (!values.length) values.push(...promptValueList(item.traits));
+  if (!values.length) values.push(promptAssetDisplayName(item));
+  const addition = values.join(", ");
+  input.value = [input.value.trim(), addition].filter(Boolean).join(", ");
+  switchPromptTab("composer");
+  input.focus();
+  document.querySelector("#prompt-slot-status").textContent = `已将“${promptAssetDisplayName(item)}”加入${slot}槽。`;
+}
+
+function resetPromptCustomForm() {
+  document.querySelector("#prompt-custom-form").reset();
+  document.querySelector("#prompt-custom-id").value = "";
+  document.querySelector("#prompt-custom-mode").textContent = "NEW";
+  document.querySelector("#prompt-custom-delete").hidden = true;
+  document.querySelector("#prompt-custom-status").textContent = "";
+}
+
+function editPromptCustomAsset(item) {
+  document.querySelector("#prompt-custom-id").value = String(item.asset_id || "");
+  document.querySelector("#prompt-custom-type").value = item.asset_type || "custom";
+  document.querySelector("#prompt-custom-name-zh").value = item.name_zh || "";
+  document.querySelector("#prompt-custom-name-en").value = item.name_en || "";
+  document.querySelector("#prompt-custom-aliases").value = promptValueList(item.aliases).join(", ");
+  document.querySelector("#prompt-custom-tags").value = promptValueList(item.tags).join(", ");
+  document.querySelector("#prompt-custom-traits").value = [
+    ...promptValueList(item.traits),
+    ...promptValueList(item.categories).map((value) => `#${value}`),
+  ].join(", ");
+  document.querySelector("#prompt-custom-mode").textContent = "EDIT";
+  document.querySelector("#prompt-custom-delete").hidden = false;
+  document.querySelector("#prompt-custom-name-zh").focus();
+}
+
+function promptCustomPayload() {
+  const traits = splitPromptField(document.querySelector("#prompt-custom-traits").value);
+  return {
+    asset_type: document.querySelector("#prompt-custom-type").value,
+    type: document.querySelector("#prompt-custom-type").value,
+    name_zh: document.querySelector("#prompt-custom-name-zh").value.trim(),
+    name_en: document.querySelector("#prompt-custom-name-en").value.trim(),
+    aliases: splitPromptField(document.querySelector("#prompt-custom-aliases").value),
+    tags: splitPromptField(document.querySelector("#prompt-custom-tags").value),
+    traits: traits.filter((value) => !value.startsWith("#")),
+    categories: traits.filter((value) => value.startsWith("#")).map((value) => value.slice(1)).filter(Boolean),
+    provenance: {source: "custom", license: "user-authored"},
+  };
+}
+
+async function savePromptCustomAsset(event) {
+  event.preventDefault();
+  const button = document.querySelector("#prompt-custom-save");
+  const status = document.querySelector("#prompt-custom-status");
+  const assetId = document.querySelector("#prompt-custom-id").value;
+  const asset = promptCustomPayload();
+  setBusy(button, true, "正在保存…");
+  try {
+    const data = await api("/api/prompt-assets/custom", {
+      method: assetId ? "PUT" : "POST",
+      body: JSON.stringify(assetId ? {asset_id: assetId, changes: asset} : asset),
+    });
+    status.textContent = data.message || (assetId ? "自定义素材已更新。" : "自定义素材已创建。");
+    resetPromptCustomForm();
+    promptAssetPage = 1;
+    await loadPromptAssets({quiet: true});
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function deletePromptCustomAsset() {
+  const assetId = document.querySelector("#prompt-custom-id").value;
+  if (!assetId) return;
+  if (!(await confirmAction("删除这个自定义素材？导入素材不能通过此入口删除。", {title: "删除自定义素材", confirmLabel: "确认删除"}))) return;
+  const button = document.querySelector("#prompt-custom-delete");
+  setBusy(button, true, "正在删除…");
+  try {
+    await api("/api/prompt-assets/custom", {method: "DELETE", body: JSON.stringify({asset_id: assetId})});
+    resetPromptCustomForm();
+    await loadPromptAssets({quiet: true});
+    showToast("自定义素材已删除");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function importPromptAssets(event) {
+  event.preventDefault();
+  const button = document.querySelector("#prompt-asset-import");
+  const status = document.querySelector("#prompt-asset-import-status");
+  const format = document.querySelector("#prompt-asset-import-format").value;
+  const mode = document.querySelector("#prompt-asset-import-mode").value;
+  const source = document.querySelector("#prompt-asset-import-source").value.trim();
+  const license = document.querySelector("#prompt-asset-import-license").value.trim();
+  const content = document.querySelector("#prompt-asset-import-content").value;
+  if (mode === "replace" && !(await confirmAction(
+    "替换整个视觉素材库会删除其他来源的已导入素材，但会保留本次包中的条目。是否继续？",
+    {title: "替换整个素材库", confirmLabel: "确认替换"},
+  ))) return;
+  const contentBytes = typeof TextEncoder === "function"
+    ? new TextEncoder().encode(content).byteLength
+    : content.length * 3;
+  if (contentBytes > 1000 * 1024) {
+    status.textContent = `导入内容约 ${(contentBytes / 1048576).toFixed(2)} MiB，超过安全请求上限；请拆分素材包。`;
+    document.querySelector("#prompt-asset-import-content").focus();
+    return;
+  }
+  setBusy(button, true, "正在导入…");
+  try {
+    const data = await api("/api/prompt-assets/import", {
+      method: "POST",
+      body: JSON.stringify({content, format, source, version: license, provenance: {source, license}, mode}),
+    });
+    status.textContent = data.message || `素材包已导入 ${Number(data.imported || data.count || 0).toLocaleString()} 项。`;
+    document.querySelector("#prompt-asset-import-content").value = "";
+    promptAssetPage = 1;
+    await loadPromptAssets({quiet: true});
+  } catch (error) {
+    status.textContent = `导入失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function updatePromptAssetsFromUrl(event) {
+  event.preventDefault();
+  const button = document.querySelector("#prompt-asset-url-import");
+  const status = document.querySelector("#prompt-asset-import-status");
+  const url = document.querySelector("#prompt-asset-url").value.trim();
+  const source = document.querySelector("#prompt-asset-url-source").value.trim();
+  setBusy(button, true, "正在安全获取…");
+  try {
+    const data = await api("/api/prompt-assets/update-url", {
+      method: "POST",
+      body: JSON.stringify({url, source, timeout: 30, mode: "merge", provenance: {source, transport: "admin_url"}}),
+    });
+    status.textContent = data.message || "远程素材包已校验并更新。";
+    promptAssetPage = 1;
+    await loadPromptAssets({quiet: true});
+  } catch (error) {
+    status.textContent = `URL 更新失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function visiblePromptAssetPools() {
+  const pools = {};
+  for (const item of promptAssetItems) {
+    const layer = promptAssetSlotMap[item.asset_type];
+    if (!layer || layer === "visual_phrases") continue;
+    if (!pools[layer]) pools[layer] = [];
+    pools[layer].push({
+      asset_id: item.asset_id,
+      label: promptAssetDisplayName(item),
+      tags: promptValueList(item.tags),
+      visual_phrases: promptValueList(item.traits),
+    });
+  }
+  return pools;
+}
+
+const promptLabTypeLayers = {
+  character: "identity",
+  outfit: "clothing",
+  pose: "pose",
+  background: "background",
+  artist: "style",
+};
+
+const promptLabLibraryTypes = {
+  character: "character",
+  outfit: "clothing",
+  pose: "pose",
+  background: "background",
+  artist: "artist",
+};
+
+function promptLabAssetRecord(item) {
+  return {
+    asset_id: item.asset_id,
+    label: promptAssetDisplayName(item),
+    tags: promptValueList(item.tags).slice(0, 16).map((value) => value.slice(0, 160)),
+    visual_phrases: promptValueList(item.traits).slice(0, 6).map((value) => value.slice(0, 160)),
+  };
+}
+
+function promptLabPoolHasType(pools, assetType) {
+  const layer = promptLabTypeLayers[assetType];
+  const aliases = [assetType, promptLabLibraryTypes[assetType], layer];
+  return aliases.some((name) => Array.isArray(pools?.[name]) && pools[name].length > 0);
+}
+
+async function loadPromptLabPools(selectedTypes) {
+  const pools = visiblePromptAssetPools();
+  const missing = selectedTypes.filter((assetType) => !promptLabPoolHasType(pools, assetType));
+  if (missing.length) {
+    const pages = await Promise.all(missing.map(async (assetType) => {
+      const data = await api("/api/prompt-assets/search", {
+        method: "POST",
+        body: JSON.stringify({
+          asset_type: promptLabLibraryTypes[assetType],
+          page: 1,
+          page_size: 24,
+          sort: "name",
+        }),
+      });
+      if (data.fingerprint) promptAssetFingerprint = String(data.fingerprint);
+      return [assetType, Array.isArray(data.items) ? data.items : []];
+    }));
+    for (const [assetType, items] of pages) {
+      const layer = promptLabTypeLayers[assetType];
+      if (!pools[layer]) pools[layer] = [];
+      pools[layer].push(...items.map(promptLabAssetRecord));
+    }
+  }
+  return {
+    pools,
+    enabledTypes: selectedTypes.filter((assetType) => promptLabPoolHasType(pools, assetType)),
+    missingTypes: selectedTypes.filter((assetType) => !promptLabPoolHasType(pools, assetType)),
+  };
+}
+
+function promptLabBaseLayers() {
+  return promptLabUseComposerBase ? promptLayersFromSlots() : {};
+}
+
+function promptLabSelectedValues(selector) {
+  return [...document.querySelectorAll(`${selector} input:checked`)].map((input) => input.value);
+}
+
+function promptLabCandidateCard(candidate) {
+  const article = document.createElement("article");
+  article.className = `prompt-candidate-card${promptLabSelection === candidate.candidate_id ? " selected" : ""}`;
+  article.tabIndex = 0;
+  article.dataset.candidateId = candidate.candidate_id;
+  const head = document.createElement("header");
+  const title = document.createElement("h3");
+  title.textContent = `候选 ${candidate.ordinal || "—"}`;
+  const badge = document.createElement("span");
+  badge.className = "ticket-tag";
+  badge.textContent = String(candidate.candidate_id || "").slice(0, 14) || "CANDIDATE";
+  head.append(title, badge);
+  const layers = document.createElement("dl");
+  layers.className = "prompt-candidate-layers";
+  const rawLayers = candidate.layers || {};
+  for (const [name, label] of [
+    ["identity", "身份"], ["clothing", "服装"], ["pose", "姿势"], ["camera", "镜头"],
+    ["background", "背景"], ["style", "风格"], ["relation", "关系句"], ["lora", "LoRA"],
+  ]) {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = promptValueList(rawLayers[name]).join(", ") || "—";
+    row.append(term, detail);
+    layers.append(row);
+  }
+  const foot = document.createElement("div");
+  foot.className = "prompt-candidate-actions";
+  const select = document.createElement("button");
+  select.className = promptLabSelection === candidate.candidate_id ? "secondary" : "ghost";
+  select.type = "button";
+  select.textContent = promptLabSelection === candidate.candidate_id ? "已选择" : "选择比较";
+  select.addEventListener("click", () => selectPromptLabCandidate(candidate.candidate_id));
+  const confirm = document.createElement("button");
+  confirm.className = "primary";
+  confirm.type = "button";
+  confirm.textContent = "确认并进入 Composer";
+  confirm.addEventListener("click", async () => {
+    selectPromptLabCandidate(candidate.candidate_id);
+    await confirmPromptLabCandidate(confirm);
+  });
+  foot.append(select, confirm);
+  const warnings = promptValueList(candidate.warnings);
+  article.append(head, layers);
+  if (warnings.length) {
+    const note = document.createElement("p");
+    note.className = "candidate-warning";
+    note.textContent = warnings.join(" · ");
+    article.append(note);
+  }
+  article.append(foot);
+  article.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectPromptLabCandidate(candidate.candidate_id);
+    }
+  });
+  return article;
+}
+
+function renderPromptLabBatch(data) {
+  promptLabBatch = data?.batch || data || null;
+  const candidates = Array.isArray(promptLabBatch?.candidates) ? promptLabBatch.candidates : [];
+  promptLabSelection = candidates[0]?.candidate_id || "";
+  const container = document.querySelector("#prompt-lab-candidates");
+  container.replaceChildren();
+  if (!candidates.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "后端没有返回候选卡。";
+    container.append(empty);
+  } else {
+    for (const candidate of candidates) container.append(promptLabCandidateCard(candidate));
+  }
+}
+
+function selectPromptLabCandidate(candidateId) {
+  promptLabSelection = String(candidateId || "");
+  if (!promptLabBatch) return;
+  const candidates = Array.isArray(promptLabBatch.candidates) ? promptLabBatch.candidates : [];
+  const container = document.querySelector("#prompt-lab-candidates");
+  container.replaceChildren(...candidates.map(promptLabCandidateCard));
+  const selected = [...container.children].find((item) => item.dataset.candidateId === promptLabSelection);
+  if (selected) selected.scrollIntoView({block: "nearest", inline: "nearest"});
+}
+
+async function generatePromptLab(event) {
+  event.preventDefault();
+  const button = document.querySelector("#prompt-lab-generate");
+  const status = document.querySelector("#prompt-lab-status");
+  const count = Number(document.querySelector("#prompt-lab-count").value);
+  if (!Number.isInteger(count) || count < 2 || count > 6) {
+    status.textContent = "候选数量必须是 2–6。";
+    return;
+  }
+  const selectedTypes = promptLabSelectedValues("#prompt-lab-types");
+  let pools;
+  let enabledTypes = selectedTypes;
+  let missingTypes = [];
+  setBusy(button, true, "正在读取素材…");
+  status.textContent = "正在读取所选类别的分页素材池…";
+  try {
+    const text = document.querySelector("#prompt-lab-pools").value.trim();
+    if (text) {
+      pools = JSON.parse(text);
+      enabledTypes = selectedTypes.filter((assetType) => promptLabPoolHasType(pools, assetType));
+      missingTypes = selectedTypes.filter((assetType) => !promptLabPoolHasType(pools, assetType));
+    } else {
+      if (!promptAssetFingerprint) await loadPromptAssetStatus({quiet: true});
+      ({pools, enabledTypes, missingTypes} = await loadPromptLabPools(selectedTypes));
+    }
+  } catch (_error) {
+    status.textContent = "候选素材池读取失败；请检查 JSON 或素材库状态。";
+    document.querySelector("#prompt-lab-pools").focus();
+    setBusy(button, false);
+    return;
+  }
+  button.textContent = "正在抽取…";
+  status.textContent = "正在按固定 Seed 生成可复现候选；不会调用 ComfyUI…";
+  try {
+    const slots = readPromptSlots();
+    const data = await api("/api/prompt-lab/generate", {
+      method: "POST",
+      body: JSON.stringify({
+        seed: document.querySelector("#prompt-lab-seed").value.trim(),
+        count,
+        base_layers: promptLabBaseLayers(),
+        asset_pools: pools,
+        locked_layers: promptLabSelectedValues("#prompt-lab-locks"),
+        enabled_asset_types: enabledTypes,
+        negative_prompt: slots.negative,
+        visual_phrases: splitPromptField(slots.visual_phrases),
+        asset_library_fingerprint: promptAssetFingerprint,
+      }),
+    });
+    renderPromptLabBatch(data);
+    const missingNote = missingTypes.length ? `；无可用素材：${missingTypes.join("、")}` : "";
+    status.textContent = data.message || `已生成 ${promptLabBatch?.candidates?.length || 0} 张草稿卡；请明确确认一张${missingNote}。`;
+  } catch (error) {
+    status.textContent = `候选生成失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function confirmPromptLabCandidate(button) {
+  if (!promptLabBatch || !promptLabSelection) {
+    document.querySelector("#prompt-lab-status").textContent = "请先生成并选择一张候选卡。";
+    return;
+  }
+  if (!(await confirmAction("确认将所选候选送入 Prompt Composer？这一步仍不会生成图片。", {title: "确认候选草稿", confirmLabel: "确认并组合", danger: false}))) return;
+  setBusy(button, true, "正在确认…");
+  try {
+    const data = await api("/api/prompt-lab/confirm", {
+      method: "POST",
+      body: JSON.stringify({
+        batch_id: promptLabBatch.batch_id,
+        selection: promptLabSelection,
+        candidate_id: promptLabSelection,
+        asset_library_fingerprint: promptAssetFingerprint,
+      }),
+    });
+    renderCompositionProof("#prompt-lab-confirm-result", "#prompt-lab-confirm-badge", data, "CONFIRMED");
+    document.querySelector("#prompt-lab-status").textContent = data.message || "候选已确认并经过 Composer；未提交 ComfyUI。";
+  } catch (error) {
+    document.querySelector("#prompt-lab-status").textContent = `确认失败：${error.message}`;
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function switchLoraView(mode) {
+  loraViewMode = mode === "gallery" ? "gallery" : "table";
+  const table = loraViewMode === "table";
+  document.querySelector("#lora-table-view").hidden = !table;
+  document.querySelector("#lora-empty").hidden = !table || loraItems.length > 0;
+  document.querySelector("#lora-gallery-view").hidden = table;
+  document.querySelector("#lora-gallery-filters").hidden = table;
+  for (const [selector, active] of [["#lora-view-table", table], ["#lora-view-gallery", !table]]) {
+    const button = document.querySelector(selector);
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  writePreference("comfy-anima-lora-view", loraViewMode);
+  if (currentPanel === "loras") {
+    if (table) searchLoras(null, {skipAutoArchive: true});
+    else loadLoraGallery({quiet: true});
+  }
+}
+
+function safePreviewDataUrl(value) {
+  const text = String(value || "");
+  return /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=\r\n]+$/iu.test(text) ? text : "";
+}
+
+async function loadLoraPreview(image, item) {
+  if (!item.preview_key || image.dataset.loaded === "true") return;
+  image.dataset.loaded = "true";
+  image.classList.add("loading");
+  try {
+    const data = await api(`/api/loras/preview?key=${encodeURIComponent(item.preview_key)}&fingerprint=${encodeURIComponent(loraGalleryFingerprint)}`);
+    const dataUrl = safePreviewDataUrl(data.data_url);
+    if (!dataUrl) throw new Error("缩略图接口未返回受支持的图片数据");
+    image.src = dataUrl;
+    image.classList.remove("loading");
+    image.classList.add("ready");
+  } catch (error) {
+    image.classList.remove("loading");
+    image.classList.add("failed");
+    image.alt = `${item.display_name || item.name || "LoRA"}（预览不可用）`;
+    image.parentElement.dataset.previewError = error.message.slice(0, 120);
+  }
+}
+
+function observeLoraPreview(image, item) {
+  image.__loraVisualItem = item;
+  if (!("IntersectionObserver" in window)) {
+    loadLoraPreview(image, item);
+    return;
+  }
+  if (!loraPreviewObserver) {
+    loraPreviewObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        loraPreviewObserver.unobserve(entry.target);
+        loadLoraPreview(entry.target, entry.target.__loraVisualItem || {});
+      }
+    }, {rootMargin: "240px 0px"});
+  }
+  loraPreviewObserver.observe(image);
+}
+
+function loraGalleryCard(item) {
+  const article = document.createElement("article");
+  article.className = "lora-gallery-card";
+  const media = document.createElement("figure");
+  media.className = "lora-preview-frame";
+  if (item.preview_key) {
+    const image = document.createElement("img");
+    image.alt = `${item.display_name || item.name || "LoRA"} 的本地 companion 预览`;
+    image.loading = "lazy";
+    image.decoding = "async";
+    media.append(image);
+    observeLoraPreview(image, item);
+  } else {
+    const missing = document.createElement("span");
+    missing.className = "lora-preview-missing";
+    missing.textContent = item.preview_status === "remote_only" ? "仅远程预览\n安全策略不代理" : "NO LOCAL\nPREVIEW";
+    media.append(missing);
+  }
+  const body = document.createElement("div");
+  body.className = "lora-gallery-body";
+  const title = document.createElement("h3");
+  title.textContent = item.display_name || item.name || "未命名 LoRA";
+  const file = document.createElement("code");
+  file.textContent = item.name || "—";
+  const badges = document.createElement("div");
+  badges.className = "chip-list";
+  badges.append(
+    chip(loraCategoryLabels[normalizeCategory(item.category)] || "未分类"),
+    chip(`元数据 ${item.metadata_status || "unknown"}`, item.metadata_status === "complete" ? "good" : "neutral"),
+    chip(`预览 ${item.preview_status || "missing"}`, item.preview_key ? "good" : "bad"),
+  );
+  if (item.favorite) badges.append(chip("★ 收藏", "good"));
+  const fingerprint = document.createElement("small");
+  fingerprint.className = "lora-gallery-item-fingerprint";
+  fingerprint.textContent = `FILE ${String(item.fingerprint || "—").slice(0, 14)}`;
+  const actions = document.createElement("div");
+  actions.className = "lora-gallery-actions";
+  const detail = document.createElement("button");
+  detail.type = "button";
+  detail.className = "secondary";
+  detail.textContent = "实时资料";
+  detail.addEventListener("click", () => openLoraDetail(item, detail));
+  actions.append(detail);
+  body.append(title, file, badges, fingerprint, actions);
+  article.append(media, body);
+  return article;
+}
+
+function loraGallerySkeletonCard() {
+  const article = document.createElement("article");
+  article.className = "lora-gallery-card is-skeleton";
+  article.setAttribute("aria-hidden", "true");
+
+  const media = document.createElement("div");
+  media.className = "lora-preview-frame lora-skeleton-block";
+
+  const body = document.createElement("div");
+  body.className = "lora-gallery-body";
+  for (const className of ["title", "file", "chips", "fingerprint", "button"]) {
+    const block = document.createElement("span");
+    block.className = `lora-skeleton-block lora-skeleton-${className}`;
+    body.append(block);
+  }
+  article.append(media, body);
+  return article;
+}
+
+function renderLoraGallerySkeleton(count = 6) {
+  if (loraPreviewObserver) loraPreviewObserver.disconnect();
+  const grid = document.querySelector("#lora-gallery-grid");
+  const safeCount = Math.max(3, Math.min(8, Number(count) || 6));
+  grid.setAttribute("aria-busy", "true");
+  grid.replaceChildren(...Array.from({length: safeCount}, () => loraGallerySkeletonCard()));
+  document.querySelector("#lora-gallery-empty").hidden = true;
+}
+
+function renderLoraGallery(data) {
+  loraGalleryItems = Array.isArray(data?.items) ? data.items : [];
+  loraGalleryPage = Math.max(1, Number(data?.page || loraGalleryPage || 1));
+  loraGalleryPages = Math.max(1, Number(data?.pages || 1));
+  loraGalleryFingerprint = String(data?.manifest_fingerprint || data?.fingerprint || "");
+  if (loraPreviewObserver) loraPreviewObserver.disconnect();
+  const grid = document.querySelector("#lora-gallery-grid");
+  grid.setAttribute("aria-busy", "false");
+  grid.replaceChildren(...loraGalleryItems.map(loraGalleryCard));
+  document.querySelector("#lora-gallery-empty").hidden = loraGalleryItems.length > 0;
+  document.querySelector("#lora-gallery-page").textContent = `第 ${loraGalleryPage} / ${loraGalleryPages} 页 · ${Number(data?.total || loraGalleryItems.length).toLocaleString()} 项`;
+  document.querySelector("#lora-gallery-prev").disabled = loraGalleryPage <= 1;
+  document.querySelector("#lora-gallery-next").disabled = loraGalleryPage >= loraGalleryPages;
+  document.querySelector("#lora-gallery-fingerprint").textContent = `MANIFEST ${loraGalleryFingerprint.slice(0, 12) || "—"}`;
+}
+
+async function loadLoraGallery({quiet = false} = {}) {
+  const status = document.querySelector("#lora-gallery-cache-status");
+  status.textContent = "正在读取 LoRA 视觉清单与文件指纹…";
+  renderLoraGallerySkeleton(Number(document.querySelector("#lora-gallery-page-size").value));
+  try {
+    const data = await api("/api/loras/gallery", {
+      method: "POST",
+      body: JSON.stringify({
+        query: document.querySelector("#lora-query").value.trim(),
+        categories: promptValueList(document.querySelector("#lora-gallery-category").value),
+        metadata_statuses: promptValueList(document.querySelector("#lora-gallery-metadata").value),
+        preview_statuses: promptValueList(document.querySelector("#lora-gallery-preview").value),
+        favorites_only: document.querySelector("#lora-gallery-favorites").checked,
+        page: loraGalleryPage,
+        page_size: Number(document.querySelector("#lora-gallery-page-size").value),
+      }),
+    });
+    renderLoraGallery(data);
+    const previewCounts = data.preview_counts || {};
+    status.textContent = `图库显示 ${loraGalleryItems.length} 项；缓存 ${Number(previewCounts.cached || 0)} · 本地 ${Number(previewCounts.local || 0)} · 缺失 ${Number(previewCounts.missing || 0)}。`;
+    return data;
+  } catch (error) {
+    renderLoraGallery({items: [], page: 1, pages: 1});
+    status.textContent = `图库读取失败：${error.message}`;
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+async function loadLoraThumbnailStatus({quiet = false} = {}) {
+  try {
+    const data = await api("/api/loras/thumbnails/status");
+    const warmup = data.warmup || data.status || data;
+    const manifest = data.manifest || {};
+    const queued = Number(warmup.queued || warmup.pending || 0);
+    const completed = Number(warmup.completed || warmup.cached || 0);
+    const failed = Number(warmup.failed || 0);
+    const available = Number(manifest.preview_counts?.cached || 0) + Number(manifest.preview_counts?.local || 0);
+    document.querySelector("#lora-gallery-cache-status").textContent = `缩略图：排队 ${queued} · 本轮完成 ${completed} · 失败 ${failed} · 当前可用 ${available}`;
+    return data;
+  } catch (error) {
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+async function warmLoraGallery() {
+  const button = document.querySelector("#lora-gallery-warm");
+  const keys = loraGalleryItems.map((item) => item.preview_key).filter(Boolean);
+  setBusy(button, true, "正在排队…");
+  try {
+    const data = await api("/api/loras/thumbnails/warm", {
+      method: "POST",
+      body: JSON.stringify({keys, limit: keys.length || Number(document.querySelector("#lora-gallery-page-size").value)}),
+    });
+    const schedule = data.schedule || data;
+    showToast(data.message || `已接受 ${Number(schedule.accepted || 0)} 个缩略图预热任务`);
+    const warmup = data.status || data.warmup || {};
+    document.querySelector("#lora-gallery-cache-status").textContent = `缩略图预热：排队 ${Number(warmup.queued || 0)} · 完成 ${Number(warmup.completed || 0)} · 失败 ${Number(warmup.failed || 0)}`;
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function clearLoraThumbnailCache() {
+  if (!(await confirmAction("清理插件生成的 LoRA 缩略图缓存？不会删除 LoRA、companion 原图或 Civitai 元数据。", {title: "清理缩略图缓存", confirmLabel: "确认清理", danger: false}))) return;
+  const button = document.querySelector("#lora-gallery-cache-clear");
+  setBusy(button, true, "正在清理…");
+  try {
+    const data = await api("/api/loras/thumbnails/cache", {method: "DELETE"});
+    showToast(data.message || `已清理 ${Number(data.removed || 0)} 个缓存文件`);
+    document.querySelector("#lora-gallery-cache-status").textContent = `缓存清理完成；释放 ${Number(data.removed_bytes || data.bytes_removed || 0).toLocaleString()} bytes。图库数据未变，按“刷新图库”可重读预览状态。`;
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function loadCurrentPanel() {
   if (currentPanel === "overview") await loadBootstrap();
   else if (currentPanel === "settings") await Promise.all([loadBootstrap(), loadConfigProfiles({quiet: true})]);
-  else if (currentPanel === "loras") await searchLoras(null);
+  else if (currentPanel === "loras") {
+    if (loraViewMode === "gallery") await loadLoraGallery();
+    else await searchLoras(null);
+  }
   else if (currentPanel === "presets") await loadPresets();
   else if (currentPanel === "models") await loadModels();
   else if (currentPanel === "tasks") await loadTasks();
   else if (currentPanel === "console") await loadConsoleLogs({reset: true});
+  else if (currentPanel === "prompt") await loadPromptWorkbench();
 }
 
 function switchPanel(name) {
@@ -2732,13 +4178,17 @@ function switchPanel(name) {
   document.querySelector("#page-title").textContent = panelTitles[name];
   window.scrollTo({top: 0, behavior: "smooth"});
   if (name === "settings") loadConfigProfiles({quiet: true});
-  if (name === "loras") searchLoras(null);
+  if (name === "loras") {
+    if (loraViewMode === "gallery") loadLoraGallery({quiet: true});
+    else searchLoras(null);
+  }
   if (name === "presets") loadPresets();
   if (name === "models") loadModels();
   if (name === "tasks") loadTasks();
   else stopTaskPolling();
   if (name === "console") loadConsoleLogs({reset: consoleEntries.length === 0});
   else stopConsolePolling();
+  if (name === "prompt") loadPromptWorkbench({quiet: true});
 }
 
 async function logout() {
@@ -2817,9 +4267,39 @@ document.querySelector("#config-profile-select").addEventListener("change", (eve
     ? `${item.active ? "当前档案。" : "可切换。"} 更新于 ${item.updated_at || "未知时间"}。`
     : "";
 });
-document.querySelector("#lora-search-form").addEventListener("submit", searchLoras);
+document.querySelector("#lora-search-form").addEventListener("submit", (event) => {
+  if (loraViewMode === "gallery") {
+    event.preventDefault();
+    loraGalleryPage = 1;
+    loadLoraGallery();
+  } else {
+    searchLoras(event);
+  }
+});
 document.querySelector("#lora-refresh").addEventListener("click", refreshLoras);
 document.querySelector("#lora-download-form").addEventListener("submit", downloadLora);
+document.querySelector("#lora-view-table").addEventListener("click", () => switchLoraView("table"));
+document.querySelector("#lora-view-gallery").addEventListener("click", () => switchLoraView("gallery"));
+document.querySelector("#lora-gallery-refresh").addEventListener("click", () => loadLoraGallery());
+document.querySelector("#lora-gallery-warm").addEventListener("click", warmLoraGallery);
+document.querySelector("#lora-gallery-cache-status-refresh").addEventListener("click", () => loadLoraThumbnailStatus());
+document.querySelector("#lora-gallery-cache-clear").addEventListener("click", clearLoraThumbnailCache);
+for (const selector of ["#lora-gallery-category", "#lora-gallery-metadata", "#lora-gallery-preview", "#lora-gallery-favorites", "#lora-gallery-page-size"]) {
+  document.querySelector(selector).addEventListener("change", () => {
+    loraGalleryPage = 1;
+    loadLoraGallery({quiet: true});
+  });
+}
+document.querySelector("#lora-gallery-prev").addEventListener("click", () => {
+  if (loraGalleryPage <= 1) return;
+  loraGalleryPage -= 1;
+  loadLoraGallery({quiet: true});
+});
+document.querySelector("#lora-gallery-next").addEventListener("click", () => {
+  if (loraGalleryPage >= loraGalleryPages) return;
+  loraGalleryPage += 1;
+  loadLoraGallery({quiet: true});
+});
 document.querySelector("#lora-category-filters").addEventListener("click", (event) => {
   const button = event.target.closest(".filter-tab");
   if (!button) return;
@@ -2943,6 +4423,62 @@ document.querySelector("#console-viewport").addEventListener("scroll", (event) =
 document.querySelector("#console-pause").addEventListener("click", () => setConsolePaused(!consolePaused));
 document.querySelector("#console-copy").addEventListener("click", copyVisibleConsoleLogs);
 document.querySelector("#console-clear").addEventListener("click", clearConsoleLogs);
+document.querySelector("#prompt-diagnostic-form").addEventListener("submit", diagnosePrompt);
+document.querySelector("#prompt-diagnostics-clear").addEventListener("click", clearPromptDiagnostics);
+document.querySelector("#prompt-index-update").addEventListener("click", updateDanbooruIndex);
+document.querySelector("#prompt-status-refresh").addEventListener("click", () => loadPromptStatus());
+document.querySelector("#prompt-experiments-refresh").addEventListener("click", () => loadExperimentalProfiles());
+document.querySelector("#prompt-workbench-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-prompt-tab]");
+  if (button) switchPromptTab(button.dataset.promptTab);
+});
+document.querySelector("#prompt-slot-form").addEventListener("submit", composePromptSlots);
+document.querySelector("#prompt-slots-clear").addEventListener("click", clearUnlockedPromptSlots);
+document.querySelector("#prompt-open-assets").addEventListener("click", () => switchPromptTab("assets", {focus: true}));
+document.querySelector("#prompt-asset-search-form").addEventListener("submit", (event) => {
+  promptAssetPage = 1;
+  searchPromptAssets(event);
+  loadPromptAssetFacets({quiet: true});
+});
+document.querySelector("#prompt-assets-sync-local").addEventListener("click", syncLocalPromptAssets);
+document.querySelector("#prompt-asset-type").addEventListener("change", () => {
+  promptAssetPage = 1;
+  searchPromptAssets(null, {quiet: true});
+  loadPromptAssetFacets({quiet: true});
+});
+document.querySelector("#prompt-asset-page-size").addEventListener("change", () => {
+  promptAssetPage = 1;
+  searchPromptAssets(null, {quiet: true});
+});
+document.querySelector("#prompt-asset-favorites-only").addEventListener("change", () => {
+  promptAssetPage = 1;
+  searchPromptAssets(null, {quiet: true});
+  loadPromptAssetFacets({quiet: true});
+});
+document.querySelector("#prompt-asset-prev").addEventListener("click", () => {
+  if (promptAssetPage <= 1) return;
+  promptAssetPage -= 1;
+  searchPromptAssets(null, {quiet: true});
+});
+document.querySelector("#prompt-asset-next").addEventListener("click", () => {
+  if (promptAssetPage >= promptAssetPages) return;
+  promptAssetPage += 1;
+  searchPromptAssets(null, {quiet: true});
+});
+document.querySelector("#prompt-custom-form").addEventListener("submit", savePromptCustomAsset);
+document.querySelector("#prompt-custom-reset").addEventListener("click", resetPromptCustomForm);
+document.querySelector("#prompt-custom-delete").addEventListener("click", deletePromptCustomAsset);
+document.querySelector("#prompt-asset-import-form").addEventListener("submit", importPromptAssets);
+document.querySelector("#prompt-asset-url-form").addEventListener("submit", updatePromptAssetsFromUrl);
+document.querySelector("#prompt-lab-form").addEventListener("submit", generatePromptLab);
+document.querySelector("#prompt-lab-use-composer").addEventListener("click", (event) => {
+  promptLabUseComposerBase = !promptLabUseComposerBase;
+  event.currentTarget.classList.toggle("active", promptLabUseComposerBase);
+  event.currentTarget.textContent = promptLabUseComposerBase ? "已读取构图台基础层" : "不读取构图台基础层";
+  document.querySelector("#prompt-lab-status").textContent = promptLabUseComposerBase
+    ? "候选会保留构图台基础层与锁定槽。"
+    : "候选从空基础层开始。";
+});
 document.querySelector("#reload-data").addEventListener("click", loadCurrentPanel);
 document.querySelector("#logout-button").addEventListener("click", logout);
 window.addEventListener("beforeunload", () => {
@@ -2957,6 +4493,8 @@ if (pluginPageBridge()) {
 
 initializeArchivePreferences();
 initializeThemePicker();
+initializePromptSubnav();
+switchLoraView(readPreference("comfy-anima-lora-view", "table"));
 updateSelectionUI();
 loadBootstrap()
   .then(() => restoreActiveLoraTask())

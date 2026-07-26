@@ -401,6 +401,42 @@
     "type": "int",
     "default": 50
   },
+  "enable_lora_visual_gallery": {
+    "description": "启用 LoRA 视觉图库",
+    "type": "bool",
+    "hint": "从最新 LoRA 清单生成指纹化视觉清单；浏览清单不会取代生成前的 LoRA Manager 强制刷新",
+    "default": true
+  },
+  "lora_visual_roots": {
+    "description": "LoRA 视觉图库本地根目录",
+    "type": "list",
+    "hint": "可选本地白名单：只读与 LoRA 精确同名的 companion 图。容器无挂载时可改用当前 LoRA Manager 同源固定预览端点；前端不能提交 URL 或路径",
+    "default": []
+  },
+  "lora_visual_cache_mb": {
+    "description": "LoRA 缩略图缓存上限（MB）",
+    "type": "int",
+    "hint": "范围 0 到 8192 MB；0 禁用持久缩略图缓存，建议保持默认 256 MB 或更低",
+    "default": 256
+  },
+  "lora_visual_warmup_workers": {
+    "description": "LoRA 缩略图预热工作线程",
+    "type": "int",
+    "hint": "范围 1 到 4；过高会增加磁盘与图像解码压力",
+    "default": 2
+  },
+  "lora_visual_preview_max_mb": {
+    "description": "LoRA companion 预览图大小上限（MB）",
+    "type": "int",
+    "hint": "范围 1 到 32 MB；超限或解码失败的本地图片不会进入缓存",
+    "default": 4
+  },
+  "lora_visual_thumbnail_size": {
+    "description": "LoRA 缩略图最长边像素",
+    "type": "int",
+    "hint": "范围 128 到 1024 像素",
+    "default": 512
+  },
   "lora_alias_rules": {
     "description": "LoRA 自定义别名规则",
     "type": "list",
@@ -695,6 +731,99 @@
     "options": ["auto", "function_call", "json", "legacy"],
     "hint": "auto 优先 Function Calling 并兼容 JSON/<pic>；function_call 为严格模式",
     "default": "auto"
+  },
+  "enable_prompt_composer_v2": {
+    "description": "启用 Prompt Composer v2",
+    "type": "bool",
+    "hint": "在本地把 LLM 输出整理为 LoRA/硬 Tags、视觉短语和末尾场景关系句；不会增加模型调用",
+    "default": true
+  },
+  "adaptive_negative_mode": {
+    "description": "动态负面词策略",
+    "type": "string",
+    "options": ["off", "conservative", "standard"],
+    "hint": "conservative 仅按多人接触、手持物、全身和极端透视等实际风险补词；standard 额外加入通用质量负面词",
+    "default": "conservative"
+  },
+  "enable_prompt_diagnostics": {
+    "description": "启用提示词诊断",
+    "type": "bool",
+    "hint": "保存有界的内存诊断摘要供 WebUI 查看；插件重载后自动清空",
+    "default": true
+  },
+  "prompt_diagnostics_include_content": {
+    "description": "诊断中显示完整分层内容",
+    "type": "bool",
+    "hint": "关闭时只显示数量、冲突、风险与哈希；不会把完整提示词写入持久日志",
+    "default": false
+  },
+  "prompt_diagnostics_capacity": {
+    "description": "内存提示词诊断保留数量",
+    "type": "int",
+    "hint": "范围 10 到 500；这些记录不会进入发布包或任务 SQLite",
+    "default": 50
+  },
+  "danbooru_validation_mode": {
+    "description": "本地 Danbooru 硬锚点校验模式",
+    "type": "string",
+    "options": ["off", "report", "guarded"],
+    "hint": "report 只报告；guarded 为未来结构化身份锚点预留，本版普通绘图路径会安全降级为 report。用户原始 Tags 与 LoRA 触发词永不被拦截",
+    "default": "report"
+  },
+  "danbooru_index_url": {
+    "description": "Danbooru 本地索引数据源 URL",
+    "type": "string",
+    "hint": "插件不附带第三方标签库。仅在管理员点击更新时读取此 HTTPS 或私网 HTTP JSON/CSV 地址",
+    "default": ""
+  },
+  "danbooru_index_timeout": {
+    "description": "Danbooru 索引更新超时（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "danbooru_index_max_size_mb": {
+    "description": "Danbooru 索引下载大小上限（MB）",
+    "type": "int",
+    "hint": "范围 1 到 128 MB；同时受 50 万记录、Tag/别名长度和单条别名数量硬限制",
+    "default": 64
+  },
+  "enable_prompt_asset_library": {
+    "description": "启用视觉提示词资产库",
+    "type": "bool",
+    "hint": "管理员可导入带来源、版本和导入时间的 JSON/CSV；安装包不捆绑外部提示词数据",
+    "default": true
+  },
+  "prompt_asset_remote_import_enabled": {
+    "description": "允许视觉资产库远程导入",
+    "type": "bool",
+    "hint": "默认关闭。开启后仍只允许解析到公网地址的 HTTPS；禁止私网/回环 HTTP、重定向、URL 凭据和未经验证的地址。局域网素材请直接粘贴 JSON/CSV",
+    "default": false
+  },
+  "prompt_asset_max_download_mb": {
+    "description": "视觉资产库远程导入上限（MB）",
+    "type": "int",
+    "hint": "范围 1 到 16 MB；还会同时限制记录数、字段数、文本长度和列表项数。该值只用于远程 HTTPS 下载",
+    "min": 1,
+    "max": 16,
+    "default": 16
+  },
+  "enable_prompt_lab": {
+    "description": "启用 Prompt Lab 候选实验室",
+    "type": "bool",
+    "hint": "Prompt Lab 只保存有界草稿并支持固定 Seed、锁定分层和重新组合；不会自动提交 ComfyUI",
+    "default": true
+  },
+  "prompt_lab_batch_capacity": {
+    "description": "Prompt Lab 草稿批次保留上限",
+    "type": "int",
+    "hint": "范围 4 到 128；超出容量的旧批次会被清理",
+    "default": 32
+  },
+  "prompt_lab_ttl_seconds": {
+    "description": "Prompt Lab 草稿有效期（秒）",
+    "type": "int",
+    "hint": "范围 60 到 86400 秒；默认 30 分钟，过期候选不能被确认",
+    "default": 1800
   },
   "user_cooldown": {
     "description": "用户冷却时间（秒）",

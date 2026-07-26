@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.5.7
+AstrBot Comfy Anima 插件 v1.7.1
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.5.7
-日期: 2026-07-21
+版本: 1.7.1
+日期: 2026-07-26
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from typing import Any
 
 from ..core.lora import LORA_TAG_PATTERN
 from ..models import PluginSettings
+from .prompt_composer import PromptComposer, PromptDiagnostics
 from .provider_response import response_error_code, response_text
 from .structured_provider import (
     StructuredProviderError,
@@ -94,11 +95,13 @@ RUNTIME_OVERRIDE = """
 角色外观连续性与生成稳定性。参考规范用于指导你的导演思路，但本次调用的输出协议覆盖参考规范：
 
 1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅当用户明确指定生成管线时增加 `pipeline="base|rtx|iterative"`；仅在确有需要时增加可选的 `negative="..."` 属性，`prompt` 属性始终必需。
-2. prompt 必须是单行英文混合提示词：先写紧凑、有序的 Anima/Danbooru tags，再用英文句号分隔一句自然语言画面描述；这句话属于 prompt 本身，不是额外回复。negative 仍是单行英文 tags。
-   - 标签块负责离散可控事实：人数、角色、作品、可见外观、服装、动作、表情、镜头、场景和光线。
-   - 末句负责标签不擅长表达的关系：主体怎样动作、手中物体、接触点、衣料状态、前后空间、环境互动和主光方向。
+2. prompt 必须是单行英文混合提示词，并在内部按三层规划：hard tags → 少量 visual phrases → 英文句号后的一个 scene sentence；这句话属于 prompt 本身，不是额外回复。negative 仍是单行英文 tags。
+   - hard tags 负责离散可控事实：人数、角色、作品、可见外观、服装、动作、表情、镜头、场景和光线。
+   - visual phrases 只补充可见但难用单一 tag 表达的情绪后果、环境联动、材质或动势；不得与 hard tags 重复。
+   - scene sentence 负责主体怎样动作、手中物体、接触点、衣料状态、前后空间、环境互动和主光方向。
    - 末句使用现在时和主动表达，通常 18 至 45 个英文单词；简单肖像可更短。可以有意识地复述 3 至 6 个最重要锚点，但不要把全部 tags 改写成流水账。
    - 末句不得加入标签块或用户需求中没有的新人物、服装、道具、动作、身体特征、场景或剧情结果；不得使用 `the image shows`、质量口号、操作指令、角色扮演台词或第二个句子。
+   - 输出前解决 solo/多人、景别、机位、姿势、朝向和昼夜等明确互斥项；negative 只按本次多人接触、手持物、全身足部、极端透视或复杂衣料风险做最小补充。
    - 复杂动作优先用 `while`、`as`、`around`、`over`、`beneath`、`through` 等关系词，把姿势、道具和环境组成一个可视场面。若视线、动作或镜头互相冲突，先在标签块中裁决，再让末句与最终标签完全一致。
 3. 普通标签使用自然空格和半角逗号；不得改写工具返回的 LoRA 文件名或 trigger words。
 4. 默认不添加质量词或安全词；只有用户明确要求时才加入。
@@ -160,6 +163,8 @@ class PictureInstruction:
     prompt: str
     negative_prompt: str = ""
     pipeline: str = ""
+    diagnostic_id: str = ""
+    diagnostics: PromptDiagnostics | None = None
 
 
 @dataclass(frozen=True)
@@ -174,9 +179,78 @@ class EditInstruction:
 class PromptDirector:
     """封装模型选择、LLM 调用及输出解析。"""
 
-    def __init__(self, reference_path: Path, settings: PluginSettings):
+    def __init__(
+        self,
+        reference_path: Path,
+        settings: PluginSettings,
+        composer: PromptComposer | None = None,
+    ):
         self._settings = settings
         self._reference = self._load_reference(reference_path)
+        self._composer = composer
+
+    def compose_picture_instruction(
+        self,
+        instruction: PictureInstruction,
+        *,
+        provider_id: str = "",
+        source: str = "director",
+    ) -> PictureInstruction:
+        """Apply the optional local composer exactly once to a picture plan."""
+
+        if self._composer is None or instruction.diagnostic_id:
+            return instruction
+        try:
+            composed = self._composer.compose(
+                instruction.prompt,
+                instruction.negative_prompt,
+                source=source,
+                provider_id=provider_id,
+                pipeline=instruction.pipeline,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PromptDirectorError(
+                "提示词本地组合校验失败，已停止且不会提交 ComfyUI",
+                "prompt_composition_failed",
+                fatal=True,
+            ) from exc
+        return PictureInstruction(
+            prompt=composed.positive_prompt,
+            negative_prompt=composed.negative_prompt,
+            pipeline=instruction.pipeline,
+            diagnostic_id=composed.diagnostic_id,
+            diagnostics=composed.diagnostics,
+        )
+
+    def compose_edit_instruction(
+        self,
+        instruction: EditInstruction,
+        *,
+        provider_id: str = "",
+        source: str = "edit",
+    ) -> EditInstruction:
+        """Compose masked-redraw tags without requiring a full-scene sentence."""
+
+        if self._composer is None:
+            return instruction
+        try:
+            composed = self._composer.compose(
+                instruction.prompt,
+                instruction.negative_prompt,
+                source=source,
+                provider_id=provider_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PromptDirectorError(
+                "重绘提示词本地组合校验失败，已停止且不会提交 ComfyUI",
+                "prompt_composition_failed",
+                fatal=True,
+            ) from exc
+        return EditInstruction(
+            prompt=composed.positive_prompt,
+            negative_prompt=composed.negative_prompt,
+            mode=instruction.mode,
+        )
 
     @staticmethod
     def _load_reference(path: Path) -> str:
@@ -469,14 +543,15 @@ class PromptDirector:
                                 "invalid_structured_fields",
                                 fatal=True,
                             )
-                        return (
+                        instruction = self.compose_picture_instruction(
                             PictureInstruction(
                                 prompt=self._normalize_prompt(positive),
                                 negative_prompt=self._normalize_negative_prompt(negative),
                                 pipeline=self._normalize_pipeline(pipeline),
                             ),
-                            provider_id,
+                            provider_id=provider_id,
                         )
+                        return instruction, provider_id
                 completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
                     raise PromptDirectorError(
@@ -488,6 +563,10 @@ class PromptDirector:
                     completion,
                     strict_protocol=True,
                 )
+                instruction = self.compose_picture_instruction(
+                    instruction,
+                    provider_id=provider_id,
+                )
                 return instruction, provider_id
             except PromptDirectorError as exc:
                 if exc.detail in {
@@ -495,6 +574,7 @@ class PromptDirector:
                     "all_models_failed",
                     "no_choices",
                     "provider_error",
+                    "prompt_composition_failed",
                 }:
                     raise
                 if attempt == 1:
@@ -666,13 +746,19 @@ class PromptDirector:
                         "invalid_edit_protocol",
                         fatal=True,
                     )
-                return instructions[0], provider_id
+                instruction = self.compose_edit_instruction(
+                    instructions[0],
+                    provider_id=provider_id,
+                    source="edit",
+                )
+                return instruction, provider_id
             except PromptDirectorError as exc:
                 if exc.detail in {
                     "error_role",
                     "all_models_failed",
                     "no_choices",
                     "provider_error",
+                    "prompt_composition_failed",
                 }:
                     raise
                 if attempt == 1:
@@ -953,6 +1039,9 @@ class PromptDirector:
 
     @staticmethod
     def _normalize_pipeline(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
         aliases = {
             "base": "base",
             "原图": "base",
@@ -963,7 +1052,7 @@ class PromptDirector:
             "迭代": "iterative",
             "迭代放大": "iterative",
         }
-        normalized = aliases.get(str(value or "rtx").strip().casefold())
+        normalized = aliases.get(raw.casefold())
         if normalized is None:
             raise PromptDirectorError("LLM 返回了未知生成管线")
         return normalized

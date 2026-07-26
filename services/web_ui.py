@@ -16,6 +16,14 @@ from astrbot.api import logger
 
 from ..constants import PLUGIN_NAME
 from ..models import PluginSettings
+from .plugin_page import (
+    V170ApiPayloadTooLargeError,
+    V170ApiValidationError,
+    validate_lora_preview_query,
+    validate_lora_preview_response,
+    validate_prompt_asset_facets_query,
+    validate_v170_api_payload,
+)
 from .task_store import TASK_STATUSES
 
 
@@ -60,6 +68,68 @@ class WebUiController(Protocol):
 
     async def web_ui_list_providers(self) -> dict[str, Any]: ...
 
+    async def web_ui_prompt_status(self) -> dict[str, Any]: ...
+
+    async def web_ui_diagnose_prompt(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_clear_prompt_diagnostics(self) -> dict[str, Any]: ...
+
+    async def web_ui_update_danbooru_index(self) -> dict[str, Any]: ...
+
+    async def web_ui_check_experimental_profiles(self) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_status(self) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_search(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_facets(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_import(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_update_url(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_sync_local(
+        self, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_create(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_update(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_delete(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_favorite(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_compose_prompt_slots(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_lab_generate(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_lab_confirm(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
     async def web_ui_search_loras(self, keyword: str, limit: int) -> dict[str, Any]: ...
 
     async def web_ui_refresh_loras(self) -> dict[str, Any]: ...
@@ -80,6 +150,22 @@ class WebUiController(Protocol):
 
     async def web_ui_archive_loras(
         self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_lora_gallery(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_lora_visual_warm(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_lora_visual_status(self) -> dict[str, Any]: ...
+
+    async def web_ui_lora_visual_prune(self) -> dict[str, Any]: ...
+
+    async def web_ui_lora_preview(
+        self, key: str, fingerprint: str
     ) -> dict[str, Any]: ...
 
     async def web_ui_list_presets(self) -> dict[str, Any]: ...
@@ -176,6 +262,73 @@ class WebUiService:
                 web.get("/api/bootstrap", self._bootstrap),
                 web.get("/api/providers", self._list_providers),
                 web.put("/api/settings", self._save_settings),
+                web.get("/api/prompt/status", self._prompt_status),
+                web.post("/api/prompt/diagnose", self._diagnose_prompt),
+                web.delete(
+                    "/api/prompt/diagnostics",
+                    self._clear_prompt_diagnostics,
+                ),
+                web.post("/api/danbooru/update", self._update_danbooru_index),
+                web.get(
+                    "/api/experiments/check",
+                    self._check_experimental_profiles,
+                ),
+                web.get(
+                    "/api/prompt-assets/status",
+                    self._prompt_assets_status,
+                ),
+                web.post(
+                    "/api/prompt-assets/search",
+                    self._prompt_assets_search,
+                ),
+                web.get(
+                    "/api/prompt-assets/facets",
+                    self._prompt_assets_facets,
+                ),
+                web.post(
+                    "/api/prompt-assets/facets",
+                    self._prompt_assets_facets,
+                ),
+                web.post(
+                    "/api/prompt-assets/import",
+                    self._prompt_assets_import,
+                ),
+                web.post(
+                    "/api/prompt-assets/update-url",
+                    self._prompt_assets_update_url,
+                ),
+                web.post(
+                    "/api/prompt-assets/sync-local",
+                    self._prompt_assets_sync_local,
+                ),
+                web.post(
+                    "/api/prompt-assets/custom",
+                    self._prompt_asset_create,
+                ),
+                web.put(
+                    "/api/prompt-assets/custom",
+                    self._prompt_asset_update,
+                ),
+                web.delete(
+                    "/api/prompt-assets/custom",
+                    self._prompt_asset_delete,
+                ),
+                web.put(
+                    "/api/prompt-assets/favorite",
+                    self._prompt_asset_favorite,
+                ),
+                web.post(
+                    "/api/prompt/compose-slots",
+                    self._compose_prompt_slots,
+                ),
+                web.post(
+                    "/api/prompt-lab/generate",
+                    self._prompt_lab_generate,
+                ),
+                web.post(
+                    "/api/prompt-lab/confirm",
+                    self._prompt_lab_confirm,
+                ),
                 web.get("/api/loras", self._search_loras),
                 web.post("/api/loras/refresh", self._refresh_loras),
                 web.post("/api/loras/download", self._download_lora),
@@ -190,6 +343,20 @@ class WebUiService:
                 web.get("/api/lora/archive/status", self._get_lora_archive_status),
                 web.get("/api/lora/archive/index", self._get_lora_archive_index),
                 web.post("/api/lora/archive/run", self._archive_loras),
+                web.post("/api/loras/gallery", self._lora_gallery),
+                web.post(
+                    "/api/loras/thumbnails/warm",
+                    self._lora_visual_warm,
+                ),
+                web.get(
+                    "/api/loras/thumbnails/status",
+                    self._lora_visual_status,
+                ),
+                web.delete(
+                    "/api/loras/thumbnails/cache",
+                    self._lora_visual_prune,
+                ),
+                web.get("/api/loras/preview", self._lora_preview),
                 web.get("/api/presets", self._list_presets),
                 web.post("/api/presets", self._save_preset),
                 web.delete(
@@ -443,6 +610,164 @@ class WebUiService:
     async def _list_providers(self, _request: web.Request) -> web.Response:
         return await self._controller_response(self._controller.web_ui_list_providers())
 
+    async def _prompt_status(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(self._controller.web_ui_prompt_status())
+
+    async def _diagnose_prompt(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        prompt = str(payload.get("prompt") or "")
+        negative = str(payload.get("negative_prompt") or "")
+        if not prompt.strip() or len(prompt) > 6000:
+            return self._json_error("提示词必须为 1–6000 个字符", status=400)
+        if len(negative) > 2000:
+            return self._json_error("负面提示词不能超过 2000 个字符", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_diagnose_prompt(
+                {"prompt": prompt, "negative_prompt": negative}
+            )
+        )
+
+    async def _clear_prompt_diagnostics(
+        self, _request: web.Request
+    ) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_clear_prompt_diagnostics()
+        )
+
+    async def _update_danbooru_index(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_update_danbooru_index()
+        )
+
+    async def _check_experimental_profiles(
+        self, _request: web.Request
+    ) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_check_experimental_profiles()
+        )
+
+    async def _prompt_assets_status(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_prompt_assets_status()
+        )
+
+    async def _prompt_assets_search(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_assets_search", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_assets_search(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_facets(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = (
+                validate_prompt_asset_facets_query(request.query)
+                if request.method == "GET"
+                else validate_v170_api_payload(
+                    "prompt_assets_facets", await self._read_json(request)
+                )
+            )
+            return await self._controller.web_ui_prompt_assets_facets(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_import(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_assets_import", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_assets_import(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_update_url(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_assets_update_url", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_assets_update_url(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_sync_local(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            raw_payload = (
+                {}
+                if request.content_length in (None, 0) and not request.can_read_body
+                else await self._read_json(request)
+            )
+            payload = validate_v170_api_payload(
+                "prompt_assets_sync_local", raw_payload
+            )
+            return await self._controller.web_ui_prompt_assets_sync_local(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_create(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_create", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_create(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_update(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_update", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_update(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_delete(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_delete", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_delete(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_favorite(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_favorite", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_favorite(payload)
+
+        return await self._controller_response(operation())
+
+    async def _compose_prompt_slots(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "compose_prompt_slots", await self._read_json(request)
+            )
+            return await self._controller.web_ui_compose_prompt_slots(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_lab_generate(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_lab_generate", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_lab_generate(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_lab_confirm(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_lab_confirm", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_lab_confirm(payload)
+
+        return await self._controller_response(operation())
+
     async def _search_loras(self, request: web.Request) -> web.Response:
         keyword = request.query.get("q", "").strip()
         try:
@@ -512,6 +837,48 @@ class WebUiService:
         return await self._controller_response(
             self._controller.web_ui_archive_loras(await self._read_json(request))
         )
+
+    async def _lora_gallery(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "lora_gallery", await self._read_json(request)
+            )
+            return await self._controller.web_ui_lora_gallery(payload)
+
+        return await self._controller_response(operation())
+
+    async def _lora_visual_warm(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "lora_visual_warm", await self._read_json(request)
+            )
+            return await self._controller.web_ui_lora_visual_warm(payload)
+
+        return await self._controller_response(operation())
+
+    async def _lora_visual_status(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_lora_visual_status()
+        )
+
+    async def _lora_visual_prune(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_lora_visual_prune()
+        )
+
+    async def _lora_preview(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            key, fingerprint = validate_lora_preview_query(
+                request.query.get("key"), request.query.get("fingerprint")
+            )
+            result = await self._controller.web_ui_lora_preview(key, fingerprint)
+            return validate_lora_preview_response(
+                result,
+                key=key,
+                fingerprint=fingerprint,
+            )
+
+        return await self._controller_response(operation())
 
     async def _list_presets(self, _request: web.Request) -> web.Response:
         return await self._controller_response(self._controller.web_ui_list_presets())
@@ -652,6 +1019,14 @@ class WebUiService:
     async def _controller_response(self, awaitable: Any) -> web.Response:
         try:
             result = await awaitable
+        except web.HTTPRequestEntityTooLarge:
+            return self._json_error("请求体超过 1 MiB 限制", status=413)
+        except V170ApiPayloadTooLargeError as exc:
+            return self._json_error(str(exc), status=413)
+        except web.HTTPBadRequest as exc:
+            return self._json_error(exc.text or "请求必须是有效 JSON", status=400)
+        except V170ApiValidationError as exc:
+            return self._json_error(str(exc), status=400)
         except WebUiActionError as exc:
             return self._json_error(str(exc), status=400)
         except Exception as exc:
@@ -666,6 +1041,8 @@ class WebUiService:
     async def _read_json(request: web.Request) -> dict[str, Any]:
         try:
             payload = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception as exc:
             raise web.HTTPBadRequest(text="请求必须是有效 JSON") from exc
         if not isinstance(payload, dict):

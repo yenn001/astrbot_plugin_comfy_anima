@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.5.7
+AstrBot Comfy Anima 插件 v1.7.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,17 +8,19 @@ AstrBot Comfy Anima 插件 v1.5.7
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.5.7
-日期: 2026-07-21
+版本: 1.7.1
+日期: 2026-07-26
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
 import shlex
 import tempfile
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -85,6 +87,8 @@ from .services.control_modes import (
     extract_natural_control_modes,
     looks_like_control_request,
 )
+from .services.danbooru_index import DanbooruIndexError, DanbooruTagIndex
+from .services.experimental_profiles import inspect_experimental_profiles
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
 from .services.lora_retrieval import LoraHybridSearchService
 from .services.lora_snapshot import LoraOperationSnapshot, record_identity
@@ -121,6 +125,7 @@ from .services.lora_prompting import (
     build_lora_trigger_plan,
     merge_runtime_lora_selections,
 )
+from .services.lora_visuals import LoraVisualError, LoraVisualService
 from .services.log_console import PluginLogConsole
 from .services.image_input import IncomingImageError, IncomingImageService
 from .services.model_manager import (
@@ -132,7 +137,10 @@ from .services.prompt_director import (
     PromptDirector,
     PromptDirectorError,
 )
+from .services.prompt_assets import PromptAssetError, PromptAssetLibrary
+from .services.prompt_composer import PromptComposer, PromptDiagnosticsStore
 from .services.provider_response import response_error_code
+from .services.prompt_lab import PromptLab, PromptLabBatch, PromptLabError
 from .services.plugin_page import PluginPageApi
 from .services.reverse_prompt import (
     ReversePromptError,
@@ -152,7 +160,8 @@ from .services.web_ui import WebUiActionError, WebUiError, WebUiService
 AUTO_DRAW_CONTROL_PROTOCOL = """
 AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）：
 - 先把用户目标归入唯一操作：从文字新生成图片、无蒙版整图语义重绘、修改现有图片的遮罩区域、语义换角、仅放大现有图片。不要因为都与图片有关就一律输出 pic。
-- 普通生图最终使用 `<pic prompt="英文 Anima 混合提示词" pipeline="base|rtx|iterative">`；negative 属性可选。prompt 必须先写有序 Danbooru/Anima tags，再用英文句号分隔一句简短自然语言画面描述。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
+- 普通生图最终使用 `<pic prompt="英文 Anima 混合提示词" pipeline="base|rtx|iterative">`；negative 属性可选。prompt 内部先规划确定的 hard tags，再放少量可见 visual phrases，最后用英文句号分隔一句简短自然语言关系描述；同一事实不要跨层重复。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
+- 输出前先消解人数、景别、机位、姿势、朝向和昼夜等明确冲突；negative 只针对本次多人接触、手持物、全身足部、极端透视或复杂衣料风险，不能加入角色身份、作品或 LoRA。
 - 只有用户明确要求修改已提供图片的遮罩区域时，才使用 `<edit prompt="遮罩区域目标英文 tags" mode="quick|lanpaint">`；negative 属性可选。quick 适合快速小范围修改，lanpaint 适合复杂结构和精细多轮重绘。
 - `<pic>` 与 `<edit>` 互斥；不要同时输出。不要在 `<think>` 内输出控制标签。
 - edit 不能创建或猜测遮罩。缺少原图或同尺寸遮罩时，不输出 edit，并请用户补充：白色/透明区域重绘，黑色区域保留。
@@ -194,6 +203,27 @@ WEB_UI_EDITABLE_FIELDS = (
     "enable_parallel_preflight",
     "enable_local_intent_router",
     "structured_director_mode",
+    "enable_prompt_composer_v2",
+    "adaptive_negative_mode",
+    "enable_prompt_diagnostics",
+    "prompt_diagnostics_include_content",
+    "prompt_diagnostics_capacity",
+    "danbooru_validation_mode",
+    "danbooru_index_url",
+    "danbooru_index_timeout",
+    "danbooru_index_max_size_mb",
+    "enable_prompt_asset_library",
+    "prompt_asset_remote_import_enabled",
+    "prompt_asset_max_download_mb",
+    "enable_prompt_lab",
+    "prompt_lab_batch_capacity",
+    "prompt_lab_ttl_seconds",
+    "enable_lora_visual_gallery",
+    "lora_visual_roots",
+    "lora_visual_cache_mb",
+    "lora_visual_warmup_workers",
+    "lora_visual_preview_max_mb",
+    "lora_visual_thumbnail_size",
     "user_cooldown",
     "send_generation_notice",
     "enable_prompt_llm",
@@ -246,6 +276,43 @@ WEB_UI_EDITABLE_FIELDS = (
     "web_ui_password",
     "web_ui_session_ttl",
 )
+
+
+class _DisabledPromptDiagnosticsStore:
+    """Drop diagnostics while preserving PromptComposer's small store contract."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = max(1, int(capacity))
+
+    @property
+    def max_items(self) -> int:
+        return self._capacity
+
+    def put(self, diagnostics: Any) -> str:
+        return str(getattr(diagnostics, "diagnostic_id", ""))
+
+    add = put
+    record = put
+
+    def get(self, _diagnostic_id: str) -> None:
+        return None
+
+    def list(
+        self,
+        _limit: Optional[int] = None,
+        *,
+        newest_first: bool = True,
+    ) -> tuple[Any, ...]:
+        del newest_first
+        return ()
+
+    snapshot = list
+
+    def clear(self) -> None:
+        return None
+
+    def __len__(self) -> int:
+        return 0
 
 
 @register(
@@ -345,6 +412,72 @@ class ComfyAnimaPlugin(Star):
                 self._persistent_data_dir / "lora_archive.json"
             )
         self.settings = PluginSettings.from_mapping(config)
+        self._danbooru_index = DanbooruTagIndex(
+            self._persistent_data_dir / "danbooru_tags_v1.sqlite3"
+        )
+        if self.settings.enable_prompt_diagnostics:
+            self._prompt_diagnostics_store: Any = PromptDiagnosticsStore(
+                capacity=self.settings.prompt_diagnostics_capacity
+            )
+        else:
+            self._prompt_diagnostics_store = _DisabledPromptDiagnosticsStore(
+                self.settings.prompt_diagnostics_capacity
+            )
+        effective_validation_mode = (
+            "report"
+            if self.settings.danbooru_validation_mode == "guarded"
+            else self.settings.danbooru_validation_mode
+        )
+        self._prompt_composer = PromptComposer(
+            adaptive_negative_mode=self.settings.adaptive_negative_mode,
+            diagnostics_store=self._prompt_diagnostics_store,
+            tag_index=self._danbooru_index,
+            # Current picture transports do not yet expose trustworthy typed
+            # identity anchors.  Keep guarded configuration fail-open as report
+            # instead of pretending that arbitrary user/LoRA tags are protected.
+            validation_mode=effective_validation_mode,
+            include_content=(
+                self.settings.enable_prompt_diagnostics
+                and self.settings.prompt_diagnostics_include_content
+            ),
+        )
+        self._prompt_assets_error = ""
+        self._prompt_assets: Optional[PromptAssetLibrary] = None
+        # Keep synchronous SQLite/catalogue work from filling asyncio's shared
+        # default executor while a large import holds the catalogue lock.
+        self._prompt_asset_io_gate = asyncio.Semaphore(2)
+        if bool(getattr(self.settings, "enable_prompt_asset_library", True)):
+            try:
+                self._prompt_assets = PromptAssetLibrary(
+                    self._persistent_data_dir / "prompt_assets_v1.sqlite3"
+                )
+            except (OSError, ValueError, PromptAssetError) as exc:
+                self._prompt_assets_error = type(exc).__name__
+                logger.warning(
+                    f"[{PLUGIN_NAME}] prompt asset library unavailable: "
+                    f"{type(exc).__name__}"
+                )
+        self._prompt_lab: Optional[PromptLab] = (
+            PromptLab() if bool(getattr(self.settings, "enable_prompt_lab", True)) else None
+        )
+        self._prompt_lab_batch_capacity = min(
+            128,
+            max(4, int(getattr(self.settings, "prompt_lab_batch_capacity", 32))),
+        )
+        self._prompt_lab_ttl_seconds = min(
+            86400,
+            max(60, int(getattr(self.settings, "prompt_lab_ttl_seconds", 1800))),
+        )
+        self._prompt_lab_batches: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._prompt_lab_lock = asyncio.Lock()
+        self._danbooru_update_task: Optional[asyncio.Task[Any]] = None
+        self._danbooru_update_state: dict[str, Any] = {
+            "id": "",
+            "status": "idle",
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "error": "",
+        }
         self._log_console_attached = self._log_console.attach(logger)
         self._active_jobs: dict[str, GenerationJob] = {}
         self._jobs_lock = asyncio.Lock()
@@ -409,6 +542,87 @@ class ComfyAnimaPlugin(Star):
             self._lora_catalog.set_record_overlay(
                 self._semantic_index.apply_overlays
             )
+        self._lora_visual_error = ""
+        self._lora_visuals: Optional[LoraVisualService] = None
+        if bool(getattr(self.settings, "enable_lora_visual_gallery", True)):
+            visual_roots = self._resolve_lora_visual_roots(
+                getattr(self.settings, "lora_visual_roots", ())
+            )
+            if self._lora_catalog is None:
+                self._lora_visual_error = "LoRA catalog is unavailable"
+            else:
+                try:
+                    thumbnail_side = min(
+                        1024,
+                        max(
+                            128,
+                            int(
+                                getattr(
+                                    self.settings,
+                                    "lora_visual_thumbnail_size",
+                                    512,
+                                )
+                            ),
+                        ),
+                    )
+                    self._lora_visuals = LoraVisualService(
+                        visual_roots,
+                        self._persistent_data_dir / "lora_visual_cache",
+                        max_cache_bytes=(
+                            min(
+                                8192,
+                                max(
+                                    0,
+                                    int(
+                                        getattr(
+                                            self.settings,
+                                            "lora_visual_cache_mb",
+                                            256,
+                                        )
+                                    ),
+                                ),
+                            )
+                            * 1024
+                            * 1024
+                        ),
+                        max_workers=min(
+                            4,
+                            max(
+                                1,
+                                int(
+                                    getattr(
+                                        self.settings,
+                                        "lora_visual_warmup_workers",
+                                        2,
+                                    )
+                                ),
+                            ),
+                        ),
+                        max_preview_bytes=(
+                            min(
+                                32,
+                                max(
+                                    1,
+                                    int(
+                                        getattr(
+                                            self.settings,
+                                            "lora_visual_preview_max_mb",
+                                            4,
+                                        )
+                                    ),
+                                ),
+                            )
+                            * 1024
+                            * 1024
+                        ),
+                        thumbnail_size=(thumbnail_side, thumbnail_side),
+                    )
+                except (OSError, ValueError, LoraVisualError) as exc:
+                    self._lora_visual_error = type(exc).__name__
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] LoRA visual gallery unavailable: "
+                        f"{type(exc).__name__}"
+                    )
         self._lora_retrieval = (
             LoraHybridSearchService(
                 self.settings,
@@ -568,7 +782,15 @@ class ComfyAnimaPlugin(Star):
             reference_path = self.settings.resolve_director_reference_path(
                 self.plugin_dir
             )
-            self._director = PromptDirector(reference_path, self.settings)
+            self._director = PromptDirector(
+                reference_path,
+                self.settings,
+                composer=(
+                    self._prompt_composer
+                    if self.settings.enable_prompt_composer_v2
+                    else None
+                ),
+            )
             if not self._auto_draw_system_prompt:
                 self._auto_draw_system_prompt = reference_path.read_text(
                     encoding="utf-8"
@@ -922,6 +1144,22 @@ class ComfyAnimaPlugin(Star):
 
         if parsed.edits:
             edit = parsed.edits[0]
+            compose_edit = getattr(self._director, "compose_edit_instruction", None)
+            if (
+                getattr(self.settings, "enable_prompt_composer_v2", True)
+                and callable(compose_edit)
+            ):
+                try:
+                    edit = compose_edit(edit, source="chat_edit")
+                except PromptDirectorError as exc:
+                    new_chain.append(
+                        Comp.Plain(
+                            f"{MessageEmoji.ERROR} 自动重绘提示词整理失败: "
+                            f"{exc.user_message}"
+                        )
+                    )
+                    result.chain = new_chain
+                    return
             access_error = self._access_error(event, edit.prompt)
             if access_error:
                 new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {access_error}"))
@@ -970,6 +1208,38 @@ class ComfyAnimaPlugin(Star):
                 if index < len(parsed.negative_prompts)
                 else ""
             )
+            pipeline = (
+                parsed.pipelines[index] if index < len(parsed.pipelines) else ""
+            )
+            compose_picture = getattr(
+                self._director,
+                "compose_picture_instruction",
+                None,
+            )
+            if (
+                getattr(self.settings, "enable_prompt_composer_v2", True)
+                and callable(compose_picture)
+            ):
+                try:
+                    instruction = compose_picture(
+                        PictureInstruction(
+                            prompt=prompt,
+                            negative_prompt=negative_prompt,
+                            pipeline=pipeline,
+                        ),
+                        source="conversation_pic",
+                    )
+                except PromptDirectorError as exc:
+                    new_chain.append(
+                        Comp.Plain(
+                            f"{MessageEmoji.ERROR} 自动绘图提示词整理失败: "
+                            f"{exc.user_message}"
+                        )
+                    )
+                    continue
+                prompt = instruction.prompt
+                negative_prompt = instruction.negative_prompt
+                pipeline = instruction.pipeline
             access_error = self._access_error(event, prompt)
             if access_error:
                 new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {access_error}"))
@@ -991,11 +1261,7 @@ class ComfyAnimaPlugin(Star):
                         height=height,
                         lora_preset=style_preset,
                         negative_prompt=negative_prompt,
-                        pipeline=(
-                            parsed.pipelines[index]
-                            if index < len(parsed.pipelines)
-                            else ""
-                        ),
+                        pipeline=pipeline,
                     ),
                 )
             except ValueError as exc:
@@ -5294,6 +5560,266 @@ QQ快捷指令:
         root.mkdir(parents=True, exist_ok=True)
         return root
 
+    @staticmethod
+    def _resolve_lora_visual_roots(raw_roots: Any) -> tuple[Path, ...]:
+        """Resolve only explicit, readable directories and reject filesystem roots."""
+
+        if isinstance(raw_roots, str):
+            values = (raw_roots,)
+        elif isinstance(raw_roots, (list, tuple, set)):
+            values = tuple(raw_roots)
+        else:
+            values = ()
+        resolved: list[Path] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            candidate = Path(text).expanduser()
+            if not candidate.is_absolute():
+                continue
+            try:
+                directory = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if not directory.is_dir():
+                continue
+            anchor = Path(directory.anchor).resolve(strict=False)
+            if directory == anchor or directory in resolved:
+                continue
+            resolved.append(directory)
+        return tuple(resolved)
+
+    def _prompt_asset_fingerprint(self) -> tuple[str, dict[str, Any]]:
+        """Return a cheap process-local revision marker without exposing DB paths."""
+
+        library = getattr(self, "_prompt_assets", None)
+        if library is None:
+            status = {
+                "ready": False,
+                "asset_count": 0,
+                "error": getattr(self, "_prompt_assets_error", "")
+                or "prompt asset library is disabled",
+            }
+            material: dict[str, Any] = {"state": "disabled"}
+        else:
+            status: dict[str, Any] = {}
+
+            def file_state() -> dict[str, int]:
+                try:
+                    stat = library.path.stat()
+                    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+                except OSError:
+                    return {"size": 0, "mtime_ns": 0}
+
+            stable_state = file_state()
+            for _ in range(3):
+                before = file_state()
+                status = library.status()
+                after = file_state()
+                stable_state = after
+                if before == after:
+                    break
+            revision = str(status.get("revision") or "").strip()
+            if (
+                revision
+                and len(revision) <= 128
+                and not any(ord(char) < 32 or ord(char) == 127 for char in revision)
+            ):
+                return revision, status
+            material = {
+                "schema_version": status.get("schema_version", ""),
+                "asset_count": status.get("asset_count", 0),
+                "custom_count": status.get("custom_count", 0),
+                "favorite_count": status.get("favorite_count", 0),
+                "last_import_sha256": status.get("last_import_sha256", ""),
+                "last_import_count": status.get("last_import_count", 0),
+                "file": stable_state,
+            }
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest(), status
+
+    @staticmethod
+    def _prompt_asset_result_revision(result: Mapping[str, Any]) -> str:
+        revision = str(result.get("revision") or "").strip()
+        if (
+            revision
+            and len(revision) <= 128
+            and not any(ord(char) < 32 or ord(char) == 127 for char in revision)
+        ):
+            return revision
+        return ""
+
+    def _prune_prompt_lab_batches_unlocked(self, now: float) -> None:
+        batches = self._prompt_lab_batches
+        expired = [
+            batch_id
+            for batch_id, record in batches.items()
+            if float(record.get("expires_at") or 0.0) <= now
+        ]
+        for batch_id in expired:
+            batches.pop(batch_id, None)
+        while len(batches) > self._prompt_lab_batch_capacity:
+            batches.popitem(last=False)
+
+    def _schedule_prompt_lab_expiry(self, batch_id: str, expires_at: float) -> None:
+        """Actively remove expired private drafts even when the UI stays idle."""
+
+        async def expire() -> None:
+            await asyncio.sleep(max(0.0, expires_at - time.time()))
+            async with self._prompt_lab_lock:
+                record = self._prompt_lab_batches.get(batch_id)
+                if record is not None and float(record.get("expires_at") or 0.0) <= time.time():
+                    self._prompt_lab_batches.pop(batch_id, None)
+
+        try:
+            task = asyncio.create_task(
+                expire(),
+                name=f"{PLUGIN_NAME}:prompt-lab-expire",
+            )
+        except RuntimeError:
+            return
+        cleanup_tasks = getattr(self, "_cleanup_tasks", None)
+        if cleanup_tasks is None:
+            cleanup_tasks = set()
+            self._cleanup_tasks = cleanup_tasks
+        cleanup_tasks.add(task)
+        task.add_done_callback(cleanup_tasks.discard)
+
+    def _v170_task_event(
+        self,
+        run_id: str,
+        phase: str,
+        message: str,
+        event_code: str,
+        *,
+        details: Optional[Mapping[str, Any]] = None,
+        level: str = "INFO",
+    ) -> None:
+        """Record one explicitly redacted v1.7 feature stage."""
+
+        logger_method = logger.warning if level == "WARNING" else logger.info
+        logger_method(f"[{PLUGIN_NAME}] {event_code}; task_id={run_id or 'memory'}")
+        store = getattr(self, "_task_store", None)
+        if store is None or not run_id:
+            return
+        try:
+            store.append_event(
+                run_id,
+                phase,
+                message,
+                level=level,
+                event_code=event_code,
+                details=dict(details or {}),
+            )
+        except (TaskStoreError, ValueError, TypeError) as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] task event persistence failed: {type(exc).__name__}"
+            )
+
+    @asynccontextmanager
+    async def _tracked_v170_operation(
+        self,
+        task_type: str,
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Track bounded WebUI work without persisting prompt or URL content."""
+
+        safe_metadata = dict(metadata or {})
+        run_id = ""
+        store = getattr(self, "_task_store", None)
+        if store is not None:
+            try:
+                run_id = store.create_task(
+                    task_type,
+                    mode="web_ui",
+                    requested_by="dashboard_admin",
+                    total_items=1,
+                    metadata=safe_metadata,
+                )
+                store.start_task(run_id, total_items=1)
+            except (TaskStoreError, ValueError, TypeError) as exc:
+                run_id = ""
+                logger.warning(
+                    f"[{PLUGIN_NAME}] feature task tracking unavailable: "
+                    f"{type(exc).__name__}"
+                )
+        state: dict[str, Any] = {"run_id": run_id, "result": {}}
+        self._v170_task_event(
+            run_id,
+            "run",
+            "The requested dashboard operation has started.",
+            f"{task_type}_started",
+            details=safe_metadata,
+        )
+        try:
+            yield state
+        except asyncio.CancelledError:
+            if store is not None and run_id:
+                try:
+                    store.finish_task(
+                        run_id,
+                        "cancelled",
+                        completed_items=0,
+                        failed_items=0,
+                        error_code="cancelled",
+                        error_summary="Dashboard operation cancelled.",
+                    )
+                except TaskStoreError:
+                    pass
+            raise
+        except Exception as exc:
+            error_code = re.sub(
+                r"[^a-z0-9_]+", "_", type(exc).__name__.casefold()
+            ).strip("_") or "operation_failed"
+            self._v170_task_event(
+                run_id,
+                "run",
+                "The dashboard operation failed; no private payload was recorded.",
+                f"{task_type}_failed",
+                details={"error_type": type(exc).__name__},
+                level="WARNING",
+            )
+            if store is not None and run_id:
+                try:
+                    store.finish_task(
+                        run_id,
+                        "failed",
+                        completed_items=0,
+                        failed_items=1,
+                        error_code=error_code[:100],
+                        error_summary=type(exc).__name__,
+                    )
+                except TaskStoreError:
+                    pass
+            raise
+        else:
+            result = dict(state.get("result") or {})
+            self._v170_task_event(
+                run_id,
+                "run",
+                "The dashboard operation completed successfully.",
+                f"{task_type}_completed",
+                details=result,
+            )
+            if store is not None and run_id:
+                try:
+                    store.finish_task(
+                        run_id,
+                        "succeeded",
+                        completed_items=1,
+                        failed_items=0,
+                        result=result,
+                    )
+                except TaskStoreError:
+                    pass
+
     def _persist_config(self, key: str, value: Any) -> bool:
         """更新 AstrBot 插件配置，写盘并在可用时回读校验。"""
         return self._persist_config_transaction(
@@ -5531,6 +6057,41 @@ QQ快捷指令:
                 "prompt_llm_provider_id": settings.prompt_llm_provider_id,
                 "prompt_llm_temperature": settings.prompt_llm_temperature,
                 "prompt_llm_max_tokens": settings.prompt_llm_max_tokens,
+                "enable_prompt_composer_v2": settings.enable_prompt_composer_v2,
+                "adaptive_negative_mode": settings.adaptive_negative_mode,
+                "enable_prompt_diagnostics": settings.enable_prompt_diagnostics,
+                "prompt_diagnostics_include_content": (
+                    settings.prompt_diagnostics_include_content
+                ),
+                "prompt_diagnostics_capacity": settings.prompt_diagnostics_capacity,
+                "danbooru_validation_mode": settings.danbooru_validation_mode,
+                "danbooru_index_url": settings.danbooru_index_url,
+                "danbooru_index_timeout": settings.danbooru_index_timeout,
+                "danbooru_index_max_size_mb": settings.danbooru_index_max_size_mb,
+                "enable_prompt_asset_library": (
+                    settings.enable_prompt_asset_library
+                ),
+                "prompt_asset_remote_import_enabled": (
+                    settings.prompt_asset_remote_import_enabled
+                ),
+                "prompt_asset_max_download_mb": (
+                    settings.prompt_asset_max_download_mb
+                ),
+                "enable_prompt_lab": settings.enable_prompt_lab,
+                "prompt_lab_batch_capacity": settings.prompt_lab_batch_capacity,
+                "prompt_lab_ttl_seconds": settings.prompt_lab_ttl_seconds,
+                "enable_lora_visual_gallery": settings.enable_lora_visual_gallery,
+                "lora_visual_roots": list(settings.lora_visual_roots),
+                "lora_visual_cache_mb": settings.lora_visual_cache_mb,
+                "lora_visual_warmup_workers": (
+                    settings.lora_visual_warmup_workers
+                ),
+                "lora_visual_preview_max_mb": (
+                    settings.lora_visual_preview_max_mb
+                ),
+                "lora_visual_thumbnail_size": (
+                    settings.lora_visual_thumbnail_size
+                ),
                 "character_swap_timeout": settings.character_swap_timeout,
                 "enable_natural_draw": settings.enable_natural_draw,
                 "enable_llm_pic_trigger": settings.enable_llm_pic_trigger,
@@ -5620,6 +6181,16 @@ QQ快捷指令:
             "iterative_steps": (1, 4),
             "iterative_denoise": (0.1, 0.8),
             "character_swap_timeout": (30, 600),
+            "prompt_diagnostics_capacity": (10, 500),
+            "danbooru_index_timeout": (5, 300),
+            "danbooru_index_max_size_mb": (1, 128),
+            "prompt_asset_max_download_mb": (1, 16),
+            "prompt_lab_batch_capacity": (4, 128),
+            "prompt_lab_ttl_seconds": (60, 86400),
+            "lora_visual_cache_mb": (0, 8192),
+            "lora_visual_warmup_workers": (1, 4),
+            "lora_visual_preview_max_mb": (1, 32),
+            "lora_visual_thumbnail_size": (128, 1024),
         }
         for key, (minimum, maximum) in numeric_ranges.items():
             if key not in supplied:
@@ -5630,7 +6201,20 @@ QQ快捷指令:
                 raise WebUiActionError(f"{key} 必须是数字") from exc
             if not minimum <= value <= maximum:
                 raise WebUiActionError(f"{key} 必须在 {minimum:g} 到 {maximum:g} 之间")
-            if key in {"iterative_steps", "character_swap_timeout"} and not value.is_integer():
+            if key in {
+                "iterative_steps",
+                "character_swap_timeout",
+                "prompt_diagnostics_capacity",
+                "danbooru_index_timeout",
+                "danbooru_index_max_size_mb",
+                "prompt_asset_max_download_mb",
+                "prompt_lab_batch_capacity",
+                "prompt_lab_ttl_seconds",
+                "lora_visual_cache_mb",
+                "lora_visual_warmup_workers",
+                "lora_visual_preview_max_mb",
+                "lora_visual_thumbnail_size",
+            } and not value.is_integer():
                 raise WebUiActionError(f"{key} 必须是整数")
 
         normalized = PluginSettings.from_mapping(candidate)
@@ -5850,6 +6434,1652 @@ QQ快捷指令:
             "chat": groups["chat"],
             "embedding": groups["embedding"],
             "rerank": groups["rerank"],
+        }
+
+    async def web_ui_prompt_status(self) -> dict[str, Any]:
+        """Return privacy-safe Composer, diagnostics and local-index state."""
+
+        store = self._prompt_diagnostics_store
+        diagnostics = [
+            item.to_dict() if hasattr(item, "to_dict") else dict(item)
+            for item in store.list(self.settings.prompt_diagnostics_capacity)
+        ]
+        index_status = self._danbooru_index.status()
+        index_status["update_task"] = dict(self._danbooru_update_state)
+        configured_validation = self.settings.danbooru_validation_mode
+        effective_validation = getattr(
+            self._prompt_composer,
+            "validation_mode",
+            "off",
+        )
+        return {
+            "composer": {
+                "enabled": self.settings.enable_prompt_composer_v2,
+                "adaptive_negative_mode": self.settings.adaptive_negative_mode,
+                "validation_mode": configured_validation,
+                "effective_validation_mode": effective_validation,
+                "guarded_degraded_to_report": (
+                    configured_validation == "guarded"
+                    and effective_validation == "report"
+                ),
+                "diagnostics_enabled": self.settings.enable_prompt_diagnostics,
+                "include_content": (
+                    self.settings.enable_prompt_diagnostics
+                    and self.settings.prompt_diagnostics_include_content
+                ),
+                "capacity": self.settings.prompt_diagnostics_capacity,
+                "count": len(store),
+            },
+            "danbooru": index_status,
+            "diagnostics": diagnostics,
+        }
+
+    async def web_ui_diagnose_prompt(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run the deterministic local Composer without invoking LLM or ComfyUI."""
+
+        positive = str(payload.get("prompt") or "").strip()
+        negative = str(payload.get("negative_prompt") or "").strip()
+        if not positive or len(positive) > 6000:
+            raise WebUiActionError("提示词必须为 1-6000 个字符")
+        if len(negative) > 2000:
+            raise WebUiActionError("负面提示词不能超过 2000 个字符")
+        try:
+            composed = self._prompt_composer.compose(
+                positive,
+                negative,
+                source="webui_diagnose",
+            )
+        except (TypeError, ValueError) as exc:
+            raise WebUiActionError(f"本地提示词诊断失败: {exc}") from exc
+        include_content = (
+            self.settings.enable_prompt_diagnostics
+            and self.settings.prompt_diagnostics_include_content
+        )
+        stored_diagnostics = self._prompt_diagnostics_store.get(
+            composed.diagnostic_id
+        )
+        if stored_diagnostics is None:
+            stored_diagnostics = (
+                composed.diagnostics
+                if include_content
+                else composed.diagnostics.redacted()
+            )
+        diagnostics = stored_diagnostics.to_dict()
+        return {
+            "composed": {
+                "positive_prompt": composed.positive_prompt if include_content else "",
+                "negative_prompt": composed.negative_prompt if include_content else "",
+                "diagnostic_id": composed.diagnostic_id,
+            },
+            "layers": composed.layers.to_dict() if include_content else {},
+            "diagnostics": diagnostics,
+            "message": (
+                "本地诊断完成；未调用 LLM，也未提交 ComfyUI"
+                + (
+                    ""
+                    if include_content
+                    else "；完整提示词与分层内容已按隐私设置隐藏"
+                )
+            ),
+        }
+
+    async def web_ui_clear_prompt_diagnostics(self) -> dict[str, Any]:
+        """Clear only the bounded in-memory prompt diagnostics buffer."""
+
+        count = len(self._prompt_diagnostics_store)
+        self._prompt_diagnostics_store.clear()
+        return {
+            "cleared": count,
+            "message": f"已清空 {count} 条内存提示词诊断",
+        }
+
+    def _require_prompt_assets(self) -> PromptAssetLibrary:
+        library = getattr(self, "_prompt_assets", None)
+        if library is None:
+            raise WebUiActionError(
+                getattr(self, "_prompt_assets_error", "")
+                or "视觉提示词资产库未启用或不可用"
+            )
+        return library
+
+    async def _run_prompt_asset_io(
+        self,
+        operation: Any,
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Bound prompt-asset work before it enters the shared thread pool."""
+
+        async with self._prompt_asset_semaphore():
+            return await asyncio.to_thread(operation, *args, **kwargs)
+
+    def _prompt_asset_semaphore(self) -> asyncio.Semaphore:
+        """Return the lazy gate used by lightweight test/controller instances too."""
+
+        gate = getattr(self, "_prompt_asset_io_gate", None)
+        if gate is None:
+            gate = asyncio.Semaphore(2)
+            self._prompt_asset_io_gate = gate
+        return gate
+
+    @staticmethod
+    def _require_web_payload(payload: Any, label: str) -> Mapping[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise WebUiActionError(f"{label} 必须是 JSON 对象")
+        return payload
+
+    async def web_ui_prompt_assets_status(self) -> dict[str, Any]:
+        """Return a path-free status and revision fingerprint."""
+
+        fingerprint, status = await self._run_prompt_asset_io(
+            self._prompt_asset_fingerprint
+        )
+        return {
+            "enabled": bool(
+                getattr(self.settings, "enable_prompt_asset_library", True)
+            ),
+            "available": self._prompt_assets is not None,
+            "fingerprint": fingerprint,
+            **status,
+        }
+
+    async def web_ui_prompt_assets_search(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Search the administrator-imported local asset catalog."""
+
+        data = self._require_web_payload(payload, "素材搜索参数")
+        library = self._require_prompt_assets()
+        filters = data.get("filters")
+        filters = filters if isinstance(filters, Mapping) else {}
+        custom_only = data.get("custom_only", filters.get("custom_only"))
+        if custom_only is not None and not isinstance(custom_only, bool):
+            raise WebUiActionError("custom_only 必须是布尔值或 null")
+        try:
+            result = await self._run_prompt_asset_io(
+                library.search,
+                str(data.get("query") or ""),
+                asset_type=str(data.get("asset_type") or data.get("kind") or ""),
+                categories=data.get(
+                    "categories",
+                    filters.get("categories", filters.get("source_work", ())),
+                ),
+                traits=data.get("traits", filters.get("traits", ())),
+                tags=data.get("tags", filters.get("tags", ())),
+                source=str(data.get("source") or filters.get("source") or ""),
+                favorite_only=bool(
+                    data.get("favorite_only", filters.get("favorite_only", False))
+                ),
+                custom_only=custom_only,
+                page=int(data.get("page") or 1),
+                page_size=int(data.get("page_size") or data.get("limit") or 50),
+                sort=str(data.get("sort") or "relevance"),
+            )
+        except (PromptAssetError, TypeError, ValueError) as exc:
+            raise WebUiActionError(f"素材搜索失败: {exc}") from exc
+        fingerprint = self._prompt_asset_result_revision(result)
+        if not fingerprint:
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+        return {**result, "fingerprint": fingerprint}
+
+    async def web_ui_prompt_assets_facets(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return stable bounded facets for the asset filter controls."""
+
+        data = self._require_web_payload(payload, "素材筛选参数")
+        library = self._require_prompt_assets()
+        custom_only = data.get("custom_only")
+        if custom_only is not None and not isinstance(custom_only, bool):
+            raise WebUiActionError("custom_only 必须是布尔值或 null")
+        try:
+            result = await self._run_prompt_asset_io(
+                library.facets,
+                asset_type=str(data.get("asset_type") or data.get("kind") or ""),
+                source=str(data.get("source") or ""),
+                favorite_only=bool(data.get("favorite_only", False)),
+                custom_only=custom_only,
+                limit=int(data.get("limit") or 200),
+            )
+        except (PromptAssetError, TypeError, ValueError) as exc:
+            raise WebUiActionError(f"素材筛选读取失败: {exc}") from exc
+        fingerprint = self._prompt_asset_result_revision(result)
+        if not fingerprint:
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+        return {**result, "fingerprint": fingerprint}
+
+    async def web_ui_prompt_assets_import(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Import reviewed UTF-8 JSON/CSV text; filesystem paths are not accepted."""
+
+        data = self._require_web_payload(payload, "素材导入参数")
+        library = self._require_prompt_assets()
+        text = data.get("text", data.get("content"))
+        if not isinstance(text, str) or not text.strip():
+            raise WebUiActionError("素材导入内容必须是非空 UTF-8 文本")
+        encoded = text.encode("utf-8")
+        max_bytes = 128 * 1024 * 1024
+        if len(encoded) > max_bytes:
+            raise WebUiActionError("素材导入内容超过配置的大小上限")
+        format_hint = str(
+            data.get("format") or data.get("content_type") or "json"
+        ).strip().casefold()
+        if format_hint in {"json", "application/json", ".json"}:
+            content_type = "application/json"
+        elif format_hint in {"csv", "text/csv", ".csv"}:
+            content_type = "text/csv"
+        else:
+            raise WebUiActionError("素材格式只支持 JSON 或 CSV")
+        provenance = data.get("provenance")
+        if provenance is not None and not isinstance(provenance, Mapping):
+            raise WebUiActionError("provenance 必须是 JSON 对象")
+        mode = str(data.get("mode") or "merge")
+        async with self._tracked_v170_operation(
+            "prompt_asset_import",
+            metadata={
+                "content_type": content_type,
+                "bytes": len(encoded),
+                "mode": mode,
+            },
+        ) as tracked:
+            self._v170_task_event(
+                tracked["run_id"],
+                "import",
+                "Validated the bounded UTF-8 asset payload; importing atomically.",
+                "prompt_asset_import_validated",
+                details={"content_type": content_type, "bytes": len(encoded)},
+            )
+            try:
+                async with self._prompt_asset_semaphore():
+                    status = await library.import_bytes_async(
+                        encoded,
+                        source=str(data.get("source") or "dashboard_import"),
+                        content_type=content_type,
+                        provenance=dict(provenance or {}),
+                        mode=mode,
+                        timeout=120,
+                    )
+            except (PromptAssetError, TypeError, ValueError) as exc:
+                raise WebUiActionError(f"素材导入失败: {exc}") from exc
+            fingerprint = self._prompt_asset_result_revision(status)
+            if not fingerprint:
+                fingerprint, _ = await self._run_prompt_asset_io(
+                    self._prompt_asset_fingerprint
+                )
+            tracked["result"] = {
+                "asset_count": int(status.get("asset_count") or 0),
+                "fingerprint": fingerprint[:16],
+            }
+            return {
+                **status,
+                "fingerprint": fingerprint,
+                "task_run_id": tracked["run_id"],
+            }
+
+    async def web_ui_prompt_assets_update_url(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fetch an asset pack only when the administrator enables remote import."""
+
+        data = self._require_web_payload(payload, "素材远程更新参数")
+        if not bool(
+            getattr(self.settings, "prompt_asset_remote_import_enabled", False)
+        ):
+            raise WebUiActionError("远程素材导入默认关闭，请先在全局设置中显式启用")
+        library = self._require_prompt_assets()
+        url = str(data.get("url") or "").strip()
+        if not url:
+            raise WebUiActionError("素材更新 URL 不能为空")
+        try:
+            timeout = float(data.get("timeout") or 30)
+        except (TypeError, ValueError) as exc:
+            raise WebUiActionError("timeout 必须是数字") from exc
+        if not 1 <= timeout <= 120:
+            raise WebUiActionError("timeout 必须在 1 到 120 秒之间")
+        provenance = data.get("provenance")
+        if provenance is not None and not isinstance(provenance, Mapping):
+            raise WebUiActionError("provenance 必须是 JSON 对象")
+        max_bytes = (
+            min(
+                16,
+                max(
+                    1,
+                    int(
+                        getattr(
+                            self.settings,
+                            "prompt_asset_max_download_mb",
+                            16,
+                        )
+                    ),
+                ),
+            )
+            * 1024
+            * 1024
+        )
+        mode = str(data.get("mode") or "merge")
+        async with self._tracked_v170_operation(
+            "prompt_asset_remote_import",
+            metadata={"max_bytes": max_bytes, "mode": mode},
+        ) as tracked:
+            self._v170_task_event(
+                tracked["run_id"],
+                "download",
+                "Remote asset fetch passed the feature gate; validating the endpoint.",
+                "prompt_asset_remote_validation_started",
+                details={"max_bytes": max_bytes},
+            )
+            try:
+                async with self._prompt_asset_semaphore():
+                    status = await library.update_from_url(
+                        url,
+                        timeout=timeout,
+                        max_bytes=max_bytes,
+                        provenance=dict(provenance or {}),
+                        mode=mode,
+                        allow_private_http=False,
+                    )
+            except (PromptAssetError, TypeError, ValueError) as exc:
+                raise WebUiActionError(f"素材远程更新失败: {exc}") from exc
+            fingerprint = self._prompt_asset_result_revision(status)
+            if not fingerprint:
+                fingerprint, _ = await self._run_prompt_asset_io(
+                    self._prompt_asset_fingerprint
+                )
+            tracked["result"] = {
+                "asset_count": int(status.get("asset_count") or 0),
+                "fingerprint": fingerprint[:16],
+            }
+            return {
+                **status,
+                "fingerprint": fingerprint,
+                "task_run_id": tracked["run_id"],
+            }
+
+    async def web_ui_prompt_asset_create(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        data = self._require_web_payload(payload, "自定义素材")
+        try:
+            item = await self._run_prompt_asset_io(
+                self._require_prompt_assets().create_custom,
+                data,
+            )
+        except (PromptAssetError, TypeError, ValueError) as exc:
+            raise WebUiActionError(f"创建自定义素材失败: {exc}") from exc
+        fingerprint = self._prompt_asset_result_revision(item)
+        if not fingerprint:
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+        return {"item": item, "fingerprint": fingerprint}
+
+    async def web_ui_prompt_asset_update(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        data = self._require_web_payload(payload, "自定义素材更新")
+        asset_id = str(data.get("asset_id") or data.get("id") or "").strip()
+        changes = data.get("changes")
+        if changes is None:
+            changes = {
+                key: value
+                for key, value in data.items()
+                if key not in {"asset_id", "id"}
+            }
+        if not isinstance(changes, Mapping):
+            raise WebUiActionError("changes 必须是 JSON 对象")
+        try:
+            item = await self._run_prompt_asset_io(
+                self._require_prompt_assets().update_custom,
+                asset_id,
+                changes,
+            )
+        except (PromptAssetError, TypeError, ValueError) as exc:
+            raise WebUiActionError(f"更新自定义素材失败: {exc}") from exc
+        fingerprint = self._prompt_asset_result_revision(item)
+        if not fingerprint:
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+        return {"item": item, "fingerprint": fingerprint}
+
+    async def web_ui_prompt_asset_delete(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        data = self._require_web_payload(payload, "自定义素材删除")
+        asset_id = str(data.get("asset_id") or data.get("id") or "").strip()
+        try:
+            deleted = await self._run_prompt_asset_io(
+                self._require_prompt_assets().delete_custom,
+                asset_id,
+            )
+        except (PromptAssetError, TypeError, ValueError) as exc:
+            raise WebUiActionError(f"删除自定义素材失败: {exc}") from exc
+        if not isinstance(deleted, Mapping):
+            raise WebUiActionError("删除自定义素材返回了无效状态")
+        fingerprint = self._prompt_asset_result_revision(deleted)
+        if not fingerprint:
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+        return {**deleted, "fingerprint": fingerprint}
+
+    async def web_ui_prompt_asset_favorite(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        data = self._require_web_payload(payload, "素材收藏设置")
+        favorite = data.get("favorite", True)
+        if not isinstance(favorite, bool):
+            raise WebUiActionError("favorite 必须是布尔值")
+        asset_id = str(data.get("asset_id") or data.get("id") or "").strip()
+        try:
+            item = await self._run_prompt_asset_io(
+                self._require_prompt_assets().set_favorite,
+                asset_id,
+                favorite,
+            )
+        except (PromptAssetError, TypeError, ValueError) as exc:
+            raise WebUiActionError(f"更新素材收藏状态失败: {exc}") from exc
+        fingerprint = self._prompt_asset_result_revision(item)
+        if not fingerprint:
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+        return {"item": item, "fingerprint": fingerprint}
+
+    async def web_ui_prompt_assets_sync_local(
+        self, payload: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """Explicitly derive first-party assets from fresh LoRA metadata and presets."""
+
+        if payload is not None:
+            self._require_web_payload(payload, "本地素材同步参数")
+        library = self._require_prompt_assets()
+        records: tuple[Any, ...] = ()
+        if self._lora_catalog is not None:
+            try:
+                records = await self._refresh_lora_manager_before(
+                    "WebUI local prompt asset sync",
+                    force=True,
+                )
+            except LoraCatalogError as exc:
+                raise WebUiActionError(exc.user_message) from exc
+        assets: list[dict[str, Any]] = []
+
+        def safe_terms(values: Any) -> list[str]:
+            result: list[str] = []
+            for value in values or ():
+                text = str(value or "").strip()
+                lowered = text.casefold()
+                if (
+                    text
+                    and len(text) <= 256
+                    and not any(
+                        marker in lowered
+                        for marker in ("<lora:", "<pic", "<edit", "<think")
+                    )
+                ):
+                    result.append(text)
+            return list(dict.fromkeys(result))[:128]
+
+        category_map = {
+            "character": "character",
+            "artist_style": "artist",
+            "clothing_concept": "clothing",
+            "background_environment": "background",
+            "composition_pose": "pose",
+        }
+        semantic_index = self._runtime_semantic_index()
+        for record in records:
+            entry = semantic_index.entry_for(record)
+            category = (
+                entry.effective_category
+                if entry is not None and entry.effective_category
+                else str(getattr(record, "category", "") or "")
+            )
+            asset_type = category_map.get(category)
+            if not asset_type:
+                continue
+            semantic_names: tuple[str, ...] = ()
+            if entry is not None:
+                semantic_names = (
+                    entry.effective_values("character_names")
+                    if asset_type == "character"
+                    else entry.effective_values("artist_style_names")
+                    if asset_type == "artist"
+                    else ()
+                )
+            fallback_name = (
+                str(getattr(record, "character_name", "") or "")
+                if asset_type == "character"
+                else str(getattr(record, "model_name", "") or "")
+            )
+            loadable_name = canonical_lora_name(record.name)
+            public_fallback = Path(loadable_name.replace("\\", "/")).stem
+            display_name = next(
+                (
+                    value
+                    for value in (*semantic_names, fallback_name, public_fallback)
+                    if str(value or "").strip()
+                ),
+                "",
+            )
+            aliases = safe_terms(
+                (
+                    *(entry.effective_values("aliases") if entry else ()),
+                    *getattr(record, "aliases", ()),
+                    *semantic_names[1:],
+                )
+            )
+            categories = safe_terms(
+                entry.effective_values("source_works")
+                if entry
+                else (getattr(record, "source_work", ""),)
+            )
+            assets.append(
+                {
+                    "asset_type": asset_type,
+                    "name": display_name,
+                    "aliases": aliases,
+                    "tags": safe_terms(getattr(record, "trigger_words", ())),
+                    "categories": categories,
+                    "source_id": "lora:"
+                    + hashlib.sha256(loadable_name.encode("utf-8")).hexdigest()[:32],
+                    "provenance": {
+                        "origin": "lora_semantic_index",
+                        "analysis_status": (
+                            str(entry.analysis_status) if entry is not None else "catalog"
+                        ),
+                    },
+                }
+            )
+        preset_map = {
+            PRESET_CATEGORY_CHARACTER: "character",
+            PRESET_CATEGORY_ARTIST_STYLE: "artist",
+            PRESET_CATEGORY_MIXED: "artist",
+        }
+        for preset in self._lora_presets.presets:
+            if not preset.enabled or preset.category not in preset_map:
+                continue
+            assets.append(
+                {
+                    "asset_type": preset_map[preset.category],
+                    "name": preset.name,
+                    "tags": safe_terms((preset.trigger_words,)),
+                    "categories": ["saved_lora_preset", preset.category],
+                    "source_id": "preset:" + preset.name,
+                    "provenance": {"origin": "saved_lora_preset"},
+                }
+            )
+        if not assets:
+            async with self._tracked_v170_operation(
+                "prompt_asset_local_sync",
+                metadata={"record_count": len(records), "asset_count": 0},
+            ) as tracked:
+                try:
+                    cleared = await self._run_prompt_asset_io(
+                        library.clear_source,
+                        "astrbot_local_assets",
+                    )
+                except (PromptAssetError, TypeError, ValueError) as exc:
+                    raise WebUiActionError(f"本地素材清空失败: {exc}") from exc
+                fingerprint = self._prompt_asset_result_revision(cleared)
+                if not fingerprint:
+                    fingerprint, _ = await self._run_prompt_asset_io(
+                        self._prompt_asset_fingerprint
+                    )
+                tracked["result"] = {
+                    "asset_count": 0,
+                    "removed": int(cleared.get("removed") or 0),
+                    "fingerprint": fingerprint[:16],
+                }
+                return {
+                    **cleared,
+                    "synced": 0,
+                    "fingerprint": fingerprint,
+                    "message": "当前没有本地素材，已清除旧的自动同步镜像",
+                    "task_run_id": tracked["run_id"],
+                }
+        encoded = json.dumps(
+            {"assets": assets},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        async with self._tracked_v170_operation(
+            "prompt_asset_local_sync",
+            metadata={"record_count": len(records), "asset_count": len(assets)},
+        ) as tracked:
+            try:
+                async with self._prompt_asset_semaphore():
+                    status = await library.import_bytes_async(
+                        encoded,
+                        source="astrbot_local_assets",
+                        content_type="application/json",
+                        provenance={
+                            "namespace": "astrbot_comfy_anima",
+                            "source_version": "v1",
+                        },
+                        mode="replace_source",
+                        timeout=120,
+                    )
+            except (PromptAssetError, TypeError, ValueError) as exc:
+                raise WebUiActionError(f"本地素材同步失败: {exc}") from exc
+            fingerprint = self._prompt_asset_result_revision(status)
+            if not fingerprint:
+                fingerprint, _ = await self._run_prompt_asset_io(
+                    self._prompt_asset_fingerprint
+                )
+            tracked["result"] = {
+                "asset_count": len(assets),
+                "fingerprint": fingerprint[:16],
+            }
+            return {
+                **status,
+                "synced": len(assets),
+                "fingerprint": fingerprint,
+                "task_run_id": tracked["run_id"],
+            }
+
+    @staticmethod
+    def _slot_values(value: Any, label: str) -> tuple[Any, ...]:
+        if value in (None, ""):
+            return ()
+        if isinstance(value, str):
+            if len(value) > 16384:
+                raise WebUiActionError(f"{label} 内容过长")
+            return (value,)
+        if not isinstance(value, (list, tuple)):
+            raise WebUiActionError(f"{label} 必须是文本或数组")
+        if len(value) > 256:
+            raise WebUiActionError(f"{label} 条目过多")
+        result: list[Any] = []
+        total = 0
+        for item in value:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            total += len(text)
+            if len(text) > 2048 or total > 16384:
+                raise WebUiActionError(f"{label} 内容过长")
+            result.append(text)
+        return tuple(result)
+
+    @staticmethod
+    def _composed_prompt_payload(composed: Any) -> dict[str, Any]:
+        return {
+            "composed": {
+                "positive_prompt": composed.positive_prompt,
+                "negative_prompt": composed.negative_prompt,
+                "diagnostic_id": composed.diagnostic_id,
+            },
+            "layers": composed.layers.to_dict(),
+            "diagnostics": composed.diagnostics.to_dict(),
+        }
+
+    async def web_ui_compose_prompt_slots(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Compose explicit editor slots locally without invoking LLM or ComfyUI."""
+
+        data = self._require_web_payload(payload, "提示词分槽参数")
+        slots = data.get("slots", {})
+        if not isinstance(slots, Mapping):
+            raise WebUiActionError("slots 必须是 JSON 对象")
+        supported = {
+            "lora": "lora",
+            "identity": "character",
+            "appearance": "appearance",
+            "clothing": "clothing",
+            "pose": "pose",
+            "camera": "camera",
+            "background": "environment",
+            "lighting": "lighting",
+            "style": "artist",
+        }
+        locked_raw = data.get("locked_slots", ())
+        if isinstance(locked_raw, str):
+            locked_values = [item.strip() for item in locked_raw.split(",")]
+        elif isinstance(locked_raw, (list, tuple, set)):
+            locked_values = [str(item or "").strip() for item in locked_raw]
+        else:
+            raise WebUiActionError("locked_slots 必须是数组")
+        locked = {item for item in locked_values if item}
+        unknown = locked - set(supported) - {
+            "visual_phrases",
+            "scene_sentence",
+            "relation",
+            "negative",
+        }
+        if unknown:
+            raise WebUiActionError(
+                "存在未知锁定分槽: " + ", ".join(sorted(unknown))
+            )
+        hard_tags: list[Any] = []
+        anchors: list[tuple[str, str]] = []
+        for slot, category in supported.items():
+            for term in self._slot_values(slots.get(slot), f"slots.{slot}"):
+                if slot in locked:
+                    anchors.append((str(term), category))
+                else:
+                    hard_tags.append(term)
+        visual_phrases = self._slot_values(
+            slots.get("visual_phrases", data.get("visual_phrases")),
+            "slots.visual_phrases",
+        )
+        scene_sentence = str(
+            slots.get(
+                "scene_sentence",
+                slots.get("relation", data.get("scene_sentence", "")),
+            )
+            or ""
+        ).strip()
+        if len(scene_sentence) > 4096:
+            raise WebUiActionError("scene_sentence 内容过长")
+        positive_prompt = str(data.get("positive_prompt") or "").strip()
+        negative_prompt = str(
+            slots.get("negative", data.get("negative_prompt", "")) or ""
+        ).strip()
+        if len(positive_prompt) > 16384 or len(negative_prompt) > 8192:
+            raise WebUiActionError("提示词超过安全长度上限")
+        try:
+            composed = await asyncio.to_thread(
+                self._prompt_composer.compose,
+                positive_prompt,
+                negative_prompt,
+                hard_tags=tuple(hard_tags),
+                visual_phrases=visual_phrases,
+                scene_sentence=scene_sentence,
+                anchors=tuple(anchors),
+                source="prompt_slots",
+            )
+        except (TypeError, ValueError) as exc:
+            raise WebUiActionError(f"提示词分槽组合失败: {exc}") from exc
+        return {
+            **self._composed_prompt_payload(composed),
+            "locked_slots": sorted(locked),
+            "submitted": False,
+        }
+
+    def _require_prompt_lab(self) -> PromptLab:
+        prompt_lab = getattr(self, "_prompt_lab", None)
+        if prompt_lab is None:
+            raise WebUiActionError("Prompt Lab 未启用")
+        return prompt_lab
+
+    async def _resolve_prompt_lab_asset_pools(
+        self,
+        raw_pools: Any,
+    ) -> Any:
+        """Replace library references with current server-side records."""
+
+        if raw_pools is None:
+            return None
+        if not isinstance(raw_pools, Mapping):
+            raise WebUiActionError("asset_pools 必须是 JSON 对象")
+        layer_types = {
+            "identity": "character",
+            "character": "character",
+            "characters": "character",
+            "clothing": "clothing",
+            "clothes": "clothing",
+            "outfit": "clothing",
+            "outfits": "clothing",
+            "pose": "pose",
+            "poses": "pose",
+            "background": "background",
+            "backgrounds": "background",
+            "style": "artist",
+            "styles": "artist",
+            "artist": "artist",
+            "artists": "artist",
+        }
+        resolved: dict[str, list[Any]] = {}
+        for raw_layer, raw_values in raw_pools.items():
+            layer = str(raw_layer or "").strip()
+            if isinstance(raw_values, (str, Mapping)):
+                values = (raw_values,)
+            elif isinstance(raw_values, (list, tuple)):
+                values = tuple(raw_values)
+            else:
+                raise WebUiActionError(f"asset_pools.{layer} 必须是数组")
+            items: list[Any] = []
+            for raw in values:
+                identifier = ""
+                if isinstance(raw, str) and re.fullmatch(
+                    r"pa_[0-9a-f]{32}", raw.strip()
+                ):
+                    identifier = raw.strip()
+                elif isinstance(raw, Mapping):
+                    candidate = str(raw.get("asset_id") or raw.get("id") or "").strip()
+                    if re.fullmatch(r"pa_[0-9a-f]{32}", candidate):
+                        identifier = candidate
+                if not identifier:
+                    items.append(raw)
+                    continue
+                library = self._require_prompt_assets()
+                try:
+                    asset = await self._run_prompt_asset_io(library.get, identifier)
+                except PromptAssetError as exc:
+                    raise WebUiActionError(
+                        "Prompt Lab 引用的素材不存在，请刷新素材库"
+                    ) from exc
+                expected_type = layer_types.get(
+                    layer.casefold().replace("-", "_").replace(" ", "_")
+                )
+                actual_type = str(asset.get("asset_type") or "")
+                if expected_type is None or actual_type != expected_type:
+                    raise WebUiActionError(
+                        "Prompt Lab 素材类型与目标分槽不一致，请重新选择"
+                    )
+                label = str(
+                    asset.get("name_zh")
+                    or asset.get("name_en")
+                    or identifier
+                )
+                items.append(
+                    {
+                        "asset_id": identifier,
+                        "label": label,
+                        "tags": list(asset.get("tags") or ()),
+                        "visual_phrases": list(asset.get("traits") or ()),
+                    }
+                )
+            resolved[layer] = items
+        return resolved
+
+    async def web_ui_prompt_lab_generate(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Generate deterministic in-memory drafts; never submit them to ComfyUI."""
+
+        data = self._require_web_payload(payload, "Prompt Lab 参数")
+        if "seed" not in data:
+            raise WebUiActionError("Prompt Lab 必须提供固定 seed")
+        seed = data.get("seed")
+        seed_hash = hashlib.sha256(str(seed).encode("utf-8")).hexdigest()
+        fingerprint, _ = await self._run_prompt_asset_io(
+            self._prompt_asset_fingerprint
+        )
+        expected = str(data.get("asset_library_fingerprint") or "").strip()
+        if expected and expected != fingerprint:
+            raise WebUiActionError("素材库已变化，请刷新素材后重新生成候选")
+        async with self._tracked_v170_operation(
+            "prompt_lab_generate",
+            metadata={
+                "seed_hash": seed_hash[:16],
+                "requested_count": int(data.get("count") or 4),
+                "asset_fingerprint": fingerprint[:16],
+            },
+        ) as tracked:
+            try:
+                resolved_asset_pools = await self._resolve_prompt_lab_asset_pools(
+                    data.get("asset_pools")
+                )
+                batch = await asyncio.to_thread(
+                    self._require_prompt_lab().generate_candidates,
+                    seed=seed,
+                    count=int(data.get("count") or 4),
+                    base_layers=data.get("base_layers"),
+                    asset_pools=resolved_asset_pools,
+                    locked_layers=data.get("locked_layers"),
+                    enabled_asset_types=data.get("enabled_asset_types"),
+                    negative_prompt=str(data.get("negative_prompt") or ""),
+                    visual_phrases=data.get("visual_phrases"),
+                )
+            except (PromptLabError, TypeError, ValueError) as exc:
+                raise WebUiActionError(f"Prompt Lab 候选生成失败: {exc}") from exc
+            final_fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+            if final_fingerprint != fingerprint:
+                raise WebUiActionError(
+                    "素材库在候选生成期间发生变化，请重新生成候选"
+                )
+            now = time.time()
+            expires_at = now + self._prompt_lab_ttl_seconds
+            async with self._prompt_lab_lock:
+                self._prune_prompt_lab_batches_unlocked(now)
+                self._prompt_lab_batches[batch.batch_id] = {
+                    "batch": batch,
+                    "created_at": now,
+                    "expires_at": expires_at,
+                    "asset_fingerprint": final_fingerprint,
+                }
+                self._prompt_lab_batches.move_to_end(batch.batch_id)
+                self._prune_prompt_lab_batches_unlocked(now)
+            self._schedule_prompt_lab_expiry(batch.batch_id, expires_at)
+            self._v170_task_event(
+                tracked["run_id"],
+                "candidate",
+                "Generated bounded deterministic candidates and stored them in memory.",
+                "prompt_lab_candidates_ready",
+                details={
+                    "candidate_count": len(batch.candidates),
+                    "locked_layers": list(batch.locked_layers),
+                    "asset_fingerprint": final_fingerprint[:16],
+                },
+            )
+            tracked["result"] = {
+                "candidate_count": len(batch.candidates),
+                "seed_hash": seed_hash[:16],
+                "asset_fingerprint": final_fingerprint[:16],
+            }
+            return {
+                "batch": batch.to_dict(),
+                "asset_library_fingerprint": final_fingerprint,
+                "expires_at": expires_at,
+                "submitted": False,
+                "task_run_id": tracked["run_id"],
+            }
+
+    async def _validate_prompt_lab_loras(
+        self,
+        lora_tags: tuple[str, ...],
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        if not lora_tags:
+            return {"required": 0, "validated": 0, "catalog_fingerprint": ""}
+        if self._lora_catalog is None:
+            raise WebUiActionError("候选包含 LoRA，但最新 LoRA 清单服务不可用")
+        self._v170_task_event(
+            run_id,
+            "lora_validation",
+            "Refreshing LoRA Manager and ComfyUI before exact candidate validation.",
+            "prompt_lab_lora_refresh_started",
+            details={"lora_count": len(lora_tags)},
+        )
+        try:
+            records = await self._refresh_lora_manager_before(
+                "Prompt Lab confirm LoRA validation",
+                force=True,
+            )
+            maximum = max(
+                0,
+                int(getattr(self.settings, "max_total_dynamic_loras", 12)),
+            )
+            remainder, selections = extract_lora_selections(
+                ", ".join(lora_tags),
+                max_loras=maximum,
+            )
+        except (LoraCatalogError, LoraWorkflowError, TypeError, ValueError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            raise WebUiActionError(f"Prompt Lab LoRA 复核失败: {message}") from exc
+        if remainder or len(selections) != len(lora_tags):
+            raise WebUiActionError("Prompt Lab 候选包含重复或无效的 LoRA 控制串")
+        exact_index: dict[str, list[Any]] = {}
+        for record in records:
+            key = canonical_lora_name(getattr(record, "name", "")).casefold()
+            if key:
+                exact_index.setdefault(key, []).append(record)
+        invalid: list[str] = []
+        for selection in selections:
+            key = canonical_lora_name(selection.name).casefold()
+            if len(exact_index.get(key, ())) != 1:
+                invalid.append(selection.name)
+        if invalid:
+            raise WebUiActionError(
+                "Prompt Lab 候选 LoRA 已变化或无法按完整名称唯一确认，请重新生成候选"
+            )
+        catalog_fingerprint = semantic_catalog_fingerprint(records)
+        self._v170_task_event(
+            run_id,
+            "lora_validation",
+            "All candidate LoRA controls matched one exact fresh catalog record.",
+            "prompt_lab_lora_validated",
+            details={
+                "lora_count": len(selections),
+                "catalog_fingerprint": catalog_fingerprint[:16],
+            },
+        )
+        return {
+            "required": len(lora_tags),
+            "validated": len(selections),
+            "catalog_fingerprint": catalog_fingerprint,
+        }
+
+    async def web_ui_prompt_lab_confirm(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Re-read and validate one memory batch, then invoke PromptComposer only."""
+
+        data = self._require_web_payload(payload, "Prompt Lab 确认参数")
+        batch_id = str(data.get("batch_id") or "").strip()
+        selection: Any = data.get(
+            "selection",
+            data.get("candidate_id", data.get("ordinal", "")),
+        )
+        if not batch_id or selection in (None, ""):
+            raise WebUiActionError("batch_id 和 selection 不能为空")
+        async with self._tracked_v170_operation(
+            "prompt_lab_confirm",
+            metadata={
+                "batch_id": batch_id[:80],
+                "selection_type": type(selection).__name__,
+            },
+        ) as tracked:
+            now = time.time()
+            async with self._prompt_lab_lock:
+                self._prune_prompt_lab_batches_unlocked(now)
+                stored = self._prompt_lab_batches.get(batch_id)
+                if stored is None:
+                    raise WebUiActionError("Prompt Lab 批次不存在或已过期，请重新生成")
+                batch = stored.get("batch")
+                stored_fingerprint = str(stored.get("asset_fingerprint") or "")
+                expires_at = float(stored.get("expires_at") or 0.0)
+            if not isinstance(batch, PromptLabBatch):
+                raise WebUiActionError("Prompt Lab 批次状态无效，请重新生成")
+            fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+            expected = str(data.get("asset_library_fingerprint") or "").strip()
+            if expected and expected != stored_fingerprint:
+                raise WebUiActionError("客户端素材库版本与候选批次不一致")
+            if fingerprint != stored_fingerprint:
+                raise WebUiActionError("素材库在候选生成后发生变化，请重新生成候选")
+            try:
+                candidate = batch.find_candidate(selection)
+            except PromptLabError as exc:
+                raise WebUiActionError(f"Prompt Lab 候选无效: {exc}") from exc
+            library_ids = tuple(
+                asset_id
+                for _, asset_id in candidate.selected_assets
+                if re.fullmatch(r"pa_[0-9a-f]{32}", asset_id)
+            )
+            if library_ids:
+                library = self._require_prompt_assets()
+                for asset_id in library_ids:
+                    try:
+                        await self._run_prompt_asset_io(library.get, asset_id)
+                    except PromptAssetError as exc:
+                        raise WebUiActionError(
+                            "候选引用的素材已不存在，请重新生成候选"
+                        ) from exc
+            self._v170_task_event(
+                tracked["run_id"],
+                "revision_validation",
+                "Re-read the in-memory batch and verified its asset revision.",
+                "prompt_lab_revision_validated",
+                details={
+                    "asset_count": len(library_ids),
+                    "asset_fingerprint": fingerprint[:16],
+                },
+            )
+            lora_validation = await self._validate_prompt_lab_loras(
+                tuple(candidate.layers.lora),
+                run_id=tracked["run_id"],
+            )
+            final_asset_fingerprint, _ = await self._run_prompt_asset_io(
+                self._prompt_asset_fingerprint
+            )
+            if final_asset_fingerprint != stored_fingerprint:
+                raise WebUiActionError(
+                    "素材库在确认校验期间发生变化，请重新生成候选"
+                )
+            try:
+                draft = await asyncio.to_thread(
+                    self._require_prompt_lab().confirm_candidate,
+                    batch,
+                    selection,
+                )
+                composed = await asyncio.to_thread(
+                    self._prompt_composer.compose,
+                    **draft.to_composer_kwargs(),
+                )
+            except (PromptLabError, TypeError, ValueError) as exc:
+                raise WebUiActionError(f"Prompt Lab 严格组合失败: {exc}") from exc
+            self._v170_task_event(
+                tracked["run_id"],
+                "composition",
+                "Confirmed candidate passed PromptComposer; no ComfyUI job was submitted.",
+                "prompt_lab_composed",
+                details={
+                    "diagnostic_id": composed.diagnostic_id,
+                    "lora_count": lora_validation["validated"],
+                },
+            )
+            tracked["result"] = {
+                "diagnostic_id": composed.diagnostic_id,
+                "lora_count": lora_validation["validated"],
+                "asset_fingerprint": final_asset_fingerprint[:16],
+            }
+            return {
+                "batch_id": batch.batch_id,
+                "candidate_id": candidate.candidate_id,
+                "confirmed": True,
+                "expires_at": expires_at,
+                "asset_library_fingerprint": final_asset_fingerprint,
+                "lora_validation": lora_validation,
+                **self._composed_prompt_payload(composed),
+                "submitted": False,
+                "task_run_id": tracked["run_id"],
+            }
+
+    def _require_lora_visuals(self) -> LoraVisualService:
+        service = getattr(self, "_lora_visuals", None)
+        if service is None:
+            raise WebUiActionError(
+                getattr(self, "_lora_visual_error", "")
+                or "LoRA 视觉图库未启用或不可用"
+            )
+        return service
+
+    async def _fresh_lora_visual_records(self, action: str) -> tuple[Any, ...]:
+        """Use the authoritative catalog gate for every visual-catalog operation."""
+
+        try:
+            return await self._refresh_lora_manager_before(action, force=True)
+        except LoraCatalogError as exc:
+            raise WebUiActionError(exc.user_message) from exc
+
+    @staticmethod
+    def _path_free_lora_visual_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(payload)
+        items = result.get("items")
+        if isinstance(items, list):
+            cleaned: list[dict[str, Any]] = []
+            for raw in items:
+                if not isinstance(raw, Mapping):
+                    continue
+                item = dict(raw)
+                item.pop("path", None)
+                cleaned.append(item)
+            result["items"] = cleaned
+        result.pop("allowed_roots", None)
+        result.pop("cache_dir", None)
+        return result
+
+    async def web_ui_lora_gallery(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return one path-free gallery page from a newly refreshed catalog."""
+
+        data = self._require_web_payload(payload, "LoRA 图库参数")
+        service = self._require_lora_visuals()
+        records = await self._fresh_lora_visual_records("WebUI LoRA visual gallery")
+        try:
+            page = await asyncio.to_thread(
+                service.list_page,
+                records,
+                query=str(data.get("query") or ""),
+                categories=data.get("categories"),
+                metadata_statuses=data.get(
+                    "metadata_statuses", data.get("metadata_status")
+                ),
+                preview_statuses=data.get(
+                    "preview_statuses", data.get("preview_status")
+                ),
+                favorite_only=data.get(
+                    "favorite_only", data.get("favorites_only", False)
+                ),
+                page=int(data.get("page") or 1),
+                page_size=int(data.get("page_size") or data.get("limit") or 50),
+            )
+        except (LoraVisualError, TypeError, ValueError, OSError) as exc:
+            raise WebUiActionError(f"LoRA 图库读取失败: {type(exc).__name__}") from exc
+        return {
+            "available": True,
+            **self._path_free_lora_visual_payload(page.to_dict()),
+        }
+
+    async def web_ui_lora_visual_warm(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Schedule bounded thumbnail work after an authoritative catalog refresh."""
+
+        data = self._require_web_payload(payload, "LoRA 缩略图预热参数")
+        service = self._require_lora_visuals()
+        try:
+            limit = int(data.get("limit") or 200)
+        except (TypeError, ValueError) as exc:
+            raise WebUiActionError("预热 limit 必须是整数") from exc
+        if not 1 <= limit <= 200:
+            raise WebUiActionError("预热 limit 必须在 1 到 200 之间")
+        raw_keys = data.get("keys")
+        if raw_keys is None:
+            requested_keys: tuple[str, ...] | None = None
+        else:
+            if isinstance(raw_keys, str):
+                values = (raw_keys,)
+            elif isinstance(raw_keys, (list, tuple)):
+                values = tuple(raw_keys)
+            else:
+                raise WebUiActionError("预热 keys 必须是数组")
+            if len(values) > 200:
+                raise WebUiActionError("单次最多预热 200 个缩略图")
+            requested_keys = tuple(
+                dict.fromkeys(str(value or "").strip().casefold() for value in values)
+            )
+            if any(not re.fullmatch(r"[0-9a-f]{64}", key) for key in requested_keys):
+                raise WebUiActionError("预热 keys 只能使用当前图库的 64 位预览标识")
+        async with self._tracked_v170_operation(
+            "lora_visual_warmup",
+            metadata={
+                "limit": limit,
+                "requested_keys": len(requested_keys or ()),
+            },
+        ) as tracked:
+            records = await self._fresh_lora_visual_records(
+                "WebUI LoRA visual warmup"
+            )
+            try:
+                manifest = await asyncio.to_thread(service.build_manifest, records)
+                item_by_key = {
+                    item.preview_key: item
+                    for item in manifest.items
+                    if item.preview_key
+                }
+                if requested_keys is None:
+                    selected_keys = tuple(item_by_key)[:limit]
+                    truncated = max(0, len(item_by_key) - len(selected_keys))
+                else:
+                    unknown = tuple(
+                        key for key in requested_keys if key not in item_by_key
+                    )
+                    if unknown:
+                        raise WebUiActionError(
+                            "预热 key 不属于当前最新 LoRA 清单，请刷新页面后重试"
+                        )
+                    selected_keys = requested_keys[:limit]
+                    truncated = max(0, len(requested_keys) - len(selected_keys))
+                remote_keys = tuple(
+                    key
+                    for key in selected_keys
+                    if item_by_key[key].preview_status == "remote_only"
+                )
+                local_or_cached_keys = tuple(
+                    key for key in selected_keys if key not in set(remote_keys)
+                )
+                if local_or_cached_keys:
+                    local_schedule = await asyncio.to_thread(
+                        service.schedule_warmup,
+                        records,
+                        keys=local_or_cached_keys,
+                        limit=limit,
+                    )
+                    schedule_payload = local_schedule.to_dict()
+                else:
+                    schedule_payload = {
+                        "accepted": 0,
+                        "deduplicated": 0,
+                        "already_cached": 0,
+                        "unavailable": 0,
+                        "truncated": 0,
+                        "keys": [],
+                    }
+            except (LoraVisualError, TypeError, ValueError, OSError) as exc:
+                raise WebUiActionError(
+                    f"LoRA 缩略图预热失败: {type(exc).__name__}"
+                ) from exc
+            remote_succeeded = 0
+            remote_failed = 0
+            if remote_keys:
+                if self._lora_catalog is None:
+                    raise WebUiActionError("LoRA Manager 缩略图服务不可用")
+                remote_gate = asyncio.Semaphore(2)
+                max_bytes = (
+                    min(
+                        4,
+                        max(
+                            1,
+                            int(
+                                getattr(
+                                    self.settings,
+                                    "lora_visual_preview_max_mb",
+                                    4,
+                                )
+                            ),
+                        ),
+                    )
+                    * 1024
+                    * 1024
+                )
+
+                async def warm_remote(index: int, preview_key: str) -> bool:
+                    async with remote_gate:
+                        try:
+                            record = await asyncio.to_thread(
+                                service.record_for_preview,
+                                records,
+                                preview_key,
+                            )
+                            content, content_type = (
+                                await self._lora_catalog.fetch_manager_preview(
+                                    record,
+                                    max_bytes=max_bytes,
+                                )
+                            )
+                            await asyncio.to_thread(
+                                service.ingest_preview_bytes,
+                                preview_key,
+                                content,
+                                content_type,
+                            )
+                        except Exception as exc:
+                            self._v170_task_event(
+                                tracked["run_id"],
+                                "warmup_item",
+                                "One remote LoRA thumbnail could not be cached.",
+                                "lora_visual_remote_item_failed",
+                                details={
+                                    "item_index": index,
+                                    "error_type": type(exc).__name__,
+                                },
+                                level="WARNING",
+                            )
+                            return False
+                        self._v170_task_event(
+                            tracked["run_id"],
+                            "warmup_item",
+                            "One remote LoRA thumbnail was safely re-encoded and cached.",
+                            "lora_visual_remote_item_cached",
+                            details={"item_index": index},
+                        )
+                        return True
+
+                remote_results = await asyncio.gather(
+                    *(
+                        warm_remote(index, key)
+                        for index, key in enumerate(remote_keys, start=1)
+                    )
+                )
+                remote_succeeded = sum(bool(result) for result in remote_results)
+                remote_failed = len(remote_results) - remote_succeeded
+            schedule_payload["remote_requested"] = len(remote_keys)
+            schedule_payload["remote_succeeded"] = remote_succeeded
+            schedule_payload["remote_failed"] = remote_failed
+            schedule_payload["unavailable"] = int(
+                schedule_payload.get("unavailable") or 0
+            ) + remote_failed
+            schedule_payload["truncated"] = int(
+                schedule_payload.get("truncated") or 0
+            ) + truncated
+            warm_status = service.warmup_status()
+            self._v170_task_event(
+                tracked["run_id"],
+                "warmup",
+                "Queued bounded thumbnail work for the current fresh manifest.",
+                "lora_visual_warmup_queued",
+                details={
+                    "accepted": schedule_payload["accepted"],
+                    "remote_succeeded": remote_succeeded,
+                    "remote_failed": remote_failed,
+                    "manifest_fingerprint": manifest.fingerprint[:16],
+                },
+            )
+            tracked["result"] = {
+                "accepted": schedule_payload["accepted"],
+                "remote_succeeded": remote_succeeded,
+                "remote_failed": remote_failed,
+                "manifest_fingerprint": manifest.fingerprint[:16],
+            }
+            return {
+                "schedule": schedule_payload,
+                "status": warm_status.to_dict(),
+                "manifest_fingerprint": manifest.fingerprint,
+                "task_run_id": tracked["run_id"],
+            }
+
+    async def web_ui_lora_visual_status(self) -> dict[str, Any]:
+        """Report current manifest/cache work without exposing any local path."""
+
+        service = getattr(self, "_lora_visuals", None)
+        if service is None:
+            return {
+                "available": False,
+                "error": getattr(self, "_lora_visual_error", "")
+                or "LoRA visual gallery is disabled",
+                "manifest": {},
+                "warmup": {},
+            }
+        records = await self._fresh_lora_visual_records(
+            "WebUI LoRA visual status"
+        )
+        try:
+            manifest = await asyncio.to_thread(service.build_manifest, records)
+            warmup = service.warmup_status()
+        except (LoraVisualError, TypeError, ValueError, OSError) as exc:
+            raise WebUiActionError(
+                f"LoRA 视觉状态读取失败: {type(exc).__name__}"
+            ) from exc
+        return {
+            "available": True,
+            "manifest": {
+                "fingerprint": manifest.fingerprint,
+                "generated_at": manifest.generated_at,
+                "total": manifest.total,
+                "category_counts": dict(manifest.category_counts),
+                "metadata_counts": dict(manifest.metadata_counts),
+                "preview_counts": dict(manifest.preview_counts),
+            },
+            "warmup": warmup.to_dict(),
+        }
+
+    async def web_ui_lora_visual_prune(self) -> dict[str, Any]:
+        """Clear recognized cache entries after refreshing the source manifest."""
+
+        service = self._require_lora_visuals()
+        records = await self._fresh_lora_visual_records(
+            "WebUI LoRA visual cache prune"
+        )
+        try:
+            manifest = await asyncio.to_thread(service.build_manifest, records)
+            result = await asyncio.to_thread(service.clear_cache)
+        except (LoraVisualError, TypeError, ValueError, OSError) as exc:
+            raise WebUiActionError(
+                f"LoRA 缩略图缓存清理失败: {type(exc).__name__}"
+            ) from exc
+        return {**result, "manifest_fingerprint": manifest.fingerprint}
+
+    async def web_ui_lora_preview(
+        self,
+        key: str,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        """Read one preview only when the key belongs to the current fresh manifest."""
+
+        preview_key = str(key or "").strip()
+        expected_fingerprint = str(fingerprint or "").strip()
+        if not preview_key or not expected_fingerprint:
+            raise WebUiActionError("preview key 和 manifest fingerprint 不能为空")
+        service = self._require_lora_visuals()
+        records = await self._fresh_lora_visual_records(
+            "WebUI LoRA visual preview"
+        )
+        try:
+            manifest = await asyncio.to_thread(service.build_manifest, records)
+            if manifest.fingerprint != expected_fingerprint:
+                raise WebUiActionError("LoRA 图库已变化，请刷新页面后重试")
+            current_item = next(
+                (
+                    item
+                    for item in manifest.items
+                    if item.preview_key == preview_key
+                ),
+                None,
+            )
+            if current_item is None:
+                raise WebUiActionError("缩略图不属于当前最新 LoRA 清单")
+            if current_item.preview_status == "remote_only":
+                if self._lora_catalog is None:
+                    raise WebUiActionError("LoRA Manager 缩略图服务不可用")
+                record = await asyncio.to_thread(
+                    service.record_for_preview,
+                    records,
+                    preview_key,
+                )
+                max_bytes = (
+                    min(
+                        4,
+                        max(
+                            1,
+                            int(
+                                getattr(
+                                    self.settings,
+                                    "lora_visual_preview_max_mb",
+                                    4,
+                                )
+                            ),
+                        ),
+                    )
+                    * 1024
+                    * 1024
+                )
+                remote_content, remote_type = (
+                    await self._lora_catalog.fetch_manager_preview(
+                        record,
+                        max_bytes=max_bytes,
+                    )
+                )
+                await asyncio.to_thread(
+                    service.ingest_preview_bytes,
+                    preview_key,
+                    remote_content,
+                    remote_type,
+                )
+            content, media_type = await asyncio.to_thread(
+                service.read_preview,
+                preview_key,
+                create_cache=True,
+            )
+        except WebUiActionError:
+            raise
+        except (
+            LoraCatalogError,
+            LoraVisualError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as exc:
+            raise WebUiActionError(
+                f"LoRA 缩略图读取失败: {type(exc).__name__}"
+            ) from exc
+        if len(content) > 1024 * 1024:
+            raise WebUiActionError("LoRA 缩略图超过 1 MiB 网关响应上限")
+        encoded = base64.b64encode(content).decode("ascii")
+        return {
+            "key": preview_key,
+            "fingerprint": manifest.fingerprint,
+            "media_type": media_type,
+            "size": len(content),
+            "data_url": f"data:{media_type};base64,{encoded}",
+        }
+
+    async def web_ui_update_danbooru_index(self) -> dict[str, Any]:
+        """Start one atomic local-index refresh and keep the previous DB on failure."""
+
+        source_url = self.settings.danbooru_index_url.strip()
+        if not source_url:
+            raise WebUiActionError("请先在全局设置中填写 Danbooru 索引数据源 URL")
+        running = self._danbooru_update_task
+        if running is not None and not running.done():
+            return {
+                "task": dict(self._danbooru_update_state),
+                "message": "Danbooru 索引更新已在进行，请勿重复提交",
+                "status": self._danbooru_index.status(),
+            }
+
+        task_id = f"danbooru-index-{int(time.time() * 1000)}"
+        self._danbooru_update_state = {
+            "id": task_id,
+            "status": "running",
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "error": "",
+        }
+
+        async def update() -> None:
+            try:
+                await self._danbooru_index.update_from_url(
+                    source_url,
+                    timeout=self.settings.danbooru_index_timeout,
+                    max_bytes=self.settings.danbooru_index_max_size_mb
+                    * 1024
+                    * 1024,
+                )
+            except asyncio.CancelledError:
+                self._danbooru_update_state = {
+                    **self._danbooru_update_state,
+                    "status": "cancelled",
+                    "finished_at": time.time(),
+                    "error": "update cancelled",
+                }
+                raise
+            except DanbooruIndexError as exc:
+                self._danbooru_update_state = {
+                    **self._danbooru_update_state,
+                    "status": "failed",
+                    "finished_at": time.time(),
+                    "error": str(exc),
+                }
+                logger.warning(
+                    f"[{PLUGIN_NAME}] Danbooru index update failed; "
+                    f"the previous snapshot is retained: {exc}"
+                )
+            except Exception as exc:
+                self._danbooru_update_state = {
+                    **self._danbooru_update_state,
+                    "status": "failed",
+                    "finished_at": time.time(),
+                    "error": type(exc).__name__,
+                }
+                logger.error(
+                    f"[{PLUGIN_NAME}] unexpected Danbooru index update failure: {exc}",
+                    exc_info=True,
+                )
+            else:
+                self._danbooru_update_state = {
+                    **self._danbooru_update_state,
+                    "status": "completed",
+                    "finished_at": time.time(),
+                    "error": "",
+                }
+                logger.info(f"[{PLUGIN_NAME}] Danbooru local tag index updated")
+
+        background = asyncio.create_task(
+            update(),
+            name=f"{PLUGIN_NAME}:{task_id}",
+        )
+        self._danbooru_update_task = background
+        self._background_task_runs[task_id] = background
+        background.add_done_callback(
+            lambda _task, identifier=task_id: self._background_task_runs.pop(
+                identifier,
+                None,
+            )
+        )
+        return {
+            "task": dict(self._danbooru_update_state),
+            "message": "Danbooru 索引后台更新已开始；失败时会保留当前旧库",
+            "status": self._danbooru_index.status(),
+        }
+
+    async def web_ui_check_experimental_profiles(self) -> dict[str, Any]:
+        """Inspect optional upstream capabilities without activating them."""
+
+        if self._client is None:
+            raise WebUiActionError(
+                self._initialization_error or "ComfyUI 客户端尚未就绪"
+            )
+        try:
+            object_info = await self._client.object_info()
+        except ComfyClientError as exc:
+            raise WebUiActionError(exc.user_message) from exc
+        return {
+            "items": list(inspect_experimental_profiles(object_info)),
+            "activation_blocked": True,
+            "message": (
+                "已读取 ComfyUI 实时节点；当前仓库没有附带已审核的实验工作流，"
+                "所以这些结果只用于评估，不能直接激活"
+            ),
         }
 
     async def web_ui_search_loras(
@@ -9849,6 +12079,13 @@ QQ快捷指令:
             task.cancel()
         if pending_reloads:
             await asyncio.gather(*pending_reloads, return_exceptions=True)
+        prompt_lab_lock = getattr(self, "_prompt_lab_lock", None)
+        if prompt_lab_lock is not None:
+            async with prompt_lab_lock:
+                self._prompt_lab_batches.clear()
+        lora_visuals = getattr(self, "_lora_visuals", None)
+        if lora_visuals is not None:
+            await asyncio.to_thread(lora_visuals.close, wait=True)
         for image_path in self._temp_dir.glob("*/*"):
             if image_path.is_file():
                 image_path.unlink(missing_ok=True)

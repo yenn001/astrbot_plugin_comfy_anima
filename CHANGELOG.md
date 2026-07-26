@@ -4,6 +4,74 @@
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-07-26
+
+### LoRA Manager 预览兼容修复
+
+- 兼容 LoRA Manager 将 `preview_url` 的 `path` 作为独立预览标识、而不是 `.safetensors` 文件路径的部署方式。
+- 仍只接受最新 Manager 清单提供的同源 `/api/lm/previews` 地址、单一 `path` 参数、无重定向和受限字节流；不接受客户端自定义 URL 或跨源地址。
+
+## [1.7.0] - 2026-07-26
+
+### 视觉提示词资产库
+
+- 新增本地 SQLite 视觉资产库，支持角色、画师、服装、背景和姿势五类资产，以及名称/别名/Tags 搜索、收藏、自定义项和分类筛选。
+- 支持管理员导入经审核的 JSON/CSV，保留数据来源、版本/命名空间、导入时间和 SHA-256；新快照会先在临时库中完整验证，失败时不覆盖上一份可用数据。
+- 远程导入默认关闭。显式开启后仍只允许解析到公网地址的 HTTPS，并受 DNS/IP 固定、禁止凭据/重定向、单次最大 16 MiB、记录数和字段长度等边界约束；局域网数据改用粘贴或上传 JSON/CSV。
+- 安装包不捆绑任何第三方大型提示词数据、索引或预览图。
+
+### 分层提示词编辑与 Prompt Lab
+
+- 提示词工坊增加身份、服装、姿势、镜头、背景、画师/风格、场景关系和 LoRA 八个明确槽位，可单独编辑、锁定和重新组合。
+- 新增确定性 Prompt Lab：相同 Seed、资产池和锁定层会生成相同的 1–6 个候选，更换非锁定层时不会破坏已锁定身份、LoRA 或其他强约束。
+- Prompt Lab 候选是有容量和 TTL 的无执行草稿，创建候选不会自动提交 ComfyUI。确认时会再次核对素材 revision、LoRA 最新清单并经过 Prompt Composer；确认结果要实际出图时仍须进入普通 QQ 绘图入口，由原有权限、风控和工作流校验负责最终提交。
+- 分层编辑和候选重组为本地确定性过程，不会增加额外 LLM 请求，也不会暴露隐藏思维链。
+
+### LoRA 视觉清单与本地缩略图
+
+- 新增 LoRA 视觉 manifest，对当前语义清单生成稳定指纹，展示精确文件、分类、元数据和预览状态，并支持分页、筛选、收藏、受限预热和缓存裁剪。
+- 缩略图优先使用显式 `lora_visual_roots` 白名单下的精确同名 companion 图。如果 AstrBot 容器没有 LoRA 挂载，可改由 LoRA Catalog 调用当前 Manager origin 的固定 `/api/lm/previews` 端点；只允许最新清单中的精确记录和 Manager 原始 `preview_url`，固定单一 `path` 参数、禁止重定向并受 4 MB 上限约束。
+- 前端无法为 LoRA 预览提交 URL 或文件路径；后端不访问 Civitai 预览或任意远程 URL，不提供模糊 basename/任意路径代理，且所有预览字节都会先解码验证并重编码为内容寻址 WebP。
+- 单图默认限制为 4 MB，预热工作线程默认 2 且最多 4，缩略图缓存默认 256 MB；可安全关闭缓存或按配额清理。
+- 视觉 manifest 仅用于管理与预览，不取代 LoRA Manager 的生成前强制刷新、精确文件唯一性检查和提交前再次复核。
+
+### 配置与升级兼容
+
+- 新增 `enable_prompt_asset_library`、`prompt_asset_remote_import_enabled`、`prompt_asset_max_download_mb`、`enable_prompt_lab`、`prompt_lab_batch_capacity`、`prompt_lab_ttl_seconds`、`enable_lora_visual_gallery`、`lora_visual_roots`、`lora_visual_cache_mb`、`lora_visual_warmup_workers`、`lora_visual_preview_max_mb` 和 `lora_visual_thumbnail_size`。
+- 所有新字段都是插件全局能力，不写入局域网环境配置档案。旧配置缺少字段时使用安全默认，已有值和环境档案不会被覆盖。
+- 发布包继续排除运行时 SQLite/DB/WAL/SHM、视觉资产数据、Prompt Lab 草稿、缩略图缓存、临时导入文件、日志和编译缓存。
+
+### 第三方边界
+
+- 上述能力均为本仓库独立实现；没有复制、捆绑或再分发 `Comfyui-Anima-Tools` 的源码、大型资产数据、预览图、提示词文本或工作流。
+
+## [1.6.0] - 2026-07-26
+
+### Prompt Composer v2
+
+- 新增不产生第二次 LLM 调用的本地三层提示词合成：硬控制与 LoRA、视觉短语、末尾英文场景关系句统一去重和排序。
+- 普通聊天 `<pic>`、自然语言绘图、显式 `/画图 --llm`、反推画图、底图控制和改图等语义入口复用同一套 Composer；未使用 `--llm` 的直接 Tags 命令继续保持原样直通。
+- LoRA 控制和可信触发词统一插入场景关系句之前，修复分镜完成后追加触发词可能落到自然语言句尾的问题。
+- 新增 `off|conservative|standard` 自适应负面词策略；默认 `conservative` 只按多人接触、手持物、全身与极端透视等已检测风险补充少量负面词，不覆盖用户显式 negative。
+
+### 本地 Danbooru 硬锚点索引
+
+- 新增可持久化的本地 JSON / CSV Tag 索引和原子更新流程；仓库与安装包不附带第三方标签库，管理员需自行配置 `danbooru_index_url`。
+- 更新地址支持 HTTPS；明文 HTTP 仅允许回环或私有局域网地址，并拒绝 URL 凭据、危险地址、超时和超出体积上限的响应。更新失败时保留上一份可用数据库。
+- 默认 `report` 模式只报告未知或冲突锚点，索引缺失不会阻止绘图。`guarded` 为未来结构化角色 / 作品 / 画师 anchor 协议预留；当前普通绘图生产路径会安全降级为等效 `report`，不会虚假宣称已经执行阻断。
+- 用户原始 Tags、手工预设触发词和 LoRA Manager 触发词始终保持信任边界，不会被索引校验器删除或拦截。
+
+### 提示词工坊、诊断与实验能力检查
+
+- AstrBot 原生 plugin-page 与独立 WebUI 新增提示词状态、本地诊断、诊断清空、Danbooru 索引后台更新和实验节点能力检查入口。
+- 诊断采用有界内存存储，默认只暴露数量、冲突、风险、哈希与阶段摘要；重载自动清空，不写入任务 SQLite 或持久日志。完整分层内容必须由管理员显式开启隐私开关。
+- 实验注册表当前仅检测画师混合、质量栈与分层回放所需节点。仓库没有附带已审核的实验工作流，节点就绪也不会自动激活或提交实验管线。
+- Prompt Composer、索引报告和诊断沿用既有群白名单、全局锁定、冷却、敏感词、管理员权限、LoRA 实时复核与工作流提交校验，不形成安全旁路。
+
+### 第三方边界
+
+- 上述能力均为本仓库独立实现；没有复制、打包或再分发 `comfyui-good-anima` 的 GPLv3 源码、二进制、标签索引、Prompt 或工作流。
+
 ## [1.5.7] - 2026-07-23
 
 ### Windows ComfyUI 控制模型依赖检查修复

@@ -19,7 +19,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 
 import aiohttp
 
@@ -28,6 +28,7 @@ from ..models import LoraSelection, PluginSettings
 
 
 MAX_CATALOG_BYTES = 10 * 1024 * 1024
+MAX_MANAGER_PREVIEW_BYTES = 4 * 1024 * 1024
 GENERIC_IDENTITY_TERMS = {
     "anima",
     "lora",
@@ -439,8 +440,11 @@ class LoraCatalogService:
         *,
         params: Optional[dict[str, Any]] = None,
         timeout: Optional[int] = None,
+        max_bytes: int = MAX_CATALOG_BYTES,
+        resource_label: str = "LoRA 清单",
     ) -> tuple[bytes, str]:
         """限制大小且禁止重定向地读取清单。"""
+        byte_limit = min(MAX_CATALOG_BYTES, max(1, int(max_bytes)))
         session = await self._get_session()
         try:
             headers = {}
@@ -460,21 +464,134 @@ class LoraCatalogService:
                     raise LoraCatalogError(f"LoRA 清单返回 HTTP {response.status}")
                 if (
                     response.content_length
-                    and response.content_length > MAX_CATALOG_BYTES
+                    and response.content_length > byte_limit
                 ):
-                    raise LoraCatalogError("LoRA 清单超过 10MB")
+                    raise LoraCatalogError(
+                        f"{resource_label}超过 {byte_limit // (1024 * 1024)}MB"
+                    )
                 chunks: list[bytes] = []
                 size = 0
                 async for chunk in response.content.iter_chunked(64 * 1024):
                     size += len(chunk)
-                    if size > MAX_CATALOG_BYTES:
-                        raise LoraCatalogError("LoRA 清单超过 10MB")
+                    if size > byte_limit:
+                        raise LoraCatalogError(
+                            f"{resource_label}超过 {byte_limit // (1024 * 1024)}MB"
+                        )
                     chunks.append(chunk)
                 return b"".join(chunks), response.headers.get("Content-Type", "")
         except asyncio.TimeoutError as exc:
             raise LoraCatalogError("读取局域网 LoRA 清单超时") from exc
         except aiohttp.ClientError as exc:
             raise LoraCatalogError("无法连接局域网 LoRA 清单", str(exc)) from exc
+
+    @staticmethod
+    def _normalized_manager_file_path(value: Any) -> str:
+        text = unicodedata.normalize("NFKC", str(value or "")).strip()
+        return re.sub(r"/+", "/", text.replace("\\", "/"))
+
+    @staticmethod
+    def _manager_paths_equal(left: str, right: str) -> bool:
+        if re.match(r"^[A-Za-z]:/", left) and re.match(r"^[A-Za-z]:/", right):
+            return left.casefold() == right.casefold()
+        return left == right
+
+    def _manager_preview_target(self, record: LoraRecord) -> str:
+        """Resolve one current Manager-owned preview without exposing its path.
+
+        The caller supplies a fresh catalog record, never a URL or server file
+        path. Only the exact Manager item retained by the latest successful
+        Manager + ComfyUI refresh may authorize the same-origin preview route.
+        """
+
+        current = {
+            canonical_lora_name(item.name).casefold(): item for item in self._cache
+        }.get(canonical_lora_name(record.name).casefold())
+        if current is None:
+            raise LoraCatalogError("LoRA 缩略图条目已过期，请刷新图库")
+        expected_hash = str(current.sha256 or "").strip().casefold()
+        supplied_hash = str(record.sha256 or "").strip().casefold()
+        if expected_hash and supplied_hash and expected_hash != supplied_hash:
+            raise LoraCatalogError("LoRA 缩略图指纹已变化，请刷新图库")
+
+        item = self._manager_item_for(current)
+        raw_preview = str(item.get("preview_url") or "").strip()
+        if not raw_preview:
+            raise LoraCatalogError("LoRA Manager 未提供可验证的缩略图")
+
+        manager = urlparse(self._manager_url)
+        candidate = urlparse(raw_preview)
+        if (
+            candidate.fragment
+            or candidate.username
+            or candidate.password
+            or raw_preview.startswith("//")
+        ):
+            raise LoraCatalogError("LoRA Manager 缩略图地址不安全")
+        try:
+            candidate_port = candidate.port
+            manager_port = manager.port
+        except ValueError as exc:
+            raise LoraCatalogError("LoRA Manager 缩略图端口无效") from exc
+        if candidate.scheme or candidate.netloc:
+            if (
+                candidate.scheme.casefold() != manager.scheme.casefold()
+                or candidate.hostname != manager.hostname
+                or candidate_port != manager_port
+            ):
+                raise LoraCatalogError("LoRA Manager 缩略图不是同源地址")
+        if candidate.path != "/api/lm/previews":
+            raise LoraCatalogError("LoRA Manager 缩略图接口不受支持")
+        try:
+            query = parse_qs(
+                candidate.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise LoraCatalogError("LoRA Manager 缩略图参数无效") from exc
+        if set(query) != {"path"} or len(query["path"]) != 1:
+            raise LoraCatalogError("LoRA Manager 缩略图参数不受支持")
+        supplied_path = self._normalized_manager_file_path(query["path"][0])
+        if not supplied_path:
+            raise LoraCatalogError("LoRA Manager 缩略图路径为空")
+
+        return urlunparse(
+            (
+                manager.scheme,
+                manager.netloc,
+                candidate.path,
+                "",
+                candidate.query,
+                "",
+            )
+        )
+
+    async def fetch_manager_preview(
+        self,
+        record: LoraRecord,
+        *,
+        max_bytes: int = MAX_MANAGER_PREVIEW_BYTES,
+    ) -> tuple[bytes, str]:
+        """Fetch one bounded same-origin preview from a fresh Manager record."""
+
+        target = self._manager_preview_target(record)
+        body, content_type = await self._fetch(
+            target,
+            timeout=self._settings.lora_catalog_timeout,
+            max_bytes=min(MAX_MANAGER_PREVIEW_BYTES, max(1, int(max_bytes))),
+            resource_label="LoRA 缩略图",
+        )
+        media_type = str(content_type or "").split(";", 1)[0].strip().casefold()
+        if media_type not in {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+            "application/octet-stream",
+        }:
+            raise LoraCatalogError("LoRA Manager 缩略图响应类型不受支持")
+        if not body:
+            raise LoraCatalogError("LoRA Manager 缩略图为空")
+        return body, media_type
 
     async def _scan_manager(self, *, force: bool = False) -> None:
         """按最短间隔触发 LoRA Manager 重新扫描磁盘索引。"""

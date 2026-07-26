@@ -1,5 +1,6 @@
 """Tests for the authenticated dedicated-port Web UI."""
 
+import base64
 import tempfile
 import sys
 import types
@@ -21,7 +22,14 @@ if "astrbot.api" not in sys.modules:
     sys.modules["astrbot.api"] = api
 
 from ..models import PluginSettings
-from ..services.web_ui import WebUiError, WebUiService
+from ..services.plugin_page import (
+    validate_v170_api_payload as native_validate_v170_api_payload,
+)
+from ..services.web_ui import (
+    WebUiError,
+    WebUiService,
+    validate_v170_api_payload as standalone_validate_v170_api_payload,
+)
 
 
 class _Controller:
@@ -41,6 +49,11 @@ class _Controller:
         self.deleted_lora = None
         self.deleted_unet = None
         self.selected_workflow = None
+        self.prompt_diagnostic_payload = None
+        self.prompt_diagnostics_cleared = 0
+        self.danbooru_updates = 0
+        self.experiment_checks = 0
+        self.v170_calls = {}
 
     async def web_ui_bootstrap(self):
         return {
@@ -121,6 +134,99 @@ class _Controller:
             },
         }
 
+    async def web_ui_prompt_status(self):
+        return {
+            "composer": {
+                "enabled": True,
+                "adaptive_negative_mode": "standard",
+                "validation_mode": "report",
+                "capacity": 50,
+                "count": 1,
+            },
+            "danbooru": {"ready": True, "tag_count": 12, "alias_count": 3},
+            "diagnostics": [{"diagnostic_id": "diag-1", "conflicts": []}],
+        }
+
+    async def web_ui_diagnose_prompt(self, payload):
+        self.prompt_diagnostic_payload = payload
+        return {
+            "composed": {
+                "positive_prompt": payload["prompt"],
+                "negative_prompt": payload.get("negative_prompt", ""),
+                "diagnostic_id": "diag-2",
+            },
+            "layers": {"hard_tags": ["1girl"], "scene_sentence": ""},
+            "diagnostics": {"diagnostic_id": "diag-2"},
+        }
+
+    async def web_ui_clear_prompt_diagnostics(self):
+        self.prompt_diagnostics_cleared += 1
+        return {"message": "cleared"}
+
+    async def web_ui_update_danbooru_index(self):
+        self.danbooru_updates += 1
+        return {"message": "updated", "status": {"ready": True}}
+
+    async def web_ui_check_experimental_profiles(self):
+        self.experiment_checks += 1
+        return {"items": [{"id": "artist_mixer", "ready": False}]}
+
+    async def web_ui_prompt_assets_status(self):
+        self.v170_calls["asset_status"] = True
+        return {"ready": True, "asset_count": 2}
+
+    async def web_ui_prompt_assets_search(self, payload):
+        self.v170_calls["asset_search"] = payload
+        return {"items": [], "page": payload.get("page", 1)}
+
+    async def web_ui_prompt_assets_facets(self, payload):
+        self.v170_calls["asset_facets"] = payload
+        return {"types": [], "sources": []}
+
+    async def web_ui_prompt_assets_import(self, payload):
+        self.v170_calls["asset_import"] = payload
+        return {"imported": 1}
+
+    async def web_ui_prompt_assets_update_url(self, payload):
+        self.v170_calls["asset_update_url"] = payload
+        return {"updated": True}
+
+    async def web_ui_prompt_assets_sync_local(self, payload=None):
+        self.v170_calls["asset_sync_local"] = payload or {}
+        return {"imported": 2, "source": "local-runtime", "fingerprint": "f" * 64}
+
+    async def web_ui_prompt_asset_create(self, payload):
+        self.v170_calls["asset_create"] = payload
+        return {"asset_id": "pa_" + "a" * 32}
+
+    async def web_ui_prompt_asset_update(self, payload):
+        self.v170_calls["asset_update"] = payload
+        return {"asset_id": payload["asset_id"]}
+
+    async def web_ui_prompt_asset_delete(self, payload):
+        self.v170_calls["asset_delete"] = payload
+        return {"deleted": True}
+
+    async def web_ui_prompt_asset_favorite(self, payload):
+        self.v170_calls["asset_favorite"] = payload
+        return {"favorite": payload["favorite"]}
+
+    async def web_ui_compose_prompt_slots(self, payload):
+        self.v170_calls["compose_slots"] = payload
+        return {
+            "composed": {"positive_prompt": "1girl", "negative_prompt": ""},
+            "layers": payload["slots"],
+            "diagnostics": {},
+        }
+
+    async def web_ui_prompt_lab_generate(self, payload):
+        self.v170_calls["lab_generate"] = payload
+        return {"batch": {"batch_id": "plb-" + "b" * 20}}
+
+    async def web_ui_prompt_lab_confirm(self, payload):
+        self.v170_calls["lab_confirm"] = payload
+        return {"confirmed": True}
+
     async def web_ui_search_loras(self, keyword, limit):
         return {"total": 1, "items": [{"name": keyword, "limit": limit}]}
 
@@ -149,6 +255,34 @@ class _Controller:
     async def web_ui_archive_loras(self, payload):
         self.archive_payload = payload
         return {"message": "archived"}
+
+    async def web_ui_lora_gallery(self, payload):
+        self.v170_calls["lora_gallery"] = payload
+        return {"items": [], "page": payload.get("page", 1)}
+
+    async def web_ui_lora_visual_warm(self, payload):
+        self.v170_calls["lora_warm"] = payload
+        return {"accepted": payload.get("limit", 0)}
+
+    async def web_ui_lora_visual_status(self):
+        self.v170_calls["lora_status"] = True
+        return {"queued": 0}
+
+    async def web_ui_lora_visual_prune(self):
+        self.v170_calls["lora_prune"] = True
+        return {"removed": 1}
+
+    async def web_ui_lora_preview(self, key, fingerprint):
+        self.v170_calls["lora_preview"] = (key, fingerprint)
+        raw = b"png"
+        return {
+            "key": key,
+            "fingerprint": fingerprint,
+            "media_type": "image/png",
+            "size": len(raw),
+            "data_url": "data:image/png;base64,"
+            + base64.b64encode(raw).decode("ascii"),
+        }
 
     async def web_ui_list_presets(self):
         return {"items": []}
@@ -349,6 +483,46 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
         self.assertIn("expectedValue: exactName", self.javascript)
         self.assertNotIn("file_path: exactName", self.javascript)
 
+    def test_prompt_workshop_exposes_config_status_and_local_diagnostics(self) -> None:
+        fields = (
+            "enable_prompt_composer_v2",
+            "adaptive_negative_mode",
+            "enable_prompt_diagnostics",
+            "prompt_diagnostics_include_content",
+            "prompt_diagnostics_capacity",
+            "danbooru_validation_mode",
+            "danbooru_index_url",
+            "danbooru_index_timeout",
+            "danbooru_index_max_size_mb",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                self.assertIn(f'name="{field}"', self.html)
+        self.assertIn('data-panel="prompt"', self.html)
+        self.assertIn('id="panel-prompt"', self.html)
+        self.assertIn('id="prompt-diagnostic-form"', self.html)
+        for route in (
+            "/api/prompt/status",
+            "/api/prompt/diagnose",
+            "/api/prompt/diagnostics",
+            "/api/danbooru/update",
+            "/api/experiments/check",
+        ):
+            self.assertIn(route, self.javascript)
+        self.assertNotIn("chain-of-thought", self.html.casefold())
+        self.assertNotIn("思维链", self.html)
+
+    def test_standalone_and_native_prompt_assets_stay_synchronized(self) -> None:
+        plugin_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            (plugin_root / "web" / "app.js").read_bytes(),
+            (plugin_root / "pages" / "control" / "app.js").read_bytes(),
+        )
+        self.assertEqual(
+            (plugin_root / "web" / "app.css").read_bytes(),
+            (plugin_root / "pages" / "control" / "app.css").read_bytes(),
+        )
+
 
 class WebUiValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -361,6 +535,22 @@ class WebUiValidationTests(unittest.TestCase):
         self.assertEqual(settings.web_ui_port, 6198)
         self.assertEqual(settings.web_ui_username, "admin")
         self.assertEqual(settings.web_ui_password, "")
+
+    def test_v170_backends_share_one_payload_validator(self) -> None:
+        self.assertIs(
+            standalone_validate_v170_api_payload,
+            native_validate_v170_api_payload,
+        )
+        payload = {
+            "query": "dress",
+            "asset_type": "clothing",
+            "page": 1,
+            "page_size": 200,
+        }
+        self.assertEqual(
+            standalone_validate_v170_api_payload("prompt_assets_search", payload),
+            native_validate_v170_api_payload("prompt_assets_search", payload),
+        )
 
     def test_enabled_ui_requires_password_and_private_bind(self) -> None:
         missing_password = PluginSettings.from_mapping(
@@ -464,6 +654,248 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved.status, 200)
         self.assertEqual(self.controller.saved_settings, {"default_width": 1024})
 
+    async def test_v170_routes_reuse_authentication_csrf_and_no_store(self) -> None:
+        anonymous = await self.client.get("/api/prompt-assets/status")
+        self.assertEqual(anonymous.status, 401)
+        self.assertEqual(anonymous.headers["Cache-Control"], "no-store")
+
+        csrf = await self._login()
+        missing_csrf = await self.client.post(
+            "/api/prompt-assets/search",
+            json={"query": "portrait"},
+        )
+        self.assertEqual(missing_csrf.status, 403)
+        missing_delete_csrf = await self.client.delete(
+            "/api/loras/thumbnails/cache"
+        )
+        self.assertEqual(missing_delete_csrf.status, 403)
+
+        status = await self.client.get("/api/prompt-assets/status")
+        self.assertEqual(status.status, 200)
+        self.assertEqual(status.headers["Cache-Control"], "no-store")
+        self.assertTrue(self.controller.v170_calls["asset_status"])
+
+        searched = await self.client.post(
+            "/api/prompt-assets/search",
+            json={
+                "query": "portrait",
+                "source": "local-runtime",
+                "page": 2,
+                "page_size": 200,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(searched.status, 200)
+        self.assertEqual(
+            self.controller.v170_calls["asset_search"],
+            {
+                "query": "portrait",
+                "source": "local-runtime",
+                "page": 2,
+                "page_size": 200,
+            },
+        )
+        facets = await self.client.get(
+            "/api/prompt-assets/facets?asset_type=clothing&favorite_only=true&limit=200"
+        )
+        self.assertEqual(facets.status, 200)
+        self.assertEqual(
+            self.controller.v170_calls["asset_facets"],
+            {"asset_type": "clothing", "favorite_only": True, "limit": 200},
+        )
+
+    async def test_v170_management_routes_forward_validated_contracts(self) -> None:
+        csrf = await self._login()
+        headers = {"X-CSRF-Token": csrf}
+        asset_id = "pa_" + "a" * 32
+        key = "1" * 64
+        fingerprint = "2" * 64
+
+        requests = (
+            (
+                "post",
+                "/api/prompt-assets/facets",
+                {"source": "local-runtime", "custom_only": False, "limit": 50},
+            ),
+            (
+                "post",
+                "/api/prompt-assets/import",
+                {
+                    "content": '[{"asset_type":"clothing","name_en":"dress"}]',
+                    "format": "json",
+                    "source": "unit-test",
+                    "provenance": {"version": "1"},
+                    "mode": "merge",
+                },
+            ),
+            (
+                "post",
+                "/api/prompt-assets/update-url",
+                {
+                    "url": "https://example.test/assets.json",
+                    "timeout": 15,
+                    "mode": "merge",
+                },
+            ),
+            (
+                "post",
+                "/api/prompt-assets/sync-local",
+                {},
+            ),
+            (
+                "post",
+                "/api/prompt-assets/custom",
+                {
+                    "asset_type": "clothing",
+                    "name_en": "dress",
+                    "tags": ["white dress"],
+                },
+            ),
+            (
+                "put",
+                "/api/prompt-assets/custom",
+                {"asset_id": asset_id, "changes": {"name_en": "wave 2"}},
+            ),
+            (
+                "put",
+                "/api/prompt-assets/favorite",
+                {"asset_id": asset_id, "favorite": True},
+            ),
+            (
+                "delete",
+                "/api/prompt-assets/custom",
+                {"asset_id": asset_id},
+            ),
+            (
+                "post",
+                "/api/prompt/compose-slots",
+                {
+                    "slots": {
+                        "identity": ["1girl"],
+                        "pose": "standing",
+                        "scene_sentence": "She is standing outdoors.",
+                    },
+                    "locked_slots": ["identity"],
+                },
+            ),
+            (
+                "post",
+                "/api/prompt-lab/generate",
+                {
+                    "seed": 42,
+                    "count": 6,
+                    "base_layers": {"character": ["1girl"]},
+                    "asset_pools": {},
+                    "locked_layers": ["character"],
+                    "asset_library_fingerprint": "a" * 32,
+                },
+            ),
+            (
+                "post",
+                "/api/prompt-lab/confirm",
+                {
+                    "batch_id": "plb-" + "b" * 20,
+                    "candidate_id": "plc-" + "c" * 20,
+                    "asset_library_fingerprint": "a" * 32,
+                },
+            ),
+            (
+                "post",
+                "/api/loras/gallery",
+                {
+                    "query": "denia",
+                    "categories": ["character"],
+                    "metadata_statuses": ["complete"],
+                    "preview_statuses": ["cached"],
+                    "favorites_only": True,
+                    "page": 1,
+                    "page_size": 200,
+                },
+            ),
+            (
+                "post",
+                "/api/loras/thumbnails/warm",
+                {"keys": [key], "limit": 200},
+            ),
+        )
+        for method, path, body in requests:
+            with self.subTest(path=path):
+                response = await getattr(self.client, method)(
+                    path,
+                    json=body,
+                    headers=headers,
+                )
+                self.assertEqual(response.status, 200, await response.text())
+
+        visual_status = await self.client.get("/api/loras/thumbnails/status")
+        self.assertEqual(visual_status.status, 200)
+        pruned = await self.client.delete(
+            "/api/loras/thumbnails/cache", headers=headers
+        )
+        self.assertEqual(pruned.status, 200)
+        preview = await self.client.get(
+            f"/api/loras/preview?key={key}&fingerprint={fingerprint}"
+        )
+        self.assertEqual(preview.status, 200)
+        preview_payload = await preview.json()
+        self.assertEqual(preview_payload["data"]["key"], key)
+        self.assertNotIn("path", preview_payload["data"])
+        self.assertEqual(
+            self.controller.v170_calls["lora_preview"],
+            (key, fingerprint),
+        )
+
+    async def test_v170_bad_body_method_and_bounds_fail_without_controller_call(self) -> None:
+        csrf = await self._login()
+        headers = {"X-CSRF-Token": csrf}
+        invalid_requests = (
+            ("/api/prompt-assets/search", {"page_size": 201}),
+            ("/api/prompt-assets/facets", {"limit": 201}),
+            ("/api/prompt-assets/update-url", {"url": "https://[bad"}),
+            (
+                "/api/prompt-assets/update-url",
+                {"url": "https://example.test:99999/assets.json"},
+            ),
+            ("/api/prompt-lab/generate", {"seed": 1, "count": 7}),
+            ("/api/prompt-lab/generate", {"seed": 2**63, "count": 1}),
+            ("/api/loras/gallery", {"page": "1"}),
+            ("/api/loras/thumbnails/warm", {"limit": 201}),
+            ("/api/loras/thumbnails/warm", {"keys": ["../preview"]}),
+        )
+        for path, body in invalid_requests:
+            with self.subTest(path=path, body=body):
+                response = await self.client.post(path, json=body, headers=headers)
+                self.assertEqual(response.status, 400)
+                payload = await response.json()
+                self.assertFalse(payload["ok"])
+
+        malformed = await self.client.post(
+            "/api/prompt-assets/search",
+            data="{",
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        self.assertEqual(malformed.status, 400)
+        self.assertFalse((await malformed.json())["ok"])
+
+        oversized = await self.client.post(
+            "/api/prompt-assets/import",
+            json={
+                "content": "x" * (1024 * 1024),
+                "format": "csv",
+                "source": "unit-test",
+            },
+            headers=headers,
+        )
+        self.assertEqual(oversized.status, 413)
+        self.assertFalse((await oversized.json())["ok"])
+
+        unsafe_preview = await self.client.get(
+            "/api/loras/preview?key=..%2Fsecret&fingerprint=" + "2" * 64
+        )
+        self.assertEqual(unsafe_preview.status, 400)
+        wrong_method = await self.client.get("/api/prompt-assets/search")
+        self.assertEqual(wrong_method.status, 405)
+
     async def test_sampler_steps_override_is_normalized_and_range_checked(self) -> None:
         csrf = await self._login()
         saved = await self.client.put(
@@ -520,6 +952,43 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             provider_payload["data"]["chat"]["items"][1]["supports_image"]
         )
+
+        prompt_status = await self.client.get("/api/prompt/status")
+        self.assertEqual(prompt_status.status, 200)
+        prompt_status_payload = await prompt_status.json()
+        self.assertEqual(
+            prompt_status_payload["data"]["danbooru"]["tag_count"],
+            12,
+        )
+
+        diagnosed = await self.client.post(
+            "/api/prompt/diagnose",
+            json={"prompt": "1girl, portrait", "negative_prompt": "text"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(diagnosed.status, 200)
+        self.assertEqual(
+            self.controller.prompt_diagnostic_payload,
+            {"prompt": "1girl, portrait", "negative_prompt": "text"},
+        )
+
+        cleared = await self.client.delete(
+            "/api/prompt/diagnostics",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(cleared.status, 200)
+        self.assertEqual(self.controller.prompt_diagnostics_cleared, 1)
+
+        updated = await self.client.post(
+            "/api/danbooru/update",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertEqual(self.controller.danbooru_updates, 1)
+
+        experiments = await self.client.get("/api/experiments/check")
+        self.assertEqual(experiments.status, 200)
+        self.assertEqual(self.controller.experiment_checks, 1)
 
         response = await self.client.get("/api/loras?q=denia&limit=12")
         self.assertEqual(response.status, 200)

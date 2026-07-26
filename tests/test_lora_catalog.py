@@ -336,6 +336,97 @@ class StrictLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("语义索引暂不可用", service._last_warning)
 
 
+class ManagerPreviewSecurityTests(unittest.IsolatedAsyncioTestCase):
+    def service(self) -> LoraCatalogService:
+        service = LoraCatalogService(
+            PluginSettings.from_mapping(
+                {
+                    "comfyui_url": "http://192.168.1.50:8188",
+                    "lora_manager_url": "http://192.168.1.50:8188/loras",
+                }
+            )
+        )
+        record = LoraRecord(
+            "characters/denia.safetensors",
+            sha256="a" * 64,
+            source="lora-manager",
+        )
+        service._cache = (record,)
+        manager_item = {
+                "file_name": "denia.safetensors",
+                "folder": "characters",
+                "file_path": (
+                    "/root/ComfyUI/models/loras/characters/denia.safetensors"
+                ),
+                "preview_url": (
+                    "/api/lm/previews?path=%2Ftmp%2Fmanager-preview%2Fdenia.jpeg"
+                ),
+                "sha256": "a" * 64,
+                "sub_type": "lora",
+        }
+        service._manager_items_by_name = {"characters/denia": manager_item}
+        service._manager_items_by_hash = {"a" * 64: manager_item}
+        return service
+
+    async def test_fetches_only_current_same_origin_manager_preview(self) -> None:
+        service = self.service()
+        calls = []
+
+        async def fake_fetch(url, **kwargs):
+            calls.append((url, kwargs))
+            return b"RIFFxxxxWEBPVP8 ", "image/jpeg"
+
+        service._fetch = fake_fetch
+        body, content_type = await service.fetch_manager_preview(service._cache[0])
+
+        self.assertEqual(body[:4], b"RIFF")
+        self.assertEqual(content_type, "image/jpeg")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(
+            calls[0][0].startswith(
+                "http://192.168.1.50:8188/api/lm/previews?"
+            )
+        )
+        self.assertEqual(calls[0][1]["max_bytes"], 4 * 1024 * 1024)
+        self.assertNotIn("file_path", calls[0][1])
+
+    async def test_accepts_manager_preview_identifier_distinct_from_file_path(self) -> None:
+        service = self.service()
+        calls = []
+
+        async def fake_fetch(url, **kwargs):
+            calls.append((url, kwargs))
+            return b"RIFFxxxxWEBPVP8 ", "image/jpeg"
+
+        service._fetch = fake_fetch
+        await service.fetch_manager_preview(service._cache[0])
+        self.assertIn("manager-preview", calls[0][0])
+
+    async def test_rejects_cross_origin_or_invalid_preview_contract(self) -> None:
+        service = self.service()
+        item = service._manager_items_by_hash["a" * 64]
+        item["preview_url"] = (
+            "https://example.invalid/api/lm/previews?path="
+            "%2Froot%2FComfyUI%2Fmodels%2Floras%2Fcharacters%2Fdenia.safetensors"
+        )
+        with self.assertRaises(LoraCatalogError):
+            await service.fetch_manager_preview(service._cache[0])
+
+        item["preview_url"] = "/api/lm/other?path=%2Ftmp%2Fother.safetensors"
+        with self.assertRaises(LoraCatalogError):
+            await service.fetch_manager_preview(service._cache[0])
+
+        item["preview_url"] = "/api/lm/previews?path=%2Ftmp%2Fother.safetensors&extra=1"
+        with self.assertRaises(LoraCatalogError):
+            await service.fetch_manager_preview(service._cache[0])
+
+    async def test_rejects_stale_record_before_network(self) -> None:
+        service = self.service()
+        stale = LoraRecord("deleted.safetensors", sha256="b" * 64)
+        with self.assertRaises(LoraCatalogError):
+            await service.fetch_manager_preview(stale)
+
+
 class CivitaiIdentityTests(unittest.IsolatedAsyncioTestCase):
     """验证 Civitai 角色、作品和别名的逻辑归档与安全消歧。"""
 

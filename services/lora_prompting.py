@@ -17,6 +17,10 @@ from .lora_presets import (
     PRESET_CATEGORY_MIXED,
     deduplicate_selections,
 )
+from .prompt_composer import (
+    insert_tags_before_scene_sentence,
+    split_hybrid_prompt,
+)
 
 
 _TRIGGER_SPLIT_RE = re.compile(r"\s*(?:,,|[,，;；\n\r]+)\s*")
@@ -320,8 +324,9 @@ def build_lora_trigger_plan(
                 conflicting_character_terms.add(trigger_key)
 
     if conflicting_character_terms:
+        tag_block, scene_sentence = split_hybrid_prompt(prompt_text)
         kept_terms: list[str] = []
-        for term in _PROMPT_TERM_SPLIT_RE.split(prompt_text):
+        for term in _PROMPT_TERM_SPLIT_RE.split(tag_block):
             value = term.strip()
             if not value:
                 continue
@@ -331,7 +336,7 @@ def build_lora_trigger_plan(
                 )
                 continue
             kept_terms.append(value)
-        prompt_text = ", ".join(kept_terms)
+        prompt_text = insert_tags_before_scene_sentence(scene_sentence, kept_terms)
         existing = _prompt_term_keys(prompt_text)
 
     for trigger, source in manual_triggers:
@@ -383,7 +388,7 @@ def build_lora_trigger_plan(
             continue
         skipped.append(f"{selection.name}: unclassified trigger words not auto-applied")
 
-    combined = ", ".join(part for part in (prompt_text, *added) if part)
+    combined = insert_tags_before_scene_sentence(prompt_text, added)
     return LoraTriggerPlan(
         prompt=combined,
         added=tuple(added),

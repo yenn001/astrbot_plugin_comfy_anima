@@ -5,7 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ..models import PluginSettings
-from ..services.prompt_director import PromptDirector, PromptDirectorError
+from ..services.prompt_composer import PromptComposer, PromptDiagnosticsStore
+from ..services.prompt_director import (
+    PictureInstruction,
+    PromptDirector,
+    PromptDirectorError,
+)
 
 
 class PictureResponseParserTests(unittest.TestCase):
@@ -184,6 +189,13 @@ class PictureResponseParserTests(unittest.TestCase):
                 '<edit prompt="red dress" mode="guess">'
             )
 
+    def test_empty_pipeline_stays_unspecified(self) -> None:
+        instruction = PromptDirector.extract_instruction(
+            '<pic prompt="1girl, portrait" pipeline="">'
+        )
+
+        self.assertEqual(instruction.pipeline, "")
+
     def test_think_edit_never_triggers(self) -> None:
         parsed = PromptDirector.parse_picture_response(
             '<think><edit prompt="hidden" mode="quick"></think>正文'
@@ -248,7 +260,11 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
     """LoRA 工具链应有独立预算，且失败时不得静默降级。"""
 
     @staticmethod
-    def _director(**overrides: object) -> PromptDirector:
+    def _director(
+        *,
+        composer: PromptComposer | None = None,
+        **overrides: object,
+    ) -> PromptDirector:
         reference = (
             Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
         )
@@ -258,7 +274,196 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 **overrides,
             }
         )
-        return PromptDirector(reference, settings)
+        return PromptDirector(reference, settings, composer=composer)
+
+    async def test_all_success_transports_share_one_local_composer(self) -> None:
+        positive = (
+            "1girl, holding flower, full body. "
+            "She holds a flower while standing in a quiet garden."
+        )
+        outputs = (
+            (
+                "function_call",
+                object(),
+                {
+                    "tools_call_name": "emit_anima_plan_v1",
+                    "tools_call_args": {
+                        "positive_tags": positive,
+                        "negative_tags": "",
+                        "pipeline": "",
+                    },
+                },
+            ),
+            (
+                "json",
+                None,
+                {
+                    "completion_text": (
+                        '{"positive_tags":"'
+                        + positive
+                        + '","negative_tags":"","pipeline":""}'
+                    )
+                },
+            ),
+            (
+                "auto",
+                None,
+                {"completion_text": f'<pic prompt="{positive}">'},
+            ),
+        )
+        results: list[PictureInstruction] = []
+
+        for mode, output_tools, response_fields in outputs:
+            with self.subTest(mode=mode):
+                store = PromptDiagnosticsStore()
+                director = self._director(
+                    structured_director_mode=mode,
+                    composer=PromptComposer(
+                        "conservative",
+                        diagnostics_store=store,
+                        validation_mode="off",
+                    ),
+                )
+
+                class Context:
+                    calls = 0
+
+                    async def llm_generate(self, **_kwargs: object) -> object:
+                        self.calls += 1
+                        return type("Response", (), response_fields)()
+
+                context = Context()
+                instruction, provider_id = await director.generate_instruction(
+                    context,
+                    object(),
+                    "draw a girl holding a flower",
+                    output_tools=output_tools,
+                )
+
+                self.assertEqual(context.calls, 1)
+                self.assertEqual(provider_id, "test-provider")
+                self.assertTrue(instruction.diagnostic_id)
+                self.assertIsNotNone(instruction.diagnostics)
+                assert instruction.diagnostics is not None
+                self.assertEqual(instruction.diagnostics.source, "director")
+                self.assertEqual(
+                    instruction.diagnostics.provider_id,
+                    "test-provider",
+                )
+                self.assertEqual(instruction.diagnostics.pipeline, "")
+                stored = store.get(instruction.diagnostic_id)
+                self.assertIsNotNone(stored)
+                assert stored is not None
+                self.assertEqual(stored.diagnostic_id, instruction.diagnostic_id)
+                self.assertEqual(stored.adaptive_negative_added, ())
+                self.assertGreater(stored.adaptive_negative_count, 0)
+                results.append(instruction)
+
+        self.assertEqual(
+            {item.prompt for item in results},
+            {positive},
+        )
+        negatives = {item.negative_prompt for item in results}
+        self.assertEqual(len(negatives), 1)
+        final_negative = negatives.pop()
+        self.assertIn("bad hands", final_negative)
+        self.assertIn("bad feet", final_negative)
+
+    async def test_composer_validation_failure_does_not_call_llm_twice(self) -> None:
+        director = self._director(
+            composer=PromptComposer(
+                "off",
+                tag_index={"1girl": True},
+                validation_mode="strict",
+            )
+        )
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="1girl, invented_token">'},
+                )()
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_instruction(context, object(), "draw")
+
+        self.assertEqual(context.calls, 1)
+        self.assertEqual(raised.exception.detail, "prompt_composition_failed")
+        self.assertTrue(raised.exception.fatal)
+
+    async def test_edit_uses_edit_diagnostic_source_without_scene_expansion(
+        self,
+    ) -> None:
+        store = PromptDiagnosticsStore()
+        director = self._director(
+            composer=PromptComposer(
+                "off",
+                diagnostics_store=store,
+                validation_mode="off",
+            )
+        )
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": (
+                            '<edit prompt="red dress, detailed lace" '
+                            'negative="school uniform" mode="quick">'
+                        )
+                    },
+                )()
+
+        context = Context()
+        instruction, provider_id = await director.generate_edit_instruction(
+            context,
+            object(),
+            "replace the masked clothes with a red dress",
+        )
+
+        self.assertEqual(context.calls, 1)
+        self.assertEqual(provider_id, "test-provider")
+        self.assertEqual(instruction.prompt, "red dress, detailed lace")
+        self.assertNotIn(". ", instruction.prompt)
+        self.assertEqual(instruction.negative_prompt, "school uniform")
+        diagnostics = store.list(limit=1)[0]
+        self.assertEqual(diagnostics.source, "edit")
+        self.assertEqual(diagnostics.provider_id, "test-provider")
+
+    def test_composed_picture_instruction_is_idempotent(self) -> None:
+        store = PromptDiagnosticsStore()
+        director = self._director(
+            composer=PromptComposer(
+                "off",
+                diagnostics_store=store,
+                validation_mode="off",
+            )
+        )
+        first = director.compose_picture_instruction(
+            PictureInstruction("1girl, portrait"),
+            provider_id="test-provider",
+            source="chat_pic",
+        )
+        second = director.compose_picture_instruction(
+            first,
+            provider_id="test-provider",
+            source="chat_pic",
+        )
+
+        self.assertIs(second, first)
+        self.assertEqual(len(store), 1)
+        self.assertEqual(first.diagnostics.source, "chat_pic")
 
     async def test_tool_budget_covers_manager_scan_and_all_agent_steps(self) -> None:
         director = self._director(

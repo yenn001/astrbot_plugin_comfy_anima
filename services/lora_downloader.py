@@ -28,7 +28,6 @@ _CIVITAI_MODEL_PATH_RE = re.compile(
     r"^/models/(?P<model_id>[1-9]\d*)(?:/[^/]+)?/?$",
     flags=re.IGNORECASE,
 )
-_MODEL_FILE_SUFFIXES = (".safetensors", ".ckpt", ".pt", ".bin")
 
 
 class LoraDownloadError(Exception):
@@ -398,35 +397,46 @@ class LoraDownloadService:
         version_id: int,
         version: dict[str, Any],
     ) -> Optional[dict[str, Any]]:
-        exact_version: list[dict[str, Any]] = []
-        same_model: list[dict[str, Any]] = []
+        """Return one uniquely and exactly identified Manager item.
+
+        A model id alone is not enough to prove that a specific Civitai version
+        is available. Ambiguous ids, hashes, or file names fail closed so
+        metadata is never written to an arbitrary LoRA file.
+        """
+
+        version_hashes = cls._version_hashes(version)
+        version_names = cls._version_file_names(version)
+        exact_matches: list[dict[str, Any]] = []
         for item in items:
             civitai = item.get("civitai")
             if not isinstance(civitai, dict):
                 civitai = {}
             item_version_id = cls._as_positive_int(civitai.get("id"))
             item_model_id = cls._as_positive_int(civitai.get("modelId"))
-            if item_version_id == version_id:
-                exact_version.append(item)
-            if item_model_id == model_id:
-                same_model.append(item)
-        if exact_version:
-            return exact_version[0]
-
-        version_hashes = cls._version_hashes(version)
-        for item in items:
             sha256 = str(item.get("sha256") or "").strip().casefold()
-            if sha256 and sha256 in version_hashes:
-                return item
-
-        version_names = cls._version_file_names(version)
-        for item in same_model:
             file_name = str(item.get("file_name") or "").strip().casefold()
-            if file_name in version_names or PurePath(file_name).stem in version_names:
-                return item
-        if len(same_model) == 1:
-            return same_model[0]
-        return None
+            id_match = item_version_id == version_id and item_model_id in {
+                None,
+                model_id,
+            }
+            hash_match = bool(sha256 and sha256 in version_hashes)
+            name_match = bool(
+                item_model_id == model_id
+                and item_version_id in {None, version_id}
+                and (
+                    file_name in version_names
+                    or PurePath(file_name).stem in version_names
+                )
+            )
+            if id_match or hash_match or name_match:
+                exact_matches.append(item)
+
+        if len(exact_matches) > 1:
+            raise LoraDownloadError(
+                "LoRA Manager 最新清单中存在多个精确匹配文件，已停止",
+                f"model={model_id}, version={version_id}, matches={len(exact_matches)}",
+            )
+        return exact_matches[0] if exact_matches else None
 
     async def _post_download(
         self,
@@ -469,29 +479,6 @@ class LoraDownloadService:
                 "LoRA Manager 扫描失败",
                 str(data.get("error") or data.get("message") or "").strip(),
             )
-
-    @classmethod
-    def _extract_file_path(cls, payload: Any) -> str:
-        """兼容未来 Manager 直接在下载响应中返回文件路径。"""
-        if isinstance(payload, dict):
-            for key in ("file_path", "filepath", "path"):
-                candidate = str(payload.get(key) or "").strip()
-                if (
-                    candidate
-                    and "://" not in candidate
-                    and candidate.casefold().endswith(_MODEL_FILE_SUFFIXES)
-                ):
-                    return candidate
-            for value in payload.values():
-                found = cls._extract_file_path(value)
-                if found:
-                    return found
-        elif isinstance(payload, list):
-            for value in payload:
-                found = cls._extract_file_path(value)
-                if found:
-                    return found
-        return ""
 
     async def _fetch_civitai_metadata(self, file_path: str) -> tuple[bool, str]:
         try:
@@ -560,11 +547,21 @@ class LoraDownloadService:
 
     async def _refresh_catalog(self) -> tuple[bool, str]:
         if self._catalog is None:
-            return True, "AstrBot LoRA 查询工具未启用，无需刷新插件缓存"
+            return False, "AstrBot LoRA 双源清单服务未启用"
         try:
             return True, await self._catalog.refresh_summary()
         except Exception as exc:
             return False, str(getattr(exc, "user_message", exc)).strip()
+
+    async def _require_catalog_refresh(self, stage: str) -> str:
+        """Require a fresh Manager + ComfyUI loadable catalog before continuing."""
+        success, message = await self._refresh_catalog()
+        if not success:
+            raise LoraDownloadError(
+                f"{stage}刷新 LoRA Manager 与 ComfyUI 可加载清单失败，已停止",
+                message or "未知错误",
+            )
+        return message
 
     async def download_from_url(self, url: str) -> LoraDownloadResult:
         """下载 URL 指向的版本，随后获取元数据并刷新 AstrBot 清单。"""
@@ -580,6 +577,9 @@ class LoraDownloadService:
 
         try:
             async with self._semaphore:
+                # Keep direct service calls fail-closed even if the command/UI
+                # caller already performed its own freshness check.
+                await self._require_catalog_refresh("下载前")
                 # 下载/判重前也必须先扫描，不能依据 Manager 的旧缓存。
                 await self._scan_manager()
                 versions = await self._fetch_versions(reference.model_id)
@@ -589,11 +589,7 @@ class LoraDownloadService:
                     raise LoraDownloadError("LoRA Manager 返回了无效的版本 ID")
                 version_name = str(version.get("name") or version_id).strip()
 
-                try:
-                    items = await self._fetch_manager_items()
-                except LoraDownloadError:
-                    # 清单读取失败不应阻止一次明确的管理员下载请求。
-                    items = []
+                items = await self._fetch_manager_items()
                 matched_item = self._find_downloaded_item(
                     items,
                     model_id=reference.model_id,
@@ -601,9 +597,8 @@ class LoraDownloadService:
                     version=version,
                 )
                 downloaded = matched_item is None
-                download_payload: dict[str, Any] = {}
                 if downloaded:
-                    download_payload = await self._post_download(
+                    await self._post_download(
                         reference.model_id,
                         version_id,
                         uuid4().hex,
@@ -612,32 +607,39 @@ class LoraDownloadService:
                         # 文件完成后再次扫描，确认真实路径后才获取元数据。
                         await self._scan_manager()
                         items = await self._fetch_manager_items()
-                        matched_item = self._find_downloaded_item(
-                            items,
-                            model_id=reference.model_id,
-                            version_id=version_id,
-                            version=version,
+                    except LoraDownloadError as exc:
+                        detail = exc.user_message
+                        if exc.detail:
+                            detail = f"{detail}: {exc.detail}"
+                        raise LoraDownloadError(
+                            "LoRA 下载已提交，但 Manager 刷新失败，文件当前未就绪",
+                            detail,
+                        ) from exc
+                    matched_item = self._find_downloaded_item(
+                        items,
+                        model_id=reference.model_id,
+                        version_id=version_id,
+                        version=version,
+                    )
+                    if matched_item is None:
+                        raise LoraDownloadError(
+                            "LoRA 下载已提交，但刷新后的 Manager 清单未找到唯一精确文件，"
+                            "当前未就绪",
+                            f"model={reference.model_id}, version={version_id}",
                         )
-                    except LoraDownloadError:
-                        # 下载已经成功；扫描失败只影响路径定位与元数据补抓。
-                        matched_item = None
 
                 file_path = self._item_file_path(matched_item)
                 if not file_path:
-                    file_path = self._extract_file_path(download_payload)
+                    raise LoraDownloadError(
+                        "LoRA Manager 最新清单中的精确匹配文件缺少路径，已停止",
+                        f"model={reference.model_id}, version={version_id}",
+                    )
                 file_name = self._item_file_name(matched_item, file_path)
 
-                if file_path:
-                    (
-                        metadata_success,
-                        metadata_message,
-                    ) = await self._fetch_civitai_metadata(file_path)
-                else:
-                    metadata_success = False
-                    metadata_message = (
-                        "下载已完成，但 Manager 清单中尚未定位到文件，"
-                        "因此无法执行单文件 Civitai 元数据获取"
-                    )
+                (
+                    metadata_success,
+                    metadata_message,
+                ) = await self._fetch_civitai_metadata(file_path)
 
                 catalog_success, catalog_message = await self._refresh_catalog()
                 return LoraDownloadResult(

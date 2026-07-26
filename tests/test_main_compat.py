@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import io
 import json
 import sys
 import tempfile
@@ -10,6 +11,7 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 from PIL import Image
 
@@ -224,6 +226,188 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertEqual(calls[0][1].negative_prompt, "lowres")
         self.assertEqual(calls[0][1].pipeline, "base")
         self.assertIn(("image", "generated.png"), result.chain)
+
+    def test_visible_pic_runs_prompt_composer_exactly_once(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            enable_prompt_composer_v2=True,
+            max_auto_images_per_reply=1,
+            enable_inpaint=False,
+        )
+        compose_calls = []
+
+        class Director:
+            @staticmethod
+            def parse_picture_response(*_args, **_kwargs):
+                return types.SimpleNamespace(
+                    text="",
+                    prompts=("1girl, portrait",),
+                    negative_prompts=("",),
+                    pipelines=("base",),
+                    edits=(),
+                )
+
+            @staticmethod
+            def compose_picture_instruction(instruction, **kwargs):
+                compose_calls.append((instruction, kwargs))
+                return self.main.PictureInstruction(
+                    prompt=f"{instruction.prompt}. A girl faces the viewer.",
+                    negative_prompt="bad anatomy",
+                    pipeline=instruction.pipeline,
+                    diagnostic_id="diagnostic-once",
+                )
+
+        plugin._director = Director()
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+        calls = []
+
+        async def run_job(event, options):
+            calls.append((event, options))
+            return [Path("generated.png")], 123, options.prompt, "", "base"
+
+        plugin._run_job = run_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<pic prompt="1girl, portrait" pipeline="base">')]
+        )
+        event = types.SimpleNamespace(
+            message_str="draw a portrait",
+            get_result=lambda: result,
+        )
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertEqual(len(compose_calls), 1)
+        self.assertEqual(compose_calls[0][1]["source"], "conversation_pic")
+        self.assertEqual(calls[0][1].prompt.count("faces the viewer"), 1)
+        self.assertEqual(calls[0][1].negative_prompt, "bad anatomy")
+
+    def test_prompt_workbench_is_private_by_default_and_can_be_cleared(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_composer_v2": True,
+                "enable_prompt_diagnostics": True,
+                "prompt_diagnostics_include_content": False,
+                "prompt_diagnostics_capacity": 10,
+            }
+        )
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "danbooru.sqlite3"
+        )
+        plugin._prompt_diagnostics_store = self.main.PromptDiagnosticsStore(
+            capacity=10
+        )
+        plugin._prompt_composer = self.main.PromptComposer(
+            adaptive_negative_mode=plugin.settings.adaptive_negative_mode,
+            diagnostics_store=plugin._prompt_diagnostics_store,
+            tag_index=plugin._danbooru_index,
+            validation_mode=plugin.settings.danbooru_validation_mode,
+            include_content=False,
+        )
+        plugin._danbooru_update_state = {
+            "id": "",
+            "status": "idle",
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "error": "",
+        }
+
+        diagnosed = asyncio.run(
+            plugin.web_ui_diagnose_prompt(
+                {
+                    "prompt": "1girl, holding cup. A girl holds a cup.",
+                    "negative_prompt": "lowres",
+                }
+            )
+        )
+        status = asyncio.run(plugin.web_ui_prompt_status())
+
+        self.assertEqual(diagnosed["composed"]["positive_prompt"], "")
+        self.assertEqual(diagnosed["composed"]["negative_prompt"], "")
+        self.assertEqual(diagnosed["layers"], {})
+        self.assertEqual(diagnosed["diagnostics"]["adaptive_negative_added"], ())
+        self.assertGreater(
+            diagnosed["diagnostics"]["adaptive_negative_count"],
+            0,
+        )
+        self.assertEqual(len(status["diagnostics"]), 1)
+        self.assertEqual(status["diagnostics"][0]["positive_prompt"], "")
+        self.assertEqual(status["diagnostics"][0]["negative_prompt"], "")
+        cleared = asyncio.run(plugin.web_ui_clear_prompt_diagnostics())
+        self.assertEqual(cleared["cleared"], 1)
+        self.assertEqual(len(plugin._prompt_diagnostics_store), 0)
+
+    def test_danbooru_background_failure_keeps_existing_status(self) -> None:
+        async def run_case() -> None:
+            class Index:
+                @staticmethod
+                def status():
+                    return {"ready": True, "revision": "old-revision"}
+
+                @staticmethod
+                async def update_from_url(*_args, **_kwargs):
+                    raise self.main.DanbooruIndexError("network unavailable")
+
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                danbooru_index_url="https://example.test/tags.json",
+                danbooru_index_timeout=5,
+                danbooru_index_max_size_mb=1,
+            )
+            plugin._danbooru_index = Index()
+            plugin._danbooru_update_task = None
+            plugin._danbooru_update_state = {
+                "id": "",
+                "status": "idle",
+                "started_at": 0.0,
+                "finished_at": 0.0,
+                "error": "",
+            }
+            plugin._background_task_runs = {}
+
+            response = await plugin.web_ui_update_danbooru_index()
+            self.assertEqual(response["task"]["status"], "running")
+            await plugin._danbooru_update_task
+            self.assertEqual(plugin._danbooru_update_state["status"], "failed")
+            self.assertEqual(plugin._danbooru_index.status()["revision"], "old-revision")
+
+        asyncio.run(run_case())
+
+    def test_guarded_status_explicitly_reports_safe_degradation(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "danbooru_validation_mode": "guarded",
+                "enable_prompt_diagnostics": True,
+            }
+        )
+        plugin._prompt_diagnostics_store = self.main.PromptDiagnosticsStore(
+            capacity=10
+        )
+        plugin._prompt_composer = self.main.PromptComposer(
+            validation_mode="report",
+            diagnostics_store=plugin._prompt_diagnostics_store,
+        )
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "danbooru.sqlite3"
+        )
+        plugin._danbooru_update_state = {"status": "idle"}
+
+        status = asyncio.run(plugin.web_ui_prompt_status())
+
+        self.assertEqual(status["composer"]["validation_mode"], "guarded")
+        self.assertEqual(
+            status["composer"]["effective_validation_mode"],
+            "report",
+        )
+        self.assertTrue(status["composer"]["guarded_degraded_to_report"])
 
     def test_direct_draw_llm_flag_reaches_generation_job(self) -> None:
         async def run_case(command_text: str, expected: bool) -> None:
@@ -3510,6 +3694,29 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.config.saved, 2)
         self.assertTrue(result["reload_scheduled"])
 
+    async def test_v170_settings_reject_out_of_range_or_fractional_values(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.config = {
+            "max_preset_loras": 12,
+            "max_total_dynamic_loras": 12,
+        }
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        invalid = (
+            {"prompt_asset_max_download_mb": 17},
+            {"prompt_lab_batch_capacity": 3},
+            {"prompt_lab_ttl_seconds": 59},
+            {"lora_visual_cache_mb": -1},
+            {"lora_visual_warmup_workers": 5},
+            {"lora_visual_preview_max_mb": 33},
+            {"lora_visual_thumbnail_size": 127},
+            {"lora_visual_warmup_workers": 1.5},
+        )
+
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises(self.main.WebUiActionError):
+                    await plugin.web_ui_save_settings(payload)
+
     async def test_web_ui_metadata_fetch_refreshes_before_and_after(self) -> None:
         record = types.SimpleNamespace(
             name="characters/denia.safetensors",
@@ -3665,6 +3872,640 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["completed_items"], 1)
             self.assertGreaterEqual(plugin._lora_catalog.refreshes, 2)
             store.close()
+
+
+class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Exercise v1.7 controller gates without constructing a full AstrBot runtime."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _asset_status(count: int = 0) -> dict[str, object]:
+        return {
+            "ready": bool(count),
+            "schema_version": "1",
+            "asset_count": count,
+            "custom_count": 0,
+            "favorite_count": 0,
+            "type_counts": {},
+            "last_import_sha256": "",
+            "last_import_count": count,
+            "error": "",
+        }
+
+    def _asset_plugin(self, library, *, remote: bool = False):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_prompt_asset_library=True,
+            prompt_asset_remote_import_enabled=remote,
+            prompt_asset_max_download_mb=64,
+        )
+        plugin._prompt_assets = library
+        plugin._prompt_assets_error = ""
+        plugin._task_store = None
+        return plugin
+
+    def _prompt_lab_plugin(self, root: Path):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_prompt_lab=True,
+            max_total_dynamic_loras=12,
+        )
+        plugin._prompt_assets = self.main.PromptAssetLibrary(
+            root / "prompt_assets.sqlite3"
+        )
+        plugin._prompt_assets_error = ""
+        plugin._prompt_lab = self.main.PromptLab()
+        plugin._prompt_composer = self.main.PromptComposer(
+            adaptive_negative_mode="off",
+            validation_mode="off",
+        )
+        plugin._prompt_lab_batch_capacity = 4
+        plugin._prompt_lab_ttl_seconds = 120
+        plugin._prompt_lab_batches = self.main.OrderedDict()
+        plugin._prompt_lab_lock = asyncio.Lock()
+        plugin._task_store = None
+        plugin._lora_catalog = None
+        return plugin
+
+    async def test_disabled_asset_library_is_unavailable_and_rejects_actions(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_prompt_asset_library=False,
+            prompt_asset_remote_import_enabled=False,
+        )
+        plugin._prompt_assets = None
+        plugin._prompt_assets_error = ""
+
+        status = await plugin.web_ui_prompt_assets_status()
+        self.assertFalse(status["enabled"])
+        self.assertFalse(status["available"])
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_search({})
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_import(
+                {"text": "[]", "source": "test"}
+            )
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_update_url(
+                {"url": "https://example.com/assets.json"}
+            )
+
+    async def test_remote_asset_gate_rejects_before_network_call(self):
+        library = Mock()
+        library.update_from_url = AsyncMock()
+        plugin = self._asset_plugin(library, remote=False)
+
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_update_url(
+                {"url": "https://example.com/assets.json"}
+            )
+        library.update_from_url.assert_not_awaited()
+
+    async def test_remote_asset_update_passes_public_https_policy_and_hard_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status(2)
+            library.update_from_url = AsyncMock(
+                return_value=self._asset_status(2)
+            )
+            plugin = self._asset_plugin(library, remote=True)
+
+            result = await plugin.web_ui_prompt_assets_update_url(
+                {
+                    "url": "https://example.com/assets.json",
+                    "timeout": 19,
+                    "mode": "replace_source",
+                }
+            )
+
+        self.assertEqual(result["asset_count"], 2)
+        kwargs = library.update_from_url.await_args.kwargs
+        self.assertEqual(kwargs["timeout"], 19)
+        self.assertEqual(kwargs["max_bytes"], 16 * 1024 * 1024)
+        self.assertFalse(kwargs["allow_private_http"])
+
+    async def test_text_import_uses_cancellation_aware_api_and_never_import_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status(1)
+            library.import_bytes_async = AsyncMock(
+                return_value=self._asset_status(1)
+            )
+            library.import_file = Mock()
+            plugin = self._asset_plugin(library)
+
+            result = await plugin.web_ui_prompt_assets_import(
+                {
+                    "source": "reviewed-test-pack",
+                    "format": "json",
+                    "text": '{"assets":[{"type":"pose","name":"standing"}]}',
+                }
+            )
+
+        self.assertEqual(result["asset_count"], 1)
+        library.import_bytes_async.assert_awaited_once()
+        library.import_file.assert_not_called()
+        self.assertEqual(
+            library.import_bytes_async.await_args.kwargs["source"],
+            "reviewed-test-pack",
+        )
+
+    async def test_asset_search_forwards_source_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status()
+            library.search.return_value = {
+                "items": [],
+                "total": 0,
+                "page": 1,
+                "page_size": 50,
+                "pages": 0,
+            }
+            plugin = self._asset_plugin(library)
+
+            await plugin.web_ui_prompt_assets_search(
+                {"query": "rice", "source": "reviewed-pack"}
+            )
+
+        self.assertEqual(library.search.call_args.kwargs["source"], "reviewed-pack")
+
+    async def test_asset_search_uses_same_transaction_opaque_revision(self):
+        library = Mock()
+        library.search.return_value = {
+            "items": [],
+            "total": 0,
+            "page": 1,
+            "page_size": 50,
+            "pages": 0,
+            "revision": "opaque-revision-7",
+        }
+        library.status.side_effect = AssertionError(
+            "same-transaction revision must avoid a second status read"
+        )
+        plugin = self._asset_plugin(library)
+
+        result = await plugin.web_ui_prompt_assets_search({})
+
+        self.assertEqual(result["fingerprint"], "opaque-revision-7")
+        library.status.assert_not_called()
+
+    async def test_empty_asset_facets_falls_back_without_undefined_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status()
+            library.facets.return_value = {
+                "type_counts": {},
+                "sources": [],
+                "categories": [],
+                "traits": [],
+                "revision": "",
+            }
+            plugin = self._asset_plugin(library)
+
+            result = await plugin.web_ui_prompt_assets_facets({})
+
+        self.assertTrue(result["fingerprint"])
+        self.assertEqual(result["sources"], [])
+
+    async def test_asset_controller_crud_round_trip_uses_mutation_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = self.main.PromptAssetLibrary(
+                Path(directory) / "prompt_assets.sqlite3"
+            )
+            plugin = self._asset_plugin(library)
+
+            created = await plugin.web_ui_prompt_asset_create(
+                {
+                    "asset_type": "pose",
+                    "name_en": "Standing",
+                    "tags": ["standing"],
+                }
+            )
+            asset_id = created["item"]["asset_id"]
+            self.assertEqual(created["fingerprint"], created["item"]["revision"])
+
+            updated = await plugin.web_ui_prompt_asset_update(
+                {
+                    "asset_id": asset_id,
+                    "changes": {"name_en": "Standing Tall"},
+                }
+            )
+            self.assertEqual(updated["item"]["name_en"], "Standing Tall")
+            self.assertEqual(updated["fingerprint"], updated["item"]["revision"])
+
+            favorite = await plugin.web_ui_prompt_asset_favorite(
+                {"asset_id": asset_id, "favorite": True}
+            )
+            self.assertTrue(favorite["item"]["favorite"])
+            self.assertEqual(favorite["fingerprint"], favorite["item"]["revision"])
+
+            searched = await plugin.web_ui_prompt_assets_search(
+                {"query": "standing tall", "custom_only": True}
+            )
+            self.assertEqual(searched["total"], 1)
+            self.assertEqual(searched["items"][0]["asset_id"], asset_id)
+
+            deleted = await plugin.web_ui_prompt_asset_delete(
+                {"asset_id": asset_id}
+            )
+            self.assertTrue(deleted["deleted"])
+            self.assertEqual(deleted["fingerprint"], deleted["revision"])
+            self.assertEqual(library.search(custom_only=True)["total"], 0)
+
+    async def test_empty_local_sync_clears_only_automatic_source(self):
+        def asset_pack(name: str, source_id: str) -> bytes:
+            return json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_type": "pose",
+                            "name_en": name,
+                            "tags": ["standing"],
+                            "source_id": source_id,
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            library = self.main.PromptAssetLibrary(
+                Path(directory) / "prompt_assets.sqlite3"
+            )
+            library.import_bytes(
+                asset_pack("Automatic Pose", "auto:pose"),
+                source="astrbot_local_assets",
+                content_type="application/json",
+            )
+            library.import_bytes(
+                asset_pack("Reviewed Pose", "reviewed:pose"),
+                source="reviewed_pack",
+                content_type="application/json",
+            )
+            custom = library.create_custom(
+                {
+                    "asset_type": "background",
+                    "name_en": "Custom Studio",
+                    "tags": ["studio"],
+                }
+            )
+            plugin = self._asset_plugin(library)
+            plugin._lora_catalog = None
+            plugin._lora_presets = types.SimpleNamespace(presets=())
+            plugin._semantic_index = None
+
+            result = await plugin.web_ui_prompt_assets_sync_local({})
+
+            self.assertEqual(result["synced"], 0)
+            self.assertEqual(result["removed"], 1)
+            self.assertEqual(result["fingerprint"], result["revision"])
+            self.assertEqual(
+                library.search(source="astrbot_local_assets")["total"], 0
+            )
+            self.assertEqual(library.search(source="reviewed_pack")["total"], 1)
+            self.assertEqual(library.get(custom["asset_id"])["name_en"], "Custom Studio")
+
+    async def test_prompt_lab_confirm_stops_after_asset_revision_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 42,
+                    "count": 1,
+                    "base_layers": {"identity": ["1girl"]},
+                }
+            )
+            plugin._prompt_assets.create_custom(
+                {"asset_type": "pose", "name_en": "standing"}
+            )
+
+            with self.assertRaisesRegex(
+                self.main.WebUiActionError,
+                "素材库在候选生成后发生变化",
+            ):
+                await plugin.web_ui_prompt_lab_confirm(
+                    {
+                        "batch_id": generated["batch"]["batch_id"],
+                        "selection": 1,
+                    }
+                )
+
+    async def test_prompt_lab_reloads_library_asset_instead_of_trusting_client_tags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            asset = plugin._prompt_assets.create_custom(
+                {
+                    "asset_type": "character",
+                    "name_en": "Verified Character",
+                    "tags": ["server_verified_identity"],
+                }
+            )
+
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 7,
+                    "count": 1,
+                    "asset_pools": {
+                        "identity": [
+                            {
+                                "asset_id": asset["asset_id"],
+                                "tags": ["client_injected_identity"],
+                            }
+                        ]
+                    },
+                }
+            )
+
+        identity = generated["batch"]["candidates"][0]["layers"]["identity"]
+        self.assertIn("server_verified_identity", identity)
+        self.assertNotIn("client_injected_identity", identity)
+
+    async def test_prompt_lab_confirm_reloads_selected_library_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            asset = plugin._prompt_assets.create_custom(
+                {
+                    "asset_type": "character",
+                    "name_en": "Verified Character",
+                    "tags": ["server_verified_identity"],
+                }
+            )
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 9,
+                    "count": 1,
+                    "asset_pools": {
+                        "identity": [{"asset_id": asset["asset_id"]}]
+                    },
+                }
+            )
+            original_get = plugin._prompt_assets.get
+            plugin._prompt_assets.get = Mock(wraps=original_get)
+
+            confirmed = await plugin.web_ui_prompt_lab_confirm(
+                {
+                    "batch_id": generated["batch"]["batch_id"],
+                    "selection": 1,
+                }
+            )
+
+        self.assertTrue(confirmed["confirmed"])
+        plugin._prompt_assets.get.assert_called_once_with(asset["asset_id"])
+
+    async def test_prompt_lab_confirm_rechecks_revision_after_lora_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 11,
+                    "count": 1,
+                    "base_layers": {"identity": ["1girl"]},
+                }
+            )
+
+            async def mutate_library(*_args, **_kwargs):
+                plugin._prompt_assets.create_custom(
+                    {"asset_type": "pose", "name_en": "Changed During Confirm"}
+                )
+                return {"required": 0, "validated": 0, "catalog_fingerprint": ""}
+
+            plugin._validate_prompt_lab_loras = AsyncMock(
+                side_effect=mutate_library
+            )
+
+            with self.assertRaises(self.main.WebUiActionError) as captured:
+                await plugin.web_ui_prompt_lab_confirm(
+                    {
+                        "batch_id": generated["batch"]["batch_id"],
+                        "selection": 1,
+                    }
+                )
+
+        self.assertIn("确认校验期间", str(captured.exception))
+
+    async def test_prompt_lab_private_batch_is_actively_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            plugin._prompt_lab_batches["batch"] = {
+                "expires_at": time.time() + 0.01,
+            }
+            plugin._schedule_prompt_lab_expiry("batch", time.time() + 0.01)
+
+            await asyncio.sleep(0.04)
+
+        self.assertNotIn("batch", plugin._prompt_lab_batches)
+
+    async def test_prompt_lab_lora_confirmation_is_exact_and_never_submits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            plugin._lora_catalog = object()
+            plugin._client = types.SimpleNamespace(submit=AsyncMock())
+            plugin._refresh_lora_manager_before = AsyncMock(
+                return_value=(
+                    types.SimpleNamespace(name="foo.safetensors"),
+                )
+            )
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": "fixed-seed",
+                    "count": 1,
+                    "base_layers": {
+                        "identity": ["1girl"],
+                        "lora": ["<lora:folder/foo:0.7>"],
+                    },
+                }
+            )
+            request = {
+                "batch_id": generated["batch"]["batch_id"],
+                "selection": 1,
+            }
+            with self.assertRaisesRegex(
+                self.main.WebUiActionError,
+                "完整名称唯一确认",
+            ):
+                await plugin.web_ui_prompt_lab_confirm(request)
+
+            plugin._refresh_lora_manager_before.return_value = (
+                types.SimpleNamespace(name="folder/foo.safetensors"),
+            )
+            confirmed = await plugin.web_ui_prompt_lab_confirm(request)
+
+        self.assertTrue(confirmed["confirmed"])
+        self.assertFalse(confirmed["submitted"])
+        self.assertEqual(confirmed["lora_validation"]["validated"], 1)
+        plugin._client.submit.assert_not_awaited()
+        self.assertTrue(
+            all(call.kwargs.get("force") is True for call in plugin._refresh_lora_manager_before.await_args_list)
+        )
+
+    async def test_lora_gallery_is_path_free_and_uses_forced_refresh(self):
+        class Page:
+            def to_dict(self):
+                return {
+                    "manifest_fingerprint": "a" * 64,
+                    "items": [
+                        {
+                            "asset_id": "b" * 64,
+                            "name": "characters/example.safetensors",
+                            "path": "/models/loras/private/example.safetensors",
+                        }
+                    ],
+                    "total": 1,
+                    "page": 1,
+                    "page_size": 50,
+                    "pages": 1,
+                }
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_visuals = types.SimpleNamespace(
+            list_page=Mock(return_value=Page())
+        )
+        plugin._lora_visual_error = ""
+        plugin._refresh_lora_manager_before = AsyncMock(return_value=(object(),))
+
+        result = await plugin.web_ui_lora_gallery({})
+
+        self.assertNotIn("path", result["items"][0])
+        self.assertTrue(plugin._refresh_lora_manager_before.await_args.kwargs["force"])
+
+    async def test_empty_root_gallery_warms_remote_keys_and_serves_reencoded_data(self):
+        catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+        visual_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_visuals"
+        )
+        record = catalog_module.LoraRecord(
+            name="characters/remote.safetensors",
+            preview_url="http://manager.invalid/api/lm/previews?opaque=1",
+            source_fingerprint="d" * 64,
+        )
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), (255, 128, 0)).save(image_buffer, format="PNG")
+
+        class Catalog:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch_manager_preview(self, current, *, max_bytes):
+                self.calls += 1
+                self.assert_record = current
+                self.max_bytes = max_bytes
+                return image_buffer.getvalue(), "image/png"
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = visual_module.LoraVisualService(
+                (),
+                Path(directory) / "cache",
+                max_preview_bytes=4 * 1024 * 1024,
+            )
+            manifest = service.build_manifest((record,))
+            key = manifest.items[0].preview_key
+            catalog = Catalog()
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(lora_visual_preview_max_mb=4)
+            plugin._lora_visuals = service
+            plugin._lora_visual_error = ""
+            plugin._lora_catalog = catalog
+            plugin._task_store = None
+            plugin._refresh_lora_manager_before = AsyncMock(return_value=(record,))
+
+            warmed = await plugin.web_ui_lora_visual_warm(
+                {"keys": [key], "limit": 1}
+            )
+            latest = service.build_manifest((record,))
+            preview = await plugin.web_ui_lora_preview(key, latest.fingerprint)
+            service.close()
+
+        self.assertEqual(warmed["schedule"]["remote_succeeded"], 1)
+        self.assertEqual(warmed["schedule"]["remote_failed"], 0)
+        self.assertEqual(catalog.calls, 1)
+        self.assertEqual(preview["media_type"], "image/webp")
+        self.assertTrue(preview["data_url"].startswith("data:image/webp;base64,"))
+        self.assertNotIn("path", preview)
+
+    async def test_lora_preview_rejects_stale_manifest_before_read(self):
+        manifest = types.SimpleNamespace(
+            fingerprint="a" * 64,
+            items=(),
+        )
+        service = types.SimpleNamespace(
+            build_manifest=Mock(return_value=manifest),
+            read_preview=Mock(),
+        )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(lora_visual_preview_max_mb=4)
+        plugin._lora_visuals = service
+        plugin._lora_visual_error = ""
+        plugin._lora_catalog = object()
+        plugin._refresh_lora_manager_before = AsyncMock(return_value=(object(),))
+
+        with self.assertRaisesRegex(
+            self.main.WebUiActionError,
+            "LoRA 图库已变化",
+        ):
+            await plugin.web_ui_lora_preview("b" * 64, "c" * 64)
+        service.read_preview.assert_not_called()
+
+    async def test_lora_cache_delete_uses_strict_clear_not_quota_prune(self):
+        service = types.SimpleNamespace(
+            build_manifest=Mock(
+                return_value=types.SimpleNamespace(fingerprint="a" * 64)
+            ),
+            clear_cache=Mock(
+                return_value={
+                    "removed": 2,
+                    "removed_bytes": 1024,
+                    "remaining_bytes": 0,
+                }
+            ),
+            prune_cache=Mock(),
+        )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_visuals = service
+        plugin._lora_visual_error = ""
+        plugin._refresh_lora_manager_before = AsyncMock(return_value=(object(),))
+
+        result = await plugin.web_ui_lora_visual_prune()
+
+        self.assertEqual(result["removed"], 2)
+        service.clear_cache.assert_called_once_with()
+        service.prune_cache.assert_not_called()
+
+    async def test_prompt_lab_task_events_store_hashes_not_private_content(self):
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self._prompt_lab_plugin(root)
+            store = task_module.TaskStore(root / "tasks.sqlite3")
+            plugin._task_store = store
+            result = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": "private-seed-value",
+                    "count": 1,
+                    "base_layers": {"identity": ["private-character-term"]},
+                }
+            )
+            task = store.get_task(result["task_run_id"])
+            events = store.read_events(run_id=result["task_run_id"])
+            serialized = json.dumps(
+                {"task": task, "events": events},
+                ensure_ascii=False,
+            )
+            store.close()
+
+        self.assertNotIn("private-seed-value", serialized)
+        self.assertNotIn("private-character-term", serialized)
+        self.assertIn("prompt_lab_candidates_ready", serialized)
 
 
 if __name__ == "__main__":

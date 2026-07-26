@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.5.7
+AstrBot Comfy Anima 插件 v1.7.0
 
 功能描述：
 - 定义插件配置、生成参数和任务数据模型
 
 作者: Yen
-版本: 1.5.7
-日期: 2026-07-21
+版本: 1.7.0
+日期: 2026-07-26
 """
 
 from dataclasses import dataclass, field
@@ -210,6 +210,12 @@ class PluginSettings:
     lora_catalog_timeout: int = 15
     lora_cache_ttl: int = 300
     lora_max_results: int = 50
+    enable_lora_visual_gallery: bool = True
+    lora_visual_roots: list[str] = field(default_factory=list)
+    lora_visual_cache_mb: int = 256
+    lora_visual_warmup_workers: int = 2
+    lora_visual_preview_max_mb: int = 4
+    lora_visual_thumbnail_size: int = 512
     lora_alias_rules: list[str] = field(default_factory=list)
     enable_lora_hybrid_search: bool = False
     lora_embedding_provider_id: str = ""
@@ -224,6 +230,21 @@ class PluginSettings:
     provider_max_concurrent_jobs: int = 4
     enable_local_intent_router: bool = True
     structured_director_mode: str = "auto"
+    enable_prompt_composer_v2: bool = True
+    adaptive_negative_mode: str = "conservative"
+    enable_prompt_diagnostics: bool = True
+    prompt_diagnostics_include_content: bool = False
+    prompt_diagnostics_capacity: int = 50
+    danbooru_validation_mode: str = "report"
+    danbooru_index_url: str = ""
+    danbooru_index_timeout: int = 30
+    danbooru_index_max_size_mb: int = 64
+    enable_prompt_asset_library: bool = True
+    prompt_asset_remote_import_enabled: bool = False
+    prompt_asset_max_download_mb: int = 16
+    enable_prompt_lab: bool = True
+    prompt_lab_batch_capacity: int = 32
+    prompt_lab_ttl_seconds: int = 1800
     enable_layered_lora_retrieval: bool = True
     lora_loader_node_id: str = "462"
     dynamic_lora_mode: str = "append"
@@ -467,6 +488,26 @@ class PluginSettings:
             lora_catalog_timeout=_as_int(data.get("lora_catalog_timeout"), 15, 1),
             lora_cache_ttl=_as_int(data.get("lora_cache_ttl"), 300, 0),
             lora_max_results=_as_int(data.get("lora_max_results"), 50, 1),
+            enable_lora_visual_gallery=_as_bool(
+                data.get("enable_lora_visual_gallery"), True
+            ),
+            lora_visual_roots=_as_string_list(data.get("lora_visual_roots"), []),
+            lora_visual_cache_mb=min(
+                8192,
+                _as_int(data.get("lora_visual_cache_mb"), 256, 0),
+            ),
+            lora_visual_warmup_workers=min(
+                4,
+                _as_int(data.get("lora_visual_warmup_workers"), 2, 1),
+            ),
+            lora_visual_preview_max_mb=min(
+                32,
+                _as_int(data.get("lora_visual_preview_max_mb"), 4, 1),
+            ),
+            lora_visual_thumbnail_size=min(
+                1024,
+                _as_int(data.get("lora_visual_thumbnail_size"), 512, 128),
+            ),
             lora_alias_rules=_as_string_list(
                 data.get("lora_alias_rules"),
                 [],
@@ -515,6 +556,63 @@ class PluginSettings:
                 if str(data.get("structured_director_mode", "auto")).strip().lower()
                 in {"auto", "function_call", "json", "legacy"}
                 else "auto"
+            ),
+            enable_prompt_composer_v2=_as_bool(
+                data.get("enable_prompt_composer_v2"), True
+            ),
+            adaptive_negative_mode=(
+                str(data.get("adaptive_negative_mode", "conservative"))
+                .strip()
+                .lower()
+                if str(data.get("adaptive_negative_mode", "conservative"))
+                .strip()
+                .lower()
+                in {"off", "conservative", "standard"}
+                else "conservative"
+            ),
+            enable_prompt_diagnostics=_as_bool(
+                data.get("enable_prompt_diagnostics"), True
+            ),
+            prompt_diagnostics_include_content=_as_bool(
+                data.get("prompt_diagnostics_include_content"), False
+            ),
+            prompt_diagnostics_capacity=min(
+                500,
+                _as_int(data.get("prompt_diagnostics_capacity"), 50, 10),
+            ),
+            danbooru_validation_mode=(
+                str(data.get("danbooru_validation_mode", "report")).strip().lower()
+                if str(data.get("danbooru_validation_mode", "report")).strip().lower()
+                in {"off", "report", "guarded"}
+                else "report"
+            ),
+            danbooru_index_url=str(data.get("danbooru_index_url", "")).strip(),
+            danbooru_index_timeout=min(
+                300,
+                _as_int(data.get("danbooru_index_timeout"), 30, 5),
+            ),
+            danbooru_index_max_size_mb=min(
+                128,
+                _as_int(data.get("danbooru_index_max_size_mb"), 64, 1),
+            ),
+            enable_prompt_asset_library=_as_bool(
+                data.get("enable_prompt_asset_library"), True
+            ),
+            prompt_asset_remote_import_enabled=_as_bool(
+                data.get("prompt_asset_remote_import_enabled"), False
+            ),
+            prompt_asset_max_download_mb=min(
+                16,
+                _as_int(data.get("prompt_asset_max_download_mb"), 16, 1),
+            ),
+            enable_prompt_lab=_as_bool(data.get("enable_prompt_lab"), True),
+            prompt_lab_batch_capacity=min(
+                128,
+                _as_int(data.get("prompt_lab_batch_capacity"), 32, 4),
+            ),
+            prompt_lab_ttl_seconds=min(
+                86400,
+                _as_int(data.get("prompt_lab_ttl_seconds"), 1800, 60),
             ),
             enable_layered_lora_retrieval=_as_bool(
                 data.get("enable_layered_lora_retrieval"), True

@@ -228,6 +228,82 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
         self.assertEqual(plan.added, ("jett (precure)",))
         self.assertEqual(plan.prompt, "1girl, jett (precure)")
 
+    def test_preset_and_manager_triggers_stay_before_scene_sentence(self) -> None:
+        preset = LoraPreset(
+            name="style preset",
+            category="artist_style",
+            selections=(LoraSelection("styles/manual", 0.5),),
+            trigger_words="hand tuned ink",
+        )
+        selections = (
+            *preset.selections,
+            LoraSelection("styles/manager", 0.6),
+        )
+        records = {
+            "styles/manual": LoraRecord(
+                "styles/manual",
+                category="artist_style",
+                trigger_words=("ignored manager trigger",),
+            ),
+            "styles/manager": LoraRecord(
+                "styles/manager",
+                category="artist_style",
+                trigger_words=("paper texture", "warm palette"),
+            ),
+        }
+
+        plan = build_lora_trigger_plan(
+            prompt=(
+                "<lora:styles/manual:0.5>, <lora:styles/manager:0.6>, "
+                "1girl, beach. A girl stands beside the sea at sunset."
+            ),
+            negative_prompt="",
+            selections=selections,
+            records_by_name=records,
+            presets=(preset,),
+        )
+
+        self.assertEqual(
+            plan.prompt,
+            "<lora:styles/manual:0.5>, <lora:styles/manager:0.6>, 1girl, "
+            "beach, hand tuned ink, paper texture, warm palette. "
+            "A girl stands beside the sea at sunset.",
+        )
+        self.assertEqual(
+            plan.added,
+            ("hand tuned ink", "paper texture", "warm palette"),
+        )
+        self.assertTrue(plan.prompt.endswith("A girl stands beside the sea at sunset."))
+
+    def test_outfit_conflict_filter_only_rewrites_hybrid_tag_block(self) -> None:
+        plan = build_lora_trigger_plan(
+            prompt=(
+                "<lora:characters/denia:0.8>, 1girl, school uniform, "
+                "(casual hoodie:1.2). A girl stands in the rain and looks at the viewer."
+            ),
+            negative_prompt="school uniform",
+            selections=(LoraSelection("characters/denia", 0.8),),
+            records_by_name={
+                "characters/denia": LoraRecord(
+                    "characters/denia",
+                    category="character",
+                    trigger_words=("denia_wuwa", "school uniform"),
+                    character_name="Denia",
+                )
+            },
+        )
+
+        self.assertEqual(
+            plan.prompt,
+            "<lora:characters/denia:0.8>, 1girl, (casual hoodie:1.2), "
+            "denia_wuwa. A girl stands in the rain and looks at the viewer.",
+        )
+        self.assertNotIn("school uniform", plan.prompt)
+        self.assertIn("(casual hoodie:1.2)", plan.prompt)
+        self.assertTrue(
+            plan.prompt.endswith("A girl stands in the rain and looks at the viewer.")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
