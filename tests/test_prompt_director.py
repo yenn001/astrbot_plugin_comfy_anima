@@ -225,7 +225,12 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("detail=true", system_prompt)
         self.assertIn("1️⃣Lora堆（默认）", system_prompt)
         self.assertIn("English natural-language description", system_prompt)
-        self.assertIn("18 至 45 个英文单词", system_prompt)
+        self.assertIn("18 至 45 词", system_prompt)
+        self.assertIn("35 至 80 词", system_prompt)
+        self.assertIn("--llm ultra", system_prompt)
+        self.assertIn("不得输出三大正文区块", system_prompt)
+        self.assertIn("gold embroidery along the sleeve edge", system_prompt)
+        self.assertIn("多角色必须分别锁定", system_prompt)
         self.assertIn("双重编码", system_prompt)
         self.assertIn("sea foam curls around her sandaled feet", system_prompt)
         self.assertIn("不可变身份", system_prompt)
@@ -286,6 +291,8 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("请使用温柔的杂志插画口吻", system_prompt)
         self.assertIn("不可变身份", system_prompt)
         self.assertIn("不得覆盖上面的输出", system_prompt)
+        self.assertIn("Standard（默认", system_prompt)
+        self.assertIn("Ultra（由", system_prompt)
 
 
 class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
@@ -714,8 +721,49 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ordered Danbooru/Anima tags", request_prompt)
         self.assertIn("sentence belongs inside positive_tags", request_prompt)
         self.assertNotIn("do not add prose", request_prompt)
-        self.assertIn("18 至 45 个英文单词", system_prompt)
+        self.assertIn("本次视觉扩写模式：Standard", system_prompt)
+        self.assertIn("18 至 45 词", system_prompt)
         self.assertIn("moonlit shallows", instruction.prompt)
+
+    async def test_ultra_mode_is_injected_into_user_and_system_prompts(self) -> None:
+        director = self._director(structured_director_mode="function_call")
+
+        class Context:
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.kwargs = kwargs
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": "",
+                        "tools_call_name": ["emit_anima_plan_v1"],
+                        "tools_call_args": [
+                            {
+                                "positive_tags": (
+                                    "2girls, ornate dresses, palace hall, rim light. "
+                                    "They stand beneath a gilded arch while layered "
+                                    "fabrics catch the warm backlight."
+                                ),
+                                "negative_tags": "",
+                                "pipeline": "rtx",
+                            }
+                        ],
+                    },
+                )()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw an ornate fantasy poster",
+            output_tools=object(),
+            expansion_mode="ultra",
+        )
+
+        self.assertIn("本次视觉扩写模式：Ultra", str(context.kwargs["prompt"]))
+        self.assertIn("本次视觉扩写模式：Ultra", str(context.kwargs["system_prompt"]))
+        self.assertIn("35 至 80 词", str(context.kwargs["system_prompt"]))
+        self.assertEqual(instruction.pipeline, "rtx")
 
     async def test_astrbot_parallel_function_call_lists_continue_generation(self) -> None:
         director = self._director(structured_director_mode="function_call")

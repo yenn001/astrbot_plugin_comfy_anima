@@ -565,6 +565,9 @@ class ReversePromptServiceTests(unittest.IsolatedAsyncioTestCase):
 
         system_prompt = captured["system_prompt"]
         self.assertIn(custom, system_prompt)
+        self.assertIn("camera-aware visual evidence stack", system_prompt)
+        self.assertIn("hand gestures", system_prompt)
+        self.assertIn("foreground", system_prompt)
         self.assertGreater(
             system_prompt.rfind("Mandatory output protocol"),
             system_prompt.rfind(custom),

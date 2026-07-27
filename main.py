@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.8.3
+AstrBot Comfy Anima 插件 v1.8.4
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.8.3
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.8.3
+版本: 1.8.4
 日期: 2026-07-27
 """
 
@@ -137,6 +137,7 @@ from .services.model_manager import (
     ModelManagerService,
 )
 from .services.prompt_director import (
+    ANIMA_VISUAL_EXPANSION_PROTOCOL,
     PictureInstruction,
     PromptDirector,
     PromptDirectorError,
@@ -1462,7 +1463,10 @@ class ComfyAnimaPlugin(Star):
             return
         if self._access_error(event, "", check_sensitive=False):
             return
-        prompt_parts: list[str] = [AUTO_DRAW_CONTROL_PROTOCOL]
+        prompt_parts: list[str] = [
+            AUTO_DRAW_CONTROL_PROTOCOL,
+            ANIMA_VISUAL_EXPANSION_PROTOCOL,
+        ]
         director = getattr(self, "_director", None)
         danbooru_context = (
             director.danbooru_runtime_context() if director is not None else ""
@@ -3581,7 +3585,13 @@ class ComfyAnimaPlugin(Star):
                 if options.use_prompt_llm is None
                 else options.use_prompt_llm
             )
-            director_text = "LLM 分镜、" if use_llm else "原始提示词、"
+            director_text = (
+                "LLM Ultra 华丽分镜、"
+                if use_llm and options.prompt_expansion_mode == "ultra"
+                else "LLM 分镜、"
+                if use_llm
+                else "原始提示词、"
+            )
             yield event.plain_result(
                 f"{MessageEmoji.DRAW} 已接收任务（{director_text}{mode_text}），请稍候……"
             )
@@ -4380,11 +4390,12 @@ class ComfyAnimaPlugin(Star):
             f"""📖 ComfyUI 绘图帮助｜v{PLUGIN_VERSION} 管线版
 ━━━━━━━━━━━━
 自然语言生图: 帮我画一个……
-/画图 <英文 Tag或画面描述> [--llm] [参数] - 合并转发图片
-/画图no <英文 Tag或画面描述> [--llm] [参数] - 直接发送图片
-默认按原始 Tags 执行；--llm / --l 启用“有序 Tags + 一句英文场景描述”优化。
+/画图 <英文 Tag或画面描述> [--llm [u|ultra]] [参数] - 合并转发图片
+/画图no <英文 Tag或画面描述> [--llm [u|ultra]] [参数] - 直接发送图片
+默认按原始 Tags 执行；--llm / --l 使用 Standard 优化；--llm u / --l u 使用 Ultra 华丽扩写。
 --raw / --no-llm 明确保持原样，不调用绘图导演。
 示例: /画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx
+华丽示例: /画图 双人奇幻宫殿海报，薄纱与金属材质，宏大逆光 --l u --pipeline rtx
 
 3 个可选生图管线（先由 Anima 生成）:
 1. base - 只生成 Anima 原图，不放大
@@ -4408,8 +4419,8 @@ class ComfyAnimaPlugin(Star):
 /换角色 A -> B [选项] | <完整 Tags> - 对现有 Tags 语义换角
 /换角色会先刷新并精确查找目标角色 LoRA；完全未命中时改用普通语义 Tags。
 --no-character-lora / --no-lora - 强制不加载目标角色 LoRA，仅用语义 Tags；只支持 keep-outfit
-/画图与 /画图no 可追加 --llm、--preset <序号|名称> 及 --pipeline <管线>
-短参数: --p b|r|i、--sz、--st、--sd、--c、--n、--pr；底图控制用 --m p d 等组合。
+/画图与 /画图no 可追加 --llm [u|ultra]、--preset <序号|名称> 及 --pipeline <管线>
+短参数: --p b|r|i、--sz、--st、--sd、--c、--n、--pr、--l [u]；底图控制用 --m p d 等组合。
 
 管理员:
 /comfy_ls - 列出工作流
@@ -4529,8 +4540,8 @@ iterative - Anima 原图 + 迭代采样放大
 明确局部/遮罩或指定 quick|lanpaint 时需提供同尺寸遮罩；普通整图换衣、换背景会自动转入 /改图。
 
 QQ快捷指令:
-/画图 <英文 Tag或画面描述> [--llm] [--pipeline base|rtx|iterative] - 合并转发
-/画图no <英文 Tag或画面描述> [--llm] [--pipeline base|rtx|iterative] - 直接图片
+/画图 <英文 Tag或画面描述> [--llm [u|ultra]] [--pipeline base|rtx|iterative] - 合并转发
+/画图no <英文 Tag或画面描述> [--llm [u|ultra]] [--pipeline base|rtx|iterative] - 直接图片
 /方案列表 - 列出 Prompt Lab 持久化方案与内置示例（管理员）
 /方案 <ID或名称> [追加要求] [参数] - 使用或调整已确认方案并生图（管理员）
 /反推 [关注点] - 在线图片反推
@@ -4548,7 +4559,7 @@ QQ快捷指令:
 --cfg 5
 --pipeline base|rtx|iterative
 --upscale / --no-upscale
---llm / --raw
+--llm / --l = Standard；--llm u / --l u = Ultra 华丽扩写；--raw = 原始 Tags
 --preset "风格001或自定义名称"
 短写: --p b|r|i、--sz、--st、--sd、--c、--n、--pr、--l、--r
 底图控制: --m p|d|l|r；支持 --m p d、--m p --m d；省略时按命令正文推断
@@ -5573,7 +5584,8 @@ QQ快捷指令:
         if not prompt:
             command = "/画图" if forward else "/画图no"
             yield event.plain_result(
-                f"{MessageEmoji.ERROR} 用法: {command} <英文 Tag或画面描述> [--llm]"
+                f"{MessageEmoji.ERROR} 用法: {command} <英文 Tag或画面描述> "
+                "[--llm [u|ultra]]"
             )
             return
         if len(prompt) > self.settings.max_prompt_length:
@@ -5593,7 +5605,10 @@ QQ快捷指令:
             return
         if self.settings.send_generation_notice:
             notice = (
-                "正在使用绘图导演优化提示词并生成……"
+                "正在使用绘图导演 Ultra 华丽模式扩写提示词并生成……"
+                if use_prompt_llm
+                and parsed_options.prompt_expansion_mode == "ultra"
+                else "正在使用绘图导演优化提示词并生成……"
                 if use_prompt_llm
                 else "已提交 ComfyUI，请稍候……"
             )
@@ -5610,6 +5625,7 @@ QQ快捷指令:
                 GenerationOptions(
                     prompt=prompt,
                     use_prompt_llm=use_prompt_llm,
+                    prompt_expansion_mode=parsed_options.prompt_expansion_mode,
                     lora_preset=preset_name,
                     width=width,
                     height=height,
@@ -5649,7 +5665,10 @@ QQ快捷指令:
         self._schedule_cleanup(image_paths)
 
     async def _generate_directed_prompt(
-        self, event: AstrMessageEvent, scene_text: str
+        self,
+        event: AstrMessageEvent,
+        scene_text: str,
+        expansion_mode: str = "standard",
     ) -> tuple[str, str, str]:
         """调用分镜模型，并防止内部请求再次注入自动绘图提示词。"""
         if not self._director:
@@ -5662,12 +5681,16 @@ QQ快捷指令:
                 event,
                 scene_text,
                 tools=self._get_lora_tool_set(),
+                expansion_mode=expansion_mode,
             )
         finally:
             self._internal_llm_events.discard(event_key)
 
     async def _generate_directed_instruction(
-        self, event: AstrMessageEvent, scene_text: str
+        self,
+        event: AstrMessageEvent,
+        scene_text: str,
+        expansion_mode: str = "standard",
     ) -> tuple[Any, str]:
         """Return a structured picture instruction including pipeline intent."""
 
@@ -5717,6 +5740,7 @@ QQ快捷指令:
                     lookup_tool_call_timeout=(
                         None if needs_lora_tools else 10
                     ),
+                    expansion_mode=expansion_mode,
                 )
         finally:
             internal_events.discard(event_key)
@@ -12113,6 +12137,7 @@ QQ快捷指令:
                         instruction, provider_id = await self._generate_directed_instruction(
                             event,
                             director_request,
+                            options.prompt_expansion_mode,
                         )
                         effective_prompt = instruction.prompt
                         director_negative = instruction.negative_prompt

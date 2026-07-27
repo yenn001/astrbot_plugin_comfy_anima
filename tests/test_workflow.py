@@ -587,10 +587,37 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
             "1girl, blue hair --raw",
             mode_context="generation",
         )
+        ultra = parse_generation_options(
+            "华丽的宫殿双人海报 --llm ultra",
+            mode_context="generation",
+        )
+        short_ultra = parse_generation_options(
+            "华丽的宫殿双人海报 --l u",
+            mode_context="generation",
+        )
 
         self.assertTrue(optimized.use_prompt_llm)
         self.assertTrue(short_optimized.use_prompt_llm)
+        self.assertEqual(optimized.prompt_expansion_mode, "standard")
+        self.assertEqual(short_optimized.prompt_expansion_mode, "standard")
+        self.assertTrue(ultra.use_prompt_llm)
+        self.assertEqual(ultra.prompt_expansion_mode, "ultra")
+        self.assertEqual(ultra.prompt, "华丽的宫殿双人海报")
+        self.assertTrue(short_ultra.use_prompt_llm)
+        self.assertEqual(short_ultra.prompt_expansion_mode, "ultra")
+        self.assertEqual(short_ultra.prompt, "华丽的宫殿双人海报")
         self.assertFalse(raw.use_prompt_llm)
+        self.assertEqual(raw.prompt_expansion_mode, "standard")
+
+    def test_llm_mode_only_consumes_recognized_value(self) -> None:
+        result = parse_generation_options(
+            "--llm girl in a red dress",
+            mode_context="generation",
+        )
+
+        self.assertTrue(result.use_prompt_llm)
+        self.assertEqual(result.prompt_expansion_mode, "standard")
+        self.assertEqual(result.prompt, "girl in a red dress")
 
     def test_generation_parser_preserves_danbooru_apostrophes_and_escapes(
         self,

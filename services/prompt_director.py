@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.8.3
+AstrBot Comfy Anima 插件 v1.8.4
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.8.3
+版本: 1.8.4
 日期: 2026-07-27
 """
 
@@ -89,6 +89,26 @@ _PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+ANIMA_VISUAL_EXPANSION_PROTOCOL = """
+Anima 自适应视觉扩写协议：
+
+- 扩写只改变画面信息密度，不改变插件传输协议。最终仍是一行英文混合提示词，不得输出三大正文区块、8 至 10 个分析段、10 至 15 个独立长句、Markdown 或扩写过程。
+- 先锁定主体数量、身份、服装、主动作、唯一镜头、场景与主光，再补充可见细节。角色身份、身体特征、服装类别、道具和剧情结果不得为了丰富度而臆造。
+- 所有模式都按镜头分配细节：肖像优先眼睛高光、睫毛、表情、刘海与面部受光；半身优先手势、持握、上身重心、领口袖口与布料褶皱；全身/动作优先支撑脚、四肢方向、接触点、服装轮廓和透视；环境图优先前中后景、空间尺度、天气与主光。
+- 多角色必须分别锁定身份、发色、服装、朝向和动作，并用 left/right、foreground/background、beside、behind、facing、holding 等关系明确归属，防止特征和肢体互串。
+- 材质写成可见结果，例如 `sheer fabric catching rim light`、`gold embroidery along the sleeve edge`、`wet hair strands clinging to her cheek`，而不是孤立堆叠材质名。前景、bokeh、花瓣、雨滴或粒子只有在服务构图时才加入，不能成为每张图的固定装饰。
+- 光影优先一组主光加一组辅助或轮廓光，说明方向与对主体的影响；不得同时堆叠互相竞争的正午、月光、霓虹和棚拍光。色彩关系服务主体分离与氛围，不机械列色卡。
+- 输出前执行可见性、归属与冲突复核：当前景别是否看得见该细节；多人细节属于谁；动作、手持物、左右关系、服装、机位、昼夜和光源是否唯一一致。无法确认的细节删除。
+
+密度模式：
+
+1. Standard（默认，由 `--llm` 或 `--l` 触发）：稳定、清晰、服从度优先。通常使用 14 至 32 个有效普通 Tags、1 至 3 个 visual phrases 和一个 18 至 45 词的 scene sentence；简单肖像可以更短。权重只用于最多 1 至 3 个容易丢失的关键锚点，通常 1.05 至 1.25。
+2. Ultra（由 `--llm ultra`、`--llm u`、`--l ultra` 或 `--l u` 触发；普通对话中用户明确要求 ultra、华丽、繁复或海报级细节时也可采用）：允许更高视觉密度与导演自由。通常使用 30 至 65 个有效普通 Tags、3 至 7 个 visual phrases 和一个 35 至 80 词的 scene sentence；覆盖 6 至 8 类相关视觉证据，包括面部/发丝、服装结构/材质、手势/接触、动势、前中后景、环境互动、主光/轮廓光和色彩关系。可在不改变身份、服装类别、主动作和剧情结果的前提下，补充题材一致的纹样、环境陈设、前景和氛围效果。权重最多用于 3 至 5 个关键锚点，通常 1.05 至 1.30。
+
+以上数字是密度上限参考，不是必须凑满的指标，LoRA tags 不计入普通 Tags 预算。Ultra 也不得靠重复同义词、质量口号、整段加权或互相竞争的特效伪造复杂度；默认仍不主动加入 `8k`、`absurdres`、`masterpiece`、`best quality` 等质量词。
+""".strip()
+
+
 RUNTIME_OVERRIDE = """
 你是 ComfyUI Anima 单图分镜导演。用户已经明确要求绘图，因此不要判断是否需要插图。
 请从用户提供的剧情或描述中只选择一个最值得定格的视觉核心，优先保证镜头、动作几何、
@@ -99,7 +119,7 @@ RUNTIME_OVERRIDE = """
    - hard tags 负责离散可控事实：人数、角色、作品、可见外观、服装、动作、表情、镜头、场景和光线。
    - visual phrases 只补充可见但难用单一 tag 表达的情绪后果、环境联动、材质或动势；不得与 hard tags 重复。
    - scene sentence 负责主体怎样动作、手中物体、接触点、衣料状态、前后空间、环境互动和主光方向。
-   - 末句使用现在时和主动表达，通常 18 至 45 个英文单词；简单肖像可更短。可以有意识地复述 3 至 6 个最重要锚点，但不要把全部 tags 改写成流水账。
+   - 末句长度与细节密度服从本次 Standard/Ultra 模式；使用现在时和主动表达，只复述最高价值锚点，不要把全部 tags 改写成流水账。
    - 末句不得加入标签块或用户需求中没有的新人物、服装、道具、动作、身体特征、场景或剧情结果；不得使用 `the image shows`、质量口号、操作指令、角色扮演台词或第二个句子。
    - 输出前解决 solo/多人、景别、机位、姿势、朝向和昼夜等明确互斥项；negative 只按本次多人接触、手持物、全身足部、极端透视或复杂衣料风险做最小补充。
    - 复杂动作优先用 `while`、`as`、`around`、`over`、`beneath`、`through` 等关系词，把姿势、道具和环境组成一个可视场面。若视线、动作或镜头互相冲突，先在标签块中裁决，再让末句与最终标签完全一致。
@@ -271,7 +291,7 @@ class PromptDirector:
 
     def _system_prompt(self) -> str:
         """组合运行时协议、用户附带参考及额外指令。"""
-        parts = [RUNTIME_OVERRIDE]
+        parts = [RUNTIME_OVERRIDE, ANIMA_VISUAL_EXPANSION_PROTOCOL]
         danbooru_context = self.danbooru_runtime_context()
         if danbooru_context:
             parts.append(danbooru_context)
@@ -361,7 +381,12 @@ class PromptDirector:
         return prompt, provider_id
 
     async def generate_with_negative(
-        self, context: Any, event: Any, scene_text: str, tools: Any = None
+        self,
+        context: Any,
+        event: Any,
+        scene_text: str,
+        tools: Any = None,
+        expansion_mode: str = "standard",
     ) -> tuple[str, str, str]:
         """调用指定 AstrBot 模型生成提示词。
 
@@ -378,6 +403,7 @@ class PromptDirector:
             event,
             scene_text,
             tools,
+            expansion_mode=expansion_mode,
         )
         return instruction.prompt, provider_id, instruction.negative_prompt
 
@@ -389,15 +415,31 @@ class PromptDirector:
         tools: Any = None,
         output_tools: Any = None,
         lookup_tool_call_timeout: int | None = None,
+        expansion_mode: str = "standard",
     ) -> tuple[PictureInstruction, str]:
         """Generate one validated picture instruction including its pipeline."""
 
         provider_id = await self._resolve_provider_id(context, event)
+        normalized_expansion_mode = str(
+            expansion_mode or "standard"
+        ).strip().casefold()
+        if normalized_expansion_mode not in {"standard", "ultra"}:
+            normalized_expansion_mode = "standard"
+        expansion_instruction = (
+            "本次视觉扩写模式：Ultra。执行高密度华丽分镜，充分使用相关的"
+            "材质、微观外观、手势接触、前中后景、环境互动、光源方向与色彩关系；"
+            "允许题材一致且不改变硬事实的装饰性补充，但不得用重复同义词或质量口号凑长度。"
+            if normalized_expansion_mode == "ultra"
+            else
+            "本次视觉扩写模式：Standard。保持清晰、稳定和高服从度，只补足当前镜头"
+            "真正可见且有控制价值的细节，不追求无意义的华丽堆叠。"
+        )
         structured_mode = str(
             getattr(self._settings, "structured_director_mode", "auto") or "auto"
         ).casefold()
         base_user_prompt = (
             "请把下面的剧情或画面需求导演成一张图。只返回规定的 pic 标签。\n\n"
+            f"{expansion_instruction}\n\n"
             f"用户内容：\n{scene_text.strip()}"
         )
         user_prompt = base_user_prompt
@@ -414,7 +456,7 @@ class PromptDirector:
                 "\n\nReturn exactly one JSON object with positive_tags, negative_tags "
                 "and pipeline fields."
             )
-        base_system_prompt = self._system_prompt()
+        base_system_prompt = self._system_prompt() + "\n\n" + expansion_instruction
         system_prompt = base_system_prompt
         if output_tools is not None:
             system_prompt += (

@@ -525,7 +525,11 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertTrue(status["composer"]["guarded_degraded_to_report"])
 
     def test_direct_draw_llm_flag_reaches_generation_job(self) -> None:
-        async def run_case(command_text: str, expected: bool) -> None:
+        async def run_case(
+            command_text: str,
+            expected: bool,
+            expected_mode: str = "standard",
+        ) -> None:
             plugin = object.__new__(self.main.ComfyAnimaPlugin)
             plugin.settings = types.SimpleNamespace(
                 max_prompt_length=6000,
@@ -570,9 +574,11 @@ class MainCompatibilityTests(unittest.TestCase):
 
             self.assertEqual(len(captured), 1)
             self.assertIs(captured[0].use_prompt_llm, expected)
+            self.assertEqual(captured[0].prompt_expansion_mode, expected_mode)
             self.assertEqual(replies[-1], ("image", False))
 
         asyncio.run(run_case("蓝发少女在海边看烟花 --llm", True))
+        asyncio.run(run_case("华丽双人海报 --l u", True, "ultra"))
         asyncio.run(run_case("1girl, blue hair, beach", False))
 
     def test_direct_draw_explicit_llm_requires_director(self) -> None:
@@ -790,10 +796,11 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "--mode quick",
             "--mode lanpaint",
             "--no-character-lora / --no-lora",
-            "/画图 <英文 Tag或画面描述> [--llm]",
-            "/画图no <英文 Tag或画面描述> [--llm]",
+            "/画图 <英文 Tag或画面描述> [--llm [u|ultra]]",
+            "/画图no <英文 Tag或画面描述> [--llm [u|ultra]]",
             "默认按原始 Tags 执行",
-            "--llm / --l 启用“有序 Tags + 一句英文场景描述”优化",
+            "--llm / --l 使用 Standard 优化",
+            "--llm u / --l u 使用 Ultra 华丽扩写",
             "--raw / --no-llm 明确保持原样",
             "/画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx",
         ):
@@ -2368,6 +2375,9 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("最终可见回复中输出合法 `<pic>`", request.system_prompt)
         self.assertIn("search_anima_danbooru_tags", request.system_prompt)
         self.assertIn("canonical_tags=10", request.system_prompt)
+        self.assertIn("Standard（默认", request.system_prompt)
+        self.assertIn("--llm ultra", request.system_prompt)
+        self.assertIn("不得输出三大正文区块", request.system_prompt)
 
 
 class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):

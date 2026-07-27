@@ -782,6 +782,7 @@ class GenerationOptions:
     cfg: Optional[float] = None
     enable_upscale: Optional[bool] = None
     use_prompt_llm: Optional[bool] = None
+    prompt_expansion_mode: str = "standard"
     dynamic_loras: tuple["LoraSelection", ...] = ()
     lora_preset: str = ""
     lora_injection_mode: Optional[str] = None

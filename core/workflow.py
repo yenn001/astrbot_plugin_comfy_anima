@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.8.3
+AstrBot Comfy Anima 插件 v1.8.4
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.8.3
+版本: 1.8.4
 日期: 2026-07-27
 """
 
@@ -879,7 +879,7 @@ def parse_generation_options(
     """解析 `/anima draw` 后的提示词和选项。
 
     支持 `--negative`、`--seed`、`--size`、`--steps`、`--cfg`、
-    `--pipeline`、`--denoise`、`--upscale`、`--no-upscale`、`--llm`、
+    `--pipeline`、`--denoise`、`--upscale`、`--no-upscale`、`--llm [u|ultra]`、
     `--raw`、`--preset` 与重绘使用的 `--mode`。`mode_context` 为
     ``semantic_redraw`` 时，`--mode` 改为解析 preserve/balanced/free。
     含空格的负面词需要使用引号。
@@ -903,6 +903,7 @@ def parse_generation_options(
     cfg = None
     enable_upscale = None
     use_prompt_llm = None
+    prompt_expansion_mode = "standard"
     lora_preset = ""
     pipeline = ""
     inpaint_mode = ""
@@ -1027,8 +1028,29 @@ def parse_generation_options(
             enable_upscale = False
         elif token == "--llm":
             use_prompt_llm = True
+            if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+                raw_expansion_mode = tokens[index + 1].strip().casefold()
+                expansion_aliases = {
+                    "s": "standard",
+                    "standard": "standard",
+                    "normal": "standard",
+                    "普通": "standard",
+                    "简洁": "standard",
+                    "u": "ultra",
+                    "ultra": "ultra",
+                    "complex": "ultra",
+                    "ornate": "ultra",
+                    "复杂": "ultra",
+                    "华丽": "ultra",
+                    "高质量": "ultra",
+                }
+                normalized_expansion_mode = expansion_aliases.get(raw_expansion_mode)
+                if normalized_expansion_mode:
+                    prompt_expansion_mode = normalized_expansion_mode
+                    index += 1
         elif token in {"--raw", "--no-llm"}:
             use_prompt_llm = False
+            prompt_expansion_mode = "standard"
         elif token in {"--preset", "--lora-preset"}:
             lora_preset = require_value(token).strip()
         elif token.startswith("--"):
@@ -1050,6 +1072,7 @@ def parse_generation_options(
         cfg=cfg,
         enable_upscale=enable_upscale,
         use_prompt_llm=use_prompt_llm,
+        prompt_expansion_mode=prompt_expansion_mode,
         lora_preset=lora_preset,
         pipeline=pipeline,
         inpaint_mode=inpaint_mode,
