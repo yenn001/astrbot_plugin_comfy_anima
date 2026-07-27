@@ -1,20 +1,20 @@
 """
-AstrBot Comfy Anima 插件 v1.7.1
+AstrBot Comfy Anima 插件 v1.8.3
 
 功能描述：
 - 定义插件常量与默认节点映射
 - 集中维护版本及指令信息
 
 作者: Yen
-版本: 1.7.1
-日期: 2026-07-26
+版本: 1.8.3
+日期: 2026-07-27
 """
 
 from typing import Final
 
 
 PLUGIN_NAME: Final[str] = "astrbot_plugin_comfy_anima"
-PLUGIN_VERSION: Final[str] = "1.7.1"
+PLUGIN_VERSION: Final[str] = "1.8.3"
 
 DEFAULT_WORKFLOW_FILE: Final[str] = "workflow/anima_v2_api.json"
 DEFAULT_DIRECTOR_REFERENCE_FILE: Final[str] = "prompts/director_reference.txt"

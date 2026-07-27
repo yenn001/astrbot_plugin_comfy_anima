@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock
 from PIL import Image
 
 from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
+from ..services.lora_catalog import LoraRecord
 from ..services.reverse_prompt import ReversePromptResult
 
 
@@ -343,6 +344,120 @@ class MainCompatibilityTests(unittest.TestCase):
         cleared = asyncio.run(plugin.web_ui_clear_prompt_diagnostics())
         self.assertEqual(cleared["cleared"], 1)
         self.assertEqual(len(plugin._prompt_diagnostics_store), 0)
+
+    def test_danbooru_llm_tool_returns_bounded_verified_and_candidate_results(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "danbooru.sqlite3"
+        )
+        plugin._danbooru_index.import_bytes(
+            json.dumps(
+                {
+                    "source": "must-not-leak",
+                    "revision": "tool-r1",
+                    "tags": [
+                        {
+                            "tag": "kei_(blue_archive)",
+                            "category": "character",
+                            "aliases": ["kei student"],
+                            "count": 123,
+                            "provenance": {"private": "must-not-leak"},
+                        },
+                        {
+                            "tag": "roxy_migurdia",
+                            "category": "character",
+                            "aliases": ["roxy"],
+                            "count": 456,
+                        },
+                    ],
+                }
+            ).encode(),
+            content_type="json",
+        )
+
+        exact = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="kei student",
+                    mode="exact",
+                    category="character",
+                )
+            )
+        )
+        self.assertTrue(exact["ok"])
+        self.assertTrue(exact["queries"][0]["verified"])
+        self.assertEqual(
+            exact["queries"][0]["results"][0]["canonical_tag"],
+            "kei_(blue_archive)",
+        )
+        self.assertEqual(
+            exact["queries"][0]["results"][0]["prompt_tag"],
+            r"kei_\(blue_archive\)",
+        )
+        serialized = json.dumps(exact, ensure_ascii=False)
+        self.assertNotIn("must-not-leak", serialized)
+        self.assertNotIn("provenance", serialized)
+        self.assertNotIn("sha256", serialized)
+
+        prefix = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="rox",
+                    mode="prefix",
+                    category="4",
+                    limit=20,
+                )
+            )
+        )
+        self.assertFalse(prefix["queries"][0]["verified"])
+        self.assertFalse(prefix["queries"][0]["results"][0]["verified"])
+        self.assertLessEqual(len(prefix["queries"][0]["results"]), 12)
+
+        batch = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="roxy | missing | kei student",
+                    mode="batch",
+                    category="character",
+                )
+            )
+        )
+        self.assertEqual(len(batch["queries"]), 3)
+        self.assertTrue(batch["queries"][0]["verified"])
+        self.assertFalse(batch["queries"][1]["verified"])
+        self.assertTrue(batch["queries"][2]["verified"])
+
+        invalid_limit = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="roxy",
+                    limit="many",
+                )
+            )
+        )
+        self.assertEqual(invalid_limit["code"], "DANBOORU_INVALID_LIMIT")
+
+    def test_danbooru_llm_tool_fails_closed_when_index_is_unavailable(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "missing.sqlite3"
+        )
+        result = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="roxy",
+                )
+            )
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DANBOORU_INDEX_UNAVAILABLE")
 
     def test_danbooru_background_failure_keeps_existing_status(self) -> None:
         async def run_case() -> None:
@@ -693,6 +808,73 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUpClass(cls) -> None:
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_explicit_draw_command_cannot_be_stolen_by_pose_route(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_natural_draw=True)
+        plugin._looks_like_inpaint_request = lambda _text: False
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                raise AssertionError("explicit /画图 must not reach image control")
+
+        plugin._image_input = ImageInput()
+        prompt = (
+            "画图 1girl, solo, Takanashi Rikka, dramatic pose, "
+            "wind blowing hair and skirt --llm"
+        )
+
+        class Event:
+            message_str = prompt
+            message_obj = types.SimpleNamespace(message_str=f"/{prompt}")
+
+            @staticmethod
+            def get_extra(key, default=None):
+                if key == "handlers_parsed_params":
+                    return {
+                        "astrbot_plugin_comfy_anima.cmd_draw_forward": {
+                            "prompt_text": "1girl,"
+                        }
+                    }
+                return default
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+            @staticmethod
+            def stop_event():
+                raise AssertionError("natural control must not stop explicit /画图")
+
+        replies = [
+            item async for item in plugin.natural_language_control_draw(Event())
+        ]
+        self.assertEqual(replies, [])
+
+    def test_explicit_command_guard_preserves_slash_only_natural_wake(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "帮我画一只猫"
+            message_obj = types.SimpleNamespace(message_str="/帮我画一只猫")
+
+            @staticmethod
+            def get_extra(_key, default=None):
+                return default
+
+        self.assertFalse(plugin._event_has_explicit_command_route(Event()))
+
+    def test_explicit_command_guard_has_original_message_fallback(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "画图 1girl, dramatic pose --llm"
+            message_obj = types.SimpleNamespace(
+                message_str="/画图 1girl, dramatic pose --llm"
+            )
+
+        self.assertTrue(plugin._event_has_explicit_command_route(Event()))
 
     async def test_event_stops_only_after_generator_finishes(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
@@ -2054,7 +2236,10 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class Event:
-            message_str = "/lora组合保存 风格 002 <lora:test-style:0.6>"
+            message_str = (
+                "/lora组合保存 风格 002 <lora:test-style:0.6> "
+                '--alias "风格2" --note "画师测试备注"'
+            )
 
             @staticmethod
             def plain_result(text):
@@ -2066,6 +2251,8 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("自动重载", results[0])
         self.assertEqual(scheduled, [True])
         self.assertEqual(persisted[0][0], "lora_presets")
+        self.assertEqual(persisted[0][1][0]["aliases"], ["风格2"])
+        self.assertEqual(persisted[0][1][0]["note"], "画师测试备注")
 
     async def test_conversation_tool_persists_and_survives_fresh_registry(self) -> None:
         self_main = self.main
@@ -2160,6 +2347,11 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         plugin._internal_llm_events = set()
         plugin._auto_draw_system_prompt = ""
         plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._director = types.SimpleNamespace(
+            danbooru_runtime_context=lambda: (
+                "本地 Danbooru 索引状态：ready=true，canonical_tags=10，aliases=2。"
+            )
+        )
 
         class Event:
             @staticmethod
@@ -2174,6 +2366,8 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不得用 shell", request.system_prompt)
         self.assertIn("普通对话绝对不要调用或提及它", request.system_prompt)
         self.assertIn("最终可见回复中输出合法 `<pic>`", request.system_prompt)
+        self.assertIn("search_anima_danbooru_tags", request.system_prompt)
+        self.assertIn("canonical_tags=10", request.system_prompt)
 
 
 class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
@@ -3258,6 +3452,49 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
+    async def test_preset_list_shows_manager_and_effective_trigger_words(self) -> None:
+        record = LoraRecord(
+            name="styles/kei.safetensors",
+            category="artist_style",
+            trigger_words=("kei style", "soft lineart"),
+        )
+
+        class Catalog:
+            @staticmethod
+            async def resolve_selections_with_records(selections, *, strict):
+                self.assertTrue(strict)
+                resolved = (
+                    LoraSelection("styles/kei.safetensors", 0.7),
+                )
+                return resolved, {
+                    "styles/kei": record,
+                    "styles/kei.safetensors": record,
+                }
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([])
+        plugin._lora_presets.save(
+            name="风格1011 kei",
+            category="style",
+            selections=(LoraSelection("styles/kei", 0.7),),
+            trigger_words="manual glow",
+            aliases=("kei风格",),
+            note="测试备注",
+        )
+        plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(0)
+
+        result = await plugin.web_ui_list_presets()
+        item = result["items"][0]
+
+        self.assertEqual(item["manager_trigger_words"], ["kei style", "soft lineart"])
+        self.assertEqual(
+            item["effective_trigger_words"],
+            ["manual glow", "kei style", "soft lineart"],
+        )
+        self.assertIn("风格1011", item["derived_aliases"])
+        self.assertEqual(item["note"], "测试备注")
+
     async def test_lora_search_refreshes_for_every_request(self) -> None:
         class Catalog:
             def __init__(self):
@@ -3913,6 +4150,7 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         plugin.settings = types.SimpleNamespace(
             enable_prompt_lab=True,
             max_total_dynamic_loras=12,
+            default_generation_pipeline="base",
         )
         plugin._prompt_assets = self.main.PromptAssetLibrary(
             root / "prompt_assets.sqlite3"
@@ -3929,6 +4167,9 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         plugin._prompt_lab_lock = asyncio.Lock()
         plugin._task_store = None
         plugin._lora_catalog = None
+        plugin._prompt_plans = self.main.PromptPlanStore(
+            root / "prompt_plans_v1.json"
+        )
         return plugin
 
     async def test_disabled_asset_library_is_unavailable_and_rejects_actions(self):
@@ -4258,6 +4499,251 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(confirmed["confirmed"])
         plugin._prompt_assets.get.assert_called_once_with(asset["asset_id"])
+
+    async def test_prompt_lab_confirm_saves_persistent_qq_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self._prompt_lab_plugin(root)
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 27,
+                    "count": 1,
+                    "base_layers": {
+                        "identity": ["1girl"],
+                        "background": ["rain", "night"],
+                    },
+                }
+            )
+
+            confirmed = await plugin.web_ui_prompt_lab_confirm(
+                {
+                    "batch_id": generated["batch"]["batch_id"],
+                    "selection": 1,
+                    "save_plan": True,
+                    "plan_name": "雨夜方案（测试）",
+                    "pipeline": "rtx",
+                }
+            )
+
+            self.assertRegex(confirmed["plan"]["plan_id"], r"^P-[0-9A-F]{6}$")
+            self.assertEqual(confirmed["plan"]["pipeline"], "rtx")
+            reloaded = self.main.PromptPlanStore(
+                root / "prompt_plans_v1.json"
+            ).resolve_plan("雨夜方案")
+            self.assertEqual(reloaded["plan_id"], confirmed["plan"]["plan_id"])
+            self.assertIn("1girl", reloaded["positive_prompt"])
+
+    async def test_prompt_plan_command_routes_through_run_job_without_llm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            saved = plugin._prompt_plans.save_plan(
+                name="方案测试（雨夜）",
+                positive_prompt="1girl, rain, night. A girl waits under an awning.",
+                negative_prompt="lowres",
+                pipeline="rtx",
+            )
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=2000,
+                send_generation_notice=False,
+            )
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._initialization_error = ""
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            calls = []
+
+            async def run_job(event, options):
+                calls.append((event, options))
+                return [Path("plan.png")], 321, options.prompt, "", None
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(
+                message_str=f"/方案 {saved['plan_id']} --seed 99 --p b",
+                plain_result=lambda text: text,
+            )
+            responses = [
+                item
+                async for item in plugin.cmd_prompt_plan_draw(
+                    event,
+                    saved["plan_id"],
+                )
+            ]
+
+        self.assertEqual(len(calls), 1)
+        options = calls[0][1]
+        self.assertFalse(options.use_prompt_llm)
+        self.assertEqual(options.seed, 99)
+        self.assertEqual(options.pipeline, "base")
+        self.assertEqual(options.negative_prompt, "lowres")
+        self.assertIn("IMAGE_RESULT", responses)
+
+    async def test_prompt_plan_command_resolves_id_before_natural_language_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=2000,
+                send_generation_notice=False,
+                show_llm_prompt=False,
+            )
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._initialization_error = ""
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._extract_pipeline_request = lambda _text: ""
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._generate_directed_instruction = AsyncMock(
+                return_value=(
+                    self.main.PictureInstruction(
+                        "1girl, cosplay costume, cafe. A cosplayer sits beside a warm window.",
+                        "bad hands",
+                        "",
+                    ),
+                    "director-provider",
+                )
+            )
+            calls = []
+
+            async def run_job(event, options):
+                calls.append((event, options))
+                return [Path("plan.png")], 654, options.prompt, "", None
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(
+                message_str="/方案 ex-005 再出个cos给我看看 --seed 11",
+                plain_result=lambda text: text,
+            )
+            responses = [
+                item
+                async for item in plugin.cmd_prompt_plan_draw(
+                    event,
+                    "ex-005",
+                )
+            ]
+
+        self.assertEqual(len(calls), 1)
+        options = calls[0][1]
+        self.assertEqual(options.seed, 11)
+        self.assertFalse(options.use_prompt_llm)
+        self.assertIn("cosplay costume", options.prompt)
+        self.assertIn("bad hands", options.negative_prompt)
+        self.assertIn("IMAGE_RESULT", responses)
+        director_request = plugin._generate_directed_instruction.await_args.args[1]
+        self.assertIn('"user_delta":"再出个cos给我看看"', director_request)
+        self.assertNotIn("prompt plan not found", "\n".join(map(str, responses)))
+
+    def test_prompt_plan_request_uses_longest_unique_name_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            saved = plugin._prompt_plans.save_plan(
+                name="风格2（凛然）",
+                positive_prompt="1girl, portrait. A woman faces the viewer.",
+            )
+
+            plan, delta = plugin._resolve_prompt_plan_request(
+                "风格2 再画一张夜景版本"
+            )
+
+        self.assertEqual(plan["plan_id"], saved["plan_id"])
+        self.assertEqual(delta, "再画一张夜景版本")
+
+    def test_prompt_plan_request_does_not_match_id_without_boundary(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._prompt_plans = self.main.PromptPlanStore("unused.json")
+
+        with self.assertRaises(self.main.PromptPlanNotFoundError):
+            plugin._resolve_prompt_plan_request("EX-005foo")
+
+    async def test_prompt_plan_raw_delta_appends_without_director(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=4000,
+                send_generation_notice=False,
+                show_llm_prompt=False,
+            )
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._initialization_error = ""
+            plugin._director = None
+            plugin._director_error = "disabled"
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._extract_pipeline_request = lambda _text: ""
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._generate_directed_instruction = AsyncMock()
+            calls = []
+
+            async def run_job(event, options):
+                calls.append(options)
+                return [Path("raw.png")], 1, options.prompt, "", None
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(
+                message_str="/方案 EX-005 red cosplay costume --raw",
+                plain_result=lambda text: text,
+            )
+            responses = [
+                item
+                async for item in plugin.cmd_prompt_plan_draw(event, "EX-005")
+            ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("red cosplay costume", calls[0].prompt)
+        plugin._generate_directed_instruction.assert_not_awaited()
+        self.assertIn("IMAGE_RESULT", responses)
+
+    async def test_prompt_plan_llm_tool_is_admin_only_and_path_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            saved = plugin._prompt_plans.save_plan(
+                name="暖光咖啡馆",
+                positive_prompt="1girl, cafe. A woman sits beside a warm window.",
+                pipeline="base",
+            )
+            denied = await plugin.list_anima_prompt_plans(
+                types.SimpleNamespace(is_admin=lambda: False),
+                keyword=saved["plan_id"],
+                detail=True,
+            )
+            allowed = await plugin.list_anima_prompt_plans(
+                types.SimpleNamespace(is_admin=lambda: True),
+                keyword=saved["plan_id"],
+                detail=True,
+            )
+
+        self.assertEqual(json.loads(denied)["code"], "PROMPT_PLAN_DENIED")
+        payload = json.loads(allowed)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["plans"][0]["plan_id"], saved["plan_id"])
+        self.assertNotIn("storage_path", allowed)
+        self.assertNotIn(str(directory), allowed)
 
     async def test_prompt_lab_confirm_rechecks_revision_after_lora_validation(self):
         with tempfile.TemporaryDirectory() as directory:

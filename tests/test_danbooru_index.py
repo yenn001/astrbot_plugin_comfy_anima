@@ -123,6 +123,74 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.assertEqual(fuzzy.match_type, "fuzzy")
         self.assertEqual(fuzzy.tag, "roxy_migurdia")
 
+    def test_explicit_search_modes_keep_discovery_separate_from_verification(
+        self,
+    ) -> None:
+        self.index.import_bytes(self.payload(), content_type="json")
+
+        exact_alias = self.index.search("Kei Student", mode="exact")
+        self.assertEqual(len(exact_alias), 1)
+        self.assertTrue(exact_alias[0].verified)
+        self.assertEqual(exact_alias[0].match_type, "alias")
+        self.assertEqual(exact_alias[0].canonical_tag, "kei_(blue_archive)")
+
+        prefix = self.index.search("roxy_m", mode="prefix")
+        self.assertEqual([item.canonical_tag for item in prefix], ["roxy_migurdia"])
+        self.assertTrue(all(not item.verified for item in prefix))
+        self.assertTrue(all("prefix" in item.match_type for item in prefix))
+        self.assertEqual(
+            self.index.search("roxy_migurdai", mode="prefix"),
+            (),
+            "prefix mode must never silently add fuzzy candidates",
+        )
+
+        canonical_keyword = self.index.search("blue archive", mode="keyword")
+        self.assertEqual(canonical_keyword[0].canonical_tag, "kei_(blue_archive)")
+        self.assertEqual(canonical_keyword[0].match_type, "keyword")
+        self.assertFalse(canonical_keyword[0].verified)
+
+        alias_keyword = self.index.search("student", mode="keyword")
+        self.assertEqual(alias_keyword[0].canonical_tag, "kei_(blue_archive)")
+        self.assertEqual(alias_keyword[0].match_type, "alias_keyword")
+        self.assertFalse(alias_keyword[0].verified)
+
+    def test_batch_lookup_is_exact_alias_only_and_preserves_order(self) -> None:
+        self.index.import_bytes(self.payload(), content_type="json")
+        results = self.index.lookup_many(
+            ("roxy", "missing", r"kei \(blue archive\)", "roxy"),
+            "character",
+        )
+
+        self.assertEqual([item.query for item in results], [
+            "roxy",
+            "missing",
+            r"kei \(blue archive\)",
+            "roxy",
+        ])
+        self.assertTrue(results[0].verified)
+        self.assertFalse(results[1].found)
+        self.assertTrue(results[2].verified)
+        self.assertTrue(results[3].verified)
+
+    def test_prefix_and_keyword_treat_sql_wildcards_as_literal_text(self) -> None:
+        payload = json.dumps(
+            [
+                {"tag": "literal%tag", "count": 20},
+                {"tag": "literalxtag", "count": 10},
+                {"tag": "under_score", "count": 5},
+            ]
+        ).encode()
+        self.index.import_bytes(payload)
+
+        self.assertEqual(
+            [item.canonical_tag for item in self.index.search("literal%", mode="prefix")],
+            ["literal%tag"],
+        )
+        self.assertEqual(
+            [item.canonical_tag for item in self.index.search("%tag", mode="keyword")],
+            ["literal%tag"],
+        )
+
     def test_category_filter_and_missing_database(self) -> None:
         missing = self.index.lookup("roxy")
         self.assertFalse(missing.found)
@@ -166,6 +234,30 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.assertTrue(result.verified)
         self.assertEqual(result.count, 1234)
         self.assertEqual(result.provenance["row"], "csv")
+
+    def test_headerless_danbooru_csv_import(self) -> None:
+        payload = (
+            'one_girl,0,123,"sole_female,1girl"\n'
+            'kei_(blue_archive),4,456,"kei_(student)_(blue_archive)"\n'
+            'long_alias_tag,0,1,"' + ("x" * 300) + '"\n'
+            'shared_alias,0,2,"shared"\n'
+            'shared,0,3,\n'
+        ).encode()
+        status = self.index.import_bytes(
+            payload,
+            source="https://catalog.example/anima.csv",
+            content_type="text/csv",
+        )
+        self.assertEqual(status["tag_count"], 5)
+        self.assertEqual(status["category_counts"], {"character": 1, "general": 4})
+        result = self.index.lookup("kei_(student)_(blue_archive)", "character")
+        self.assertTrue(result.verified)
+        self.assertEqual(result.canonical_tag, "kei_(blue_archive)")
+        self.assertEqual(result.count, 456)
+        self.assertTrue(self.index.lookup("long_alias_tag").verified)
+        self.assertFalse(self.index.lookup("x" * 300).found)
+        self.assertTrue(self.index.lookup("shared").verified)
+        self.assertEqual(self.index.lookup("shared").canonical_tag, "shared")
 
     def test_failed_import_preserves_old_snapshot(self) -> None:
         before = self.index.import_bytes(self.payload())

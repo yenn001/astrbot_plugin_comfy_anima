@@ -561,6 +561,18 @@
             "hint": "填写数字会规范为角色N并保留前导零，也可以使用自定义名称",
             "default": ""
           },
+          "aliases": {
+            "description": "组合简称 / 别名",
+            "type": "list",
+            "hint": "每行一个。用于“风格1011”这类稳定简称；重复或歧义简称会拒绝自动命中",
+            "default": []
+          },
+          "note": {
+            "description": "管理备注",
+            "type": "text",
+            "hint": "只用于管理、搜索和说明，不会直接写入生成提示词",
+            "default": ""
+          },
           "loras": {
             "description": "LoRA 串",
             "type": "list",
@@ -570,7 +582,7 @@
           "trigger_words": {
             "description": "角色触发词",
             "type": "text",
-            "hint": "使用英文逗号分隔，会自动追加到正面提示词",
+            "hint": "手动补充项；生成前仍会强刷 LoRA Manager，并按角色规则合并最新身份触发词",
             "default": ""
           },
           "description": {
@@ -597,6 +609,18 @@
             "hint": "填写 001 会规范为风格001并保留前导零，也可以直接填写自定义名称",
             "default": ""
           },
+          "aliases": {
+            "description": "组合简称 / 别名",
+            "type": "list",
+            "hint": "例如显示名称为“风格1011 kei”时，可填写“风格1011”；安全数字前缀也会自动派生",
+            "default": []
+          },
+          "note": {
+            "description": "管理备注",
+            "type": "text",
+            "hint": "可记录画师、用途或版本，不会直接写入生成提示词",
+            "default": ""
+          },
           "loras": {
             "description": "LoRA 串",
             "type": "list",
@@ -606,7 +630,7 @@
           "trigger_words": {
             "description": "画师/风格触发词",
             "type": "text",
-            "hint": "例如 @748cm_style，会自动追加到正面提示词",
+            "hint": "手动补充项，例如 @748cm_style；生成前仍会强刷 Manager 并合并最新风格触发词",
             "default": ""
           },
           "description": {
@@ -633,6 +657,18 @@
             "hint": "填写数字会规范为组合N并保留前导零，也可以使用自定义名称",
             "default": ""
           },
+          "aliases": {
+            "description": "组合简称 / 别名",
+            "type": "list",
+            "hint": "每行一个；仅唯一命中时才会自动选择",
+            "default": []
+          },
+          "note": {
+            "description": "管理备注",
+            "type": "text",
+            "hint": "只用于管理和检索，不会直接写入生成提示词",
+            "default": ""
+          },
           "loras": {
             "description": "LoRA 串",
             "type": "list",
@@ -642,6 +678,7 @@
           "trigger_words": {
             "description": "组合触发词",
             "type": "text",
+            "hint": "手动补充项；生成前仍会按最新 Manager 元数据和每个 LoRA 的实际分类合并触发词",
             "default": ""
           },
           "description": {

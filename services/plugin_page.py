@@ -30,6 +30,7 @@ _CONTENT_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _ASSET_REVISION_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{64})$")
 _LAB_BATCH_RE = re.compile(r"^plb-[0-9a-f]{20}$")
 _LAB_CANDIDATE_RE = re.compile(r"^plc-[0-9a-f]{20}$")
+_PROMPT_PLAN_ID_RE = re.compile(r"^P-[0-9A-F]{6}$")
 _DATA_URL_RE = re.compile(
     r"^data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]*={0,2})$"
 )
@@ -627,8 +628,33 @@ def validate_v170_api_payload(
             payload["selection"] = normalized_selection
         if "candidate_id" in payload:
             payload["candidate_id"] = normalized_selection
+        if "save_plan" in payload:
+            payload["save_plan"] = _bounded_bool(
+                payload["save_plan"], "save_plan"
+            )
+        if "plan_name" in payload:
+            payload["plan_name"] = _bounded_text(
+                payload["plan_name"], "plan_name", 80
+            )
+        if "pipeline" in payload:
+            pipeline = _bounded_text(
+                payload["pipeline"], "pipeline", 16, required=True
+            ).casefold()
+            if pipeline not in {"base", "rtx", "iterative"}:
+                raise V170ApiValidationError("pipeline is not supported")
+            payload["pipeline"] = pipeline
         _optional_fingerprint(payload, "asset_library_fingerprint")
         return payload
+
+    if operation == "prompt_plan_delete":
+        plan_id = _bounded_text(
+            payload.get("plan_id"), "plan_id", 8, required=True
+        ).upper()
+        if not _PROMPT_PLAN_ID_RE.fullmatch(plan_id):
+            raise V170ApiValidationError(
+                "plan_id must be a custom P-XXXXXX identifier"
+            )
+        return {"plan_id": plan_id}
 
     if operation == "lora_gallery":
         if "query" in payload:
@@ -933,6 +959,12 @@ class PluginPageApi:
         if method == "POST" and path == "/api/prompt-lab/confirm":
             return await self._controller.web_ui_prompt_lab_confirm(
                 validate_v170_api_payload("prompt_lab_confirm", body)
+            )
+        if method == "GET" and path == "/api/prompt-plans":
+            return await self._controller.web_ui_list_prompt_plans()
+        if method == "POST" and path == "/api/prompt-plans/delete":
+            return await self._controller.web_ui_delete_prompt_plan(
+                validate_v170_api_payload("prompt_plan_delete", body)
             )
 
         if method == "GET" and path == "/api/loras":

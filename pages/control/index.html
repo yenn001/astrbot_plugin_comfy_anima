@@ -529,17 +529,20 @@
         <section id="panel-presets" class="panel" aria-labelledby="page-title">
           <div class="content-grid preset-layout">
             <article class="card numbered-card" data-number="A">
-              <div class="card-head"><div><p class="eyebrow">PRESET EDITOR</p><h2>保存组合</h2></div></div>
+              <div class="card-head"><div><p class="eyebrow">PRESET EDITOR</p><h2 id="preset-editor-title">新建组合</h2></div></div>
               <form id="preset-form" class="stack">
+                <input name="identifier" type="hidden">
                 <div class="form-grid compact-grid">
-                  <label><span>名称</span><input name="name" placeholder="风格001 / 达妮娅" required></label>
+                  <label><span>显示名称</span><input name="name" placeholder="风格1011 kei / 达妮娅" required></label>
                   <label><span>分类</span><select name="category"><option value="artist_style">画师/风格</option><option value="character">角色</option><option value="mixed">混合</option><option value="auto">自动判断</option></select></label>
                 </div>
+                <label><span>简称 / 别名（每行或逗号分隔）</span><textarea name="aliases" rows="3" placeholder="风格1011&#10;kei风格"></textarea></label>
+                <label><span>备注</span><textarea name="note" rows="2" placeholder="只用于管理和检索说明，不直接写进提示词"></textarea></label>
                 <label><span>LoRA 串（每行 name=weight）</span><textarea name="loras" rows="9" placeholder="anima-highres-aesthetic-boost=0.5&#10;black deniav1-2=1.0" required></textarea></label>
-                <label><span>触发词</span><textarea name="trigger_words" rows="3"></textarea></label>
+                <label><span>手动补充触发词</span><textarea name="trigger_words" rows="3" placeholder="可留空；生成前仍会强刷 Manager 并合并最新元数据触发词"></textarea></label>
                 <label><span>说明</span><textarea name="description" rows="3"></textarea></label>
                 <label class="toggle"><input name="enabled" type="checkbox" checked><span>启用此组合</span></label>
-                <button class="primary" type="submit">强制刷新并保存</button>
+                <div class="inline-actions"><button id="preset-save" class="primary" type="submit">强制刷新并保存</button><button id="preset-cancel-edit" class="ghost" type="button" hidden>取消编辑</button></div>
               </form>
             </article>
             <article class="card table-card numbered-card" data-number="B">
@@ -548,7 +551,7 @@
                 <button id="preset-refresh" class="secondary" type="button">刷新校验</button>
               </div>
               <div class="table-wrap">
-                <table><thead><tr><th>名称</th><th>分类</th><th>LoRA</th><th>状态</th><th>动作</th></tr></thead><tbody id="preset-table"></tbody></table>
+                <table><thead><tr><th>名称 / 简称</th><th>分类</th><th>LoRA</th><th>触发词</th><th>备注</th><th>状态</th><th>动作</th></tr></thead><tbody id="preset-table"></tbody></table>
               </div>
               <div id="preset-empty" class="empty-state">尚未读取组合。</div>
             </article>
@@ -824,13 +827,15 @@
                   <fieldset class="prompt-check-fieldset"><legend>参与类别</legend><div id="prompt-lab-types" class="prompt-check-grid"><label><input type="checkbox" value="character" checked>角色</label><label><input type="checkbox" value="outfit" checked>服装</label><label><input type="checkbox" value="pose" checked>姿势</label><label><input type="checkbox" value="background" checked>背景</label><label><input type="checkbox" value="artist" checked>画师 / 风格</label></div></fieldset>
                   <fieldset class="prompt-check-fieldset"><legend>锁定槽位</legend><div id="prompt-lab-locks" class="prompt-check-grid"><label><input type="checkbox" value="identity">身份</label><label><input type="checkbox" value="clothing">服装</label><label><input type="checkbox" value="pose">姿势</label><label><input type="checkbox" value="camera">镜头</label><label><input type="checkbox" value="background">背景</label><label><input type="checkbox" value="style">风格</label><label><input type="checkbox" value="relation">关系句</label><label><input type="checkbox" value="lora">LoRA</label></div></fieldset>
                   <label><span>候选素材池（JSON，可选）</span><textarea id="prompt-lab-pools" rows="8" maxlength="40000" placeholder='{"pose":[{"asset_id":"custom:pose:1","label":"低角度","tags":["from below"]}]}'></textarea></label>
+                  <div class="prompt-plan-save-row"><label><span>方案名称</span><input id="prompt-plan-name" maxlength="80" placeholder="例如：雨夜霓虹肖像"></label><label class="compact-toggle prompt-plan-save-toggle"><input id="prompt-plan-save" type="checkbox" checked><span>确认时保存为 QQ 方案</span></label></div>
                   <div class="prompt-action-row"><button id="prompt-lab-generate" class="primary" type="submit">生成候选卡</button><button id="prompt-lab-use-composer" class="secondary active" type="button">已读取构图台基础层</button></div>
                 </form>
                 <p id="prompt-lab-status" class="muted live-line" role="status">等待生成候选；不会调用 ComfyUI。</p>
               </article>
-              <aside class="card dark-card prompt-lab-confirmation"><div class="card-head"><div><p class="eyebrow">EXPLICIT CONFIRMATION</p><h2>确认结果</h2></div><span id="prompt-lab-confirm-badge" class="ticket-tag">UNCONFIRMED</span></div><div id="prompt-lab-confirm-result" class="prompt-compact-result"><div class="empty-state compact-empty">先选中候选卡，再点击“确认并进入 Composer”。确认也不会自动出图。</div></div></aside>
+              <aside class="card dark-card prompt-lab-confirmation"><div class="card-head"><div><p class="eyebrow">EXPLICIT CONFIRMATION</p><h2>确认结果</h2></div><span id="prompt-lab-confirm-badge" class="ticket-tag">UNCONFIRMED</span></div><div id="prompt-lab-confirm-result" class="prompt-compact-result"><div class="empty-state compact-empty">先选中候选卡，再点击“确认并保存方案”。保存后可在 QQ 使用 /方案 ID 出图；确认本身不会自动出图。</div></div></aside>
             </div>
             <div id="prompt-lab-candidates" class="prompt-candidate-strip" aria-live="polite"><div class="empty-state">尚未生成候选卡。</div></div>
+            <article class="card prompt-plan-library"><div class="card-head"><div><p class="eyebrow">QQ PROMPT PLAN LIBRARY</p><h2>已保存方案</h2></div><div class="prompt-action-row"><span id="prompt-plan-count" class="ticket-tag">0 PLANS</span><button id="prompt-plans-refresh" class="secondary" type="button">刷新方案库</button></div></div><p class="muted">方案持久保存在插件数据目录。复制指令后可在 QQ 发送 <code>/方案 P-XXXXXX</code>；实际绘图仍会经过权限、风控、LoRA 实时刷新与提交前复核。</p><div id="prompt-plan-list" class="prompt-plan-grid" aria-live="polite"><div class="empty-state compact-empty">正在等待读取方案库。</div></div><p id="prompt-plan-status" class="muted live-line" role="status"></p></article>
           </section>
 
           <section id="prompt-page-diagnostics" class="prompt-subpage" role="tabpanel" aria-labelledby="prompt-tab-diagnostics" hidden>

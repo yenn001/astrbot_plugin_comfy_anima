@@ -24,6 +24,7 @@ class _Controller:
         self.selected_workflow = None
         self.prompt_diagnostic_payload = None
         self.prompt_diagnostics_cleared = 0
+        self.deleted_prompt_plan = None
         self.danbooru_updates = 0
         self.v170_calls = {}
 
@@ -114,6 +115,19 @@ class _Controller:
     async def web_ui_prompt_lab_confirm(self, payload):
         self.v170_calls["lab_confirm"] = payload
         return {"confirmed": True}
+
+    async def web_ui_list_prompt_plans(self):
+        self.v170_calls["prompt_plans_list"] = True
+        return {
+            "items": [
+                {"plan_id": "EX-001", "name": "Rainy neon portrait", "builtin": True},
+                {"plan_id": "P-ABC123", "name": "My saved plan", "builtin": False},
+            ]
+        }
+
+    async def web_ui_delete_prompt_plan(self, payload):
+        self.deleted_prompt_plan = payload
+        return {"deleted": True, "plan_id": payload["plan_id"]}
 
     async def web_ui_search_loras(self, keyword, limit):
         self.search_query = (keyword, limit)
@@ -343,6 +357,8 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
                     "batch_id": "plb-" + "b" * 20,
                     "selection": 1,
                     "asset_library_fingerprint": "a" * 32,
+                    "save_plan": True,
+                    "plan_name": "My rainy-night plan",
                 },
                 "lab_confirm",
             ),
@@ -409,6 +425,45 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
             {"asset_type": "clothing", "custom_only": False, "limit": 50},
         )
 
+    async def test_prompt_plan_routes_reuse_controller_and_validate_delete_payload(
+        self,
+    ) -> None:
+        listed = await self.api.dispatch(
+            {"method": "GET", "path": "/api/prompt-plans"}
+        )
+        self.assertEqual(listed["items"][0]["plan_id"], "EX-001")
+        self.assertTrue(self.controller.v170_calls["prompt_plans_list"])
+
+        deleted = await self.api.dispatch(
+            {
+                "method": "POST",
+                "path": "/api/prompt-plans/delete",
+                "body": {"plan_id": "P-ABC123"},
+            }
+        )
+        self.assertEqual(deleted, {"deleted": True, "plan_id": "P-ABC123"})
+        self.assertEqual(
+            self.controller.deleted_prompt_plan,
+            {"plan_id": "P-ABC123"},
+        )
+
+        for payload in (
+            {"plan_id": "EX-001"},
+            {"plan_id": "../prompt_plans_v1.json"},
+            {"plan_id": ""},
+            {"plan_id": 123},
+            {},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises((PluginPageActionError, ValueError)):
+                    await self.api.dispatch(
+                        {
+                            "method": "POST",
+                            "path": "/api/prompt-plans/delete",
+                            "body": payload,
+                        }
+                    )
+
     async def test_v170_bad_body_method_and_bounds_fail_safely(self) -> None:
         invalid_envelopes = (
             {
@@ -440,6 +495,26 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
                 "method": "POST",
                 "path": "/api/prompt-lab/generate",
                 "body": {"seed": 1, "count": 7},
+            },
+            {
+                "method": "POST",
+                "path": "/api/prompt-lab/confirm",
+                "body": {
+                    "batch_id": "plb-" + "b" * 20,
+                    "candidate_id": "plc-" + "c" * 20,
+                    "save_plan": "yes",
+                    "plan_name": "My plan",
+                },
+            },
+            {
+                "method": "POST",
+                "path": "/api/prompt-lab/confirm",
+                "body": {
+                    "batch_id": "plb-" + "b" * 20,
+                    "candidate_id": "plc-" + "c" * 20,
+                    "save_plan": True,
+                    "plan_name": "x" * 257,
+                },
             },
             {
                 "method": "POST",

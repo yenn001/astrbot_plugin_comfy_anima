@@ -60,6 +60,10 @@ _TRAILING_ANNOTATION_RE = re.compile(
     r"「[^「」]*」|『[^『』]*』)\s*$"
 )
 _STYLE_NUMBER_RE = re.compile(r"^(风格|style)0*(\d+)$", flags=re.IGNORECASE)
+_STYLE_PREFIX_RE = re.compile(
+    r"^(风格|style)\s*0*(\d+)(?=\s|[（(\[【:：|｜])",
+    flags=re.IGNORECASE,
+)
 
 
 def _preset_lookup_key(value: str) -> str:
@@ -89,7 +93,36 @@ def _strip_trailing_annotations(value: str) -> str:
     return text
 
 
-def _preset_name_aliases(value: str) -> tuple[str, ...]:
+def normalize_preset_aliases(value: Any) -> tuple[str, ...]:
+    """Normalize user-managed aliases while preserving their display text."""
+
+    if isinstance(value, str):
+        raw_items = re.split(r"[\r\n,，;；]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = []
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        alias = str(raw or "").strip()
+        if not alias:
+            continue
+        if len(alias) > 40:
+            raise LoraPresetError("组合简称不能超过 40 个字符")
+        key = _preset_lookup_key(alias)
+        if key and key not in seen:
+            seen.add(key)
+            aliases.append(alias)
+    if len(aliases) > 12:
+        raise LoraPresetError("单个组合最多允许 12 个简称/别名")
+    return tuple(aliases)
+
+
+def _preset_name_aliases(
+    value: str,
+    explicit_aliases: Iterable[str] = (),
+) -> tuple[str, ...]:
     """Return safe, deterministic aliases derived from one saved display name."""
     display_name = str(value or "").strip()
     base_name = _strip_trailing_annotations(display_name)
@@ -107,6 +140,11 @@ def _preset_name_aliases(value: str) -> tuple[str, ...]:
     numeric = _STYLE_NUMBER_RE.fullmatch(_preset_lookup_key(base_name))
     if numeric:
         add(f"{numeric.group(1)}{int(numeric.group(2))}")
+    prefix = _STYLE_PREFIX_RE.match(base_name)
+    if prefix:
+        add(f"{prefix.group(1)}{int(prefix.group(2))}")
+    for alias in explicit_aliases:
+        add(str(alias or ""))
     return tuple(aliases)
 
 
@@ -119,6 +157,8 @@ class LoraPreset:
     selections: tuple[LoraSelection, ...]
     trigger_words: str = ""
     description: str = ""
+    aliases: tuple[str, ...] = ()
+    note: str = ""
     enabled: bool = True
 
     @property
@@ -233,6 +273,12 @@ class LoraPresetRegistry:
     def presets(self) -> tuple[LoraPreset, ...]:
         return tuple(self._presets)
 
+    @staticmethod
+    def aliases_for(preset: LoraPreset) -> tuple[str, ...]:
+        """Return every unique callable alias except the full display name."""
+
+        return _preset_name_aliases(preset.name, preset.aliases)[1:]
+
     def load(self, raw_presets: Any) -> None:
         self._presets = []
         if not isinstance(raw_presets, list):
@@ -258,6 +304,8 @@ class LoraPresetRegistry:
                     selections=selections,
                     trigger_words=str(item.get("trigger_words") or "").strip(),
                     description=str(item.get("description") or "").strip(),
+                    aliases=normalize_preset_aliases(item.get("aliases", [])),
+                    note=str(item.get("note") or "").strip(),
                     enabled=bool(item.get("enabled", True)),
                 )
                 self._upsert(preset)
@@ -285,7 +333,9 @@ class LoraPresetRegistry:
                 (
                     preset.name,
                     preset.description,
+                    preset.note,
                     preset.trigger_words,
+                    *preset.aliases,
                     *(selection.name for selection in preset.selections),
                 )
             ).casefold()
@@ -318,7 +368,7 @@ class LoraPresetRegistry:
             for preset in self._presets
             if any(
                 _preset_alias_key(alias) == _preset_alias_key(value)
-                for alias in _preset_name_aliases(preset.name)[1:]
+                for alias in _preset_name_aliases(preset.name, preset.aliases)[1:]
             )
         ]
         if enabled_only:
@@ -362,7 +412,7 @@ class LoraPresetRegistry:
 
         aliases: dict[str, list[tuple[str, LoraPreset]]] = {}
         for preset in self.list_presets(category=PRESET_CATEGORY_ARTIST_STYLE):
-            for alias in _preset_name_aliases(preset.name):
+            for alias in _preset_name_aliases(preset.name, preset.aliases):
                 aliases.setdefault(_preset_alias_key(alias), []).append((alias, preset))
         candidates = sorted(
             (
@@ -418,7 +468,10 @@ class LoraPresetRegistry:
         selections: tuple[LoraSelection, ...],
         trigger_words: str = "",
         description: str = "",
+        aliases: Any = (),
+        note: str = "",
         enabled: bool = True,
+        identifier: str = "",
     ) -> LoraPreset:
         normalized_category = normalize_category(category)
         normalized_name = self._normalize_name(name, normalized_category)
@@ -427,14 +480,41 @@ class LoraPresetRegistry:
             raise LoraPresetError("LoRA 组合至少需要一个 LoRA")
         if len(normalized_selections) > self._max_loras:
             raise LoraPresetError(f"单个组合最多允许 {self._max_loras} 个 LoRA")
+        normalized_aliases = tuple(
+            alias
+            for alias in normalize_preset_aliases(aliases)
+            if _preset_lookup_key(alias) != _preset_lookup_key(normalized_name)
+        )
+        normalized_note = str(note or "").strip()
+        if len(normalized_note) > 500:
+            raise LoraPresetError("组合备注不能超过 500 个字符")
         preset = LoraPreset(
             name=normalized_name,
             category=normalized_category,
             selections=normalized_selections,
             trigger_words=trigger_words.strip(),
             description=description.strip(),
+            aliases=normalized_aliases,
+            note=normalized_note,
             enabled=enabled,
         )
+        if str(identifier or "").strip():
+            current = self.resolve(identifier, enabled_only=False)
+            current_index = self._presets.index(current)
+            duplicate = next(
+                (
+                    item
+                    for item in self._presets
+                    if item is not current
+                    and _preset_lookup_key(item.name)
+                    == _preset_lookup_key(preset.name)
+                ),
+                None,
+            )
+            if duplicate is not None:
+                raise LoraPresetError(f"LoRA 组合名称已存在: {preset.name}")
+            self._presets[current_index] = preset
+            return preset
         self._upsert(preset)
         return preset
 
@@ -482,6 +562,8 @@ class LoraPresetRegistry:
                 ],
                 "trigger_words": preset.trigger_words,
                 "description": preset.description,
+                "aliases": list(preset.aliases),
+                "note": preset.note,
                 "enabled": preset.enabled,
             }
             for preset in self._presets
@@ -526,7 +608,11 @@ class LoraPresetRegistry:
                 line += " | disabled"
             if preset.trigger_words:
                 line += f" | triggers: {preset.trigger_words}"
+            if preset.aliases:
+                line += f" | aliases: {', '.join(preset.aliases)}"
             if detail and preset.description:
                 line += f" | {preset.description[:300]}"
+            if detail and preset.note:
+                line += f" | note: {preset.note[:300]}"
             lines.append(line)
         return "\n".join(lines)

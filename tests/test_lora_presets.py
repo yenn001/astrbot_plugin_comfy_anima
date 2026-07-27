@@ -90,6 +90,8 @@ class LoraPresetRegistryTests(unittest.TestCase):
                 ],
                 "trigger_words": "denia, silver hair",
                 "description": "默认角色组合",
+                "aliases": ["娅娅", "黑海岸达妮娅"],
+                "note": "日常角色版本",
                 "enabled": True,
             },
             {
@@ -108,6 +110,8 @@ class LoraPresetRegistryTests(unittest.TestCase):
 
         self.assertEqual(second.to_config(), serialized)
         self.assertEqual(second.presets[0].selections[0].name, "characters/denia")
+        self.assertEqual(second.presets[0].aliases, ("娅娅", "黑海岸达妮娅"))
+        self.assertEqual(second.presets[0].note, "日常角色版本")
         self.assertFalse(second.presets[1].enabled)
 
     def test_list_filters_by_category_keyword_and_enabled_state(self) -> None:
@@ -211,6 +215,49 @@ class LoraPresetRegistryTests(unittest.TestCase):
             registry.find_mentioned_style("请用风格2画达妮娅"),
             annotated,
         )
+
+    def test_style_number_prefix_and_explicit_alias_can_select_named_artist(self) -> None:
+        registry = LoraPresetRegistry([])
+        preset = registry.save(
+            name="风格1011 kei",
+            category="style",
+            selections=_selection("styles/kei"),
+            aliases="kei风格, 蓝档kei",
+            note="Blue Archive 画师备注",
+        )
+
+        self.assertIs(registry.resolve("风格1011"), preset)
+        self.assertIs(registry.resolve("kei风格"), preset)
+        self.assertIs(
+            registry.find_mentioned_style("用风格1011画一个角色"),
+            preset,
+        )
+        self.assertIn("风格1011", registry.aliases_for(preset))
+        self.assertEqual(preset.note, "Blue Archive 画师备注")
+
+    def test_edit_can_rename_without_leaving_duplicate_old_entry(self) -> None:
+        registry = LoraPresetRegistry([])
+        original = registry.save(
+            name="风格1011 kei",
+            category="style",
+            selections=_selection("styles/old"),
+            aliases=("风格1011",),
+        )
+
+        updated = registry.save(
+            identifier=original.name,
+            name="风格1011 kei v2",
+            category="style",
+            selections=_selection("styles/new", 0.65),
+            aliases=("风格1011", "kei新版"),
+            note="第二版",
+        )
+
+        self.assertEqual(len(registry.presets), 1)
+        self.assertIs(registry.resolve("风格1011"), updated)
+        self.assertEqual(updated.note, "第二版")
+        with self.assertRaises(LoraPresetError):
+            registry.resolve("风格1011 kei")
 
     def test_ambiguous_omitted_note_requires_full_style_name(self) -> None:
         registry = LoraPresetRegistry([])

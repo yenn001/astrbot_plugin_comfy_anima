@@ -130,6 +130,12 @@ class WebUiController(Protocol):
         self, payload: dict[str, Any]
     ) -> dict[str, Any]: ...
 
+    async def web_ui_list_prompt_plans(self) -> dict[str, Any]: ...
+
+    async def web_ui_delete_prompt_plan(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
     async def web_ui_search_loras(self, keyword: str, limit: int) -> dict[str, Any]: ...
 
     async def web_ui_refresh_loras(self) -> dict[str, Any]: ...
@@ -328,6 +334,14 @@ class WebUiService:
                 web.post(
                     "/api/prompt-lab/confirm",
                     self._prompt_lab_confirm,
+                ),
+                web.get(
+                    "/api/prompt-plans",
+                    self._prompt_plans,
+                ),
+                web.post(
+                    "/api/prompt-plans/delete",
+                    self._prompt_plan_delete,
                 ),
                 web.get("/api/loras", self._search_loras),
                 web.post("/api/loras/refresh", self._refresh_loras),
@@ -765,6 +779,20 @@ class WebUiService:
                 "prompt_lab_confirm", await self._read_json(request)
             )
             return await self._controller.web_ui_prompt_lab_confirm(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_plans(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_prompt_plans()
+        )
+
+    async def _prompt_plan_delete(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_plan_delete", await self._read_json(request)
+            )
+            return await self._controller.web_ui_delete_prompt_plan(payload)
 
         return await self._controller_response(operation())
 

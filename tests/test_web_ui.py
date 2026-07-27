@@ -51,6 +51,7 @@ class _Controller:
         self.selected_workflow = None
         self.prompt_diagnostic_payload = None
         self.prompt_diagnostics_cleared = 0
+        self.deleted_prompt_plan = None
         self.danbooru_updates = 0
         self.experiment_checks = 0
         self.v170_calls = {}
@@ -226,6 +227,27 @@ class _Controller:
     async def web_ui_prompt_lab_confirm(self, payload):
         self.v170_calls["lab_confirm"] = payload
         return {"confirmed": True}
+
+    async def web_ui_list_prompt_plans(self):
+        self.v170_calls["prompt_plans_list"] = True
+        return {
+            "items": [
+                {
+                    "plan_id": "EX-001",
+                    "name": "Rainy neon portrait",
+                    "builtin": True,
+                },
+                {
+                    "plan_id": "P-ABC123",
+                    "name": "My saved plan",
+                    "builtin": False,
+                },
+            ]
+        }
+
+    async def web_ui_delete_prompt_plan(self, payload):
+        self.deleted_prompt_plan = payload
+        return {"deleted": True, "plan_id": payload["plan_id"]}
 
     async def web_ui_search_loras(self, keyword, limit):
         return {"total": 1, "items": [{"name": keyword, "limit": limit}]}
@@ -523,6 +545,26 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             (plugin_root / "pages" / "control" / "app.css").read_bytes(),
         )
 
+    def test_preset_editor_supports_alias_note_edit_and_trigger_provenance(self) -> None:
+        for field in ("identifier", "aliases", "note", "trigger_words"):
+            self.assertIn(f'name="{field}"', self.html)
+        for identifier in (
+            "preset-editor-title",
+            "preset-save",
+            "preset-cancel-edit",
+        ):
+            self.assertIn(f'id="{identifier}"', self.html)
+        for marker in (
+            "function editPreset(item)",
+            "function resetPresetEditor()",
+            "Manager 最新：",
+            "最终有效：",
+            'identifier: values.get("identifier")',
+            'aliases: values.get("aliases")',
+            'note: values.get("note")',
+        ):
+            self.assertIn(marker, self.javascript)
+
 
 class WebUiValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -551,6 +593,30 @@ class WebUiValidationTests(unittest.TestCase):
             standalone_validate_v170_api_payload("prompt_assets_search", payload),
             native_validate_v170_api_payload("prompt_assets_search", payload),
         )
+
+    def test_prompt_plan_delete_payload_is_shared_bounded_and_custom_only(self) -> None:
+        payload = {"plan_id": "P-ABC123"}
+        self.assertEqual(
+            standalone_validate_v170_api_payload("prompt_plan_delete", payload),
+            payload,
+        )
+        self.assertEqual(
+            native_validate_v170_api_payload("prompt_plan_delete", payload),
+            payload,
+        )
+        for invalid in (
+            {"plan_id": "EX-001"},
+            {"plan_id": "../prompt_plans_v1.json"},
+            {"plan_id": ""},
+            {"plan_id": 123},
+            {},
+        ):
+            with self.subTest(payload=invalid):
+                with self.assertRaises(ValueError):
+                    standalone_validate_v170_api_payload(
+                        "prompt_plan_delete",
+                        invalid,
+                    )
 
     def test_enabled_ui_requires_password_and_private_bind(self) -> None:
         missing_password = PluginSettings.from_mapping(
@@ -704,6 +770,62 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
             {"asset_type": "clothing", "favorite_only": True, "limit": 200},
         )
 
+    async def test_prompt_plan_routes_require_auth_and_csrf_and_forward_contract(
+        self,
+    ) -> None:
+        anonymous = await self.client.get("/api/prompt-plans")
+        self.assertEqual(anonymous.status, 401)
+        self.assertEqual(anonymous.headers["Cache-Control"], "no-store")
+
+        csrf = await self._login()
+        listed = await self.client.get("/api/prompt-plans")
+        self.assertEqual(listed.status, 200, await listed.text())
+        self.assertEqual(listed.headers["Cache-Control"], "no-store")
+        listed_payload = await listed.json()
+        self.assertEqual(listed_payload["data"]["items"][0]["plan_id"], "EX-001")
+        self.assertTrue(self.controller.v170_calls["prompt_plans_list"])
+
+        missing_csrf = await self.client.post(
+            "/api/prompt-plans/delete",
+            json={"plan_id": "P-ABC123"},
+        )
+        self.assertEqual(missing_csrf.status, 403)
+        self.assertIsNone(self.controller.deleted_prompt_plan)
+
+        deleted = await self.client.post(
+            "/api/prompt-plans/delete",
+            json={"plan_id": "P-ABC123"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(deleted.status, 200, await deleted.text())
+        self.assertEqual(
+            self.controller.deleted_prompt_plan,
+            {"plan_id": "P-ABC123"},
+        )
+        self.assertEqual((await deleted.json())["data"]["plan_id"], "P-ABC123")
+
+    async def test_prompt_plan_delete_rejects_builtin_and_unsafe_ids_before_controller(
+        self,
+    ) -> None:
+        csrf = await self._login()
+        headers = {"X-CSRF-Token": csrf}
+        for payload in (
+            {"plan_id": "EX-001"},
+            {"plan_id": "../prompt_plans_v1.json"},
+            {"plan_id": ""},
+            {"plan_id": 123},
+            {},
+        ):
+            with self.subTest(payload=payload):
+                response = await self.client.post(
+                    "/api/prompt-plans/delete",
+                    json=payload,
+                    headers=headers,
+                )
+                self.assertEqual(response.status, 400, await response.text())
+                self.assertFalse((await response.json())["ok"])
+        self.assertIsNone(self.controller.deleted_prompt_plan)
+
     async def test_v170_management_routes_forward_validated_contracts(self) -> None:
         csrf = await self._login()
         headers = {"X-CSRF-Token": csrf}
@@ -797,6 +919,8 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
                     "batch_id": "plb-" + "b" * 20,
                     "candidate_id": "plc-" + "c" * 20,
                     "asset_library_fingerprint": "a" * 32,
+                    "save_plan": True,
+                    "plan_name": "My rainy-night plan",
                 },
             ),
             (
@@ -858,6 +982,24 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("/api/prompt-lab/generate", {"seed": 1, "count": 7}),
             ("/api/prompt-lab/generate", {"seed": 2**63, "count": 1}),
+            (
+                "/api/prompt-lab/confirm",
+                {
+                    "batch_id": "plb-" + "b" * 20,
+                    "candidate_id": "plc-" + "c" * 20,
+                    "save_plan": "yes",
+                    "plan_name": "My plan",
+                },
+            ),
+            (
+                "/api/prompt-lab/confirm",
+                {
+                    "batch_id": "plb-" + "b" * 20,
+                    "candidate_id": "plc-" + "c" * 20,
+                    "save_plan": True,
+                    "plan_name": "x" * 257,
+                },
+            ),
             ("/api/loras/gallery", {"page": "1"}),
             ("/api/loras/thumbnails/warm", {"limit": 201}),
             ("/api/loras/thumbnails/warm", {"keys": ["../preview"]}),

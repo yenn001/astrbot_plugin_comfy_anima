@@ -188,7 +188,7 @@ def _json_mapping(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
-def _aliases(value: Any) -> tuple[str, ...]:
+def _aliases(value: Any, *, skip_overlong: bool = False) -> tuple[str, ...]:
     if value is None or value == "":
         return ()
     if isinstance(value, str):
@@ -214,6 +214,8 @@ def _aliases(value: Any) -> tuple[str, ...]:
     for item in values:
         normalized = normalize_tag(str(item))
         if len(normalized) > MAX_TAG_LENGTH:
+            if skip_overlong:
+                continue
             raise DanbooruIndexError("tag alias exceeds length limit")
         if normalized and normalized not in seen:
             seen.add(normalized)
@@ -250,6 +252,8 @@ def _category(value: Any) -> str:
 def _record_from_mapping(
     raw: Mapping[str, Any],
     default_provenance: Mapping[str, Any],
+    *,
+    skip_overlong_aliases: bool = False,
 ) -> _ImportRecord:
     tag_value = raw.get("tag", raw.get("name", raw.get("canonical_tag", "")))
     normalized_tag = normalize_tag(str(tag_value))
@@ -257,7 +261,10 @@ def _record_from_mapping(
         raise DanbooruIndexError("tag record is missing tag/name")
     if len(normalized_tag) > MAX_TAG_LENGTH:
         raise DanbooruIndexError("tag name exceeds length limit")
-    aliases = _aliases(raw.get("aliases", raw.get("alias", ())))
+    aliases = _aliases(
+        raw.get("aliases", raw.get("alias", ())),
+        skip_overlong=skip_overlong_aliases,
+    )
     aliases = tuple(alias for alias in aliases if alias != normalized_tag)
     provenance = _json_mapping(raw.get("provenance"))
     # Dataset-level reviewed provenance is authoritative. Individual records
@@ -339,27 +346,118 @@ def _records_from_csv(
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise DanbooruIndexError("tag index CSV must be UTF-8") from exc
-    reader = csv.DictReader(io.StringIO(text, newline=""))
-    if not reader.fieldnames:
-        raise DanbooruIndexError("tag index CSV is missing a header")
-    lowered = {str(name).strip().casefold(): name for name in reader.fieldnames}
-    if not any(name in lowered for name in ("tag", "name", "canonical_tag")):
-        raise DanbooruIndexError("tag index CSV requires tag or name column")
+    # Prefer the documented headered format, but also accept the common
+    # Danbooru export shape used by Anima tag indexes:
+    # ``tag,category,count,aliases`` without a header row.  The latter is
+    # intentionally detected conservatively so an arbitrary malformed CSV is
+    # still rejected instead of being silently interpreted as tags.
+    stream = io.StringIO(text, newline="")
+    probe = csv.reader(stream)
+    try:
+        first_row = next(probe)
+    except StopIteration as exc:
+        raise DanbooruIndexError("tag index CSV is missing a header") from exc
+    lowered = {str(name).strip().casefold() for name in first_row}
+    has_header = any(name in lowered for name in ("tag", "name", "canonical_tag"))
     records: list[_ImportRecord] = []
-    for row_number, raw in enumerate(reader, start=2):
+
+    if has_header:
+        stream.seek(0)
+        reader = csv.DictReader(stream)
+        if not reader.fieldnames:
+            raise DanbooruIndexError("tag index CSV is missing a header")
+        for row_number, raw in enumerate(reader, start=2):
+            if len(records) >= MAX_INDEX_RECORDS:
+                raise DanbooruIndexError("tag index contains too many records")
+            normalized_row = {
+                str(key).strip().casefold(): value for key, value in raw.items() if key
+            }
+            if not any(str(value or "").strip() for value in normalized_row.values()):
+                continue
+            try:
+                records.append(_record_from_mapping(normalized_row, provenance))
+            except DanbooruIndexError as exc:
+                raise DanbooruIndexError(
+                    f"invalid CSV record on line {row_number}: {exc}"
+                ) from exc
+        return records, {}
+
+    # Headerless Anima/Danbooru exports have at least tag, category and count.
+    # Validate those two numeric/semantic columns before accepting the format.
+    if len(first_row) < 3:
+        raise DanbooruIndexError("tag index CSV requires tag or name column")
+    try:
+        _category(first_row[1])
+        _count(first_row[2])
+    except DanbooruIndexError as exc:
+        raise DanbooruIndexError("tag index CSV requires tag or name column") from exc
+
+    def rows() -> Iterable[tuple[int, list[str]]]:
+        yield 1, first_row
+        for row_number, raw in enumerate(probe, start=2):
+            yield row_number, raw
+
+    for row_number, raw in rows():
         if len(records) >= MAX_INDEX_RECORDS:
             raise DanbooruIndexError("tag index contains too many records")
-        normalized_row = {
-            str(key).strip().casefold(): value for key, value in raw.items() if key
-        }
-        if not any(str(value or "").strip() for value in normalized_row.values()):
+        if not any(str(value or "").strip() for value in raw):
             continue
+        normalized_row = {
+            "tag": raw[0] if len(raw) > 0 else "",
+            "category": raw[1] if len(raw) > 1 else "",
+            "count": raw[2] if len(raw) > 2 else "",
+            "aliases": raw[3] if len(raw) > 3 else "",
+        }
         try:
-            records.append(_record_from_mapping(normalized_row, provenance))
+            records.append(
+                _record_from_mapping(
+                    normalized_row,
+                    provenance,
+                    skip_overlong_aliases=True,
+                )
+            )
         except DanbooruIndexError as exc:
             raise DanbooruIndexError(
                 f"invalid CSV record on line {row_number}: {exc}"
             ) from exc
+
+    # Some headerless Danbooru exports intentionally include broad aliases
+    # which either name another canonical tag or point to several canonical
+    # tags.  Such aliases cannot be verified uniquely.  Drop only those
+    # ambiguous aliases while retaining every canonical tag and every unique,
+    # bounded alias; JSON and headered CSV imports keep their strict conflict
+    # behavior unchanged.
+    canonical_tags = {record.normalized_tag for record in records}
+    owners: dict[str, set[str]] = {}
+    for record in records:
+        for alias in record.normalized_aliases:
+            owners.setdefault(alias, set()).add(record.normalized_tag)
+    ambiguous = {
+        alias
+        for alias, tag_owners in owners.items()
+        if alias in canonical_tags or len(tag_owners) > 1
+    }
+    if ambiguous:
+        records = [
+            _ImportRecord(
+                tag=record.tag,
+                normalized_tag=record.normalized_tag,
+                category=record.category,
+                aliases=tuple(
+                    alias
+                    for alias in record.aliases
+                    if alias not in ambiguous
+                ),
+                normalized_aliases=tuple(
+                    alias
+                    for alias in record.normalized_aliases
+                    if alias not in ambiguous
+                ),
+                count=record.count,
+                provenance=record.provenance,
+            )
+            for record in records
+        ]
     return records, {}
 
 
@@ -659,6 +757,148 @@ class DanbooruTagIndex:
             candidates=tuple(candidates),
         )
 
+    def lookup_many(
+        self,
+        values: Sequence[str],
+        category: str = "",
+    ) -> tuple[TagLookup, ...]:
+        """Resolve several exact canonical/alias queries in one immutable snapshot.
+
+        Batch lookup deliberately performs no prefix or fuzzy fallback.  This keeps
+        one tool call suitable for validating multiple candidate tags without
+        allowing a suggestion to masquerade as a verified canonical match.
+        """
+
+        queries = tuple(str(value or "").strip() for value in values)
+        category_filter = _category(category)
+        if not queries:
+            return ()
+        results: list[TagLookup] = []
+        with self._lock:
+            if not self.path.is_file():
+                return tuple(
+                    TagLookup(
+                        query=query,
+                        normalized_query=normalize_tag(query),
+                        provenance={},
+                    )
+                    for query in queries
+                )
+            try:
+                connection = self._connect()
+                try:
+                    for query in queries:
+                        normalized = normalize_tag(query)
+                        if not normalized:
+                            results.append(
+                                TagLookup(
+                                    query=query,
+                                    normalized_query=normalized,
+                                    provenance={},
+                                )
+                            )
+                            continue
+                        row = self._exact(connection, normalized, category_filter)
+                        if row is None:
+                            results.append(
+                                TagLookup(
+                                    query=query,
+                                    normalized_query=normalized,
+                                    provenance={},
+                                )
+                            )
+                            continue
+                        results.append(
+                            self._lookup_from_row(
+                                connection,
+                                query,
+                                normalized,
+                                row,
+                                verified=True,
+                            )
+                        )
+                finally:
+                    connection.close()
+            except sqlite3.Error as exc:
+                self._last_error = str(exc)
+                return tuple(
+                    TagLookup(
+                        query=query,
+                        normalized_query=normalize_tag(query),
+                        provenance={},
+                    )
+                    for query in queries
+                )
+        return tuple(results)
+
+    def search(
+        self,
+        value: str,
+        *,
+        mode: str = "exact",
+        category: str = "",
+        limit: int = 8,
+    ) -> tuple[TagCandidate, ...]:
+        """Return bounded exact, prefix or keyword candidates from one snapshot.
+
+        Exact canonical and unique-alias matches are verified.  Prefix and keyword
+        results are discovery hints only and must be confirmed with a later exact
+        lookup before they are treated as user identity evidence.
+        """
+
+        query = str(value or "").strip()
+        normalized = normalize_tag(query)
+        if not normalized:
+            return ()
+        normalized_mode = str(mode or "exact").strip().casefold()
+        if normalized_mode == "alias":
+            normalized_mode = "exact"
+        if normalized_mode in {"contains", "search"}:
+            normalized_mode = "keyword"
+        if normalized_mode not in {"exact", "prefix", "keyword"}:
+            raise ValueError("mode must be exact, prefix or keyword")
+        effective_limit = max(1, min(int(limit), 50))
+        category_filter = _category(category)
+        with self._lock:
+            if not self.path.is_file():
+                return ()
+            try:
+                connection = self._connect()
+                try:
+                    if normalized_mode == "exact":
+                        row = self._exact(connection, normalized, category_filter)
+                        if row is None:
+                            return ()
+                        return (
+                            self._candidate_from_row(
+                                connection,
+                                row,
+                                verified=True,
+                            ),
+                        )
+                    if normalized_mode == "prefix":
+                        return tuple(
+                            self._prefix_candidates(
+                                connection,
+                                normalized,
+                                category_filter,
+                                limit=effective_limit,
+                            )
+                        )
+                    return tuple(
+                        self._keyword_candidates(
+                            connection,
+                            normalized,
+                            category_filter,
+                            limit=effective_limit,
+                        )
+                    )
+                finally:
+                    connection.close()
+            except sqlite3.Error as exc:
+                self._last_error = str(exc)
+                return ()
+
     @staticmethod
     def _connect_path(path: Path) -> sqlite3.Connection:
         uri = path.resolve(strict=False).as_uri() + "?mode=ro"
@@ -823,6 +1063,83 @@ class DanbooruTagIndex:
                 ).fetchone()
                 combined[int(row["id"])] = selected
 
+        candidates = [
+            self._candidate_from_row(connection, row) for row in combined.values()
+        ]
+        candidates.sort(key=lambda item: (-item.score, -item.count, item.tag))
+        return candidates[:limit]
+
+    def _prefix_candidates(
+        self,
+        connection: sqlite3.Connection,
+        normalized: str,
+        category: str,
+        *,
+        limit: int,
+    ) -> list[TagCandidate]:
+        escaped = (
+            normalized.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        )
+        category_sql, category_params = self._category_sql(category)
+        rows = connection.execute(
+            """SELECT t.*, 'prefix' AS match_type,
+                      t.tag AS matched_value, 0.9 AS score
+               FROM tags t
+               WHERE t.normalized_tag LIKE ? ESCAPE '\\'"""
+            + category_sql
+            + " ORDER BY t.count DESC, t.tag LIMIT ?",
+            [escaped + "%", *category_params, limit],
+        ).fetchall()
+        alias_category_sql, alias_params = self._category_sql(category)
+        alias_rows = connection.execute(
+            """SELECT t.*, 'alias_prefix' AS match_type,
+                      a.alias AS matched_value, 0.86 AS score
+               FROM aliases a JOIN tags t ON t.id = a.tag_id
+               WHERE a.normalized_alias LIKE ? ESCAPE '\\'"""
+            + alias_category_sql
+            + " ORDER BY t.count DESC, t.tag LIMIT ?",
+            [escaped + "%", *alias_params, limit],
+        ).fetchall()
+        combined: dict[int, sqlite3.Row] = {}
+        for row in [*rows, *alias_rows]:
+            combined.setdefault(int(row["id"]), row)
+        candidates = [
+            self._candidate_from_row(connection, row) for row in combined.values()
+        ]
+        candidates.sort(key=lambda item: (-item.score, -item.count, item.tag))
+        return candidates[:limit]
+
+    def _keyword_candidates(
+        self,
+        connection: sqlite3.Connection,
+        normalized: str,
+        category: str,
+        *,
+        limit: int,
+    ) -> list[TagCandidate]:
+        category_sql, category_params = self._category_sql(category)
+        rows = connection.execute(
+            """SELECT t.*, 'keyword' AS match_type,
+                      t.tag AS matched_value, 0.75 AS score
+               FROM tags t
+               WHERE instr(t.normalized_tag, ?) > 0"""
+            + category_sql
+            + " ORDER BY t.count DESC, t.tag LIMIT ?",
+            [normalized, *category_params, limit],
+        ).fetchall()
+        alias_category_sql, alias_params = self._category_sql(category)
+        alias_rows = connection.execute(
+            """SELECT t.*, 'alias_keyword' AS match_type,
+                      a.alias AS matched_value, 0.7 AS score
+               FROM aliases a JOIN tags t ON t.id = a.tag_id
+               WHERE instr(a.normalized_alias, ?) > 0"""
+            + alias_category_sql
+            + " ORDER BY t.count DESC, t.tag LIMIT ?",
+            [normalized, *alias_params, limit],
+        ).fetchall()
+        combined: dict[int, sqlite3.Row] = {}
+        for row in [*rows, *alias_rows]:
+            combined.setdefault(int(row["id"]), row)
         candidates = [
             self._candidate_from_row(connection, row) for row in combined.values()
         ]

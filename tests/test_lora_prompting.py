@@ -96,7 +96,7 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
         self.assertNotIn("silver hair", plan.prompt)
         self.assertTrue(any("removed positive" in item for item in plan.skipped))
 
-    def test_manual_preset_triggers_are_authoritative_for_members(self) -> None:
+    def test_manual_preset_triggers_supplement_latest_manager_metadata(self) -> None:
         preset = LoraPreset(
             name="风格001",
             category="artist_style",
@@ -118,8 +118,10 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             presets=(preset,),
         )
 
-        self.assertEqual(plan.prompt, "1girl, hand tuned style")
-        self.assertNotIn("manager trigger", plan.prompt)
+        self.assertEqual(
+            plan.prompt,
+            "1girl, hand tuned style, manager trigger, second trigger",
+        )
 
     def test_semantic_rewrite_suppresses_manual_and_metadata_triggers(self) -> None:
         preset = LoraPreset(
@@ -144,7 +146,7 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             suppressed_terms=("denia_wuwa",),
         )
 
-        self.assertEqual(plan.prompt, "1girl, hand tuned style")
+        self.assertEqual(plan.prompt, "1girl, hand tuned style, manager style")
         self.assertNotIn("denia_wuwa", plan.prompt)
         self.assertTrue(any("suppressed" in item for item in plan.skipped))
 
@@ -243,7 +245,7 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             "styles/manual": LoraRecord(
                 "styles/manual",
                 category="artist_style",
-                trigger_words=("ignored manager trigger",),
+                trigger_words=("latest manager trigger",),
             ),
             "styles/manager": LoraRecord(
                 "styles/manager",
@@ -266,12 +268,17 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
         self.assertEqual(
             plan.prompt,
             "<lora:styles/manual:0.5>, <lora:styles/manager:0.6>, 1girl, "
-            "beach, hand tuned ink, paper texture, warm palette. "
+            "beach, hand tuned ink, latest manager trigger, paper texture, warm palette. "
             "A girl stands beside the sea at sunset.",
         )
         self.assertEqual(
             plan.added,
-            ("hand tuned ink", "paper texture", "warm palette"),
+            (
+                "hand tuned ink",
+                "latest manager trigger",
+                "paper texture",
+                "warm palette",
+            ),
         )
         self.assertTrue(plan.prompt.endswith("A girl stands beside the sea at sunset."))
 

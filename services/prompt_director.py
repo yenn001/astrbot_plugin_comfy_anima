@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.7.1
+AstrBot Comfy Anima 插件 v1.8.3
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.7.1
-日期: 2026-07-26
+版本: 1.8.3
+日期: 2026-07-27
 """
 
 import asyncio
@@ -16,7 +16,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from ..core.lora import LORA_TAG_PATTERN
 from ..models import PluginSettings
@@ -127,6 +127,7 @@ RUNTIME_OVERRIDE = """
 24. 区分“生成后放大”和“放大已有图片”：前者可选择 rtx 生图管线，后者属于独立 RTX 图片工具，不能伪造成 pic。区分“新画一个穿红裙的角色”、无蒙版整图重绘和遮罩局部重绘：普通生图与整图语义重绘输出 pic；只有原图与有效遮罩齐全的局部修改才输出 edit。整图语义重绘会由插件明确标记，必须承认它是重新生成而非像素级修改。
 25. 先在内部锁定唯一操作类型，再规划提示词。不要把 base、rtx、iterative、quick、lanpaint、放大倍率、遮罩位置或“修改/替换/重绘”等操作指令写进视觉 prompt。
 26. 当用户内容明确标记“无蒙版整图语义重绘”时，未明确指定风格组合就不得自动套用默认风格001；应使用反推得到的可观察画风和色调。只有用户明确点名风格组合时才查询并应用对应预设。
+27. 本地 Danbooru 索引状态会由运行时附加。只有本次工具列表真实包含 `search_anima_danbooru_tags` 时才可调用；对不确定的角色、作品、画师、服装或姿势 canonical tag，优先合并为一次有界查询。exact canonical 或 unique alias 且 `verified=true` 才是已确认结果；prefix、keyword、fuzzy 只用于发现候选，必须再用 canonical tag 做 exact 查询后才能采用。常见且确定的 general tag 不要逐项查询，避免工具风暴。
 """.strip()
 
 
@@ -184,10 +185,12 @@ class PromptDirector:
         reference_path: Path,
         settings: PluginSettings,
         composer: PromptComposer | None = None,
+        danbooru_status_provider: Callable[[], Mapping[str, Any]] | None = None,
     ):
         self._settings = settings
         self._reference = self._load_reference(reference_path)
         self._composer = composer
+        self._danbooru_status_provider = danbooru_status_provider
 
     def compose_picture_instruction(
         self,
@@ -269,6 +272,9 @@ class PromptDirector:
     def _system_prompt(self) -> str:
         """组合运行时协议、用户附带参考及额外指令。"""
         parts = [RUNTIME_OVERRIDE]
+        danbooru_context = self.danbooru_runtime_context()
+        if danbooru_context:
+            parts.append(danbooru_context)
         if self._settings.auto_draw_system_prompt:
             parts.extend(
                 [
@@ -288,6 +294,37 @@ class PromptDirector:
                 ["管理员补充要求：", self._settings.director_extra_instruction]
             )
         return "\n\n".join(parts)
+
+    def danbooru_runtime_context(self) -> str:
+        """Expose only bounded index readiness, never source paths or provenance."""
+
+        provider = self._danbooru_status_provider
+        if provider is None:
+            return ""
+        try:
+            status = provider()
+        except Exception:
+            status = {}
+        if not isinstance(status, Mapping) or not bool(status.get("ready")):
+            return (
+                "本地 Danbooru 索引状态：ready=false。不得声称已查库或已验证标签；"
+                "若本次没有查询工具，只使用你能高置信确认的普通英文 Tags。"
+            )
+        tag_count = max(0, int(status.get("tag_count") or 0))
+        alias_count = max(0, int(status.get("alias_count") or 0))
+        revision = re.sub(
+            r"[^A-Za-z0-9._-]",
+            "",
+            str(status.get("revision") or "")[:64],
+        )
+        return (
+            "本地 Danbooru 索引状态：ready=true，"
+            f"canonical_tags={tag_count}，aliases={alias_count}，"
+            f"revision={revision or 'unknown'}。"
+            "这套索引可通过 search_anima_danbooru_tags 进行有界只读查询；"
+            "工具不在本次列表时不得假装调用。候选结果只帮助发现，最终应使用"
+            " verified exact canonical/alias 所指向的 canonical_tag。"
+        )
 
     def _lora_tool_call_timeout(self) -> int:
         """Return a per-call budget that covers Manager scan and catalog read."""
@@ -351,6 +388,7 @@ class PromptDirector:
         scene_text: str,
         tools: Any = None,
         output_tools: Any = None,
+        lookup_tool_call_timeout: int | None = None,
     ) -> tuple[PictureInstruction, str]:
         """Generate one validated picture instruction including its pipeline."""
 
@@ -392,23 +430,32 @@ class PromptDirector:
             "max_tokens": self._settings.prompt_llm_max_tokens,
         }
 
-        uses_lora_tools = tools is not None
+        uses_lookup_tools = tools is not None
         tool_call_timeout = 0
         request_timeout = self._settings.prompt_llm_timeout
+        if uses_lookup_tools:
+            tool_call_timeout = max(
+                1,
+                int(
+                    lookup_tool_call_timeout
+                    if lookup_tool_call_timeout is not None
+                    else self._lora_tool_call_timeout()
+                ),
+            )
+            request_timeout = self._lora_agent_timeout(tool_call_timeout)
+
         async def invoke(
             active_prompt: str,
             *,
             include_output_tools: bool = True,
         ) -> Any:
             use_output_tools = include_output_tools and output_tools is not None
-            if uses_lora_tools:
+            if uses_lookup_tools:
                 if not hasattr(context, "tool_loop_agent"):
                     raise PromptDirectorError(
-                        "当前 AstrBot 不支持 LoRA 查询工具，已停止本次绘图",
+                        "当前 AstrBot 不支持本地资产查询工具，已停止本次绘图",
                         fatal=True,
                     )
-                tool_call_timeout = self._lora_tool_call_timeout()
-                request_timeout = self._lora_agent_timeout(tool_call_timeout)
                 response = await asyncio.wait_for(
                     context.tool_loop_agent(
                         event=event,
@@ -472,9 +519,9 @@ class PromptDirector:
         try:
             response = await invoke(user_prompt)
         except asyncio.TimeoutError as exc:
-            if uses_lora_tools:
+            if uses_lookup_tools:
                 raise PromptDirectorError(
-                    "LoRA 查询或 LLM 分镜超时，已停止本次绘图",
+                    "本地资产查询或 LLM 分镜超时，已停止本次绘图",
                     (
                         f"provider={provider_id}, "
                         f"tool_call_timeout={tool_call_timeout}, "
@@ -486,9 +533,9 @@ class PromptDirector:
         except PromptDirectorError:
             raise
         except Exception as exc:
-            if uses_lora_tools:
+            if uses_lookup_tools:
                 raise PromptDirectorError(
-                    "LoRA 查询工具调用失败，已停止本次绘图",
+                    "本地资产查询工具调用失败，已停止本次绘图",
                     f"provider={provider_id}, error={exc}",
                     fatal=True,
                 ) from exc
@@ -583,8 +630,8 @@ class PromptDirector:
                         detail = first_error.detail or first_error.user_message
                     raise PromptDirectorError(
                         (
-                            "LoRA 工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI"
-                            if uses_lora_tools
+                            "本地资产工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI"
+                            if uses_lookup_tools
                             else "绘图模型连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI"
                         ),
                         detail,
@@ -638,7 +685,12 @@ class PromptDirector:
         raise AssertionError("unreachable")
 
     async def generate_edit_instruction(
-        self, context: Any, event: Any, scene_text: str, tools: Any = None
+        self,
+        context: Any,
+        event: Any,
+        scene_text: str,
+        tools: Any = None,
+        lookup_tool_call_timeout: int | None = None,
     ) -> tuple[EditInstruction, str]:
         """Plan a masked redraw without allowing the model to invent a mask."""
 
@@ -659,7 +711,18 @@ class PromptDirector:
             "选择 lanpaint。prompt 中不得出现 change、replace、edit、mask、here、there 等"
             "操作或位置指代词，也不得重复描述黑色保留区域。"
         )
-        tool_call_timeout = self._lora_tool_call_timeout() if tools is not None else 0
+        tool_call_timeout = (
+            max(
+                1,
+                int(
+                    lookup_tool_call_timeout
+                    if lookup_tool_call_timeout is not None
+                    else self._lora_tool_call_timeout()
+                ),
+            )
+            if tools is not None
+            else 0
+        )
         request_timeout = (
             self._lora_agent_timeout(tool_call_timeout)
             if tools is not None
@@ -670,7 +733,7 @@ class PromptDirector:
             if tools is not None:
                 if not hasattr(context, "tool_loop_agent"):
                     raise PromptDirectorError(
-                        "当前 AstrBot 不支持 LoRA 查询工具，已停止本次重绘",
+                        "当前 AstrBot 不支持本地资产查询工具，已停止本次重绘",
                         fatal=True,
                     )
                 response = await asyncio.wait_for(

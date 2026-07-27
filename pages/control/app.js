@@ -44,6 +44,8 @@ let promptAssetFingerprint = "";
 let promptLabBatch = null;
 let promptLabSelection = "";
 let promptLabUseComposerBase = true;
+let promptPlanItems = [];
+let presetItems = [];
 let loraViewMode = "table";
 let loraGalleryItems = [];
 let loraGalleryPage = 1;
@@ -1943,7 +1945,8 @@ async function loadPresets() {
   empty.textContent = "正在强制刷新并校验所有组合…";
   try {
     const data = await api("/api/presets");
-    for (const item of data.items || []) {
+    presetItems = data.items || [];
+    for (const item of presetItems) {
       const row = document.createElement("tr");
       const statusCell = document.createElement("td");
       statusCell.append(chip(item.available ? (item.enabled ? "可用" : "已停用") : "含失效 LoRA", item.available ? "good" : "bad"));
@@ -1954,27 +1957,67 @@ async function loadPresets() {
         statusCell.append(detail);
       }
       const action = document.createElement("td");
+      const editButton = document.createElement("button");
+      editButton.className = "secondary compact";
+      editButton.type = "button";
+      editButton.textContent = "编辑";
+      editButton.addEventListener("click", () => editPreset(item));
       const deleteButton = document.createElement("button");
       deleteButton.className = "danger compact";
       deleteButton.type = "button";
       deleteButton.textContent = "删除";
       deleteButton.addEventListener("click", () => deletePreset(item.name));
-      action.append(deleteButton);
+      action.append(editButton, deleteButton);
+      const aliases = unique(item.derived_aliases || item.aliases || []);
+      const triggerLines = [
+        `手动补充：${item.trigger_words || "（无）"}`,
+        `Manager 最新：${(item.manager_trigger_words || []).join(", ") || "（无）"}`,
+        `最终有效：${(item.effective_trigger_words || []).join(", ") || "（无）"}`,
+      ];
       row.append(
-        textCell(item.name),
+        textCell([item.name, aliases.length ? `简称：${aliases.join(" / ")}` : ""].filter(Boolean).join("\n"), "multiline"),
         textCell(item.category_label),
         textCell((item.loras || []).join("\n"), "multiline"),
+        textCell(triggerLines.join("\n"), "multiline"),
+        textCell([item.note, item.description].filter(Boolean).join("\n") || "—", "multiline"),
         statusCell,
         action,
       );
       table.append(row);
     }
-    empty.hidden = (data.items || []).length > 0;
-    empty.textContent = data.items?.length ? "" : "尚未保存任何组合。";
+    empty.hidden = presetItems.length > 0;
+    empty.textContent = presetItems.length ? "" : "尚未保存任何组合。";
   } catch (error) {
     empty.textContent = error.message;
     showToast(error.message, true);
   }
+}
+
+function resetPresetEditor() {
+  const form = document.querySelector("#preset-form");
+  form.reset();
+  form.elements.namedItem("identifier").value = "";
+  form.elements.namedItem("enabled").checked = true;
+  document.querySelector("#preset-editor-title").textContent = "新建组合";
+  document.querySelector("#preset-save").textContent = "强制刷新并保存";
+  document.querySelector("#preset-cancel-edit").hidden = true;
+}
+
+function editPreset(item) {
+  const form = document.querySelector("#preset-form");
+  form.elements.namedItem("identifier").value = item.name || "";
+  form.elements.namedItem("name").value = item.name || "";
+  form.elements.namedItem("category").value = item.category || "mixed";
+  form.elements.namedItem("aliases").value = (item.aliases || []).join("\n");
+  form.elements.namedItem("note").value = item.note || "";
+  form.elements.namedItem("loras").value = (item.loras || []).join("\n");
+  form.elements.namedItem("trigger_words").value = item.trigger_words || "";
+  form.elements.namedItem("description").value = item.description || "";
+  form.elements.namedItem("enabled").checked = item.enabled !== false;
+  document.querySelector("#preset-editor-title").textContent = `编辑：${item.name}`;
+  document.querySelector("#preset-save").textContent = "强制刷新并更新";
+  document.querySelector("#preset-cancel-edit").hidden = false;
+  form.scrollIntoView({behavior: "smooth", block: "start"});
 }
 
 async function savePreset(event) {
@@ -1984,16 +2027,20 @@ async function savePreset(event) {
   setBusy(button, true, "正在保存…");
   const values = new FormData(form);
   const payload = {
+    identifier: values.get("identifier"),
     name: values.get("name"),
     category: values.get("category"),
     loras: String(values.get("loras") || "").split("\n").map((item) => item.trim()).filter(Boolean),
     trigger_words: values.get("trigger_words"),
     description: values.get("description"),
+    aliases: values.get("aliases"),
+    note: values.get("note"),
     enabled: form.elements.namedItem("enabled").checked,
   };
   try {
     const data = await api("/api/presets", {method: "POST", body: JSON.stringify(payload)});
     showToast(data.message);
+    resetPresetEditor();
     await loadPresets();
     if (data.reload_scheduled) await reloadAfterPluginChange();
   } catch (error) {
@@ -3016,6 +3063,7 @@ async function loadExperimentalProfiles({quiet = false} = {}) {
 async function loadPromptWorkbench({quiet = false} = {}) {
   await loadPromptStatus({quiet});
   if (promptActiveTab === "assets") await loadPromptAssets({quiet});
+  if (promptActiveTab === "lab") await loadPromptPlans({quiet});
   if (promptActiveTab === "diagnostics") await loadExperimentalProfiles({quiet});
 }
 
@@ -3256,6 +3304,7 @@ function switchPromptTab(name, {focus = false, load = true} = {}) {
   }
   if (!load || currentPanel !== "prompt") return;
   if (promptActiveTab === "assets") loadPromptAssets({quiet: true});
+  if (promptActiveTab === "lab") loadPromptPlans({quiet: true});
   if (promptActiveTab === "diagnostics") loadExperimentalProfiles({quiet: true});
 }
 
@@ -3777,9 +3826,11 @@ function promptLabCandidateCard(candidate) {
   select.textContent = promptLabSelection === candidate.candidate_id ? "已选择" : "选择比较";
   select.addEventListener("click", () => selectPromptLabCandidate(candidate.candidate_id));
   const confirm = document.createElement("button");
-  confirm.className = "primary";
+  confirm.className = "primary prompt-lab-confirm-button";
   confirm.type = "button";
-  confirm.textContent = "确认并进入 Composer";
+  confirm.textContent = document.querySelector("#prompt-plan-save")?.checked === false
+    ? "仅确认 Composer"
+    : "确认并保存方案";
   confirm.addEventListener("click", async () => {
     selectPromptLabCandidate(candidate.candidate_id);
     await confirmPromptLabCandidate(confirm);
@@ -3894,7 +3945,12 @@ async function confirmPromptLabCandidate(button) {
     document.querySelector("#prompt-lab-status").textContent = "请先生成并选择一张候选卡。";
     return;
   }
-  if (!(await confirmAction("确认将所选候选送入 Prompt Composer？这一步仍不会生成图片。", {title: "确认候选草稿", confirmLabel: "确认并组合", danger: false}))) return;
+  const savePlan = document.querySelector("#prompt-plan-save").checked;
+  const planName = document.querySelector("#prompt-plan-name").value.trim();
+  const actionText = savePlan
+    ? "确认组合所选候选并保存为可在 QQ 调用的方案？这一步不会自动生成图片。"
+    : "确认将所选候选送入 Prompt Composer？这一步不会保存方案，也不会生成图片。";
+  if (!(await confirmAction(actionText, {title: "确认候选草稿", confirmLabel: savePlan ? "确认并保存" : "仅确认组合", danger: false}))) return;
   setBusy(button, true, "正在确认…");
   try {
     const data = await api("/api/prompt-lab/confirm", {
@@ -3904,15 +3960,149 @@ async function confirmPromptLabCandidate(button) {
         selection: promptLabSelection,
         candidate_id: promptLabSelection,
         asset_library_fingerprint: promptAssetFingerprint,
+        save_plan: savePlan,
+        plan_name: planName,
       }),
     });
     renderCompositionProof("#prompt-lab-confirm-result", "#prompt-lab-confirm-badge", data, "CONFIRMED");
-    document.querySelector("#prompt-lab-status").textContent = data.message || "候选已确认并经过 Composer；未提交 ComfyUI。";
+    const plan = data?.plan || data?.result?.plan || null;
+    const planId = String(plan?.plan_id || plan?.id || "");
+    document.querySelector("#prompt-lab-status").textContent = data.message || (planId
+      ? `方案 ${planId} 已保存；可在 QQ 使用 /方案 ${planId}。`
+      : "候选已确认并经过 Composer；未提交 ComfyUI。");
+    if (savePlan) await loadPromptPlans({quiet: true});
   } catch (error) {
     document.querySelector("#prompt-lab-status").textContent = `确认失败：${error.message}`;
     showToast(error.message, true);
   } finally {
     setBusy(button, false);
+  }
+}
+
+async function copyPromptPlanCommand(planId) {
+  const id = String(planId || "").trim();
+  if (!id) return;
+  const command = `/方案 ${id}`;
+  try {
+    await navigator.clipboard.writeText(command);
+  } catch (_error) {
+    const textarea = document.createElement("textarea");
+    textarea.value = command;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+  showToast(`已复制：${command}`);
+}
+
+function promptPlanCard(plan) {
+  const planId = String(plan?.plan_id || plan?.id || "").trim();
+  const builtin = Boolean(plan?.builtin) || planId.startsWith("EX-");
+  const article = document.createElement("article");
+  article.className = `prompt-plan-card${builtin ? " builtin" : ""}`;
+  const head = document.createElement("header");
+  const heading = document.createElement("div");
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "eyebrow";
+  eyebrow.textContent = builtin ? "BUILT-IN EXAMPLE" : "SAVED PLAN";
+  const title = document.createElement("h3");
+  title.textContent = String(plan?.name || planId || "未命名方案");
+  heading.append(eyebrow, title);
+  const badge = document.createElement("span");
+  badge.className = "ticket-tag";
+  badge.textContent = planId || "NO ID";
+  head.append(heading, badge);
+
+  const facts = document.createElement("dl");
+  facts.className = "prompt-plan-facts";
+  for (const [label, value] of [
+    ["管线", plan?.pipeline || "base"],
+    ["更新", promptTimestamp(plan?.updated_at || plan?.created_at)],
+  ]) {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = String(value || "—");
+    row.append(term, detail);
+    facts.append(row);
+  }
+
+  const preview = document.createElement("p");
+  preview.className = "prompt-plan-preview";
+  preview.textContent = String(plan?.positive_prompt || plan?.positive || "未返回提示词预览");
+  const actions = document.createElement("div");
+  actions.className = "prompt-plan-actions";
+  const copy = document.createElement("button");
+  copy.className = "secondary";
+  copy.type = "button";
+  copy.textContent = "复制 QQ 指令";
+  copy.disabled = !planId;
+  copy.addEventListener("click", () => copyPromptPlanCommand(planId));
+  actions.append(copy);
+  if (!builtin) {
+    const remove = document.createElement("button");
+    remove.className = "ghost danger-button";
+    remove.type = "button";
+    remove.textContent = "删除方案";
+    remove.disabled = !planId;
+    remove.addEventListener("click", () => deletePromptPlan(planId, plan?.name));
+    actions.append(remove);
+  }
+  article.append(head, facts, preview, actions);
+  return article;
+}
+
+function renderPromptPlans(data) {
+  const items = Array.isArray(data) ? data : (data?.items || data?.plans || data?.results || []);
+  promptPlanItems = Array.isArray(items) ? items : [];
+  const container = document.querySelector("#prompt-plan-list");
+  container.replaceChildren();
+  document.querySelector("#prompt-plan-count").textContent = `${promptPlanItems.length} PLANS`;
+  if (!promptPlanItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state compact-empty";
+    empty.textContent = "尚未保存方案；可先确认一张候选卡，或使用内置示例。";
+    container.append(empty);
+    return;
+  }
+  for (const plan of promptPlanItems) container.append(promptPlanCard(plan));
+}
+
+async function loadPromptPlans({quiet = false} = {}) {
+  const status = document.querySelector("#prompt-plan-status");
+  status.textContent = "正在读取持久化方案库…";
+  try {
+    const data = await api("/api/prompt-plans");
+    renderPromptPlans(data);
+    status.textContent = data?.message || `已读取 ${promptPlanItems.length} 个方案。`;
+    return data;
+  } catch (error) {
+    status.textContent = `方案库读取失败：${error.message}`;
+    if (!quiet) showToast(error.message, true);
+    return null;
+  }
+}
+
+async function deletePromptPlan(planId, planName = "") {
+  const label = String(planName || planId || "此方案");
+  if (!(await confirmAction(`删除自定义方案“${label}”？此操作不会删除素材库或 LoRA。`, {title: "删除 QQ 方案", confirmLabel: "确认删除"}))) return;
+  const status = document.querySelector("#prompt-plan-status");
+  status.textContent = `正在删除 ${planId}…`;
+  try {
+    const data = await api("/api/prompt-plans/delete", {
+      method: "POST",
+      body: JSON.stringify({plan_id: planId}),
+    });
+    status.textContent = data?.message || `方案 ${planId} 已删除。`;
+    await loadPromptPlans({quiet: true});
+  } catch (error) {
+    status.textContent = `方案删除失败：${error.message}`;
+    showToast(error.message, true);
   }
 }
 
@@ -4381,6 +4571,7 @@ document.querySelector("#lora-detail-reanalyze").addEventListener("click", (even
 });
 document.querySelector("#preset-form").addEventListener("submit", savePreset);
 document.querySelector("#preset-refresh").addEventListener("click", loadPresets);
+document.querySelector("#preset-cancel-edit").addEventListener("click", resetPresetEditor);
 document.querySelector("#model-refresh").addEventListener("click", loadModels);
 document.querySelector("#task-refresh").addEventListener("click", () => loadTasks());
 document.querySelector("#task-type-filter").addEventListener("change", () => {
@@ -4471,6 +4662,13 @@ document.querySelector("#prompt-custom-delete").addEventListener("click", delete
 document.querySelector("#prompt-asset-import-form").addEventListener("submit", importPromptAssets);
 document.querySelector("#prompt-asset-url-form").addEventListener("submit", updatePromptAssetsFromUrl);
 document.querySelector("#prompt-lab-form").addEventListener("submit", generatePromptLab);
+document.querySelector("#prompt-plans-refresh").addEventListener("click", () => loadPromptPlans());
+document.querySelector("#prompt-plan-save").addEventListener("change", (event) => {
+  document.querySelector("#prompt-plan-name").disabled = !event.target.checked;
+  for (const button of document.querySelectorAll(".prompt-lab-confirm-button")) {
+    button.textContent = event.target.checked ? "确认并保存方案" : "仅确认 Composer";
+  }
+});
 document.querySelector("#prompt-lab-use-composer").addEventListener("click", (event) => {
   promptLabUseComposerBase = !promptLabUseComposerBase;
   event.currentTarget.classList.toggle("active", promptLabUseComposerBase);

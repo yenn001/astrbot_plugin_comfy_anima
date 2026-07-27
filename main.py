@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.7.1
+AstrBot Comfy Anima 插件 v1.8.3
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.7.1
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.7.1
-日期: 2026-07-26
+版本: 1.8.3
+日期: 2026-07-27
 """
 
 import asyncio
@@ -87,7 +87,11 @@ from .services.control_modes import (
     extract_natural_control_modes,
     looks_like_control_request,
 )
-from .services.danbooru_index import DanbooruIndexError, DanbooruTagIndex
+from .services.danbooru_index import (
+    DanbooruIndexError,
+    DanbooruTagIndex,
+    escape_prompt_tag,
+)
 from .services.experimental_profiles import inspect_experimental_profiles
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
 from .services.lora_retrieval import LoraHybridSearchService
@@ -141,6 +145,11 @@ from .services.prompt_assets import PromptAssetError, PromptAssetLibrary
 from .services.prompt_composer import PromptComposer, PromptDiagnosticsStore
 from .services.provider_response import response_error_code
 from .services.prompt_lab import PromptLab, PromptLabBatch, PromptLabError
+from .services.prompt_plans import (
+    PromptPlanError,
+    PromptPlanNotFoundError,
+    PromptPlanStore,
+)
 from .services.plugin_page import PluginPageApi
 from .services.reverse_prompt import (
     ReversePromptError,
@@ -175,8 +184,49 @@ AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）
 - “把图中 A 角色换成 B 角色并保持场景”属于语义换角，由插件专用路由处理；不要擅自退化为普通 pic 或局部 edit。
 - 只有人物身份 A→B 才是换角；“把泳装换成礼服、把背景换成夜景、把发型换成长发”是属性改图。若用户同时要求“把 A 换成 B 并穿新衣”，保留为一个组合换角任务，不要丢弃服装覆盖要求。
 - LoRA 文件名只能来自本次工具返回；插件会在提交前强制刷新并复核 LoRA Manager 与 ComfyUI。
+- 插件可能提供 `search_anima_danbooru_tags` 只读工具和本地 Danbooru 索引。对不确定的角色、作品、画师、服装或姿势 canonical tag，优先一次批量查询；只有 exact canonical 或 unique alias 且 `verified=true` 才能当作已确认标签。prefix、keyword、fuzzy 只是候选，必须再 exact 确认。常见且确定的 general tag 不要逐个查询；工具不可用时不得声称已经查库。
+- 管理员说“用方案 P-XXXXXX/某方案画图”时，先调用 `list_anima_prompt_plans`。先用 detail=false 查找真实 ID；唯一确认后再用 detail=true 读取完整正负提示词和管线。不得编造方案 ID、名称或内容。读取成功后把方案 positive_prompt 原样作为 `<pic prompt>` 基础，negative_prompt 放入 negative，除非用户明确覆盖管线，否则沿用方案 pipeline。
 - `emit_anima_plan_v1` 是插件内部绘图导演的私有输出协议，不是普通对话工具。普通对话绝对不要调用或提及它；需要生图时必须在最终可见回复中输出合法 `<pic>` 标签，等待插件接管并真正提交 ComfyUI。
 """.strip()
+
+_DANBOORU_TOOL_CATEGORIES = {
+    "": "",
+    "0": "general",
+    "1": "artist",
+    "3": "copyright",
+    "4": "character",
+    "5": "meta",
+    "general": "general",
+    "artist": "artist",
+    "copyright": "copyright",
+    "character": "character",
+    "meta": "meta",
+}
+_DANBOORU_BATCH_SPLIT_RE = re.compile(r"[|\r\n]+")
+_DANBOORU_IDENTITY_CATEGORIES = frozenset({"artist", "copyright", "character"})
+_DANBOORU_ROUTER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "at",
+        "by",
+        "draw",
+        "for",
+        "from",
+        "girl",
+        "image",
+        "in",
+        "man",
+        "of",
+        "on",
+        "picture",
+        "the",
+        "to",
+        "with",
+        "woman",
+    }
+)
 
 PIPELINE_PROFILE_MAP = {
     "anima_base": "base",
@@ -346,6 +396,9 @@ class ComfyAnimaPlugin(Star):
         )
         self._config_profiles = ConfigProfileService(
             self._persistent_data_dir / "config_profiles.json"
+        )
+        self._prompt_plans = PromptPlanStore(
+            self._persistent_data_dir / "prompt_plans_v1.json"
         )
         self._semantic_index_path = self._persistent_data_dir / "lora_semantic_v2.json"
         self._semantic_index_error = ""
@@ -790,6 +843,7 @@ class ComfyAnimaPlugin(Star):
                     if self.settings.enable_prompt_composer_v2
                     else None
                 ),
+                danbooru_status_provider=self._danbooru_index.status,
             )
             if not self._auto_draw_system_prompt:
                 self._auto_draw_system_prompt = reference_path.read_text(
@@ -853,6 +907,354 @@ class ComfyAnimaPlugin(Star):
                 f"[{PLUGIN_NAME}] Web UI startup failed: {exc}",
                 exc_info=True,
             )
+
+    @staticmethod
+    def _danbooru_tool_index_payload(status: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ready": bool(status.get("ready")),
+            "revision": str(status.get("revision") or "")[:64],
+            "tag_count": max(0, int(status.get("tag_count") or 0)),
+            "alias_count": max(0, int(status.get("alias_count") or 0)),
+        }
+
+    @staticmethod
+    def _danbooru_tool_candidate_payload(candidate: Any) -> dict[str, Any]:
+        canonical = str(
+            getattr(candidate, "canonical_tag", "")
+            or getattr(candidate, "tag", "")
+        ).strip()
+        aliases = tuple(str(item).strip() for item in getattr(candidate, "aliases", ()))
+        return {
+            "canonical_tag": canonical,
+            "prompt_tag": escape_prompt_tag(canonical) if canonical else "",
+            "category": str(getattr(candidate, "category", "") or ""),
+            "post_count": max(0, int(getattr(candidate, "count", 0) or 0)),
+            "match_type": str(getattr(candidate, "match_type", "none") or "none"),
+            "matched_value": str(getattr(candidate, "matched_value", "") or "")[:256],
+            "verified": bool(getattr(candidate, "verified", False)),
+            "aliases": [item for item in aliases if item][:6],
+        }
+
+    @filter.llm_tool(name="search_anima_danbooru_tags")
+    async def search_anima_danbooru_tags(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        mode: str = "exact",
+        category: str = "",
+        limit: int = 8,
+    ) -> str:
+        """在管理员导入的本地 Danbooru 索引中查询 canonical Tags。
+
+        这是只读工具，只用于真实绘图或标签校验。exact 会同时匹配 canonical
+        与唯一 alias；prefix/keyword 只返回候选，必须再用候选 canonical_tag
+        做 exact 查询并确认 verified=true。batch 使用竖线或换行分隔多个待验证
+        Tag，一次最多 12 项。不要用它逐个查询常见 general Tags。
+
+        Args:
+            query(string): 一个查询；batch 模式用 `tag1 | tag2` 或换行分隔。
+            mode(string): exact、prefix、keyword 或 batch，默认 exact。
+            category(string): 可选 general、artist、copyright、character、meta。
+            limit(number): prefix/keyword 最多返回多少候选，范围 1 到 12。
+        """
+
+        del event
+        normalized_mode = str(mode or "exact").strip().casefold()
+        if normalized_mode in {"alias"}:
+            normalized_mode = "exact"
+        if normalized_mode in {"contains", "search"}:
+            normalized_mode = "keyword"
+        if normalized_mode not in {"exact", "prefix", "keyword", "batch"}:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "code": "DANBOORU_INVALID_MODE",
+                    "allowed": ["exact", "prefix", "keyword", "batch"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        category_key = str(category or "").strip().casefold()
+        if category_key not in _DANBOORU_TOOL_CATEGORIES:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "code": "DANBOORU_INVALID_CATEGORY",
+                    "allowed": ["general", "artist", "copyright", "character", "meta"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        normalized_category = _DANBOORU_TOOL_CATEGORIES[category_key]
+        try:
+            effective_limit = max(1, min(int(limit), 12))
+        except (TypeError, ValueError):
+            return json.dumps(
+                {"ok": False, "code": "DANBOORU_INVALID_LIMIT", "max_limit": 12},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        raw_query = str(query or "").strip()
+        if not raw_query or len(raw_query) > 4096:
+            return json.dumps(
+                {"ok": False, "code": "DANBOORU_INVALID_QUERY"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        status = await asyncio.to_thread(self._danbooru_index.status)
+        if not bool(status.get("ready")):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "code": "DANBOORU_INDEX_UNAVAILABLE",
+                    "index": self._danbooru_tool_index_payload(status),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        if normalized_mode == "batch":
+            queries = tuple(
+                dict.fromkeys(
+                    item.strip()
+                    for item in _DANBOORU_BATCH_SPLIT_RE.split(raw_query)
+                    if item.strip()
+                )
+            )
+            if not queries or len(queries) > 12 or any(len(item) > 256 for item in queries):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "code": "DANBOORU_INVALID_BATCH",
+                        "max_queries": 12,
+                        "max_query_length": 256,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            lookups = await asyncio.to_thread(
+                self._danbooru_index.lookup_many,
+                queries,
+                normalized_category,
+            )
+            query_results = [
+                {
+                    "query": lookup.query,
+                    "verified": bool(lookup.verified),
+                    "results": (
+                        [self._danbooru_tool_candidate_payload(lookup)]
+                        if lookup.found
+                        else []
+                    ),
+                }
+                for lookup in lookups
+            ]
+        else:
+            if len(raw_query) > 256:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "code": "DANBOORU_QUERY_TOO_LONG",
+                        "max_query_length": 256,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            if normalized_mode == "keyword" and len(raw_query) < 2:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "code": "DANBOORU_QUERY_TOO_SHORT",
+                        "minimum_keyword_length": 2,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            candidates = await asyncio.to_thread(
+                self._danbooru_index.search,
+                raw_query,
+                mode=normalized_mode,
+                category=normalized_category,
+                limit=effective_limit,
+            )
+            query_results = [
+                {
+                    "query": raw_query,
+                    "verified": bool(candidates and candidates[0].verified),
+                    "results": [
+                        self._danbooru_tool_candidate_payload(candidate)
+                        for candidate in candidates
+                    ],
+                }
+            ]
+
+        final_status = await asyncio.to_thread(self._danbooru_index.status)
+        index_changed = str(status.get("revision") or "") != str(
+            final_status.get("revision") or ""
+        )
+        if index_changed:
+            if normalized_mode == "batch":
+                lookups = await asyncio.to_thread(
+                    self._danbooru_index.lookup_many,
+                    queries,
+                    normalized_category,
+                )
+                query_results = [
+                    {
+                        "query": lookup.query,
+                        "verified": bool(lookup.verified),
+                        "results": (
+                            [self._danbooru_tool_candidate_payload(lookup)]
+                            if lookup.found
+                            else []
+                        ),
+                    }
+                    for lookup in lookups
+                ]
+            else:
+                candidates = await asyncio.to_thread(
+                    self._danbooru_index.search,
+                    raw_query,
+                    mode=normalized_mode,
+                    category=normalized_category,
+                    limit=effective_limit,
+                )
+                query_results = [
+                    {
+                        "query": raw_query,
+                        "verified": bool(candidates and candidates[0].verified),
+                        "results": [
+                            self._danbooru_tool_candidate_payload(candidate)
+                            for candidate in candidates
+                        ],
+                    }
+                ]
+            repeated_status = await asyncio.to_thread(self._danbooru_index.status)
+            if str(final_status.get("revision") or "") != str(
+                repeated_status.get("revision") or ""
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "code": "DANBOORU_INDEX_CHANGED",
+                        "index": self._danbooru_tool_index_payload(repeated_status),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            final_status = repeated_status
+        payload = {
+            "ok": True,
+            "code": "DANBOORU_QUERY_OK",
+            "index": self._danbooru_tool_index_payload(final_status),
+            "index_changed_during_query": index_changed,
+            "mode": normalized_mode,
+            "category": normalized_category,
+            "queries": query_results,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(encoded.encode("utf-8")) > 24 * 1024:
+            for item in query_results:
+                for result in item["results"]:
+                    result["aliases"] = []
+            payload["aliases_truncated"] = True
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        logger.info(
+            f"[{PLUGIN_NAME}] Danbooru LLM query completed: "
+            f"mode={normalized_mode}, category={normalized_category or 'any'}, "
+            f"queries={len(query_results)}, "
+            f"results={sum(len(item['results']) for item in query_results)}, "
+            f"revision={str(final_status.get('revision') or '')[:16]}, "
+            f"changed={index_changed}"
+        )
+        return encoded
+
+    @filter.llm_tool(name="list_anima_prompt_plans")
+    async def list_anima_prompt_plans(
+        self,
+        event: AstrMessageEvent,
+        keyword: str = "",
+        detail: bool = False,
+    ) -> str:
+        """查询管理员在 Prompt Lab 保存的 QQ 绘图方案及内置示例。
+
+        只在管理员明确提到“方案”、短 ID 或已保存方案名称时调用。先用
+        detail=false 确认唯一 ID；真正出图前再用该 ID 和 detail=true 读取完整
+        positive_prompt、negative_prompt 与 pipeline。不得猜测或编造方案。
+
+        Args:
+            keyword(string): 可选方案 ID、完整名称或唯一短名称。
+            detail(boolean): 是否返回完整正负提示词和分槽；默认只返回摘要。
+        """
+
+        is_admin = getattr(event, "is_admin", None)
+        if not callable(is_admin) or not bool(is_admin()):
+            return json.dumps(
+                {"ok": False, "code": "PROMPT_PLAN_DENIED"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        query = str(keyword or "").strip()
+        if len(query) > 128:
+            return json.dumps(
+                {"ok": False, "code": "PROMPT_PLAN_INVALID_QUERY"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        try:
+            if query and bool(detail):
+                plans = [self._prompt_plans.resolve_plan(query)]
+            else:
+                plans = self._prompt_plans.list_plans(
+                    keyword=query,
+                    include_prompts=bool(detail),
+                )[:50]
+        except PromptPlanError as exc:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "code": "PROMPT_PLAN_LOOKUP_FAILED",
+                    "message": str(exc)[:256],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        safe_plans: list[dict[str, Any]] = []
+        for plan in plans:
+            item = {
+                "plan_id": str(plan.get("plan_id") or ""),
+                "name": str(plan.get("name") or ""),
+                "pipeline": str(plan.get("pipeline") or "base"),
+                "builtin": bool(plan.get("builtin")),
+            }
+            if detail:
+                item.update(
+                    {
+                        "positive_prompt": str(plan.get("positive_prompt") or ""),
+                        "negative_prompt": str(plan.get("negative_prompt") or ""),
+                        "layers": plan.get("layers") or {},
+                        "locked_layers": list(plan.get("locked_layers") or ()),
+                    }
+                )
+            safe_plans.append(item)
+        return json.dumps(
+            {
+                "ok": True,
+                "code": "PROMPT_PLAN_QUERY_OK",
+                "count": len(safe_plans),
+                "plans": safe_plans,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     @filter.llm_tool(name="list_anima_loras")
     async def list_anima_loras(
@@ -1061,6 +1463,12 @@ class ComfyAnimaPlugin(Star):
         if self._access_error(event, "", check_sensitive=False):
             return
         prompt_parts: list[str] = [AUTO_DRAW_CONTROL_PROTOCOL]
+        director = getattr(self, "_director", None)
+        danbooru_context = (
+            director.danbooru_runtime_context() if director is not None else ""
+        )
+        if danbooru_context:
+            prompt_parts.append(danbooru_context)
         system_prompt = self._auto_draw_system_prompt.strip()
         if system_prompt:
             prompt_parts.append(system_prompt)
@@ -1309,7 +1717,11 @@ class ComfyAnimaPlugin(Star):
         """Handle only explicit image A-to-B requests before ordinary drawing."""
 
         message = str(event.message_str or "").strip()
-        if not message or message.startswith(("/", "／")):
+        if (
+            not message
+            or self._event_has_explicit_command_route(event)
+            or message.startswith(("/", "／"))
+        ):
             return
         request = parse_natural_character_swap(message)
         if request is None:
@@ -1437,6 +1849,7 @@ class ComfyAnimaPlugin(Star):
         if (
             not self.settings.enable_natural_draw
             or not message
+            or self._event_has_explicit_command_route(event)
             or message.startswith(("/", "／"))
             or parse_natural_character_swap(message) is not None
             or self._looks_like_inpaint_request(message)
@@ -1520,6 +1933,7 @@ class ComfyAnimaPlugin(Star):
         message = str(event.message_str or "").strip()
         if (
             not message
+            or self._event_has_explicit_command_route(event)
             or message.startswith(("/", "／"))
             or parse_natural_character_swap(message) is not None
             or self._looks_like_inpaint_request(message)
@@ -1597,6 +2011,7 @@ class ComfyAnimaPlugin(Star):
         if (
             not self.settings.enable_inpaint
             or not message
+            or self._event_has_explicit_command_route(event)
             or message.startswith(("/", "／"))
             or not self._looks_like_inpaint_request(message)
         ):
@@ -1629,6 +2044,7 @@ class ComfyAnimaPlugin(Star):
         message = (event.message_str or "").strip()
         if (
             not self.settings.enable_natural_draw
+            or self._event_has_explicit_command_route(event)
             or message.startswith(("/", "／"))
             or not self._looks_like_draw_request(message)
         ):
@@ -1723,6 +2139,293 @@ class ComfyAnimaPlugin(Star):
             event, command_text, forward=True
         ):
             yield response
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("方案列表")
+    async def cmd_prompt_plan_list(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[Any, None]:
+        """列出 Prompt Lab 已保存方案与内置示例。"""
+
+        try:
+            plans = await asyncio.to_thread(
+                self._prompt_plans.list_plans,
+                include_prompts=False,
+            )
+        except PromptPlanError as exc:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 方案库读取失败: {exc}"
+            )
+            return
+        lines = ["📚 可用绘图方案:"]
+        for plan in plans:
+            marker = "内置" if plan.get("builtin") else "自定义"
+            lines.append(
+                f"{plan['plan_id']}｜{plan['name']}｜"
+                f"{plan.get('pipeline') or 'base'}｜{marker}"
+            )
+        lines.append("用法: /方案 <ID或名称> [--seed/--size/--pipeline 等参数]")
+        yield event.plain_result("\n".join(lines))
+
+    def _resolve_prompt_plan_request(
+        self,
+        request_text: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Resolve the longest real plan prefix and return its user delta."""
+
+        text = str(request_text or "").strip()
+        if not text:
+            raise PromptPlanNotFoundError("prompt plan request is empty")
+        id_match = re.match(
+            r"^(?P<id>(?:P-[0-9A-Fa-f]{6}|EX-[0-9]{3}))"
+            r"(?=$|[\s:：,，]|[\u4e00-\u9fff])"
+            r"[\s:：,，]*(?P<delta>.*)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if id_match is not None:
+            return (
+                self._prompt_plans.resolve_plan(id_match.group("id")),
+                id_match.group("delta").strip(),
+            )
+        try:
+            return self._prompt_plans.resolve_plan(text), ""
+        except PromptPlanNotFoundError as original_error:
+            parts = text.split()
+            for end in range(len(parts) - 1, 0, -1):
+                candidate = " ".join(parts[:end]).strip()
+                delta = " ".join(parts[end:]).strip()
+                try:
+                    return self._prompt_plans.resolve_plan(candidate), delta
+                except PromptPlanNotFoundError:
+                    continue
+            raise original_error
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("方案")
+    async def cmd_prompt_plan_draw(
+        self, event: AstrMessageEvent, selection: str = ""
+    ) -> AsyncGenerator[Any, None]:
+        """按持久化 Prompt Plan 走正常权限、LoRA 刷新与生图主链。"""
+
+        command_text = self._extract_command_text(
+            event.message_str,
+            selection,
+            command="方案",
+        )
+        if not command_text:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 用法: /方案 <ID或名称> "
+                "[--seed 123 --size 832x1216 --pipeline base|rtx|iterative]"
+            )
+            return
+        try:
+            overrides = parse_generation_options(
+                command_text,
+                mode_context="generation",
+            )
+            plan, user_delta = await asyncio.to_thread(
+                self._resolve_prompt_plan_request,
+                overrides.prompt,
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        except PromptPlanError as exc:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 方案查找失败: {exc}"
+            )
+            return
+        positive_prompt = str(plan.get("positive_prompt") or "").strip()
+        if not positive_prompt:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 方案正面提示词为空")
+            return
+        if len(positive_prompt) > self.settings.max_prompt_length:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 方案提示词超过当前上限 "
+                f"{self.settings.max_prompt_length} 字符"
+            )
+            return
+        if len(user_delta) > self.settings.max_prompt_length:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 方案追加要求不能超过 "
+                f"{self.settings.max_prompt_length} 字符"
+            )
+            return
+        stored_negative = str(plan.get("negative_prompt") or "").strip(" ,")
+        extra_negative = overrides.negative_prompt.strip(" ,")
+        access_error = self._access_error(
+            event,
+            ", ".join(
+                part
+                for part in (
+                    positive_prompt,
+                    stored_negative,
+                    extra_negative,
+                    user_delta,
+                )
+                if part
+            ),
+        )
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        if not self._client or (not self._workflow_builder and not self._pipeline_builders):
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 插件尚未就绪: {self._initialization_error}"
+            )
+            return
+        final_prompt = positive_prompt
+        directed_negative = ""
+        director_provider = ""
+        requested_pipeline = ""
+        width, height = overrides.width, overrides.height
+        preset_name = overrides.lora_preset
+        if user_delta:
+            try:
+                detected_width, detected_height = self._extract_resolution_request(
+                    user_delta
+                )
+                width = width if width is not None else detected_width
+                height = height if height is not None else detected_height
+                requested_pipeline = self._extract_pipeline_request(user_delta)
+                preset_name = preset_name or self._find_requested_style_preset(
+                    user_delta
+                )
+            except ValueError as exc:
+                yield event.plain_result(f"{MessageEmoji.ERROR} 追加要求参数错误: {exc}")
+                return
+            if overrides.use_prompt_llm is False:
+                final_prompt = ", ".join(
+                    part.strip(" ,")
+                    for part in (positive_prompt, user_delta)
+                    if part.strip(" ,")
+                )
+            else:
+                if not self._director:
+                    yield event.plain_result(
+                        f"{MessageEmoji.ERROR} 方案追加要求需要可用的 LLM 绘图导演: "
+                        f"{self._director_error}"
+                    )
+                    return
+                director_request = (
+                    "Adapt one already confirmed Anima drawing baseline only as requested. "
+                    "Preserve every baseline fact that the user_delta does not explicitly "
+                    "replace. Keep exact LoRA controls and filenames unchanged. Return one "
+                    "final three-layer Anima prompt and bounded negative tags; do not explain "
+                    "the operation. Input data:\n"
+                    + json.dumps(
+                        {
+                            "confirmed_positive_prompt": positive_prompt,
+                            "confirmed_negative_prompt": stored_negative,
+                            "confirmed_pipeline": str(plan.get("pipeline") or "base"),
+                            "user_delta": user_delta,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                try:
+                    instruction, director_provider = (
+                        await self._generate_directed_instruction(
+                            event,
+                            director_request,
+                        )
+                    )
+                except PromptDirectorError as exc:
+                    yield event.plain_result(
+                        f"{MessageEmoji.ERROR} 方案追加要求编排失败: {exc.user_message}"
+                    )
+                    return
+                final_prompt = instruction.prompt
+                directed_negative = instruction.negative_prompt.strip(" ,")
+            if len(final_prompt) > self.settings.max_prompt_length:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 调整后的方案提示词超过当前上限 "
+                    f"{self.settings.max_prompt_length} 字符"
+                )
+                return
+            final_access_error = self._access_error(event, final_prompt)
+            if final_access_error:
+                yield event.plain_result(
+                    f"{MessageEmoji.WARNING} {final_access_error}"
+                )
+                return
+        negative_prompt = ", ".join(
+            part
+            for part in (stored_negative, directed_negative, extra_negative)
+            if part
+        )
+        final_access_error = self._access_error(
+            event,
+            ", ".join(
+                part for part in (final_prompt, negative_prompt) if part
+            ),
+        )
+        if final_access_error:
+            yield event.plain_result(
+                f"{MessageEmoji.WARNING} {final_access_error}"
+            )
+            return
+        if self.settings.send_generation_notice:
+            yield event.plain_result(
+                f"{MessageEmoji.DRAW} 正在"
+                f"{'按追加要求调整并' if user_delta else ''}执行方案 "
+                f"{plan['plan_id']}｜{plan['name']}……"
+            )
+        try:
+            image_paths, seed, _, _, warning = await self._run_job(
+                event,
+                GenerationOptions(
+                    prompt=final_prompt,
+                    negative_prompt=negative_prompt,
+                    seed=overrides.seed,
+                    width=width,
+                    height=height,
+                    steps=overrides.steps,
+                    cfg=overrides.cfg,
+                    enable_upscale=overrides.enable_upscale,
+                    use_prompt_llm=False,
+                    lora_preset=preset_name,
+                    pipeline=(
+                        overrides.pipeline
+                        or requested_pipeline
+                        or (
+                            instruction.pipeline
+                            if user_delta and overrides.use_prompt_llm is not False
+                            else ""
+                        )
+                        or str(plan.get("pipeline") or "base")
+                    ),
+                    denoise=overrides.denoise,
+                ),
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except PromptDirectorError as exc:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 方案提示词处理失败: {exc.user_message}"
+            )
+            return
+        except (ComfyClientError, WorkflowError) as exc:
+            message = getattr(exc, "user_message", str(exc))
+            logger.error(f"[{PLUGIN_NAME}] prompt plan draw failed: {exc}", exc_info=True)
+            yield event.plain_result(f"{MessageEmoji.ERROR} 方案生成失败: {message}")
+            return
+        if warning:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {warning}")
+        yield event.plain_result(
+            f"{MessageEmoji.INFO} 已执行方案 {plan['plan_id']}｜{plan['name']}"
+            + (f"\n追加要求: {user_delta}" if user_delta else "")
+            + (
+                f"\n绘图导演模型: {director_provider}"
+                if user_delta and self.settings.show_llm_prompt
+                else ""
+            )
+        )
+        yield self._make_image_result(event, image_paths, seed, forward=False)
+        self._schedule_cleanup(image_paths)
 
     @filter.command("画图no")
     async def cmd_draw_direct(
@@ -2211,7 +2914,11 @@ class ComfyAnimaPlugin(Star):
         """Route explicit existing-image upscale language before LLM drawing."""
 
         message = str(event.message_str or "").strip()
-        if not message or message.startswith(("/", "／")):
+        if (
+            not message
+            or self._event_has_explicit_command_route(event)
+            or message.startswith(("/", "／"))
+        ):
             return
         has_image = await self._image_input.has_any(event)
         if not self._looks_like_standalone_upscale_request(
@@ -3306,7 +4013,7 @@ class ComfyAnimaPlugin(Star):
             yield event.plain_result(
                 f"{MessageEmoji.INFO} 用法: /lora组合保存 <角色|风格|混合|auto> "
                 '<名称|数字|auto> <lora:名称:权重>... [--trigger "触发词"] '
-                '[--description "说明"]'
+                '[--alias "简称"] [--note "备注"] [--description "说明"]'
             )
             return
 
@@ -3314,6 +4021,8 @@ class ComfyAnimaPlugin(Star):
         lora_parts: list[str] = []
         trigger_words = ""
         description = ""
+        aliases: list[str] = []
+        note = ""
         index = 2
         while index < len(tokens):
             token = tokens[index]
@@ -3329,6 +4038,18 @@ class ComfyAnimaPlugin(Star):
                     return
                 index += 1
                 description = tokens[index]
+            elif token in {"--alias", "--aliases"}:
+                if index + 1 >= len(tokens):
+                    yield event.plain_result(f"{MessageEmoji.ERROR} {token} 缺少参数")
+                    return
+                index += 1
+                aliases.append(tokens[index])
+            elif token == "--note":
+                if index + 1 >= len(tokens):
+                    yield event.plain_result(f"{MessageEmoji.ERROR} {token} 缺少参数")
+                    return
+                index += 1
+                note = tokens[index]
             elif token.startswith("--"):
                 yield event.plain_result(f"{MessageEmoji.ERROR} 未知选项: {token}")
                 return
@@ -3348,6 +4069,8 @@ class ComfyAnimaPlugin(Star):
                 ),
                 trigger_words=trigger_words,
                 description=description,
+                aliases=aliases,
+                note=note,
                 refresh_action="管理员保存 LoRA 组合",
             )
         except (LoraPresetError, LoraCatalogError) as exc:
@@ -3388,7 +4111,10 @@ class ComfyAnimaPlugin(Star):
         entries: Any,
         trigger_words: str = "",
         description: str = "",
+        aliases: Any = (),
+        note: str = "",
         enabled: bool = True,
+        identifier: str = "",
         refresh_action: str = "保存 LoRA 组合",
     ) -> LoraPreset:
         """Validate against the fresh catalog and persist one preset transactionally."""
@@ -3401,7 +4127,10 @@ class ComfyAnimaPlugin(Star):
                 entries=entries,
                 trigger_words=trigger_words,
                 description=description,
+                aliases=aliases,
+                note=note,
                 enabled=enabled,
+                identifier=identifier,
                 refresh_action=refresh_action,
             )
 
@@ -3413,7 +4142,10 @@ class ComfyAnimaPlugin(Star):
         entries: Any,
         trigger_words: str = "",
         description: str = "",
+        aliases: Any = (),
+        note: str = "",
         enabled: bool = True,
+        identifier: str = "",
         refresh_action: str = "保存 LoRA 组合",
     ) -> LoraPreset:
         """Run one serialized preset validation and persistence transaction."""
@@ -3460,7 +4192,10 @@ class ComfyAnimaPlugin(Star):
             selections=selections,
             trigger_words=trigger_words,
             description=description,
+            aliases=aliases,
+            note=note,
             enabled=enabled,
+            identifier=identifier,
         )
         if not self._persist_config("lora_presets", self._lora_presets.to_config()):
             self._lora_presets.load(previous_presets)
@@ -3796,6 +4531,8 @@ iterative - Anima 原图 + 迭代采样放大
 QQ快捷指令:
 /画图 <英文 Tag或画面描述> [--llm] [--pipeline base|rtx|iterative] - 合并转发
 /画图no <英文 Tag或画面描述> [--llm] [--pipeline base|rtx|iterative] - 直接图片
+/方案列表 - 列出 Prompt Lab 持久化方案与内置示例（管理员）
+/方案 <ID或名称> [追加要求] [参数] - 使用或调整已确认方案并生图（管理员）
 /反推 [关注点] - 在线图片反推
 /反推画图 [补充要求] [--m p|d|l|r] - 反推并可接底图控制生成
 /改图 [要求] - 无蒙版整图修改；支持换衣、换背景、换表情或重新画一张
@@ -3832,6 +4569,8 @@ QQ快捷指令:
 /anima draw 1girl, white hair, blue eyes --raw --pipeline iterative --preset 风格001
 /画图 一名蓝发少女在海边浅水中拿着烟花 --llm --p r
 /画图no 1girl, blue hair, portrait --raw --p b
+/方案 EX-001 --seed 123 --p r
+/方案 我的雨夜方案 --sz 832x1216
 /底图控制 画成雨夜中的角色 --m p d --p r
 /底图控制 构图和姿势不变，用风格001-1画出来
 /底图控制 按线稿完成上色 --m l --p b
@@ -4945,14 +5684,27 @@ QQ快捷指令:
             self._internal_llm_events = internal_events
         internal_events.add(event_key)
         try:
-            lora_tools = (
-                self._get_lora_tool_set()
-                if self._scene_needs_lora_tools(scene_text)
-                else None
+            needs_prompt_plan_tools = self._scene_needs_prompt_plan_tools(
+                scene_text
+            )
+            needs_lora_tools = self._scene_needs_lora_tools(scene_text)
+            needs_danbooru_tools = self._scene_needs_danbooru_tools(scene_text)
+            lookup_tools = (
+                self._get_prompt_plan_tool_set()
+                if needs_prompt_plan_tools
+                else (
+                    self._get_lora_tool_set()
+                    if needs_lora_tools
+                    else (
+                        self._get_danbooru_tool_set()
+                        if needs_danbooru_tools
+                        else None
+                    )
+                )
             )
             output_tools = (
                 self._get_director_output_tool_set()
-                if lora_tools is None
+                if lookup_tools is None
                 else None
             )
             async with self._provider_slot():
@@ -4960,8 +5712,11 @@ QQ快捷指令:
                     self.context,
                     event,
                     scene_text,
-                    tools=lora_tools,
+                    tools=lookup_tools,
                     output_tools=output_tools,
+                    lookup_tool_call_timeout=(
+                        None if needs_lora_tools else 10
+                    ),
                 )
         finally:
             internal_events.discard(event_key)
@@ -4976,17 +5731,24 @@ QQ快捷指令:
         event_key = id(event)
         self._internal_llm_events.add(event_key)
         try:
-            lora_tools = (
+            needs_lora_tools = self._scene_needs_lora_tools(scene_text)
+            needs_danbooru_tools = self._scene_needs_danbooru_tools(scene_text)
+            lookup_tools = (
                 self._get_lora_tool_set()
-                if self._scene_needs_lora_tools(scene_text)
-                else None
+                if needs_lora_tools
+                else (
+                    self._get_danbooru_tool_set() if needs_danbooru_tools else None
+                )
             )
             async with self._provider_slot():
                 return await self._director.generate_edit_instruction(
                     self.context,
                     event,
                     scene_text,
-                    tools=lora_tools,
+                    tools=lookup_tools,
+                    lookup_tool_call_timeout=(
+                        None if needs_lora_tools else 10
+                    ),
                 )
         finally:
             self._internal_llm_events.discard(event_key)
@@ -5037,8 +5799,79 @@ QQ快捷指令:
                 return True
         return False
 
+    @staticmethod
+    def _scene_needs_prompt_plan_tools(scene_text: str) -> bool:
+        """Recognize explicit saved-plan intent without scanning other assets."""
+
+        source = str(scene_text or "")
+        if re.search(r"\b(?:P-[0-9A-Fa-f]{6}|EX-[0-9]{3})\b", source):
+            return True
+        return bool(
+            re.search(
+                r"(?:使用|用|套用|采用|调用|按)\s*[\"'“”‘’]?\s*方案",
+                source,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _danbooru_index_ready(self) -> bool:
+        index = getattr(self, "_danbooru_index", None)
+        if index is None:
+            return False
+        try:
+            return bool(index.status().get("ready"))
+        except Exception:
+            return False
+
+    def _scene_needs_danbooru_tools(self, scene_text: str) -> bool:
+        """Route only likely identity/tag lookups through the slower tool loop."""
+
+        index = getattr(self, "_danbooru_index", None)
+        if index is None or not self._danbooru_index_ready():
+            return False
+        source = str(scene_text or "")
+        folded = source.casefold()
+        if re.search(
+            r"\b(?:danbooru|booru|canonical\s*tags?|artist\s*tags?|"
+            r"character\s*tags?|copyright\s*tags?)\b|"
+            r"标签|tag名|角色名|作品名|画师名|画师标签|角色标签|作品标签",
+            folded,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        if re.search(r"[A-Za-z][^\r\n]{0,80}\\?\([^\r\n)]{2,80}\\?\)", source):
+            return True
+
+        words = [
+            token
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9'_-]{1,40}", source)
+            if token.casefold() not in _DANBOORU_ROUTER_STOPWORDS
+        ][:12]
+        queries: list[str] = []
+        for width in (1, 2, 3):
+            for start in range(0, len(words) - width + 1):
+                value = " ".join(words[start : start + width]).strip()
+                if 2 <= len(value) <= 96 and value not in queries:
+                    queries.append(value)
+                if len(queries) >= 24:
+                    break
+            if len(queries) >= 24:
+                break
+        if not queries:
+            return False
+        try:
+            lookups = index.lookup_many(queries)
+        except Exception:
+            return False
+        return any(
+            bool(lookup.verified)
+            and str(lookup.category or "").casefold()
+            in _DANBOORU_IDENTITY_CATEGORIES
+            for lookup in lookups
+        )
+
     def _get_lora_tool_set(self) -> Any:
-        """构造只读的 LoRA 清单与保存组合查询工具集。"""
+        """构造强制刷新的 LoRA 工具，并附带可用的 Danbooru 查询。"""
         if not self.settings.enable_lora_tool:
             return None
         try:
@@ -5048,6 +5881,8 @@ QQ快捷指令:
             tool_names = ["list_anima_lora_presets"]
             if self._lora_catalog:
                 tool_names.append("list_anima_loras")
+            if self._danbooru_index_ready():
+                tool_names.append("search_anima_danbooru_tags")
             tools = [
                 tool
                 for name in tool_names
@@ -5056,6 +5891,34 @@ QQ快捷指令:
             return ToolSet(tools) if tools else None
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] 无法构造 LoRA 工具集: {exc}")
+            return None
+
+    def _get_danbooru_tool_set(self) -> Any:
+        """Construct the read-only tag lookup set without invoking LoRA Manager."""
+
+        if not self._danbooru_index_ready():
+            return None
+        try:
+            from astrbot.core.agent.tool import ToolSet
+
+            manager = self.context.get_llm_tool_manager()
+            tool = manager.get_func("search_anima_danbooru_tags")
+            return ToolSet([tool]) if tool is not None else None
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 无法构造 Danbooru 工具集: {exc}")
+            return None
+
+    def _get_prompt_plan_tool_set(self) -> Any:
+        """Construct the local read-only Prompt Plan lookup set."""
+
+        try:
+            from astrbot.core.agent.tool import ToolSet
+
+            manager = self.context.get_llm_tool_manager()
+            tool = manager.get_func("list_anima_prompt_plans")
+            return ToolSet([tool]) if tool is not None else None
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 无法构造 Prompt Plan 工具集: {exc}")
             return None
 
     def _get_director_output_tool_set(self) -> Any:
@@ -7536,20 +8399,61 @@ QQ快捷指令:
                 )
             except (PromptLabError, TypeError, ValueError) as exc:
                 raise WebUiActionError(f"Prompt Lab 严格组合失败: {exc}") from exc
+            saved_plan: Optional[dict[str, Any]] = None
+            if bool(data.get("save_plan", False)):
+                plan_name = str(data.get("plan_name") or "").strip()
+                if not plan_name:
+                    plan_name = f"方案 {candidate.candidate_id[-6:].upper()}"
+                pipeline = str(
+                    data.get("pipeline")
+                    or getattr(self.settings, "default_generation_pipeline", "base")
+                    or "base"
+                ).strip().casefold()
+                if pipeline not in {"base", "rtx", "iterative"}:
+                    raise WebUiActionError("方案管线仅支持 base、rtx 或 iterative")
+                try:
+                    saved_plan = await asyncio.to_thread(
+                        self._prompt_plans.save_plan,
+                        name=plan_name,
+                        positive_prompt=composed.positive_prompt,
+                        negative_prompt=composed.negative_prompt,
+                        pipeline=pipeline,
+                        layers=candidate.layers.to_dict(),
+                        locked_layers=batch.locked_layers,
+                        source="prompt_lab",
+                    )
+                except PromptPlanError as exc:
+                    raise WebUiActionError(f"绘图方案保存失败: {exc}") from exc
             self._v170_task_event(
                 tracked["run_id"],
                 "composition",
-                "Confirmed candidate passed PromptComposer; no ComfyUI job was submitted.",
+                (
+                    "Confirmed candidate passed PromptComposer and was saved as a QQ plan; "
+                    "no ComfyUI job was submitted."
+                    if saved_plan is not None
+                    else "Confirmed candidate passed PromptComposer; no ComfyUI job was submitted."
+                ),
                 "prompt_lab_composed",
                 details={
                     "diagnostic_id": composed.diagnostic_id,
                     "lora_count": lora_validation["validated"],
+                    "plan_saved": saved_plan is not None,
+                    "plan_id": (
+                        str(saved_plan.get("plan_id") or "")
+                        if saved_plan is not None
+                        else ""
+                    ),
                 },
             )
             tracked["result"] = {
                 "diagnostic_id": composed.diagnostic_id,
                 "lora_count": lora_validation["validated"],
                 "asset_fingerprint": final_asset_fingerprint[:16],
+                "plan_id": (
+                    str(saved_plan.get("plan_id") or "")
+                    if saved_plan is not None
+                    else ""
+                ),
             }
             return {
                 "batch_id": batch.batch_id,
@@ -7559,9 +8463,49 @@ QQ快捷指令:
                 "asset_library_fingerprint": final_asset_fingerprint,
                 "lora_validation": lora_validation,
                 **self._composed_prompt_payload(composed),
+                "plan": saved_plan,
                 "submitted": False,
                 "task_run_id": tracked["run_id"],
             }
+
+    async def web_ui_list_prompt_plans(self) -> dict[str, Any]:
+        """Return the authenticated Prompt Plan library without internal paths."""
+
+        try:
+            plans = await asyncio.to_thread(
+                self._prompt_plans.list_plans,
+                include_prompts=True,
+            )
+        except PromptPlanError as exc:
+            raise WebUiActionError(f"方案库读取失败: {exc}") from exc
+        return {
+            "plans": plans,
+            "count": len(plans),
+            "custom_count": sum(not bool(item.get("builtin")) for item in plans),
+            "builtin_count": sum(bool(item.get("builtin")) for item in plans),
+        }
+
+    async def web_ui_delete_prompt_plan(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Delete one validated custom plan; built-ins remain immutable."""
+
+        data = self._require_web_payload(payload, "方案删除参数")
+        plan_id = str(data.get("plan_id") or "").strip().upper()
+        if not re.fullmatch(r"P-[0-9A-F]{6}", plan_id):
+            raise WebUiActionError("只能删除自定义 P-XXXXXX 方案")
+        try:
+            removed = await asyncio.to_thread(
+                self._prompt_plans.delete_plan,
+                plan_id,
+            )
+        except PromptPlanError as exc:
+            raise WebUiActionError(f"方案删除失败: {exc}") from exc
+        return {
+            "deleted": True,
+            "plan_id": removed["plan_id"],
+            "name": removed["name"],
+        }
 
     def _require_lora_visuals(self) -> LoraVisualService:
         service = getattr(self, "_lora_visuals", None)
@@ -9243,14 +10187,43 @@ QQ快捷指令:
         for preset in self._lora_presets.presets:
             available = True
             error = ""
+            resolved_selections = preset.selections
+            records_by_name: dict[str, Any] = {}
             try:
-                await self._lora_catalog.resolve_selections(
+                resolved_selections, records_by_name = (
+                    await self._lora_catalog.resolve_selections_with_records(
                     preset.selections,
                     strict=True,
+                )
                 )
             except LoraCatalogError as exc:
                 available = False
                 error = exc.user_message
+            manager_triggers: list[str] = []
+            seen_manager_triggers: set[str] = set()
+            for selection in resolved_selections:
+                record = records_by_name.get(
+                    canonical_lora_name(selection.name).casefold()
+                )
+                if record is None:
+                    continue
+                for trigger in getattr(record, "trigger_words", ()):
+                    value = str(trigger or "").strip()
+                    key = value.casefold()
+                    if value and key not in seen_manager_triggers:
+                        seen_manager_triggers.add(key)
+                        manager_triggers.append(value)
+            effective_triggers: list[str] = []
+            if available:
+                effective_triggers = list(
+                    build_lora_trigger_plan(
+                        prompt="",
+                        negative_prompt="",
+                        selections=resolved_selections,
+                        records_by_name=records_by_name,
+                        presets=(replace(preset, selections=resolved_selections),),
+                    ).added
+                )
             items.append(
                 {
                     "name": preset.name,
@@ -9261,7 +10234,14 @@ QQ快捷指令:
                         for selection in preset.selections
                     ],
                     "trigger_words": preset.trigger_words,
+                    "manager_trigger_words": manager_triggers,
+                    "effective_trigger_words": effective_triggers,
                     "description": preset.description,
+                    "aliases": list(preset.aliases),
+                    "derived_aliases": list(
+                        self._lora_presets.aliases_for(preset)
+                    ),
+                    "note": preset.note,
                     "enabled": preset.enabled,
                     "available": available,
                     "error": error,
@@ -9287,7 +10267,10 @@ QQ快捷指令:
                 entries=payload.get("loras", []),
                 trigger_words=str(payload.get("trigger_words") or ""),
                 description=str(payload.get("description") or ""),
+                aliases=payload.get("aliases", []),
+                note=str(payload.get("note") or ""),
                 enabled=bool(payload.get("enabled", True)),
+                identifier=str(payload.get("identifier") or ""),
                 refresh_action="Web UI 保存 LoRA 组合",
             )
         except (LoraCatalogError, LoraPresetError) as exc:
@@ -11932,6 +12915,45 @@ QQ快捷指令:
         preset = next((part for part in match.groups() if part is not None), "")
         cleaned = f"{text[: match.start()]} {text[match.end() :]}"
         return re.sub(r"\s{2,}", " ", cleaned).strip(), preset.strip()
+
+    @staticmethod
+    def _event_has_explicit_command_route(event: AstrMessageEvent) -> bool:
+        """Return true when AstrBot already activated an explicit command.
+
+        AstrBot removes the configured wake prefix from ``event.message_str``
+        before plugin handlers run.  Consequently, checking only for a leading
+        slash cannot protect higher-priority natural-language routes from
+        stealing commands such as ``/画图 ... dramatic pose ...``.
+        """
+
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            try:
+                parsed = get_extra("handlers_parsed_params", {})
+            except TypeError:
+                parsed = get_extra("handlers_parsed_params")
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, Mapping) and bool(parsed):
+                return True
+
+        # Compatibility fallback for lightweight events or older AstrBot
+        # builds that do not expose the activated-command mapping.  Restrict
+        # this to this plugin's explicit image commands so a slash used merely
+        # as a wake prefix (for example ``/帮我画一只猫``) still reaches the
+        # natural-language drawing route.
+        message_obj = getattr(event, "message_obj", None)
+        original = str(getattr(message_obj, "message_str", "") or "").strip()
+        return bool(
+            re.match(
+                r"^[/／](?:"
+                r"画图no|画图|底图控制|控制画图|改图|重绘|放大|换角色|"
+                r"反推画图|反推|方案列表|方案"
+                r")(?=\s|$)",
+                original,
+                flags=re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _extract_command_text(message: str, fallback: str, command: str) -> str:

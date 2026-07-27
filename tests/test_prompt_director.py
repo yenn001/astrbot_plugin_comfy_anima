@@ -238,6 +238,38 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertIn("重新生成而非像素级修改", system_prompt)
         self.assertIn("不得自动套用默认风格001", system_prompt)
 
+    def test_system_prompt_exposes_dynamic_bounded_danbooru_status(self) -> None:
+        reference = (
+            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+        )
+        status = {
+            "ready": True,
+            "tag_count": 111513,
+            "alias_count": 28903,
+            "revision": "safe-rev-1",
+            "source": "must-not-leak",
+            "sha256": "must-not-leak",
+        }
+        director = PromptDirector(
+            reference,
+            PluginSettings.from_mapping({}),
+            danbooru_status_provider=lambda: status,
+        )
+
+        prompt = director._system_prompt()
+        self.assertIn("canonical_tags=111513", prompt)
+        self.assertIn("aliases=28903", prompt)
+        self.assertIn("revision=safe-rev-1", prompt)
+        self.assertIn("search_anima_danbooru_tags", prompt)
+        self.assertIn("verified exact canonical/alias", prompt)
+        self.assertNotIn("must-not-leak", prompt)
+
+        status.clear()
+        status.update({"ready": False, "error": "private database path"})
+        refreshed = director._system_prompt()
+        self.assertIn("ready=false", refreshed)
+        self.assertNotIn("private database path", refreshed)
+
     def test_custom_prompt_keeps_runtime_constraints(self) -> None:
         reference = (
             Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
@@ -532,7 +564,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 tools=object(),
             )
 
-        self.assertIn("LoRA 查询工具调用失败", raised.exception.user_message)
+        self.assertIn("本地资产查询工具调用失败", raised.exception.user_message)
         self.assertTrue(raised.exception.fatal)
         self.assertEqual(context.llm_generate_calls, 0)
 
@@ -559,7 +591,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 tools=object(),
             )
 
-        self.assertIn("不支持 LoRA 查询工具", raised.exception.user_message)
+        self.assertIn("不支持本地资产查询工具", raised.exception.user_message)
         self.assertTrue(raised.exception.fatal)
         self.assertEqual(context.llm_generate_calls, 0)
 

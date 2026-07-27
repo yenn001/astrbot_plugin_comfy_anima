@@ -244,7 +244,8 @@ def build_lora_trigger_plan(
     Style and functional LoRAs receive every metadata trigger.  Character
     LoRAs receive one reliable identity trigger only, so default clothes and
     appearance tags cannot defeat an explicit outfit change.  A preset's
-    manually saved trigger string is authoritative for all of its members.
+    manually saved trigger string supplements the latest role-appropriate
+    Manager metadata for its members.
     """
 
     prompt_text = str(prompt or "").strip(" ,")
@@ -255,7 +256,6 @@ def build_lora_trigger_plan(
     }
     added: list[str] = []
     skipped: list[str] = []
-    manual_member_keys: set[str] = set()
     preset_roles: dict[str, str] = {}
     manual_triggers: list[tuple[str, str]] = []
 
@@ -291,12 +291,6 @@ def build_lora_trigger_plan(
         manual = _split_trigger_text(preset.trigger_words)
         if not manual:
             continue
-        for selection in preset.selections:
-            key = _canonical_key(selection.name)
-            manual_member_keys.add(key)
-            resolved_record = records_by_name.get(key)
-            if resolved_record is not None:
-                manual_member_keys.add(_canonical_key(resolved_record.name))
         for trigger in manual:
             manual_triggers.append((trigger, f"preset {preset.name}"))
 
@@ -344,8 +338,6 @@ def build_lora_trigger_plan(
 
     for selection in selections:
         key = _canonical_key(selection.name)
-        if key in manual_member_keys:
-            continue
         record = records_by_name.get(key)
         if record is None:
             skipped.append(f"{selection.name}: no fresh metadata record")

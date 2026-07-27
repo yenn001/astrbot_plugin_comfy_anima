@@ -48,6 +48,7 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
         plugin._find_requested_style_preset = lambda _text: ""
         plugin._get_director_output_tool_set = lambda: None
         plugin._get_lora_tool_set = lambda: object()
+        plugin._get_danbooru_tool_set = lambda: object()
         return plugin
 
     async def test_plain_drawing_uses_llm_generate_not_tool_loop(self) -> None:
@@ -102,6 +103,51 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("<lora:characters/denia:0.8>", instruction.prompt)
+        self.assertEqual(context.llm_calls, 0)
+        self.assertEqual(context.tool_calls, 1)
+
+    async def test_known_danbooru_identity_uses_lookup_tool_without_lora(self) -> None:
+        class Context:
+            llm_calls = 0
+            tool_calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.llm_calls += 1
+                raise AssertionError("known identity lookup should use the tool loop")
+
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                self.tool_calls += 1
+                return types.SimpleNamespace(
+                    completion_text=(
+                        '<pic prompt="1girl, roxy_migurdia, blue hair, portrait. '
+                        'Roxy faces the viewer in a quiet portrait.">'
+                    )
+                )
+
+        class Index:
+            @staticmethod
+            def status() -> dict[str, object]:
+                return {"ready": True, "revision": "r1"}
+
+            @staticmethod
+            def lookup_many(queries: object) -> tuple[object, ...]:
+                return tuple(
+                    types.SimpleNamespace(
+                        verified=str(query).casefold() == "roxy",
+                        category="character" if str(query).casefold() == "roxy" else "",
+                    )
+                    for query in queries
+                )
+
+        context = Context()
+        plugin = self._plugin(context)
+        plugin._danbooru_index = Index()
+        instruction, _provider = await plugin._generate_directed_instruction(
+            object(),
+            "Draw Roxy Migurdia in a quiet portrait",
+        )
+
+        self.assertIn("roxy_migurdia", instruction.prompt)
         self.assertEqual(context.llm_calls, 0)
         self.assertEqual(context.tool_calls, 1)
 
