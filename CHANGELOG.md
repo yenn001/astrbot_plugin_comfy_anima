@@ -2,6 +2,15 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.1] - 2026-07-28
+
+### 纯语义角色身份热修复
+
+- 已知角色改为以一个合格的 `character_(作品)` canonical Tag 作为主身份锚点；目标外貌从必填式清单收敛为 0–4 项可选高置信证据。模糊、争议或只记得一部分的发型、瞳色、耳型、体型等外貌会被省略，不再为了凑数量污染目标身份。
+- 本地 Danbooru 索引的 `character + exact + verified` 结果会规范化并固定 canonical 主锚点；后续分类器只评估源 Tags 清理和可选外貌，不再重新否定已 exact 证明的身份。LoRA exact、Danbooru exact、Provider 高置信和普通 Provider 结果使用分层证据与对应门槛，prefix/keyword/fuzzy 仍不能直接授权身份。
+- 用户目标或附加要求中的“置信度 100%”“confidence=1”等自定义置信度会被移除并标记为忽略，不能覆盖 Provider、Danbooru 或最终分类安全阈值。
+- 修复角色别名含 `/` 时被误判为显式 LoRA 路径的问题，例如 `今汐/今夕` 现在仍按自然角色别名解析。严格文件语义仅由 `lora:` 前缀或 `.safetensors`、`.ckpt`、`.pt`、`.bin` 后缀触发。
+
 ## [1.9.0] - 2026-07-28
 
 ### `/画图` 显式文字换角

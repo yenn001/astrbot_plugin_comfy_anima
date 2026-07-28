@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.0
+AstrBot Comfy Anima 插件 v1.9.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.0
+版本: 1.9.1
 日期: 2026-07-28
 """
 
@@ -75,6 +75,7 @@ from .services.character_swap import (
     CharacterSwapPreparation,
     CharacterSwapRequest,
     fit_canvas_to_aspect_ratio,
+    is_explicit_lora_reference,
     is_original_character_query,
     normalize_semantic_identity_payload,
     parse_character_swap_request,
@@ -4407,6 +4408,8 @@ class ComfyAnimaPlugin(Star):
 示例: /画图 1girl, roxy migurdia, blue hair, twin braids, school uniform, standing，把角色换成甘雨，穿JK制服 --lcc u
 该模式会清除旧角色姓名与稳定外貌；保留服装、动作、表情、构图和背景，除非后半句明确修改。
 目标 LoRA 可唯一确认时使用；缺失或同一身份有多个版本时使用纯语义 Tags。明确文件名或跨身份歧义不会猜选。
+已知角色以 character_(作品) canonical Tag 为主锚点；外貌只保留 0~4 项高置信稳定特征，模糊信息直接留空。
+本地 Danbooru character exact 会固定主锚点；“置信度100%”等用户文字不会覆盖安全阈值，今汐/今夕等斜杠别名也不会被误当作 LoRA 路径。
 
 3 个可选生图管线（先由 Anima 生成）:
 1. base - 只生成 Anima 原图，不放大
@@ -4586,6 +4589,8 @@ QQ快捷指令:
 --preview
 --no-character-lora / --no-lora（强制纯语义 Tags，不加载目标角色 LoRA；仅 keep-outfit）
 目标角色 LoRA 完全未命中，或同一身份存在多个无法唯一选定的版本时，会自动改用纯语义 Tags；跨身份歧义、近似名称和显式文件请求仍会停止并要求确认。
+已知角色只要求一个经验证的 character_(作品) 主锚点；外貌可为 0~4 项且必须高置信。Danbooru character exact、LoRA exact、Provider 高置信和普通 Provider 结果使用分层校验阈值。
+用户正文中的置信度声明会被忽略；斜杠可用于角色别名，只有 lora: 前缀或 .safetensors/.ckpt/.pt/.bin 后缀才进入严格文件语义。
 
 示例:
 /anima draw 她在雨夜回头看向镜头 --pipeline rtx --seed 123
@@ -4871,7 +4876,7 @@ QQ快捷指令:
         job: GenerationJob,
         target_query: str,
         expansion_mode: str = "standard",
-    ) -> tuple[tuple[str, ...], str]:
+    ) -> tuple[tuple[str, ...], str, dict[str, Any]]:
         """Generate bounded ordinary identity tags when no target LoRA exists."""
 
         if self._director is None or not hasattr(self.context, "llm_generate"):
@@ -4889,8 +4894,13 @@ QQ快捷指令:
             "Example: {\"canonical_identity_tag\":\"rice_shower_(umamusume)\","
             "\"appearance_tags\":[\"brown hair\",\"purple eyes\",\"horse ears\"],"
             "\"confidence\":0.95}. canonical_identity_tag must be one short ASCII "
-            "English canonical character tag. For a known character, appearance_tags "
-            "must contain only stable, well-established physical traits and may be empty. "
+            "English canonical character tag including the work qualifier whenever one "
+            "exists. For a known character, the canonical tag is always primary. Return "
+            "zero to four appearance_tags only when they are iconic, stable and highly "
+            "certain for that exact character, such as an unmistakable hair color/style, "
+            "eye color, ears or permanent facial mark. Omit every vague, disputed or "
+            "partially remembered trait instead of guessing. Do not reconstruct a full face "
+            "or body checklist merely to fill the array. "
             "If and only if target_character explicitly requests an original/OC character, "
             'set canonical_identity_tag to exactly "original character" and create '
             f"{appearance_budget} mutually consistent stable physical traits, preserving "
@@ -5014,14 +5024,57 @@ QQ快捷指令:
                 except (TypeError, ValueError) as exc:
                     last_error = str(exc) or type(exc).__name__
                 else:
+                    provider_tag_count = len(tags)
+                    identity_anchor_source = (
+                        "original_profile" if original_target else "provider_qualified"
+                    )
+                    index_verified = False
+                    if not original_target:
+                        canonical_tag = tags[0]
+                        tag_index = getattr(self, "_danbooru_index", None)
+                        if tag_index is not None:
+                            try:
+                                lookup = await asyncio.to_thread(
+                                    tag_index.lookup,
+                                    canonical_tag,
+                                    "character",
+                                )
+                            except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+                                lookup = None
+                            if (
+                                lookup is not None
+                                and bool(getattr(lookup, "found", False))
+                                and bool(getattr(lookup, "verified", False))
+                                and str(getattr(lookup, "category", "")).casefold()
+                                == "character"
+                            ):
+                                canonical_tag = str(
+                                    getattr(lookup, "canonical_tag", "")
+                                    or getattr(lookup, "tag", "")
+                                    or canonical_tag
+                                ).strip()
+                                identity_anchor_source = "danbooru_exact"
+                                index_verified = True
+                        # Keep the canonical character-and-work anchor first. Optional
+                        # appearance candidates survive only as proposals; finalize()
+                        # injects them when the second classifier is highly confident,
+                        # otherwise it safely falls back to the canonical anchor alone.
+                        tags = (canonical_tag, *tags[1:])
                     self._record_image_task_phase(
                         job,
                         "resolver",
-                        "已生成受限普通身份 Tags；后续不会加载目标角色 LoRA。",
+                        (
+                            "已确认角色与作品身份 Tag；高置信外貌候选将作为可选增强。"
+                            if not original_target
+                            else "已生成原创角色稳定身份档案；后续不会加载目标角色 LoRA。"
+                        ),
                         "character_swap_semantic_target_ready",
                         details={
                             "provider_id": provider_id,
                             "tag_count": len(tags),
+                            "provider_tag_count": provider_tag_count,
+                            "identity_anchor_source": identity_anchor_source,
+                            "index_verified": index_verified,
                             "attempt": attempt,
                             "confidence": confidence_value,
                             "parse_strategy": parse_strategy,
@@ -5029,7 +5082,15 @@ QQ快捷指令:
                         },
                         level="WARNING",
                     )
-                    return tuple(tags), provider_id
+                    return (
+                        tuple(tags),
+                        provider_id,
+                        {
+                            "confidence": confidence_value,
+                            "index_verified": index_verified,
+                            "anchor_source": identity_anchor_source,
+                        },
+                    )
                 self._record_image_task_phase(
                     job,
                     "resolver",
@@ -5072,14 +5133,7 @@ QQ快捷指令:
     ) -> bool:
         """Use semantic identity when an optional target LoRA cannot be proven."""
 
-        explicit_target_lora = bool(
-            "/" in request.target_query.replace("\\", "/")
-            or re.search(
-                r"\.(?:safetensors|ckpt|pt|bin)$",
-                request.target_query,
-                re.IGNORECASE,
-            )
-        )
+        explicit_target_lora = is_explicit_lora_reference(request.target_query)
         return bool(
             not explicit_target_lora
             and error_code
@@ -5386,13 +5440,25 @@ QQ快捷指令:
                         exc.code,
                     ):
                         raise
-                    fallback_tags, _fallback_provider = (
+                    fallback_tags, _fallback_provider, identity_evidence = (
                         await self._generate_semantic_target_tags(
                             event,
                             job,
                             effective_request.target_query,
                             effective_request.prompt_expansion_mode,
                         )
+                    )
+                    effective_request = replace(
+                        effective_request,
+                        semantic_identity_confidence=float(
+                            identity_evidence.get("confidence") or 0.0
+                        ),
+                        semantic_identity_index_verified=bool(
+                            identity_evidence.get("index_verified")
+                        ),
+                        semantic_identity_anchor_source=str(
+                            identity_evidence.get("anchor_source") or ""
+                        ),
                     )
                     preparation = planner.prepare(
                         effective_request,
@@ -5427,6 +5493,19 @@ QQ快捷指令:
                             preparation.target_metadata_record is not None
                         ),
                         "source_lora_present": preparation.source_record is not None,
+                        "semantic_identity_confidence": round(
+                            effective_request.semantic_identity_confidence,
+                            4,
+                        ),
+                        "semantic_identity_index_verified": (
+                            effective_request.semantic_identity_index_verified
+                        ),
+                        "semantic_identity_anchor_source": (
+                            effective_request.semantic_identity_anchor_source
+                        ),
+                        "ignored_control_directives": list(
+                            effective_request.ignored_control_directives
+                        ),
                         "preserved_lora_count": len(preparation.preserved_loras),
                         "removed_character_lora_count": len(
                             preparation.removed_character_loras
@@ -5462,6 +5541,16 @@ QQ快捷指令:
                         "removed_term_count": len(plan.removed_terms),
                         "kept_term_count": len(plan.kept_terms),
                         "added_term_count": len(plan.added_terms),
+                        "semantic_canonical_only": bool(
+                            plan.target_record is None
+                            and not is_original_character_query(
+                                effective_request.target_query
+                            )
+                            and len(plan.added_terms) == 1
+                        ),
+                        "ignored_control_directives": list(
+                            effective_request.ignored_control_directives
+                        ),
                         "final_lora_count": len(plan.loras),
                     },
                 )
@@ -5565,7 +5654,26 @@ QQ快捷指令:
             return
 
         if effective_request.preview:
-            yield event.plain_result(f"{MessageEmoji.INFO} {plan.preview_text()}")
+            preview_lines = [plan.preview_text()]
+            if (
+                plan.target_record is None
+                and not is_original_character_query(effective_request.target_query)
+            ):
+                if len(plan.added_terms) == 1:
+                    preview_lines.append(
+                        "身份策略：仅使用角色_(作品)主锚点；没有猜测或补写不确定外貌。"
+                    )
+                else:
+                    preview_lines.append(
+                        "身份策略：角色_(作品)为主锚点；只附加分类模型确认的稳定外貌候选。"
+                    )
+            if "confidence_override" in effective_request.ignored_control_directives:
+                preview_lines.append(
+                    "安全提示：已忽略消息中的置信度阈值覆盖，插件继续使用内置安全门槛。"
+                )
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} " + "\n".join(preview_lines)
+            )
             return
         assert generated is not None
         image_paths, seed, final_prompt, _provider_id, director_warning = generated
@@ -5583,6 +5691,22 @@ QQ快捷指令:
             info_lines.append(
                 "当前清单未找到目标角色 LoRA，本次使用普通语义 Tags；"
                 "身份还原度可能低于 LoRA 模式。"
+            )
+        if (
+            plan.target_record is None
+            and not is_original_character_query(effective_request.target_query)
+        ):
+            if len(plan.added_terms) == 1:
+                info_lines.append(
+                    "身份采用角色_(作品)主锚点；未补写任何拿不准的眼睛、五官、耳朵或发色特征。"
+                )
+            else:
+                info_lines.append(
+                    "身份以角色_(作品)为主；附加外貌仅来自高置信稳定候选，模糊特征已留空。"
+                )
+        if "confidence_override" in effective_request.ignored_control_directives:
+            info_lines.append(
+                "已忽略用户文本中的置信度阈值覆盖，本次仍按插件内置安全门槛执行。"
             )
         if effective_request.edit_requirement:
             info_lines.append("已同时应用新服装/属性要求，并清理与其冲突的原 Tags。")

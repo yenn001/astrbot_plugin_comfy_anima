@@ -185,6 +185,18 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertFalse(request.use_target_lora)
         self.assertNotIn("LoRA", request.edit_requirement)
 
+    def test_target_role_and_confidence_override_are_normalized(self) -> None:
+        request = parse_character_swap_request(
+            "Denia -> 目标角色鸣潮的今汐 置信度满足0.5即可 | "
+            "1girl, denia_wuwa, black hair, standing"
+        )
+
+        self.assertEqual(request.target_query, "鸣潮的今汐")
+        self.assertEqual(
+            request.ignored_control_directives,
+            ("confidence_override",),
+        )
+
     def test_text_character_change_parser_keeps_original_character_traits(self) -> None:
         request = parse_text_character_change_request(
             "1girl, blue hair, purple eyes, standing，把原角色换成"
@@ -232,6 +244,29 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.code,
             "semantic_original_appearance_missing",
+        )
+
+    def test_known_character_rejects_more_than_four_appearance_candidates(
+        self,
+    ) -> None:
+        with self.assertRaises(CharacterSwapError) as raised:
+            normalize_semantic_identity_payload(
+                {
+                    "canonical_identity_tag": "jinhsi_(wuthering_waves)",
+                    "appearance_tags": [
+                        "long white hair",
+                        "red eyes",
+                        "dragon horns",
+                        "pale skin",
+                        "beauty mark under left eye",
+                    ],
+                    "confidence": 0.95,
+                }
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "semantic_target_appearance_excessive",
         )
 
     def test_canvas_preserves_ratio_near_one_megapixel(self) -> None:
@@ -440,6 +475,45 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             target_trigger_count=len(preparation.target_trigger_words),
         )
 
+    def _semantic_preparation(
+        self,
+        request: CharacterSwapRequest,
+        target_tags: tuple[str, ...],
+    ):
+        return self.planner.prepare(
+            request,
+            positive_prompt=(
+                "1girl, denia_wuwa, black hair, school uniform, standing, "
+                "beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=target_tags,
+        )
+
+    def _semantic_classification(
+        self,
+        preparation,
+        *,
+        confidence: float,
+        appearance_ids: tuple[int, ...] = (),
+    ):
+        payload = _classification_payload(
+            len(preparation.tags),
+            source_identity_ids=[1, 2],
+            outfit_ids=[3],
+            pose_action_ids=[4],
+            scene_lighting_ids=[5],
+            style_quality_ids=[0, 6],
+            target_appearance_trigger_ids=list(appearance_ids),
+            confidence=confidence,
+        )
+        return self.planner.parse_classification(
+            json.dumps(payload),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
     def test_keep_outfit_replaces_only_identity_and_character_lora(self) -> None:
         preparation = self._prepare(
             negative="kallen_kaslana, white hair, low quality"
@@ -573,6 +647,173 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             [("styles/warm-ink.safetensors", 0.4)],
         )
         self.assertNotIn("rice shower", plan.negative_prompt)
+
+    def test_slash_alias_is_not_an_explicit_lora_file_and_can_fallback(self) -> None:
+        request = parse_character_swap_request(
+            "Denia -> 目标角色《鸣潮》的今汐/今夕 | "
+            "1girl, denia_wuwa, black hair, standing"
+        )
+        preparation = self.planner.prepare(
+            request,
+            positive_prompt=request.tags,
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=(
+                "jinhsi_(wuthering_waves)",
+                "white hair",
+                "red eyes",
+            ),
+        )
+
+        self.assertEqual(request.target_query, "《鸣潮》的今汐/今夕")
+        self.assertIsNone(preparation.target_record)
+        self.assertEqual(
+            preparation.target_trigger_words[0],
+            "jinhsi_(wuthering_waves)",
+        )
+
+    def test_target_role_with_safetensors_suffix_remains_strict(self) -> None:
+        request = parse_character_swap_request(
+            "Denia -> 目标角色characters/missing.safetensors | "
+            "1girl, denia_wuwa, black hair, standing"
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.prepare(
+                request,
+                positive_prompt=request.tags,
+                negative_prompt="",
+                records=self.records,
+                fallback_target_tags=("missing_character_(work)",),
+            )
+
+        self.assertEqual(raised.exception.code, "character_not_found")
+
+    def test_danbooru_exact_identity_allows_point85_classification(self) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "鸣潮的今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            (
+                "jinhsi_(wuthering_waves)",
+                "white hair",
+                "red eyes",
+            ),
+        )
+
+        plan = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.85,
+                appearance_ids=(1, 2),
+            ),
+        )
+
+        self.assertIn("jinhsi_(wuthering_waves)", plan.prompt)
+        self.assertNotIn("white hair", plan.prompt)
+        self.assertNotIn("red eyes", plan.prompt)
+
+    def test_high_provider_confidence_allows_point82_classification_without_index(
+        self,
+    ) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "鸣潮的今汐",
+                semantic_identity_confidence=0.92,
+                semantic_identity_index_verified=False,
+                semantic_identity_anchor_source="provider_qualified",
+            ),
+            ("jinhsi_(wuthering_waves)", "white hair"),
+        )
+
+        plan = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.82,
+                appearance_ids=(1,),
+            ),
+        )
+
+        self.assertIn("jinhsi_(wuthering_waves)", plan.prompt)
+        self.assertNotIn("white hair", plan.prompt)
+
+    def test_guarded_provider_confidence_still_requires_point90_classification(
+        self,
+    ) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "鸣潮的今汐",
+                semantic_identity_confidence=0.85,
+                semantic_identity_index_verified=False,
+                semantic_identity_anchor_source="provider_qualified",
+            ),
+            ("jinhsi_(wuthering_waves)", "white hair"),
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.finalize(
+                preparation,
+                self._semantic_classification(
+                    preparation,
+                    confidence=0.89,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "low_classification_confidence")
+        self.assertEqual(raised.exception.details["minimum_confidence"], 0.9)
+
+        plan = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.90,
+            ),
+        )
+        self.assertIn("jinhsi_(wuthering_waves)", plan.prompt)
+
+    def test_known_character_appearance_requires_point92_classification(self) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "鸣潮的今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_anchor_source="provider_qualified",
+            ),
+            (
+                "jinhsi_(wuthering_waves)",
+                "long white hair",
+                "red eyes",
+                "dragon horns",
+            ),
+        )
+
+        guarded = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.91,
+                appearance_ids=(1, 2, 3),
+            ),
+        )
+        trusted = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.92,
+                appearance_ids=(1, 2, 3),
+            ),
+        )
+
+        for tag in ("long white hair", "red eyes", "dragon horns"):
+            self.assertNotIn(tag, guarded.prompt)
+            self.assertIn(tag, trusted.prompt)
 
     def test_explicit_no_character_lora_skips_existing_target_lora(self) -> None:
         request = CharacterSwapRequest(
@@ -936,6 +1177,51 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         ):
             self.assertIn(preserved, plan.prompt)
         self.assertEqual(plan.loras, ())
+
+    def test_original_character_requires_three_classifier_verified_traits(
+        self,
+    ) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "原创角色：银色长发、金色眼睛、精灵耳、左眼下美人痣",
+                semantic_identity_confidence=0.95,
+                semantic_identity_anchor_source="original_profile",
+            ),
+            (
+                "original character",
+                "long silver hair",
+                "golden eyes",
+                "elf ears",
+                "beauty mark under left eye",
+            ),
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.finalize(
+                preparation,
+                self._semantic_classification(
+                    preparation,
+                    confidence=0.95,
+                    appearance_ids=(1, 2),
+                ),
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "semantic_original_appearance_unverified",
+        )
+
+        plan = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.95,
+                appearance_ids=(1, 2, 3),
+            ),
+        )
+        for tag in ("long silver hair", "golden eyes", "elf ears"):
+            self.assertIn(tag, plan.prompt)
+        self.assertNotIn("beauty mark under left eye", plan.prompt)
 
     def test_missing_explicit_target_file_never_uses_semantic_fallback(self) -> None:
         with self.assertRaises(CharacterSwapError) as raised:

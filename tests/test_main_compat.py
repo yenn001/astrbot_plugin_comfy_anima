@@ -3068,7 +3068,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        tags, provider = await plugin._generate_semantic_target_tags(
+        tags, provider, evidence = await plugin._generate_semantic_target_tags(
             object(),
             self.main.GenerationJob("u", "swap", 0.0),
             "赛马娘的米浴",
@@ -3076,10 +3076,55 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(provider, "semantic-provider")
         self.assertEqual(tags[0], "rice_shower_(umamusume)")
+        self.assertEqual(evidence["confidence"], 0.95)
+        self.assertFalse(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "provider_qualified")
         self.assertEqual(
             json.loads(calls[0]["prompt"]),
             {"target_character": "赛马娘的米浴"},
         )
+
+    async def test_danbooru_exact_lookup_canonicalizes_and_pins_evidence(
+        self,
+    ) -> None:
+        plugin, _calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "jinhsi_(wuthering_waves)",
+                    "appearance_tags": ["long white hair", "red eyes"],
+                    "confidence": 0.94,
+                }
+            )
+        )
+        lookups = []
+
+        class ExactIndex:
+            @staticmethod
+            def lookup(tag, category):
+                lookups.append((tag, category))
+                return types.SimpleNamespace(
+                    found=True,
+                    verified=True,
+                    category="character",
+                    canonical_tag="jinhsi_(wuthering_waves)",
+                    tag="jinhsi_(wuthering_waves)",
+                )
+
+        plugin._danbooru_index = ExactIndex()
+
+        tags, provider, evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "鸣潮的今汐",
+        )
+
+        self.assertEqual(lookups, [("jinhsi_(wuthering_waves)", "character")])
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags[0], "jinhsi_(wuthering_waves)")
+        self.assertEqual(tags[1:], ("long white hair", "red eyes"))
+        self.assertEqual(evidence["confidence"], 0.94)
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "danbooru_exact")
 
     async def test_formatter_accepts_think_extra_fields_and_numeric_strings(self) -> None:
         plugin, _calls = self._plugin(
@@ -3089,7 +3134,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         event = object()
 
-        tags, provider = await plugin._generate_semantic_target_tags(
+        tags, provider, _evidence = await plugin._generate_semantic_target_tags(
             event,
             self.main.GenerationJob("u", "swap", 0.0),
             "赛马娘的米浴",
@@ -3110,7 +3155,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        tags, _provider = await plugin._generate_semantic_target_tags(
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
             object(),
             self.main.GenerationJob("u", "swap", 0.0),
             "赛马娘的米浴",
@@ -3137,7 +3182,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin, _calls = self._plugin(response)
 
-        tags, _provider = await plugin._generate_semantic_target_tags(
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
             object(),
             self.main.GenerationJob("u", "swap", 0.0),
             "赛马娘的米浴",
@@ -3170,7 +3215,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         }
         plugin, _calls = self._plugin(response)
 
-        tags, _provider = await plugin._generate_semantic_target_tags(
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
             object(),
             self.main.GenerationJob("u", "swap", 0.0),
             "赛马娘的米浴",
@@ -3194,7 +3239,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         }
         plugin, _calls = self._plugin(response)
 
-        tags, _provider = await plugin._generate_semantic_target_tags(
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
             object(),
             self.main.GenerationJob("u", "swap", 0.0),
             "赛马娘的米浴",
@@ -3267,7 +3312,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
             '"appearance_tags":[],"confidence":0.92}'
         )
 
-        tags, _provider = await plugin._generate_semantic_target_tags(
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
             object(),
             self.main.GenerationJob("u", "swap", 0.0),
             "Hat Kid",

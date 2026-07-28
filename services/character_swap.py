@@ -65,6 +65,24 @@ _MULTI_SUBJECT_KEYS = frozenset(
 )
 _SPLIT_NAME_RE = re.compile(r"\s*(?:/|\||；|;|，|,)\s*")
 _WEIGHT_SUFFIX_RE = re.compile(r":\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*$")
+_EXPLICIT_LORA_FILE_RE = re.compile(
+    r"\.(?:safetensors|ckpt|pt|bin)$",
+    flags=re.IGNORECASE,
+)
+_TARGET_ROLE_PREFIX_RE = re.compile(
+    r"^(?:(?:目标|新|替换后(?:的)?)\s*)?(?:角色|人物)\s*[:：]?\s*",
+    flags=re.IGNORECASE,
+)
+_UNTRUSTED_CONFIDENCE_DIRECTIVE_RE = re.compile(
+    r"(?:[,，。；;]\s*)?"
+    r"(?:置信度|可信度|confidence)\s*"
+    r"(?:(?:只需|需要|需|满足|达到|设为|设置为|降低到|降到|大于|小于)\s*)?"
+    r"(?:>=|<=|>|<|=)?\s*"
+    r"(?:为|到)?\s*"
+    r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*%?\s*"
+    r"(?:即可|就行|以上|以下|左右)?",
+    flags=re.IGNORECASE,
+)
 _STRICT_LORA_TAG_RE = re.compile(
     r"<lora:([^<>:]+):([+-]?(?:\d+(?:\.\d+)?|\.\d+))>",
     re.IGNORECASE,
@@ -375,6 +393,10 @@ class CharacterSwapRequest:
     cfg: Optional[float] = None
     enable_upscale: Optional[bool] = None
     denoise: Optional[float] = None
+    semantic_identity_confidence: float = 0.0
+    semantic_identity_index_verified: bool = False
+    semantic_identity_anchor_source: str = ""
+    ignored_control_directives: tuple[str, ...] = ()
 
     @property
     def source_kind(self) -> str:
@@ -505,6 +527,34 @@ def _strip_no_character_lora_suffix(value: str) -> tuple[str, bool]:
         return normalized, False
     target = normalized[: match.start()].rstrip(" \t，,。；;、:-")
     return target, True
+
+
+def is_explicit_lora_reference(value: str) -> bool:
+    """Return whether a target is an explicit LoRA file reference.
+
+    A slash by itself is not sufficient evidence: users commonly separate
+    aliases with ``/`` (for example ``今汐/今夕``). Only a supported model-file
+    suffix or an explicit ``lora:`` prefix activates strict file semantics.
+    """
+
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+    return bool(
+        _EXPLICIT_LORA_FILE_RE.search(normalized)
+        or normalized.casefold().startswith("lora:")
+    )
+
+
+def _normalize_target_character_query(value: str) -> tuple[str, tuple[str, ...]]:
+    """Remove transport/control prose that cannot redefine safety policy."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+    ignored: list[str] = []
+    if _UNTRUSTED_CONFIDENCE_DIRECTIVE_RE.search(normalized):
+        normalized = _UNTRUSTED_CONFIDENCE_DIRECTIVE_RE.sub(" ", normalized)
+        ignored.append("confidence_override")
+    normalized = _TARGET_ROLE_PREFIX_RE.sub("", normalized, count=1)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" \t，,。；;")
+    return normalized, tuple(ignored)
 
 
 def _canonical_key(value: Any) -> str:
@@ -834,6 +884,15 @@ def normalize_semantic_identity_payload(
                 "原创角色至少需要 3 项稳定外貌特征",
                 code="semantic_original_appearance_missing",
             )
+    elif len(tags) > 5:
+        # Known characters are anchored by the qualified ``character_(work)``
+        # tag.  Extra appearance is optional evidence, never a checklist to be
+        # filled from memory; bounding it to four prevents verbose speculative
+        # reconstructions from reaching the second-stage classifier.
+        raise CharacterSwapError(
+            "已知角色最多只允许 4 项高置信稳定外貌候选",
+            code="semantic_target_appearance_excessive",
+        )
 
     recognized_fields = {
         "canonical_identity_tag",
@@ -1030,10 +1089,8 @@ def resolve_character_record(
     raw_query = unicodedata.normalize("NFKC", str(query or "")).strip().replace(
         "\\", "/"
     )
-    explicit_path = "/" in raw_query
-    explicit_file = bool(
-        re.search(r"\.(?:safetensors|ckpt|pt|bin)$", raw_query, re.IGNORECASE)
-    )
+    explicit_file = is_explicit_lora_reference(raw_query)
+    explicit_path = explicit_file and "/" in raw_query
     query_keys = _query_identity_keys(
         canonical_lora_name(raw_query) if explicit_file else raw_query
     )
@@ -1263,13 +1320,7 @@ class CharacterSwapPlanner:
                 code="same_character",
             )
         target_metadata: Optional[LoraRecord] = None
-        explicit_target = "/" in request.target_query.replace("\\", "/") or bool(
-            re.search(
-                r"\.(?:safetensors|ckpt|pt|bin)$",
-                request.target_query,
-                re.IGNORECASE,
-            )
-        )
+        explicit_target = is_explicit_lora_reference(request.target_query)
         try:
             if not _is_original_character_query(request.target_query):
                 target_metadata = resolve_character_record(
@@ -1492,8 +1543,15 @@ outfit, pose, style and quality tags are invalid identities. Separately identify
 stable physical appearance candidates and default-outfit candidates; leave pose,
 scene, style, quality and unknown candidates unselected. Do not invent any target
 tag. For target-outfit mode, select only candidates that explicitly describe the
-target's default outfit. Confidence must reflect both source classification and the
-target-name-to-identity match. When target_character explicitly says original/OC,
+target's default outfit. For a known named character, one qualified
+``character_(work)`` identity candidate is sufficient and physical appearance
+candidates are optional. Do not lower confidence merely because no target hair, eye,
+face or body candidates were supplied. When target_identity_is_pinned is true,
+candidate 0 was already exact-verified by the local Danbooru character index: set
+target_identity_trigger_id to 0 and let confidence reflect source-tag classification
+rather than re-judging that identity. Otherwise confidence must reflect both source
+classification and the target-name-to-identity match. When target_character explicitly
+says original/OC,
 the exact candidate ``original character`` is the required identity anchor; select
 it only when at least three other candidates are coherent stable physical traits.
 Return one JSON object only. Do not include
@@ -1509,6 +1567,12 @@ explanations."""
                 else "bounded_semantic_generation"
             ),
             "target_lora_will_be_loaded": preparation.target_record is not None,
+            "target_identity_is_pinned": bool(
+                preparation.request.semantic_identity_index_verified
+            ),
+            "target_identity_evidence": (
+                preparation.request.semantic_identity_anchor_source or "unverified"
+            ),
             "mode": preparation.request.mode,
             "source_tags": [
                 {"id": index, "tag": tag}
@@ -1656,11 +1720,46 @@ explanations."""
                 "首版语义换角只支持单角色，分类模型判断并非单一人物",
                 code="multiple_subjects",
             )
-        minimum_confidence = 0.9 if preparation.target_record is None else 0.82
+        semantic_original = bool(
+            preparation.target_record is None
+            and _is_original_character_query(preparation.request.target_query)
+        )
+        if preparation.target_record is not None:
+            evidence_tier = "lora_exact"
+            minimum_confidence = 0.82
+        elif preparation.target_metadata_record is not None:
+            evidence_tier = "lora_metadata"
+            minimum_confidence = 0.82
+        elif semantic_original:
+            evidence_tier = "original_profile"
+            minimum_confidence = 0.90
+        elif preparation.request.semantic_identity_index_verified:
+            evidence_tier = "danbooru_exact"
+            minimum_confidence = 0.82
+        elif preparation.request.semantic_identity_confidence >= 0.90:
+            evidence_tier = "provider_high"
+            minimum_confidence = 0.82
+        else:
+            evidence_tier = "provider_guarded"
+            minimum_confidence = 0.90
         if classification.confidence < minimum_confidence:
             raise CharacterSwapError(
-                f"换角分类置信度不足 {minimum_confidence:.2f}，已停止自动改写",
+                "换角分类置信度 "
+                f"{classification.confidence:.2f} 低于当前身份证据要求 "
+                f"{minimum_confidence:.2f}，已停止自动改写",
                 code="low_classification_confidence",
+                details={
+                    "actual_confidence": round(classification.confidence, 4),
+                    "minimum_confidence": minimum_confidence,
+                    "evidence_tier": evidence_tier,
+                    "resolver_confidence": round(
+                        preparation.request.semantic_identity_confidence,
+                        4,
+                    ),
+                    "index_verified": bool(
+                        preparation.request.semantic_identity_index_verified
+                    ),
+                },
             )
         if classification.uncertain_ids:
             raise CharacterSwapError(
@@ -1741,7 +1840,11 @@ explanations."""
 
         target_trigger = preparation.deterministic_target_trigger
         if preparation.target_record is None:
-            trigger_id = classification.target_identity_trigger_id
+            trigger_id = (
+                0
+                if preparation.request.semantic_identity_index_verified
+                else classification.target_identity_trigger_id
+            )
             if trigger_id is None:
                 raise CharacterSwapError(
                     "纯 Tags 换角无法确认唯一目标身份 Tag",
@@ -1811,7 +1914,27 @@ explanations."""
                         code="ambiguous_target_trigger",
                     )
 
-        for trigger_id in classification.target_appearance_trigger_ids:
+        target_appearance_ids = classification.target_appearance_trigger_ids
+        if semantic_original:
+            if len(target_appearance_ids) < 3:
+                raise CharacterSwapError(
+                    "原创角色最终至少需要 3 项经过分类确认的稳定外貌特征",
+                    code="semantic_original_appearance_unverified",
+                    details={
+                        "verified_appearance_count": len(target_appearance_ids),
+                        "minimum_appearance_count": 3,
+                    },
+                )
+        elif (
+            preparation.target_record is None
+            and preparation.target_metadata_record is None
+            and classification.confidence < 0.92
+        ):
+            # A known model-native character never needs appearance tags to prove
+            # identity. Ambiguous optional traits are dropped rather than guessed.
+            target_appearance_ids = ()
+
+        for trigger_id in target_appearance_ids:
             trigger = preparation.target_trigger_words[trigger_id]
             folded = unicodedata.normalize("NFKC", trigger).casefold()
             if not _is_stable_appearance_term(folded) or any(
@@ -1849,7 +1972,7 @@ explanations."""
         if preparation.target_record is None:
             added_terms.extend(
                 preparation.target_trigger_words[index]
-                for index in classification.target_appearance_trigger_ids
+                for index in target_appearance_ids
             )
         if preparation.request.mode == SWAP_MODE_TARGET_OUTFIT:
             added_terms.extend(
@@ -1872,7 +1995,7 @@ explanations."""
                 *added_terms,
                 *(
                     preparation.target_trigger_words[index]
-                    for index in classification.target_appearance_trigger_ids
+                    for index in target_appearance_ids
                 ),
             )
             if _prompt_term_key(value)
@@ -2133,7 +2256,10 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
     target_text, natural_no_lora = _strip_no_character_lora_suffix(
         match.group("target")
     )
-    target_query = target_text.strip(" \"'，,")
+    target_query, ignored_control_directives = _normalize_target_character_query(
+        target_text
+    )
+    target_query = target_query.strip(" \"'，,")
     if natural_no_lora:
         use_target_lora = False
     if not target_query:
@@ -2163,6 +2289,7 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
         negative_prompt=negative_prompt,
         preview=preview,
         use_target_lora=use_target_lora,
+        ignored_control_directives=ignored_control_directives,
     )
 
 
@@ -2219,6 +2346,9 @@ def parse_text_character_change_request(
 
     target_tail = match.group("target").strip(" \t，,。；;")
     target_tail, no_lora = _strip_no_character_lora_suffix(target_tail)
+    target_tail, ignored_control_directives = _normalize_target_character_query(
+        target_tail
+    )
     target_tail = target_tail.strip(" \t，,。；;")
     target_query = target_tail
     edit_requirement = ""
@@ -2264,6 +2394,7 @@ def parse_text_character_change_request(
         cfg=cfg,
         enable_upscale=enable_upscale,
         denoise=denoise,
+        ignored_control_directives=ignored_control_directives,
     )
 
 
@@ -2287,6 +2418,9 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     if _is_generic_source_query(source_query):
         source_query = ""
     target_text, target_no_lora = _strip_no_character_lora_suffix(match.group("target"))
+    target_text, ignored_control_directives = _normalize_target_character_query(
+        target_text
+    )
     embedded_edit = ""
     edit_split = re.split(
         r"(?=(?:并|且|同时)(?:让|改|换|穿|戴|加|去掉|移除|保持|保留))",
@@ -2317,6 +2451,13 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     edit_requirement = _NO_CHARACTER_LORA_RE.sub("", edit_requirement).strip(
         " \t，,。；;"
     )
+    if _UNTRUSTED_CONFIDENCE_DIRECTIVE_RE.search(edit_requirement):
+        edit_requirement = _UNTRUSTED_CONFIDENCE_DIRECTIVE_RE.sub(
+            " ", edit_requirement
+        ).strip(" \t，,。；;")
+        ignored_control_directives = tuple(
+            dict.fromkeys((*ignored_control_directives, "confidence_override"))
+        )
     mode = (
         SWAP_MODE_TARGET_OUTFIT
         if re.search(r"(?:用|换成|采用).{0,8}(?:默认|原版|角色).{0,4}(?:衣服|服装|造型)", source)
@@ -2331,6 +2472,7 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
         mode=mode,
         use_target_lora=use_target_lora,
         edit_requirement=edit_requirement,
+        ignored_control_directives=ignored_control_directives,
     )
 
 
@@ -2372,6 +2514,7 @@ __all__ = [
     "SWAP_MODE_KEEP_OUTFIT",
     "SWAP_MODE_TARGET_OUTFIT",
     "fit_canvas_to_aspect_ratio",
+    "is_explicit_lora_reference",
     "is_original_character_query",
     "normalize_semantic_identity_payload",
     "parse_character_swap_request",
