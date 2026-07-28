@@ -2,6 +2,14 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.4] - 2026-07-28
+
+### Danbooru exact 角色只保留 canonical 身份
+
+- 本地 Danbooru `character` exact 或唯一 alias 一旦确认已知角色，正面身份现在只注入规范 canonical Tag，例如飞鸟马时只新增 `toki_(blue_archive)`。
+- Provider 返回的发色、发型、瞳色、体型等外貌候选会在 exact 身份路径全部丢弃，避免 `long white hair`、`twintails` 等模型记忆对已知角色造成过约束、冲突或幻觉。
+- 原创角色仍保留用户指定的稳定外貌；本地索引无法 exact 确认而进入受控 Provider 回退时，仍可使用经过分类器高置信验证的有限外貌候选。
+
 ## [1.9.3] - 2026-07-28
 
 ### 本地 Danbooru 角色精确检索

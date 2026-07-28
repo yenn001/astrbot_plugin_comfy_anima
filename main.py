@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.3
+AstrBot Comfy Anima 插件 v1.9.4
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.3
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.3
+版本: 1.9.4
 日期: 2026-07-28
 """
 
@@ -5237,18 +5237,28 @@ QQ快捷指令:
                                 canonical_tag = resolution.canonical_tag
                                 identity_anchor_source = "danbooru_exact"
                                 index_verified = True
-                        # Keep the canonical character-and-work anchor first. Optional
-                        # appearance candidates survive only as proposals; finalize()
-                        # injects them when the second classifier is highly confident,
-                        # otherwise it safely falls back to the canonical anchor alone.
-                        tags = (canonical_tag, *tags[1:])
+                        # A locally exact-verified model-native character already has
+                        # the strongest available identity anchor.  Provider appearance
+                        # memory is unnecessary here and can over-constrain or hallucinate
+                        # traits (for example hair colour/style), so exact identities are
+                        # canonical-only.  Optional appearance remains available only for
+                        # guarded Provider fallback and original-character profiles.
+                        tags = (
+                            (canonical_tag,)
+                            if index_verified
+                            else (canonical_tag, *tags[1:])
+                        )
                     self._record_image_task_phase(
                         job,
                         "resolver",
                         (
-                            "已确认角色与作品身份 Tag；高置信外貌候选将作为可选增强。"
-                            if not original_target
-                            else "已生成原创角色稳定身份档案；后续不会加载目标角色 LoRA。"
+                            "本地 Danbooru 已确认角色 canonical；已丢弃 Provider 外貌猜测。"
+                            if index_verified
+                            else (
+                                "已确认角色与作品身份 Tag；高置信外貌候选将作为可选增强。"
+                                if not original_target
+                                else "已生成原创角色稳定身份档案；后续不会加载目标角色 LoRA。"
+                            )
                         ),
                         "character_swap_semantic_target_ready",
                         details={

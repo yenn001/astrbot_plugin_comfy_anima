@@ -3187,8 +3187,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(provider, "semantic-provider")
-        self.assertEqual(tags[0], "jinhsi_(wuthering_waves)")
-        self.assertEqual(tags[1:], ("long white hair", "red eyes"))
+        self.assertEqual(tags, ("jinhsi_(wuthering_waves)",))
         self.assertEqual(evidence["confidence"], 0.94)
         self.assertTrue(evidence["index_verified"])
         self.assertEqual(evidence["anchor_source"], "danbooru_exact")
@@ -3238,8 +3237,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(provider, "semantic-provider")
-        self.assertEqual(tags[0], "toki_(blue_archive)")
-        self.assertEqual(tags[1:], ("long white hair", "blue eyes"))
+        self.assertEqual(tags, ("toki_(blue_archive)",))
         self.assertTrue(evidence["index_verified"])
         self.assertEqual(evidence["match_variant"], "alias_without_work")
 
