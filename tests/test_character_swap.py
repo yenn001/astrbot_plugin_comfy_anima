@@ -10,8 +10,10 @@ from ..services.character_swap import (
     CharacterSwapRequest,
     SWAP_MODE_TARGET_OUTFIT,
     fit_canvas_to_aspect_ratio,
+    normalize_semantic_identity_payload,
     parse_character_swap_request,
     parse_natural_character_swap,
+    parse_text_character_change_request,
     resolve_character_record,
 )
 from ..services.lora_catalog import LoraRecord
@@ -149,6 +151,88 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertEqual(natural.source_query, "")
         self.assertEqual(natural.target_query, "赛马娘的米浴")
         self.assertFalse(natural.use_target_lora)
+
+    def test_text_character_change_parser_keeps_tags_and_edit_separate(self) -> None:
+        request = parse_text_character_change_request(
+            "1girl, roxy migurdia, blue hair, twin braids, school uniform, "
+            "standing, looking at viewer，把角色换成甘雨，穿JK制服",
+            preset="风格GZC",
+            pipeline="rtx",
+            prompt_expansion_mode="ultra",
+            steps=20,
+        )
+
+        self.assertEqual(request.source_query, "")
+        self.assertEqual(request.target_query, "甘雨")
+        self.assertIn("roxy migurdia", request.tags)
+        self.assertNotIn("把角色换成", request.tags)
+        self.assertEqual(request.edit_requirement, "穿JK制服")
+        self.assertEqual(request.preset, "风格GZC")
+        self.assertEqual(request.pipeline, "rtx")
+        self.assertEqual(request.prompt_expansion_mode, "ultra")
+        self.assertEqual(request.steps, 20)
+
+    def test_text_character_change_parser_consumes_trailing_no_lora_phrase(
+        self,
+    ) -> None:
+        request = parse_text_character_change_request(
+            "1girl, roxy, blue hair, school uniform，把角色换成甘雨，"
+            "换成白裙，无需使用角色 LoRA"
+        )
+
+        self.assertEqual(request.target_query, "甘雨")
+        self.assertEqual(request.edit_requirement, "换成白裙")
+        self.assertFalse(request.use_target_lora)
+        self.assertNotIn("LoRA", request.edit_requirement)
+
+    def test_text_character_change_parser_keeps_original_character_traits(self) -> None:
+        request = parse_text_character_change_request(
+            "1girl, blue hair, purple eyes, standing，把原角色换成"
+            "原创角色：黑色长发、金色眼睛、精灵耳、左眼下有美人痣，其他保持不变"
+        )
+
+        self.assertIn("原创角色", request.target_query)
+        self.assertIn("黑色长发", request.target_query)
+        self.assertIn("美人痣", request.target_query)
+        self.assertEqual(request.edit_requirement, "其他保持不变")
+
+    def test_text_character_change_parser_requires_source_tags(self) -> None:
+        with self.assertRaises(CharacterSwapError) as raised:
+            parse_text_character_change_request("把角色换成甘雨")
+        self.assertEqual(raised.exception.code, "text_character_change_tags_missing")
+
+    def test_original_semantic_payload_requires_coherent_appearance(self) -> None:
+        tags, confidence, ignored = normalize_semantic_identity_payload(
+            {
+                "canonical_identity_tag": "original character",
+                "appearance_tags": [
+                    "long black hair",
+                    "golden eyes",
+                    "elf ears",
+                    "beauty mark under left eye",
+                ],
+                "confidence": 0.95,
+            },
+            allow_original=True,
+        )
+
+        self.assertEqual(tags[0], "original character")
+        self.assertEqual(confidence, 0.95)
+        self.assertEqual(ignored, 0)
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            normalize_semantic_identity_payload(
+                {
+                    "canonical_identity_tag": "original character",
+                    "appearance_tags": ["long black hair", "golden eyes"],
+                    "confidence": 0.95,
+                },
+                allow_original=True,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "semantic_original_appearance_missing",
+        )
 
     def test_canvas_preserves_ratio_near_one_megapixel(self) -> None:
         width, height = fit_canvas_to_aspect_ratio(4000, 2000)
@@ -385,6 +469,55 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         )
         self.assertTrue(plan.suppress_default_style)
 
+    def test_character_change_removes_extended_identity_but_keeps_expression(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("", "Kallen Kaslana"),
+            positive_prompt=(
+                "1girl, roxy_migurdia_(mushoku_tensei), blue hair, twin braids, "
+                "ahoge, blue eyes, petite, small breasts, beauty mark under left eye, "
+                "school uniform, standing, looking at viewer, open mouth, beach, "
+                "masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=list(range(1, 9)),
+                    outfit_ids=[9],
+                    pose_action_ids=[10, 11, 12],
+                    scene_lighting_ids=[13],
+                    style_quality_ids=[0, 14],
+                    target_appearance_trigger_ids=[1],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+        plan = self.planner.finalize(preparation, classification)
+
+        for removed in (
+            "roxy_migurdia_(mushoku_tensei)",
+            "blue hair",
+            "twin braids",
+            "ahoge",
+            "blue eyes",
+            "petite",
+            "small breasts",
+            "beauty mark under left eye",
+        ):
+            self.assertNotIn(removed, plan.prompt)
+        for preserved in (
+            "school uniform",
+            "standing",
+            "looking at viewer",
+            "open mouth",
+            "beach",
+        ):
+            self.assertIn(preserved, plan.prompt)
+
     def test_target_outfit_requires_and_uses_metadata_terms(self) -> None:
         preparation = self._prepare(mode=SWAP_MODE_TARGET_OUTFIT)
         classification = self._classification(
@@ -560,6 +693,86 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         self.assertIn(preparation.target_metadata_record, (rice_a, rice_b))
         self.assertEqual(preparation.target_trigger_words, ("rice_shower_(umamusume)",))
 
+    def test_optional_target_lora_uses_semantic_fallback_for_same_character_variants(
+        self,
+    ) -> None:
+        rice_a = _record(
+            "characters/rice_shower_a.safetensors",
+            "米浴",
+            "rice-a",
+            triggers=("rice_shower_(umamusume)",),
+            source_work="赛马娘",
+        )
+        rice_b = _record(
+            "characters/rice_shower_b.safetensors",
+            "米浴",
+            "rice-b",
+            triggers=("rice_shower_(umamusume)",),
+            source_work="赛马娘",
+        )
+
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "米浴"),
+            positive_prompt="1girl, denia_wuwa, black hair, standing",
+            negative_prompt="",
+            records=(*self.records, rice_a, rice_b),
+            fallback_target_tags=(
+                "rice_shower_(umamusume)",
+                "brown hair",
+                "purple eyes",
+                "horse ears",
+            ),
+        )
+
+        self.assertIsNone(preparation.target_record)
+        self.assertIsNone(preparation.target_metadata_record)
+        self.assertEqual(
+            preparation.target_trigger_words,
+            (
+                "rice_shower_(umamusume)",
+                "brown hair",
+                "purple eyes",
+                "horse ears",
+            ),
+        )
+
+    def test_optional_target_lora_keeps_cross_identity_alias_ambiguous(self) -> None:
+        first = _record(
+            "characters/alex_game_a.safetensors",
+            "Alex A",
+            "alex-a",
+            triggers=("alex_a_(game_a)",),
+            source_work="Game A",
+        )
+        second = _record(
+            "characters/alex_game_b.safetensors",
+            "Alex B",
+            "alex-b",
+            triggers=("alex_b_(game_b)",),
+            source_work="Game B",
+        )
+        first_entry = _semantic_entry(first, "阿历克斯")
+        second_entry = _semantic_entry(second, "阿历克斯")
+        planner = CharacterSwapPlanner(
+            LoraSemanticIndex(
+                entries={
+                    first_entry.identity_key: first_entry,
+                    second_entry.identity_key: second_entry,
+                }
+            )
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            planner.prepare(
+                CharacterSwapRequest("Denia", "阿历克斯"),
+                positive_prompt="1girl, denia_wuwa, black hair, standing",
+                negative_prompt="",
+                records=(*self.records, first, second),
+                fallback_target_tags=("alex_a_(game_a)", "black hair"),
+            )
+
+        self.assertEqual(raised.exception.code, "ambiguous_character")
+
     def test_no_character_lora_keeps_cross_identity_alias_ambiguous(self) -> None:
         first = _record(
             "characters/alex_game_a.safetensors",
@@ -664,6 +877,65 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         self.assertNotIn("battle suit", plan.prompt)
         self.assertNotIn("jumping", plan.prompt)
         self.assertEqual(plan.prompt.count("best quality"), 0)
+
+    def test_original_character_uses_stable_appearance_without_target_lora(
+        self,
+    ) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "Denia",
+                "原创角色：银色长发、金色眼睛、精灵耳、左眼下美人痣",
+            ),
+            positive_prompt=(
+                "1girl, denia_wuwa, black hair, school uniform, standing, "
+                "looking at viewer, open mouth, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=(
+                "original character",
+                "long silver hair",
+                "golden eyes",
+                "elf ears",
+                "beauty mark under left eye",
+            ),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1, 2],
+                    outfit_ids=[3],
+                    pose_action_ids=[4, 5, 6],
+                    scene_lighting_ids=[7],
+                    style_quality_ids=[0, 8],
+                    target_appearance_trigger_ids=[1, 2, 3, 4],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIsNone(plan.target_record)
+        for tag in (
+            "original character",
+            "long silver hair",
+            "golden eyes",
+            "elf ears",
+            "beauty mark under left eye",
+        ):
+            self.assertIn(tag, plan.prompt)
+        self.assertNotIn("denia_wuwa", plan.prompt)
+        for preserved in (
+            "school uniform",
+            "standing",
+            "looking at viewer",
+            "open mouth",
+            "beach",
+        ):
+            self.assertIn(preserved, plan.prompt)
+        self.assertEqual(plan.loras, ())
 
     def test_missing_explicit_target_file_never_uses_semantic_fallback(self) -> None:
         with self.assertRaises(CharacterSwapError) as raised:

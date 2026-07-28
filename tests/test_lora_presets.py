@@ -235,6 +235,58 @@ class LoraPresetRegistryTests(unittest.TestCase):
         self.assertIn("风格1011", registry.aliases_for(preset))
         self.assertEqual(preset.note, "Blue Archive 画师备注")
 
+    def test_named_style_mention_accepts_full_name_alias_and_word_orders(self) -> None:
+        registry = LoraPresetRegistry([])
+        preset = registry.save(
+            name="风格GZC",
+            category="style",
+            selections=_selection("styles/gzc"),
+            aliases=("谷子茶",),
+        )
+
+        for text in (
+            "风格GZC，JK制服",
+            "用风格GZC画甘雨",
+            "使用 GZC 画甘雨",
+            "采用谷子茶画风",
+            "套用 GZC，背景保持简洁",
+            "按GZC画一张",
+            "风格使用 GZC，JK制服",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(registry.find_mentioned_style(text), preset)
+
+        self.assertIn("GZC", registry.aliases_for(preset))
+
+    def test_named_style_alias_ambiguity_fails_closed(self) -> None:
+        registry = LoraPresetRegistry([])
+        first = registry.save(
+            name="风格GZC（暖色）",
+            category="style",
+            selections=_selection("styles/gzc-warm"),
+            aliases=("gzc",),
+        )
+        second = registry.save(
+            name="风格GZC（冷色）",
+            category="style",
+            selections=_selection("styles/gzc-cool"),
+            aliases=("gzc",),
+        )
+
+        self.assertIsNone(registry.find_mentioned_style("使用 GZC 画甘雨"))
+        self.assertIs(registry.find_mentioned_style("使用风格GZC（暖色）"), first)
+        self.assertIs(registry.find_mentioned_style("风格GZC（冷色），JK制服"), second)
+
+    def test_named_style_ascii_alias_does_not_match_inside_longer_word(self) -> None:
+        registry = LoraPresetRegistry([])
+        registry.save(
+            name="风格GZC",
+            category="style",
+            selections=_selection("styles/gzc"),
+        )
+
+        self.assertIsNone(registry.find_mentioned_style("use agzcx rendering"))
+
     def test_edit_can_rename_without_leaving_duplicate_old_entry(self) -> None:
         registry = LoraPresetRegistry([])
         original = registry.save(

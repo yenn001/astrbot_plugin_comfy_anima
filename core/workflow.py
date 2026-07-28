@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.8.4
+AstrBot Comfy Anima 插件 v1.9.0
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.8.4
-日期: 2026-07-27
+版本: 1.9.0
+日期: 2026-07-28
 """
 
 import copy
@@ -904,6 +904,7 @@ def parse_generation_options(
     enable_upscale = None
     use_prompt_llm = None
     prompt_expansion_mode = "standard"
+    prompt_edit_mode = ""
     lora_preset = ""
     pipeline = ""
     inpaint_mode = ""
@@ -1026,31 +1027,59 @@ def parse_generation_options(
             enable_upscale = True
         elif token == "--no-upscale":
             enable_upscale = False
-        elif token == "--llm":
+        elif token in {"--llm", "--llm-character-change"}:
+            if token == "--llm-character-change" and mode_context != "generation":
+                raise ValueError("--llmcc/--lcc 仅用于 /画图 与 /画图no")
             use_prompt_llm = True
-            if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
-                raw_expansion_mode = tokens[index + 1].strip().casefold()
-                expansion_aliases = {
-                    "s": "standard",
-                    "standard": "standard",
-                    "normal": "standard",
-                    "普通": "standard",
-                    "简洁": "standard",
-                    "u": "ultra",
-                    "ultra": "ultra",
-                    "complex": "ultra",
-                    "ornate": "ultra",
-                    "复杂": "ultra",
-                    "华丽": "ultra",
-                    "高质量": "ultra",
-                }
-                normalized_expansion_mode = expansion_aliases.get(raw_expansion_mode)
+            if token == "--llm-character-change":
+                prompt_edit_mode = "character_change"
+            expansion_aliases = {
+                "s": "standard",
+                "standard": "standard",
+                "normal": "standard",
+                "普通": "standard",
+                "简洁": "standard",
+                "u": "ultra",
+                "ultra": "ultra",
+                "complex": "ultra",
+                "ornate": "ultra",
+                "复杂": "ultra",
+                "华丽": "ultra",
+                "高质量": "ultra",
+            }
+            character_change_aliases = {
+                "c",
+                "cc",
+                "char-change",
+                "char_change",
+                "character-change",
+                "character_change",
+            }
+            while index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+                raw_mode = tokens[index + 1].strip().casefold()
+                normalized_expansion_mode = expansion_aliases.get(raw_mode)
                 if normalized_expansion_mode:
                     prompt_expansion_mode = normalized_expansion_mode
                     index += 1
+                    continue
+                if raw_mode in character_change_aliases and mode_context == "generation":
+                    prompt_edit_mode = "character_change"
+                    index += 1
+                    continue
+                if (
+                    mode_context == "generation"
+                    and raw_mode == "char"
+                    and index + 2 < len(tokens)
+                    and tokens[index + 2].strip().casefold() == "change"
+                ):
+                    prompt_edit_mode = "character_change"
+                    index += 2
+                    continue
+                break
         elif token in {"--raw", "--no-llm"}:
             use_prompt_llm = False
             prompt_expansion_mode = "standard"
+            prompt_edit_mode = ""
         elif token in {"--preset", "--lora-preset"}:
             lora_preset = require_value(token).strip()
         elif token.startswith("--"):
@@ -1073,6 +1102,7 @@ def parse_generation_options(
         enable_upscale=enable_upscale,
         use_prompt_llm=use_prompt_llm,
         prompt_expansion_mode=prompt_expansion_mode,
+        prompt_edit_mode=prompt_edit_mode,
         lora_preset=lora_preset,
         pipeline=pipeline,
         inpaint_mode=inpaint_mode,

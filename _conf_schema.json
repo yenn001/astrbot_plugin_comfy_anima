@@ -232,7 +232,7 @@
   "enable_prompt_llm": {
     "description": "默认启用 LLM 分镜优化",
     "type": "bool",
-    "hint": "用于自然语言绘图及 /anima draw；/画图 和 /画图no 默认直通 Tags，--llm/--l 使用 Standard，--llm u/--l u 使用 Ultra 华丽扩写",
+    "hint": "用于自然语言绘图及 /anima draw；/画图 和 /画图no 默认直通 Tags，--llm/--l 使用 Standard，--llm u/--l u 使用 Ultra。显式文字换角仅由 /画图(no) 的 --llm c、--llmcc、--lcc 触发，不会从普通聊天自动推断",
     "default": true
   },
   "prompt_llm_provider_id": {
@@ -245,7 +245,7 @@
   "auto_draw_system_prompt": {
     "description": "绘图 System Prompt",
     "type": "text",
-    "hint": "留空使用插件内置分镜导演；自定义内容会叠加在插件运行时约束之后。需要出图时必须保留合法 <pic prompt=\"英文 tags\">；换装等场景可选 negative=\"英文 tags\"",
+    "hint": "留空使用插件内置分镜导演；自定义内容会叠加在插件运行时约束之后。需要出图时必须保留合法 <pic prompt=\"英文 tags\">；换装等场景可选 negative=\"英文 tags\"。不得要求普通聊天自行启用 --llm c/--llmcc/--lcc 专用文字换角模式",
     "default": "",
     "editor_mode": true,
     "editor_language": "markdown"
@@ -253,7 +253,7 @@
   "director_extra_instruction": {
     "description": "分镜模型附加要求",
     "type": "text",
-    "hint": "附加在内置参考提示词后，例如固定画风或角色连续性要求",
+    "hint": "附加在内置参考提示词后，例如固定画风或角色连续性要求；不能覆盖显式文字换角的旧身份清理、LoRA 可选降级和原创角色边界",
     "default": ""
   },
   "prompt_llm_timeout": {

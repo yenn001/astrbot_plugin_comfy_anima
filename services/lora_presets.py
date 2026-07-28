@@ -64,6 +64,10 @@ _STYLE_PREFIX_RE = re.compile(
     r"^(风格|style)\s*0*(\d+)(?=\s|[（(\[【:：|｜])",
     flags=re.IGNORECASE,
 )
+_NAMED_STYLE_PREFIX_RE = re.compile(
+    r"^(?:风格|style)\s*[:：|｜-]?\s*(?P<name>[^\s:：|｜-].*)$",
+    flags=re.IGNORECASE,
+)
 
 
 def _preset_lookup_key(value: str) -> str:
@@ -91,6 +95,38 @@ def _strip_trailing_annotations(value: str) -> str:
             break
         text = shortened
     return text
+
+
+def _lookup_key_mentioned(source_key: str, candidate_key: str) -> bool:
+    """Return whether a compact preset key occurs without an ASCII collision.
+
+    Chinese descriptions commonly attach a preset directly to words such as
+    ``画`` or punctuation, so ``\b`` is not suitable.  ASCII aliases still need
+    guards to prevent a short name such as ``gzc`` from matching a longer
+    identifier accidentally.  Numeric style names also keep the historical
+    no-prefix-collision guarantee (``风格001`` must not match ``风格0012``).
+    """
+
+    if not source_key or not candidate_key:
+        return False
+    ascii_word = frozenset(
+        "abcdefghijklmnopqrstuvwxyz0123456789_"
+    )
+    start = 0
+    while True:
+        index = source_key.find(candidate_key, start)
+        if index < 0:
+            return False
+        before = source_key[index - 1] if index > 0 else ""
+        after_index = index + len(candidate_key)
+        after = source_key[after_index] if after_index < len(source_key) else ""
+        if (
+            (candidate_key[0] not in ascii_word or before not in ascii_word)
+            and (candidate_key[-1] not in ascii_word or after not in ascii_word)
+            and (not candidate_key[-1].isdigit() or not after.isdigit())
+        ):
+            return True
+        start = index + 1
 
 
 def normalize_preset_aliases(value: Any) -> tuple[str, ...]:
@@ -143,6 +179,9 @@ def _preset_name_aliases(
     prefix = _STYLE_PREFIX_RE.match(base_name)
     if prefix:
         add(f"{prefix.group(1)}{int(prefix.group(2))}")
+    named_style = _NAMED_STYLE_PREFIX_RE.match(base_name)
+    if named_style and not _STYLE_NUMBER_RE.fullmatch(_preset_lookup_key(base_name)):
+        add(named_style.group("name"))
     for alias in explicit_aliases:
         add(str(alias or ""))
     return tuple(aliases)
@@ -388,10 +427,13 @@ class LoraPresetRegistry:
         raise LoraPresetError(f"找不到 LoRA 组合: {value}")
 
     def find_mentioned_style(self, text: str) -> Optional[LoraPreset]:
-        """识别自然语言中的完整风格名或唯一的无备注简称。"""
+        """识别完整风格名或唯一别名；任何歧义都拒绝自动选择。"""
         source = str(text or "")
         if not source:
             return None
+
+        source_key = _preset_lookup_key(source)
+        styles = self.list_presets(category=PRESET_CATEGORY_ARTIST_STYLE)
 
         numeric_request = re.search(
             r"(?:用|使用|采用|套用|按|切换(?:到|为)?)?\s*"
@@ -410,32 +452,39 @@ class LoraPresetRegistry:
             ):
                 return numeric_preset
 
-        aliases: dict[str, list[tuple[str, LoraPreset]]] = {}
-        for preset in self.list_presets(category=PRESET_CATEGORY_ARTIST_STYLE):
-            for alias in _preset_name_aliases(preset.name, preset.aliases):
-                aliases.setdefault(_preset_alias_key(alias), []).append((alias, preset))
-        candidates = sorted(
-            (
-                values[0]
-                for values in aliases.values()
-                if len({id(preset) for _, preset in values}) == 1
-            ),
-            key=lambda item: len(item[0]),
-            reverse=True,
-        )
-        for alias, preset in candidates:
-            escaped = re.escape(alias)
-            digit_guard = r"(?!\d)" if alias[-1:].isdigit() else ""
-            intent_pattern = (
-                rf"(?:用|使用|采用|套用|按|切换(?:到|为)?)\s*"
-                rf"[‘’“”\"'「」『』]?\s*{escaped}{digit_guard}"
+        # A complete saved display name is stronger than every derived or
+        # administrator-managed alias.  Prefer the longest exact name so
+        # ``Night Style`` is not shadowed by another preset named ``Night``.
+        full_name_matches = [
+            preset
+            for preset in styles
+            if _lookup_key_mentioned(source_key, _preset_lookup_key(preset.name))
+        ]
+        if full_name_matches:
+            longest = max(
+                len(_preset_lookup_key(preset.name)) for preset in full_name_matches
             )
-            if re.search(intent_pattern, source, flags=re.IGNORECASE):
-                return preset
-            if re.fullmatch(r"风格\d+", alias, flags=re.IGNORECASE) and re.search(
-                rf"{escaped}{digit_guard}", source, flags=re.IGNORECASE
-            ):
-                return preset
+            strongest = [
+                preset
+                for preset in full_name_matches
+                if len(_preset_lookup_key(preset.name)) == longest
+            ]
+            return strongest[0] if len(strongest) == 1 else None
+
+        aliases: dict[str, list[tuple[str, LoraPreset]]] = {}
+        for preset in styles:
+            for alias in _preset_name_aliases(preset.name, preset.aliases)[1:]:
+                aliases.setdefault(_preset_alias_key(alias), []).append((alias, preset))
+        unique_alias_matches: dict[int, LoraPreset] = {}
+        for alias_key, values in aliases.items():
+            matched_presets = {id(preset): preset for _, preset in values}
+            if len(matched_presets) != 1:
+                continue
+            if _lookup_key_mentioned(source_key, alias_key):
+                preset = next(iter(matched_presets.values()))
+                unique_alias_matches[id(preset)] = preset
+        if len(unique_alias_matches) == 1:
+            return next(iter(unique_alias_matches.values()))
         return None
 
     def match_style_selections(

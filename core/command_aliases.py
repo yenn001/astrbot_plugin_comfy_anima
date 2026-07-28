@@ -64,6 +64,8 @@ _GENERATION_OPTION_ALIASES = {
     "--nu": "--no-upscale",
     "--llm": "--llm",
     "--l": "--llm",
+    "--llmcc": "--llm-character-change",
+    "--lcc": "--llm-character-change",
     "--raw": "--raw",
     "--no-llm": "--raw",
     "--r": "--raw",

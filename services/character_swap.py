@@ -116,12 +116,27 @@ _OBVIOUS_OUTFIT_MARKERS = (
 )
 _APPEARANCE_MARKERS = (
     "hair",
+    "braid",
+    "bangs",
+    "ahoge",
+    "ponytail",
+    "twintails",
+    "twin tails",
     "eyes",
     "eye",
+    "pupil",
+    "heterochromia",
+    "eyebrow",
+    "eyelash",
     "skin",
     "face",
     "facial",
+    "nose",
+    "lips",
+    "teeth",
     "freckles",
+    "mole",
+    "beauty mark",
     "scar",
     "tattoo",
     "marking",
@@ -131,18 +146,96 @@ _APPEARANCE_MARKERS = (
     "tail",
     "fangs",
     "species",
+    "petite",
+    "slender",
+    "slim",
+    "curvy",
+    "muscular",
+    "tall",
+    "short stature",
+    "breasts",
+    "wide hips",
+    "narrow waist",
+    "body build",
+    "figure",
     "发",
     "头发",
+    "辫",
+    "刘海",
+    "呆毛",
+    "马尾",
+    "双马尾",
     "眼",
+    "瞳",
+    "异色瞳",
+    "眉",
+    "睫毛",
     "皮肤",
     "脸",
+    "鼻",
+    "唇",
+    "牙",
     "雀斑",
+    "痣",
+    "美人痣",
     "伤疤",
     "纹身",
     "耳",
     "角",
     "翅",
     "尾",
+    "娇小",
+    "纤细",
+    "苗条",
+    "丰满",
+    "肌肉",
+    "高挑",
+    "矮小",
+    "胸",
+    "胯",
+    "腰",
+    "体型",
+    "身材",
+)
+_TRANSIENT_APPEARANCE_STATE_MARKERS = (
+    "open mouth",
+    "closed mouth",
+    "smile",
+    "grin",
+    "blush",
+    "crying",
+    "tears",
+    "wink",
+    "winking",
+    "closed eyes",
+    "half-closed eyes",
+    "one eye closed",
+    "looking at viewer",
+    "looking back",
+    "looking away",
+    "angry",
+    "embarrassed",
+    "surprised",
+    "张嘴",
+    "闭嘴",
+    "微笑",
+    "笑",
+    "脸红",
+    "哭",
+    "泪",
+    "眨眼",
+    "闭眼",
+    "半闭眼",
+    "看向",
+    "回头看",
+    "生气",
+    "害羞",
+    "惊讶",
+)
+_ORIGINAL_CHARACTER_RE = re.compile(
+    r"(?:原创(?:角色|人物)?|自创(?:角色|人物)?|原创设定|自设|"
+    r"(?<![a-z0-9])oc(?![a-z0-9])|original\s+character)",
+    re.IGNORECASE,
 )
 _GENERIC_IDENTITY_QUALIFIERS = frozenset(
     {"character", "fiction", "game", "original", "series", "work"}
@@ -275,6 +368,13 @@ class CharacterSwapRequest:
     preview: bool = False
     use_target_lora: bool = True
     edit_requirement: str = ""
+    pipeline: str = ""
+    prompt_expansion_mode: str = "standard"
+    seed: Optional[int] = None
+    steps: Optional[int] = None
+    cfg: Optional[float] = None
+    enable_upscale: Optional[bool] = None
+    denoise: Optional[float] = None
 
     @property
     def source_kind(self) -> str:
@@ -354,6 +454,31 @@ def _identity_key(value: Any) -> str:
 
 def _is_generic_source_query(value: Any) -> bool:
     return _identity_key(value) in _GENERIC_SOURCE_QUERY_KEYS
+
+
+def _is_original_character_query(value: Any) -> bool:
+    return bool(_ORIGINAL_CHARACTER_RE.search(str(value or "")))
+
+
+def is_original_character_query(value: Any) -> bool:
+    """Public bounded check shared by the Provider bridge and planner."""
+
+    return _is_original_character_query(value)
+
+
+def _is_stable_appearance_term(value: Any) -> bool:
+    """Recognize identity-bearing appearance without deleting expressions.
+
+    Eye and mouth words are especially ambiguous in prompt tags.  Stable color,
+    shape and anatomy may be replaced during a character change, while transient
+    gaze, blinking, smiling and mouth-state tags belong to the preserved action /
+    expression layer.
+    """
+
+    folded = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    if any(marker in folded for marker in _TRANSIENT_APPEARANCE_STATE_MARKERS):
+        return False
+    return any(marker in folded for marker in _APPEARANCE_MARKERS)
 
 
 def _is_meaningful_identity_key(value: str) -> bool:
@@ -439,6 +564,17 @@ def _semantic_identity_anchor_candidate(value: str) -> bool:
     return True
 
 
+def _target_identity_anchor_candidate(value: str, target_query: str) -> bool:
+    """Accept a proven named identity or an explicitly requested original OC."""
+
+    if _semantic_identity_anchor_candidate(value):
+        return True
+    return bool(
+        _is_original_character_query(target_query)
+        and _prompt_term_key(value) == "originalcharacter"
+    )
+
+
 def _trusted_identity_signature(
     record: LoraRecord,
     semantic_index: LoraSemanticIndex,
@@ -497,6 +633,8 @@ def _records_share_proven_identity(
 
 def normalize_semantic_identity_payload(
     payload: Mapping[str, Any],
+    *,
+    allow_original: bool = False,
 ) -> tuple[tuple[str, ...], float, int]:
     """Canonicalize safe, common semantic-identity JSON response shapes."""
 
@@ -677,11 +815,25 @@ def normalize_semantic_identity_payload(
                 "稳定外观 Tags 中不能混入第二个角色身份锚点",
                 code="semantic_target_multiple_identity",
             )
-    if not tags or not _semantic_identity_anchor_candidate(tags[0]):
+    original_anchor = (
+        allow_original and _prompt_term_key(tags[0] if tags else "") == "originalcharacter"
+    )
+    if not tags or not (
+        _semantic_identity_anchor_candidate(tags[0]) or original_anchor
+    ):
         raise CharacterSwapError(
             "纯语义身份首项不是可验证的角色身份锚点",
             code="semantic_target_identity_anchor",
         )
+    if original_anchor:
+        stable_appearance = tuple(
+            tag for tag in tags[1:] if _is_stable_appearance_term(tag)
+        )
+        if len(stable_appearance) < 3:
+            raise CharacterSwapError(
+                "原创角色至少需要 3 项稳定外貌特征",
+                code="semantic_original_appearance_missing",
+            )
 
     recognized_fields = {
         "canonical_identity_tag",
@@ -1119,13 +1271,14 @@ class CharacterSwapPlanner:
             )
         )
         try:
-            target_metadata = resolve_character_record(
-                records,
-                request.target_query,
-                self._semantic_index,
-                role_label="目标",
-                allow_equivalent_variants=not request.use_target_lora,
-            )
+            if not _is_original_character_query(request.target_query):
+                target_metadata = resolve_character_record(
+                    records,
+                    request.target_query,
+                    self._semantic_index,
+                    role_label="目标",
+                    allow_equivalent_variants=not request.use_target_lora,
+                )
         except CharacterSwapError as exc:
             # Pure semantic mode intentionally does not select a target LoRA file.
             # Multiple LoRA variants of the same requested character therefore do
@@ -1137,12 +1290,33 @@ class CharacterSwapPlanner:
                 and not explicit_target
                 and exc.code == "character_not_found"
             )
-            legacy_missing_fallback = (
-                exc.code == "character_not_found"
+            equivalent_ambiguous_variants = False
+            if (
+                request.use_target_lora
                 and not explicit_target
+                and exc.code == "ambiguous_character"
+            ):
+                try:
+                    resolve_character_record(
+                        records,
+                        request.target_query,
+                        self._semantic_index,
+                        role_label="目标",
+                        allow_equivalent_variants=True,
+                    )
+                except CharacterSwapError:
+                    pass
+                else:
+                    equivalent_ambiguous_variants = True
+            optional_lora_fallback = (
+                not explicit_target
                 and bool(fallback_target_tags)
+                and (
+                    exc.code == "character_not_found"
+                    or equivalent_ambiguous_variants
+                )
             )
-            if not (semantic_metadata_optional or legacy_missing_fallback):
+            if not (semantic_metadata_optional or optional_lora_fallback):
                 raise
         target = target_metadata if request.use_target_lora else None
         if (
@@ -1302,10 +1476,14 @@ class CharacterSwapPlanner:
         system_prompt = """You are a conservative Anima/Danbooru tag classifier.
 You do not rewrite prompts and you never invent tags. Classify every numbered source
 tag into exactly one provided bucket. The task is a single-character identity swap.
-Identity includes the source character name, identity token, hair color/style, eye
-color, facial markings, species traits and other character-defining appearance.
-Outfit includes clothes, shoes and ordinary accessories. Preserve pose, action,
-expression, camera, composition, scene, lighting, style and quality. Weighted tag
+Identity includes the source character name, identity token, hair color/style
+(including braids, bangs, ahoge and ponytails), eye color/pupil/heterochromia,
+stable face traits, brows/lashes, skin, scars/tattoos/moles, species traits,
+body build/height/breast size and other character-defining appearance. Outfit
+includes clothes, shoes and ordinary accessories. Preserve pose, action and
+transient expression or gaze such as smile, blush, open mouth, closed eyes,
+looking direction and tears, plus camera, composition, scene, lighting, style
+and quality. Weighted tag
 groups that mix incompatible buckets must go to uncertain_ids. Also verify the
 numbered target candidates against the exact requested target character and select
 exactly one unique identity token when it is supported. Return null when no candidate
@@ -1315,7 +1493,10 @@ stable physical appearance candidates and default-outfit candidates; leave pose,
 scene, style, quality and unknown candidates unselected. Do not invent any target
 tag. For target-outfit mode, select only candidates that explicitly describe the
 target's default outfit. Confidence must reflect both source classification and the
-target-name-to-identity match. Return one JSON object only. Do not include
+target-name-to-identity match. When target_character explicitly says original/OC,
+the exact candidate ``original character`` is the required identity anchor; select
+it only when at least three other candidates are coherent stable physical traits.
+Return one JSON object only. Do not include
 explanations."""
         payload = {
             "source_character": preparation.request.source_query,
@@ -1530,8 +1711,10 @@ explanations."""
                     "分类模型把通用主体或明显衣装 Tag 误判为角色身份",
                     code="unsafe_source_identity_classification",
                 )
-            if key not in source_identity_keys and not any(
-                marker in folded for marker in _APPEARANCE_MARKERS
+            if (
+                key not in source_identity_keys
+                and not _semantic_identity_anchor_candidate(term)
+                and not _is_stable_appearance_term(folded)
             ):
                 raise CharacterSwapError(
                     "分类模型把无法证明属于身份外观的 Tag 标为角色身份",
@@ -1567,7 +1750,10 @@ explanations."""
             target_trigger = preparation.target_trigger_words[trigger_id]
             target_key = _prompt_term_key(target_trigger)
             if (
-                not _semantic_identity_anchor_candidate(target_trigger)
+                not _target_identity_anchor_candidate(
+                    target_trigger,
+                    preparation.request.target_query,
+                )
                 or target_key in _GENERIC_NON_IDENTITY_KEYS
             ):
                 raise CharacterSwapError(
@@ -1628,7 +1814,7 @@ explanations."""
         for trigger_id in classification.target_appearance_trigger_ids:
             trigger = preparation.target_trigger_words[trigger_id]
             folded = unicodedata.normalize("NFKC", trigger).casefold()
-            if not any(marker in folded for marker in _APPEARANCE_MARKERS) or any(
+            if not _is_stable_appearance_term(folded) or any(
                 marker in folded for marker in _OBVIOUS_OUTFIT_MARKERS
             ):
                 raise CharacterSwapError(
@@ -1980,6 +2166,107 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
     )
 
 
+def parse_text_character_change_request(
+    prompt_text: str,
+    *,
+    preset: str = "",
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    negative_prompt: str = "",
+    pipeline: str = "",
+    prompt_expansion_mode: str = "standard",
+    seed: Optional[int] = None,
+    steps: Optional[int] = None,
+    cfg: Optional[float] = None,
+    enable_upscale: Optional[bool] = None,
+    denoise: Optional[float] = None,
+) -> CharacterSwapRequest:
+    """Parse the explicit ``/画图 ... --llm c`` text-to-text swap form.
+
+    This parser is intentionally unavailable to ordinary chat.  The primary
+    form is ``<complete source tags>, 把角色换成<target>``.  Keeping the source
+    tags before the replacement clause makes the edit boundary deterministic
+    and prevents an LLM from deciding which text is transport metadata.
+    """
+
+    source = unicodedata.normalize("NFKC", str(prompt_text or "")).strip()
+    match = re.search(
+        r"(?P<tags>.*?)"
+        r"(?:把|将)\s*(?P<source>[^，,。；;\n]{0,120}?)\s*"
+        r"(?:替换成|替换为|换成|换为)\s*(?P<target>.+)$",
+        source,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        raise CharacterSwapError(
+            "换角模式需要明确写成：<原 Tag 串>，把角色换成目标角色",
+            code="text_character_change_mapping_missing",
+        )
+
+    tags = match.group("tags").strip(" \t，,。；;|:")
+    if not tags:
+        raise CharacterSwapError(
+            "换角模式缺少原始 Tag 串；请先写完整 Tags，再写“把角色换成……”",
+            code="text_character_change_tags_missing",
+        )
+
+    source_query = match.group("source").strip(" \t\"'，,。；;")
+    source_query = re.sub(
+        r"^(?:原|当前|这个|该|图中|画面中)?(?:角色|人物)$",
+        "",
+        source_query,
+    ).strip()
+
+    target_tail = match.group("target").strip(" \t，,。；;")
+    target_tail, no_lora = _strip_no_character_lora_suffix(target_tail)
+    target_tail = target_tail.strip(" \t，,。；;")
+    target_query = target_tail
+    edit_requirement = ""
+    if _is_original_character_query(target_tail):
+        boundary = re.search(
+            r"[，,。；;]\s*(?=(?:其余|其他|剩余|动作|姿势|表情|构图|镜头|"
+            r"场景|背景|光线|风格|服装|衣服).{0,18}"
+            r"(?:保持|保留|不变|改成|换成|穿|戴|增加|添加|去掉|移除))",
+            target_tail,
+        )
+        if boundary is not None:
+            target_query = target_tail[: boundary.start()].strip(" \t，,。；;")
+            edit_requirement = target_tail[boundary.end() :].strip(" \t，,。；;")
+    else:
+        parts = re.split(r"[，,。；;\n]+", target_tail, maxsplit=1)
+        target_query = parts[0].strip(" \t\"'，,。；;")
+        if len(parts) == 2:
+            edit_requirement = parts[1].strip(" \t，,。；;")
+
+    target_query = target_query.strip(" \t\"'，,。；;")
+    if not target_query:
+        raise CharacterSwapError(
+            "目标角色不能为空",
+            code="empty_character_query",
+        )
+    return CharacterSwapRequest(
+        source_query=source_query,
+        target_query=target_query,
+        tags=tags,
+        mode=SWAP_MODE_KEEP_OUTFIT,
+        preset=str(preset or "").strip(),
+        width=width,
+        height=height,
+        negative_prompt=str(negative_prompt or "").strip(" ,"),
+        use_target_lora=not no_lora,
+        edit_requirement=edit_requirement,
+        pipeline=str(pipeline or "").strip(),
+        prompt_expansion_mode=(
+            "ultra" if str(prompt_expansion_mode).casefold() == "ultra" else "standard"
+        ),
+        seed=seed,
+        steps=steps,
+        cfg=cfg,
+        enable_upscale=enable_upscale,
+        denoise=denoise,
+    )
+
+
 def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     """Recognize only explicit A-to-B natural-language replacement requests."""
 
@@ -2085,9 +2372,11 @@ __all__ = [
     "SWAP_MODE_KEEP_OUTFIT",
     "SWAP_MODE_TARGET_OUTFIT",
     "fit_canvas_to_aspect_ratio",
+    "is_original_character_query",
     "normalize_semantic_identity_payload",
     "parse_character_swap_request",
     "parse_natural_character_swap",
+    "parse_text_character_change_request",
     "resolve_character_record",
     "response_text",
 ]

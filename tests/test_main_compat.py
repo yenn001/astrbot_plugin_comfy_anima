@@ -606,6 +606,122 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertIn("LLM 提示词优化不可用", replies[0])
         self.assertIn("provider missing", replies[0])
 
+    def test_direct_draw_character_change_routes_to_swap_pipeline(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+        plugin._director = object()
+        plugin._director_error = ""
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: "风格GZC"
+        captured = []
+
+        async def handle_swap(_event, request, *, forward=False):
+            captured.append((request, forward))
+            yield "swap-complete"
+
+        plugin._handle_character_swap = handle_swap
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "1girl, roxy, blue hair, standing，把角色换成甘雨 --lcc u",
+                    forward=True,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(replies, ["swap-complete"])
+        self.assertEqual(len(captured), 1)
+        request, forward = captured[0]
+        self.assertEqual(request.target_query, "甘雨")
+        self.assertIn("blue hair", request.tags)
+        self.assertEqual(request.preset, "风格GZC")
+        self.assertEqual(request.prompt_expansion_mode, "ultra")
+        self.assertTrue(forward)
+
+    def test_direct_draw_no_character_change_keeps_direct_delivery(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+        plugin._director = object()
+        plugin._director_error = ""
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        captured = []
+
+        async def handle_swap(_event, request, *, forward=False):
+            captured.append((request, forward))
+            yield "swap-complete"
+
+        plugin._handle_character_swap = handle_swap
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "1girl, roxy, blue hair，把角色换成甘雨 --llm c",
+                    forward=False,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(replies, ["swap-complete"])
+        self.assertEqual(len(captured), 1)
+        _request, forward = captured[0]
+        self.assertFalse(forward)
+
+    def test_character_swap_optional_lora_errors_use_semantic_fallback(self) -> None:
+        request = self.main.CharacterSwapRequest("", "冷门角色")
+        checker = self.main.ComfyAnimaPlugin._character_swap_semantic_retry_allowed
+
+        for code in (
+            "character_not_found",
+            "ambiguous_character",
+            "semantic_target_tags_missing",
+            "missing_target_trigger",
+        ):
+            with self.subTest(code=code):
+                self.assertTrue(checker(request, code))
+        self.assertFalse(checker(request, "character_suggestion"))
+        self.assertFalse(
+            checker(
+                self.main.CharacterSwapRequest(
+                    "",
+                    "characters/exact-target.safetensors",
+                ),
+                "character_not_found",
+            )
+        )
+
+    def test_known_style_does_not_hide_character_lora_lookup(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_lora_tool=True,
+            enable_local_intent_router=True,
+        )
+        plugin._find_requested_style_preset = (
+            lambda text: "风格GZC" if "GZC" in text else ""
+        )
+        plugin._lora_presets = types.SimpleNamespace(
+            presets=(
+                types.SimpleNamespace(
+                    category=self.main.PRESET_CATEGORY_CHARACTER,
+                    name="甘雨",
+                ),
+            )
+        )
+        plugin._semantic_index = types.SimpleNamespace(entries={})
+
+        self.assertFalse(plugin._scene_needs_lora_tools("风格GZC，JK制服"))
+        self.assertTrue(plugin._scene_needs_lora_tools("风格GZC，原神甘雨"))
+        self.assertTrue(plugin._scene_needs_lora_tools("风格使用 UNKNOWN，JK制服"))
+
     def test_direct_draw_reports_prompt_protocol_failure_without_handler_crash(
         self,
     ) -> None:
@@ -773,7 +889,8 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "/重绘 <要求> --mode lanpaint",
             "--pipeline base|rtx|iterative",
             "--no-character-lora / --no-lora",
-            "目标角色 LoRA 完全未命中时会自动改用纯语义 Tags",
+            "目标角色 LoRA 完全未命中，或同一身份存在多个无法唯一选定的版本时",
+            "跨身份歧义、近似名称和显式文件请求仍会停止并要求确认",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, help_text)
@@ -802,6 +919,8 @@ class HelpTextTests(unittest.IsolatedAsyncioTestCase):
             "--llm / --l 使用 Standard 优化",
             "--llm u / --l u 使用 Ultra 华丽扩写",
             "--raw / --no-llm 明确保持原样",
+            "缺失或同一身份有多个版本时使用纯语义 Tags",
+            "明确文件名或跨身份歧义不会猜选",
             "/画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx",
         ):
             with self.subTest(expected=expected):

@@ -619,6 +619,57 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
         self.assertEqual(result.prompt_expansion_mode, "standard")
         self.assertEqual(result.prompt, "girl in a red dress")
 
+    def test_generation_llm_character_change_aliases_are_structured(self) -> None:
+        cases = {
+            "old tags, replace with Ganyu --llm c": "standard",
+            "old tags, replace with Ganyu --llm char change": "standard",
+            "old tags, replace with Ganyu --llmcc": "standard",
+            "old tags, replace with Ganyu --lcc": "standard",
+            "old tags, replace with Ganyu --llm c u": "ultra",
+            "old tags, replace with Ganyu --llmcc u": "ultra",
+            "old tags, replace with Ganyu --lcc u": "ultra",
+        }
+
+        for command, expansion_mode in cases.items():
+            with self.subTest(command=command):
+                result = parse_generation_options(command, mode_context="generation")
+                self.assertTrue(result.use_prompt_llm)
+                self.assertEqual(result.prompt_edit_mode, "character_change")
+                self.assertEqual(result.prompt_expansion_mode, expansion_mode)
+                self.assertEqual(result.prompt, "old tags, replace with Ganyu")
+
+    def test_raw_clears_llm_character_change_mode(self) -> None:
+        result = parse_generation_options(
+            "old tags, replace with Ganyu --llm c --raw",
+            mode_context="generation",
+        )
+
+        self.assertFalse(result.use_prompt_llm)
+        self.assertEqual(result.prompt_edit_mode, "")
+        self.assertEqual(result.prompt_expansion_mode, "standard")
+
+    def test_character_change_compact_alias_is_generation_only(self) -> None:
+        with self.assertRaisesRegex(ValueError, "仅用于 /画图"):
+            parse_generation_options(
+                "replace the character --llmcc",
+                mode_context="semantic_redraw",
+            )
+
+    def test_character_change_language_without_explicit_switch_stays_ordinary(
+        self,
+    ) -> None:
+        result = parse_generation_options(
+            "1girl, blue hair, standing，把角色换成甘雨",
+            mode_context="generation",
+        )
+
+        self.assertIsNot(result.use_prompt_llm, True)
+        self.assertEqual(result.prompt_edit_mode, "")
+        self.assertEqual(
+            result.prompt,
+            "1girl, blue hair, standing，把角色换成甘雨",
+        )
+
     def test_generation_parser_preserves_danbooru_apostrophes_and_escapes(
         self,
     ) -> None:
