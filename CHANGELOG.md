@@ -2,6 +2,16 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.3] - 2026-07-28
+
+### 本地 Danbooru 角色精确检索
+
+- 语义换角现在优先查询管理员导入的本地 Danbooru `character` 分类。用户直接给出英文 canonical 或唯一 alias 时可在调用绘图模型前完成确认；纯中文请求会让绘图模型同时返回 canonical、最多八个同角色罗马字候选与作品提示，再由本地索引批量 exact。
+- 新增安全查询变体：例如 Provider 返回并不存在的 `asuma_toki_(blue_archive)` 时，会剥离最后作品限定查询唯一 alias `asuma_toki`，并复核返回 canonical 的作品仍为 `blue_archive`，最终稳定固定到 `toki_(blue_archive)`。兔女郎等变体保持独立，错误作品限定不会借用同名 alias。
+- Prefix、keyword、Embedding 与 Rerank 只能处理本地索引生成的有限候选池；任何候选在使用前都必须重新通过 `character` exact。多个不同角色身份冲突时，Embedding/Rerank 只给出候选顺序，插件仍会停止而不猜选。
+- 任务时间线与 `--preview` 增加 Danbooru 查询变体、匹配类型、候选数量、Embedding/Rerank 可用状态和 exact 结果说明，不记录 Provider 原始回复或完整用户提示词。
+- 已使用 `.88` 的真实 111,513 项索引验证飞鸟马时、兔女郎飞鸟马时、今汐与 RIO；其中角色分类共 32,091 项。
+
 ## [1.9.2] - 2026-07-28
 
 ### 文本换角安全边界与命令参数热修复

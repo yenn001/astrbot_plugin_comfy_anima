@@ -488,6 +488,10 @@ class CharacterSwapRequest:
     semantic_identity_confidence: float = 0.0
     semantic_identity_index_verified: bool = False
     semantic_identity_anchor_source: str = ""
+    semantic_identity_match_variant: str = ""
+    semantic_identity_match_type: str = ""
+    semantic_identity_candidate_count: int = 0
+    semantic_identity_query_count: int = 0
     ignored_control_directives: tuple[str, ...] = ()
 
     @property
@@ -862,13 +866,7 @@ def _records_share_proven_identity(
     return bool(shared_triggers or (shared_names and shared_works))
 
 
-def normalize_semantic_identity_payload(
-    payload: Mapping[str, Any],
-    *,
-    allow_original: bool = False,
-) -> tuple[tuple[str, ...], float, int]:
-    """Canonicalize safe, common semantic-identity JSON response shapes."""
-
+def _semantic_payload_mapping(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     active: Mapping[str, Any] = payload
     for _depth in range(2):
         nested = next(
@@ -882,6 +880,90 @@ def normalize_semantic_identity_payload(
         if not isinstance(nested, Mapping):
             break
         active = nested
+    return active
+
+
+def semantic_identity_lookup_hints(
+    payload: Mapping[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Extract bounded ASCII discovery hints without authorizing identity."""
+
+    active = _semantic_payload_mapping(payload)
+
+    def values(keys: Sequence[str], limit: int) -> tuple[str, ...]:
+        raw: Any = next(
+            (active.get(key) for key in keys if active.get(key) is not None),
+            [],
+        )
+        if isinstance(raw, str):
+            raw = [item.strip() for item in re.split(r"[,;\n]+", raw) if item.strip()]
+        if not isinstance(raw, list):
+            raise CharacterSwapError(
+                "纯语义角色检索候选字段格式无效",
+                code="semantic_target_lookup_hint_type",
+            )
+        output: list[str] = []
+        seen: set[str] = set()
+        for item in raw[:limit]:
+            if not isinstance(item, str):
+                raise CharacterSwapError(
+                    "纯语义角色检索候选必须为字符串",
+                    code="semantic_target_lookup_hint_type",
+                )
+            value = unicodedata.normalize("NFKC", item)
+            value = re.sub(r"\\([()\[\]{}])", r"\1", value)
+            value = re.sub(r"\s+", " ", value).strip(" ,")
+            if (
+                not value
+                or len(value) > 80
+                or not value.isascii()
+                or not re.fullmatch(r"[A-Za-z0-9_().'/&+ :\-]+", value)
+                or re.search(
+                    r"(?:embedding|wildcard|lora)\s*:|https?://|\\|\.\.|"
+                    r"^(?:assistant|developer|system|user)\s*:",
+                    value,
+                    re.IGNORECASE,
+                )
+            ):
+                raise CharacterSwapError(
+                    "纯语义角色检索候选未通过安全校验",
+                    code="semantic_target_lookup_hint_invalid",
+                )
+            folded = value.casefold()
+            if folded not in seen:
+                seen.add(folded)
+                output.append(value)
+        return tuple(output)
+
+    identities = values(
+        (
+            "identity_candidates",
+            "character_name_candidates",
+            "lookup_names",
+            "romanized_names",
+        ),
+        8,
+    )
+    works = values(
+        (
+            "work_hints",
+            "work_hint",
+            "copyright_candidates",
+            "lookup_works",
+        ),
+        4,
+    )
+    return identities, works
+
+
+def normalize_semantic_identity_payload(
+    payload: Mapping[str, Any],
+    *,
+    allow_original: bool = False,
+) -> tuple[tuple[str, ...], float, int]:
+    """Canonicalize safe, common semantic-identity JSON response shapes."""
+
+    active = _semantic_payload_mapping(payload)
 
     canonical = next(
         (
@@ -1088,6 +1170,14 @@ def normalize_semantic_identity_payload(
         "confidence",
         "score",
         "certainty",
+        "identity_candidates",
+        "character_name_candidates",
+        "lookup_names",
+        "romanized_names",
+        "work_hints",
+        "work_hint",
+        "copyright_candidates",
+        "lookup_works",
     }
     ignored_field_count = len(set(active) - recognized_fields)
     return tuple(tags), confidence, ignored_field_count
@@ -2803,6 +2893,7 @@ __all__ = [
     "is_explicit_lora_reference",
     "is_original_character_query",
     "normalize_semantic_identity_payload",
+    "semantic_identity_lookup_hints",
     "parse_character_swap_request",
     "parse_natural_character_swap",
     "parse_text_character_change_request",

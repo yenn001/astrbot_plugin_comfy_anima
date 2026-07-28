@@ -109,6 +109,71 @@ async def identity_rerank(_query, documents, top_n):
 
 
 class LoraHybridSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generic_document_ranking_uses_embedding_and_rerank(self):
+        query = "碧蓝档案的飞鸟马时"
+
+        def vectors(text):
+            lowered = text.casefold()
+            if text == query or "toki_(blue_archive)" in lowered:
+                return [1.0, 0.0, 0.0]
+            return [0.0, 1.0, 0.0]
+
+        embedding = FakeEmbeddingProvider(vectors)
+
+        async def prefer_toki(_query, documents, _top_n):
+            preferred = next(
+                index for index, document in enumerate(documents) if "toki_" in document
+            )
+            remaining = [index for index in range(len(documents)) if index != preferred]
+            return [
+                types.SimpleNamespace(index=preferred, relevance_score=0.99),
+                *(
+                    types.SimpleNamespace(index=index, relevance_score=0.5)
+                    for index in remaining
+                ),
+            ]
+
+        rerank = FakeRerankProvider(prefer_toki)
+        service = LoraHybridSearchService(
+            make_settings(lora_retrieval_timeout=1),
+            make_context(embedding, rerank),
+        )
+
+        order, diagnostics = await service.rank_documents(
+            query,
+            (
+                "canonical: rio_(blue_archive)",
+                "canonical: toki_(blue_archive)\naliases: asuma_toki",
+            ),
+            limit=2,
+        )
+
+        self.assertEqual(order[0], 1)
+        self.assertTrue(diagnostics["embedding_used"])
+        self.assertTrue(diagnostics["rerank_used"])
+
+    async def test_generic_document_ranking_reports_configured_unavailable(self):
+        service = LoraHybridSearchService(
+            make_settings(lora_retrieval_timeout=1),
+            make_context(),
+        )
+
+        order, diagnostics = await service.rank_documents(
+            "角色",
+            ("candidate a", "candidate b"),
+            limit=2,
+        )
+
+        self.assertEqual(order, (0, 1))
+        self.assertEqual(
+            diagnostics["embedding_status"],
+            "configured_but_unavailable",
+        )
+        self.assertEqual(
+            diagnostics["rerank_status"],
+            "configured_but_unavailable",
+        )
+
     async def test_unique_full_path_exact_match_skips_both_providers(self):
         embedding = FakeEmbeddingProvider(lambda _text: [1.0, 0.0, 0.0])
         rerank = FakeRerankProvider(identity_rerank)

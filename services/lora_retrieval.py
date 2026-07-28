@@ -150,6 +150,96 @@ class LoraHybridSearchService:
         self.last_diagnostics["mode"] = "lexical_fallback"
         return self._stable_union(exact, lexical)[:effective_limit]
 
+    async def rank_documents(
+        self,
+        query: str,
+        documents: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> tuple[tuple[int, ...], dict[str, Any]]:
+        """Optionally rank a bounded generic candidate pool.
+
+        This adapter is intentionally non-authoritative.  Callers must re-check
+        every selected item against their own exact source of truth.
+        """
+
+        clean_query = str(query or "").strip()
+        safe_documents = tuple(str(item or "")[:5000] for item in documents[:40])
+        effective_limit = max(1, min(int(limit), len(safe_documents) or 1))
+        diagnostics: dict[str, Any] = {
+            "embedding_used": False,
+            "rerank_used": False,
+            "embedding_status": "disabled",
+            "rerank_status": "disabled",
+            "candidate_count": len(safe_documents),
+        }
+        if not safe_documents or not clean_query:
+            return tuple(range(len(safe_documents)))[:effective_limit], diagnostics
+
+        async def operation() -> tuple[int, ...]:
+            order = list(range(len(safe_documents)))
+            embedding_id = str(
+                getattr(self._settings, "lora_embedding_provider_id", "") or ""
+            ).strip()
+            embedding_provider = self._find_embedding_provider()
+            if embedding_provider is not None:
+                try:
+                    vectors = await self._embed_texts(
+                        embedding_provider,
+                        (clean_query, *safe_documents),
+                    )
+                    query_vector = self._normalize_vector(vectors[0])
+                    document_vectors = tuple(
+                        self._normalize_vector(vector) for vector in vectors[1:]
+                    )
+                    order.sort(
+                        key=lambda index: (
+                            -self._dot(query_vector, document_vectors[index]),
+                            index,
+                        )
+                    )
+                    diagnostics["embedding_used"] = True
+                    diagnostics["embedding_status"] = "ready"
+                except Exception as exc:
+                    diagnostics["embedding_status"] = "unavailable"
+                    diagnostics["embedding_error"] = type(exc).__name__
+            elif embedding_id:
+                diagnostics["embedding_status"] = "configured_but_unavailable"
+
+            rerank_id = str(
+                getattr(self._settings, "lora_rerank_provider_id", "") or ""
+            ).strip()
+            rerank_provider = self._find_rerank_provider()
+            if rerank_provider is not None and order:
+                budget = min(20, len(order))
+                pool = order[:budget]
+                try:
+                    ranked = await self._rerank_document_indexes(
+                        rerank_provider,
+                        clean_query,
+                        tuple(safe_documents[index] for index in pool),
+                    )
+                    order = [pool[index] for index in ranked] + order[budget:]
+                    diagnostics["rerank_used"] = True
+                    diagnostics["rerank_status"] = "ready"
+                except Exception as exc:
+                    diagnostics["rerank_status"] = "unavailable"
+                    diagnostics["rerank_error"] = type(exc).__name__
+            elif rerank_id:
+                diagnostics["rerank_status"] = "configured_but_unavailable"
+            return tuple(order[:effective_limit])
+
+        timeout = max(
+            0.01,
+            float(getattr(self._settings, "lora_retrieval_timeout", 30)),
+        )
+        try:
+            order = await asyncio.wait_for(operation(), timeout=timeout)
+        except asyncio.TimeoutError:
+            diagnostics["fallback_code"] = "timeout"
+            order = tuple(range(len(safe_documents)))[:effective_limit]
+        return order, diagnostics
+
     async def _hybrid_search(
         self,
         records: tuple[LoraRecord, ...],
@@ -442,6 +532,45 @@ class LoraHybridSearchService:
             raise ValueError("rerank_empty")
         ranked_indexes.extend(index for index in range(len(records)) if index not in seen)
         return tuple(records[index] for index in ranked_indexes)
+
+    async def _rerank_document_indexes(
+        self,
+        provider: Any,
+        query: str,
+        documents: tuple[str, ...],
+    ) -> tuple[int, ...]:
+        top_n = max(
+            1,
+            min(
+                len(documents),
+                int(getattr(self._settings, "lora_rerank_top_n", 8)),
+            ),
+        )
+        response = await provider.rerank(query, list(documents), top_n=top_n)
+        raw_items = getattr(response, "results", response)
+        if not isinstance(raw_items, (list, tuple)):
+            raise ValueError("rerank_response")
+        ranked_indexes: list[int] = []
+        seen: set[int] = set()
+        for item in raw_items:
+            if isinstance(item, Mapping):
+                index = item.get("index")
+                score = item.get("relevance_score", item.get("score", 0.0))
+            else:
+                index = getattr(item, "index", None)
+                score = getattr(item, "relevance_score", getattr(item, "score", 0.0))
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise ValueError("rerank_index")
+            if index < 0 or index >= len(documents) or index in seen:
+                raise ValueError("rerank_index")
+            if not math.isfinite(float(score)):
+                raise ValueError("rerank_score")
+            seen.add(index)
+            ranked_indexes.append(index)
+        if not ranked_indexes:
+            raise ValueError("rerank_empty")
+        ranked_indexes.extend(index for index in range(len(documents)) if index not in seen)
+        return tuple(ranked_indexes)
 
     @classmethod
     def _exact_matches(

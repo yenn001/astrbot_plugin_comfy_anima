@@ -444,25 +444,25 @@
     "default": []
   },
   "enable_lora_hybrid_search": {
-    "description": "启用 LoRA Embedding + Rerank 混合搜索",
+    "description": "启用 LoRA / Danbooru 角色 Embedding + Rerank 混合检索",
     "type": "bool",
-    "hint": "每次先强制刷新 LoRA Manager 与 ComfyUI 当前可加载清单，再用 Embedding 召回、Rerank 精排；任何模型异常都会回退词法搜索，最终文件校验不受向量结果影响",
+    "hint": "LoRA 检索用 Embedding 召回与 Rerank 精排；Danbooru 角色检索只对本地 exact/prefix/keyword 得到的有限候选排序，模型分数永远不能直接授权角色身份。异常自动回退确定性检索",
     "default": false
   },
   "lora_embedding_provider_id": {
-    "description": "LoRA 搜索 Embedding Provider ID",
+    "description": "语义检索 Embedding Provider ID",
     "type": "string",
-    "hint": "选择 AstrBot 已保存的 Embedding Provider；留空则跳过向量召回",
+    "hint": "供 LoRA 召回和 Danbooru 角色候选排序共用；选择 AstrBot 已保存的 Embedding Provider，留空则跳过向量召回",
     "default": ""
   },
   "lora_rerank_provider_id": {
-    "description": "LoRA 搜索 Rerank Provider ID",
+    "description": "语义检索 Rerank Provider ID",
     "type": "string",
-    "hint": "选择 AstrBot 已保存的 Rerank Provider；留空则跳过精排",
+    "hint": "供 LoRA 与 Danbooru 角色候选排序共用；选择 AstrBot 已保存的 Rerank Provider，留空则跳过精排",
     "default": ""
   },
   "lora_embedding_top_k": {
-    "description": "Embedding 召回数量",
+    "description": "Embedding 候选数量",
     "type": "int",
     "hint": "范围 4-100；只从本次刷新后仍可加载的 LoRA 中召回",
     "default": 20
@@ -470,7 +470,7 @@
   "lora_rerank_top_n": {
     "description": "Rerank 精排数量",
     "type": "int",
-    "hint": "范围 1-50；精确文件名和唯一别名命中始终优先",
+    "hint": "范围 1-50；LoRA 精确文件名、Danbooru canonical 和唯一别名始终优先，Rerank 不会覆盖 exact 结果",
     "default": 8
   },
   "lora_retrieval_timeout": {

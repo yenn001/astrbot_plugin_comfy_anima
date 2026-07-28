@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock
 from PIL import Image
 
 from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
+from ..services.danbooru_index import DanbooruTagIndex
 from ..services.lora_catalog import LoraRecord
 from ..services.reverse_prompt import ReversePromptResult
 
@@ -3178,13 +3179,102 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
             "鸣潮的今汐",
         )
 
-        self.assertEqual(lookups, [("jinhsi_(wuthering_waves)", "character")])
+        self.assertEqual(
+            lookups,
+            [
+                ("jinhsi_(wuthering_waves)", "character"),
+                ("jinhsi", "character"),
+            ],
+        )
         self.assertEqual(provider, "semantic-provider")
         self.assertEqual(tags[0], "jinhsi_(wuthering_waves)")
         self.assertEqual(tags[1:], ("long white hair", "red eyes"))
         self.assertEqual(evidence["confidence"], 0.94)
         self.assertTrue(evidence["index_verified"])
         self.assertEqual(evidence["anchor_source"], "danbooru_exact")
+
+    async def test_danbooru_alias_without_work_resolves_asuma_toki(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "asuma_toki_(blue_archive)",
+                    "identity_candidates": ["asuma_toki", "toki"],
+                    "work_hints": ["blue_archive"],
+                    "appearance_tags": ["long white hair", "blue eyes"],
+                    "confidence": 0.95,
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki"],
+                                "count": 10652,
+                            },
+                            {
+                                "tag": "toki_(bunny)_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki_(bunny)"],
+                                "count": 5539,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "碧蓝档案里的飞鸟马时",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags[0], "toki_(blue_archive)")
+        self.assertEqual(tags[1:], ("long white hair", "blue eyes"))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["match_variant"], "alias_without_work")
+
+    async def test_ascii_user_alias_uses_local_index_without_provider(self) -> None:
+        plugin, calls = self._plugin("provider must not run")
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki"],
+                                "count": 10652,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "飞鸟马时/Asuma Toki",
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(provider, "danbooru-local")
+        self.assertEqual(tags, ("toki_(blue_archive)",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["match_variant"], "user_ascii_exact")
 
     async def test_formatter_accepts_think_extra_fields_and_numeric_strings(self) -> None:
         plugin, _calls = self._plugin(

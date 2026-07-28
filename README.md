@@ -1,6 +1,6 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.2
+> 当前版本：v1.9.3
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
@@ -41,6 +41,7 @@
 - 自然语言绘图：由 AstrBot 中已配置的聊天 Provider 生成画面意图，再由本地 Prompt Composer v2 整理为“硬控制与 LoRA / 视觉短语 / 英文场景关系句”三层提示词；不增加第二次 LLM 调用。
 - 直接 Tags：`/画图` 和 `/画图no` 默认跳过 LLM，直接把用户输入写入工作流；显式 `--llm c` / `--llmcc` / `--lcc` 可对一段完整旧 Tags 执行受控文字换角。
 - 图片反推：使用 AstrBot 多模态 Provider 提取结构化 Tags、构图、角色候选和置信度。
+- 精确角色检索：换角会先查本地 Danbooru character canonical 与唯一 alias，再让绘图模型提供最多八个同角色罗马字候选并批量 exact；作品限定必须一致。Prefix、keyword、Embedding 与 Rerank 只负责有限候选发现和排序，最终身份必须重新通过本地 exact，多个角色冲突时停止而不猜选。
 - 底图控制生成：Pose 锁定人体姿态，Depth 约束空间结构，Lineart 按线稿生成上色成图，Reference 柔和参考外观、配色与画风；支持组合与自然语言。
 - 无蒙版整图改图：引用一张图后直接说换衣、换背景、换表情或重新画一张；原图像素接入 img2img，插件按保守、平衡或自由模式控制改动幅度。
 - 单角色语义换角：从图片或完整 Tags 中移除原角色身份，保留服装、姿势、构图、背景和风格，再以目标 LoRA 或纯语义 Tags 重建整张图。

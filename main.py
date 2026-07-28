@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.2
+AstrBot Comfy Anima 插件 v1.9.3
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.2
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.2
+版本: 1.9.3
 日期: 2026-07-28
 """
 
@@ -79,12 +79,14 @@ from .services.character_swap import (
     is_explicit_lora_reference,
     is_original_character_query,
     normalize_semantic_identity_payload,
+    semantic_identity_lookup_hints,
     parse_character_swap_request,
     parse_natural_character_swap,
     parse_text_character_change_request,
     response_text as character_swap_response_text,
 )
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
+from .services.character_identity import resolve_character_identity
 from .services.control_modes import (
     CONTROL_MODES,
     extract_command_control_modes,
@@ -4871,6 +4873,64 @@ QQ快捷指令:
             details={"last_error_code": last_error.code if last_error else ""},
         ) from last_error
 
+    async def _rank_danbooru_character_candidates(
+        self,
+        target_query: str,
+        candidates: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], dict[str, Any]]:
+        """Order exact-verified candidates without authorizing the first result."""
+
+        if not candidates:
+            return (), {
+                "embedding_used": False,
+                "rerank_used": False,
+                "candidate_count": 0,
+            }
+        tag_index = getattr(self, "_danbooru_index", None)
+        documents: list[str] = []
+        for canonical in candidates[:20]:
+            aliases: tuple[str, ...] = ()
+            count = 0
+            if tag_index is not None:
+                try:
+                    lookup = await asyncio.to_thread(
+                        tag_index.lookup,
+                        canonical,
+                        "character",
+                    )
+                except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+                    lookup = None
+                if lookup is not None and bool(getattr(lookup, "verified", False)):
+                    aliases = tuple(getattr(lookup, "aliases", ()) or ())[:16]
+                    count = int(getattr(lookup, "count", 0) or 0)
+            documents.append(
+                "\n".join(
+                    (
+                        f"canonical: {canonical}",
+                        f"aliases: {', '.join(aliases)}",
+                        f"post_count: {count}",
+                        "category: character",
+                    )
+                )
+            )
+        retrieval = getattr(self, "_lora_retrieval", None)
+        if retrieval is None or not bool(
+            getattr(self.settings, "enable_lora_hybrid_search", False)
+        ):
+            return candidates[:20], {
+                "embedding_used": False,
+                "rerank_used": False,
+                "candidate_count": len(documents),
+                "fallback_code": "hybrid_disabled",
+            }
+        order, diagnostics = await retrieval.rank_documents(
+            target_query,
+            tuple(documents),
+            limit=len(documents),
+        )
+        ranked = tuple(candidates[index] for index in order if index < len(candidates))
+        return ranked, diagnostics
+
     async def _generate_semantic_target_tags(
         self,
         event: AstrMessageEvent,
@@ -4879,6 +4939,74 @@ QQ快捷指令:
         expansion_mode: str = "standard",
     ) -> tuple[tuple[str, ...], str, dict[str, Any]]:
         """Generate bounded ordinary identity tags when no target LoRA exists."""
+
+        tag_index = getattr(self, "_danbooru_index", None)
+        if tag_index is not None and not is_original_character_query(target_query):
+            try:
+                local_resolution = await asyncio.to_thread(
+                    resolve_character_identity,
+                    tag_index,
+                    target_query=target_query,
+                    allow_discovery=False,
+                )
+            except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+                local_resolution = None
+            if local_resolution is not None and local_resolution.ambiguous:
+                ranked, diagnostics = await self._rank_danbooru_character_candidates(
+                    target_query,
+                    local_resolution.candidates,
+                )
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "本地 Danbooru 候选存在跨身份冲突；Embedding/Rerank 仅完成排序，未授权猜选。",
+                    "character_swap_danbooru_ambiguous",
+                    level="ERROR",
+                    details={
+                        "candidate_count": local_resolution.candidate_count,
+                        "query_count": local_resolution.query_count,
+                        "embedding_used": bool(diagnostics.get("embedding_used")),
+                        "rerank_used": bool(diagnostics.get("rerank_used")),
+                        "embedding_status": diagnostics.get("embedding_status", ""),
+                        "rerank_status": diagnostics.get("rerank_status", ""),
+                    },
+                )
+                suggestions = "、".join(ranked[:3]) or "未知"
+                raise CharacterSwapError(
+                    "本地 Danbooru 角色别名指向多个不同身份，已停止且不会猜选。"
+                    f"候选排序：{suggestions}",
+                    code="semantic_target_danbooru_ambiguous",
+                    details={
+                        "candidate_count": local_resolution.candidate_count,
+                        "query_count": local_resolution.query_count,
+                    },
+                )
+            if local_resolution is not None and local_resolution.verified:
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "用户目标名称已由本地 Danbooru character exact/唯一别名直接确认。",
+                    "character_swap_danbooru_local_exact",
+                    details={
+                        "query_count": local_resolution.query_count,
+                        "candidate_count": local_resolution.candidate_count,
+                        "match_variant": local_resolution.match_variant,
+                        "match_type": local_resolution.match_type,
+                    },
+                )
+                return (
+                    (local_resolution.canonical_tag,),
+                    "danbooru-local",
+                    {
+                        "confidence": 1.0,
+                        "index_verified": True,
+                        "anchor_source": "danbooru_exact",
+                        "match_variant": local_resolution.match_variant,
+                        "match_type": local_resolution.match_type,
+                        "candidate_count": local_resolution.candidate_count,
+                        "query_count": local_resolution.query_count,
+                    },
+                )
 
         if self._director is None or not hasattr(self.context, "llm_generate"):
             raise CharacterSwapError(
@@ -4890,13 +5018,22 @@ QQ快捷指令:
         appearance_budget = "6 to 12" if expansion_mode == "ultra" else "3 to 8"
         system_prompt = (
             "You convert one target character request into conservative Anima/Danbooru "
-            "identity tags. Return one JSON object with exactly these "
-            'fields: "canonical_identity_tag", "appearance_tags", and "confidence". '
-            "Example: {\"canonical_identity_tag\":\"rice_shower_(umamusume)\","
-            "\"appearance_tags\":[\"brown hair\",\"purple eyes\",\"horse ears\"],"
+            "identity tags. Return one JSON object with exactly these fields: "
+            '"canonical_identity_tag", "identity_candidates", "work_hints", '
+            '"appearance_tags", and "confidence". Example: '
+            "{\"canonical_identity_tag\":\"toki_(blue_archive)\","
+            "\"identity_candidates\":[\"asuma_toki\",\"toki\"],"
+            "\"work_hints\":[\"blue_archive\"],"
+            "\"appearance_tags\":[\"long white hair\",\"blue eyes\"],"
             "\"confidence\":0.95}. canonical_identity_tag must be one short ASCII "
             "English canonical character tag including the work qualifier whenever one "
-            "exists. For a known character, the canonical tag is always primary. Return "
+            "exists. identity_candidates must contain one to eight short ASCII official "
+            "romanized names, common Danbooru aliases or canonical spellings for only the "
+            "same requested character; include the unqualified full name when known. "
+            "work_hints must contain zero to four ASCII Danbooru copyright/work tags. "
+            "Never include a different character merely as a possibility. The local "
+            "Danbooru character index will exact-check every candidate and reject conflicts. "
+            "For a known character, the canonical tag is always primary. Return "
             "zero to four appearance_tags only when they are iconic, stable and highly "
             "certain for that exact character, such as an unmistakable hair color/style, "
             "eye color, ears or permanent facial mark. Omit every vague, disputed or "
@@ -4999,6 +5136,9 @@ QQ快捷指令:
                             allow_original=original_target,
                         )
                     )
+                    identity_candidates, work_hints = semantic_identity_lookup_hints(
+                        payload
+                    )
                 except ReversePromptError as exc:
                     last_error = exc.code
                 except CharacterSwapError as exc:
@@ -5030,30 +5170,71 @@ QQ快捷指令:
                         "original_profile" if original_target else "provider_qualified"
                     )
                     index_verified = False
+                    match_variant = "none"
+                    match_type = "none"
+                    candidate_count = 0
+                    query_count = 0
                     if not original_target:
                         canonical_tag = tags[0]
-                        tag_index = getattr(self, "_danbooru_index", None)
                         if tag_index is not None:
                             try:
-                                lookup = await asyncio.to_thread(
-                                    tag_index.lookup,
-                                    canonical_tag,
-                                    "character",
+                                resolution = await asyncio.to_thread(
+                                    resolve_character_identity,
+                                    tag_index,
+                                    target_query=target_query,
+                                    canonical_tag=canonical_tag,
+                                    identity_candidates=identity_candidates,
+                                    work_hints=work_hints,
                                 )
                             except (DanbooruIndexError, OSError, RuntimeError, ValueError):
-                                lookup = None
-                            if (
-                                lookup is not None
-                                and bool(getattr(lookup, "found", False))
-                                and bool(getattr(lookup, "verified", False))
-                                and str(getattr(lookup, "category", "")).casefold()
-                                == "character"
-                            ):
-                                canonical_tag = str(
-                                    getattr(lookup, "canonical_tag", "")
-                                    or getattr(lookup, "tag", "")
-                                    or canonical_tag
-                                ).strip()
+                                resolution = None
+                            if resolution is not None:
+                                candidate_count = resolution.candidate_count
+                                query_count = resolution.query_count
+                                match_variant = resolution.match_variant
+                                match_type = resolution.match_type
+                            if resolution is not None and resolution.ambiguous:
+                                ranked, diagnostics = (
+                                    await self._rank_danbooru_character_candidates(
+                                        target_query,
+                                        resolution.candidates,
+                                    )
+                                )
+                                self._record_image_task_phase(
+                                    job,
+                                    "resolver",
+                                    "本地 Danbooru 候选存在跨身份冲突；Embedding/Rerank 仅完成排序，未授权猜选。",
+                                    "character_swap_danbooru_ambiguous",
+                                    level="ERROR",
+                                    details={
+                                        "candidate_count": resolution.candidate_count,
+                                        "query_count": resolution.query_count,
+                                        "embedding_used": bool(
+                                            diagnostics.get("embedding_used")
+                                        ),
+                                        "rerank_used": bool(
+                                            diagnostics.get("rerank_used")
+                                        ),
+                                        "embedding_status": diagnostics.get(
+                                            "embedding_status", ""
+                                        ),
+                                        "rerank_status": diagnostics.get(
+                                            "rerank_status", ""
+                                        ),
+                                    },
+                                )
+                                suggestions = "、".join(ranked[:3]) or "未知"
+                                raise CharacterSwapError(
+                                    "本地 Danbooru 找到多个不同角色身份，已停止且不会让模型猜选。"
+                                    f"候选排序：{suggestions}",
+                                    code="semantic_target_danbooru_ambiguous",
+                                    details={
+                                        "candidate_count": resolution.candidate_count,
+                                        "query_count": resolution.query_count,
+                                    },
+                                )
+                            if resolution is not None and resolution.verified:
+                                canonical_tag = resolution.canonical_tag
                                 identity_anchor_source = "danbooru_exact"
                                 index_verified = True
                         # Keep the canonical character-and-work anchor first. Optional
@@ -5076,6 +5257,14 @@ QQ快捷指令:
                             "provider_tag_count": provider_tag_count,
                             "identity_anchor_source": identity_anchor_source,
                             "index_verified": index_verified,
+                            "danbooru_match_variant": match_variant,
+                            "danbooru_match_type": match_type,
+                            "danbooru_candidate_count": candidate_count,
+                            "danbooru_query_count": query_count,
+                            "provider_identity_candidate_count": len(
+                                identity_candidates
+                            ),
+                            "provider_work_hint_count": len(work_hints),
                             "attempt": attempt,
                             "confidence": confidence_value,
                             "parse_strategy": parse_strategy,
@@ -5090,6 +5279,10 @@ QQ快捷指令:
                             "confidence": confidence_value,
                             "index_verified": index_verified,
                             "anchor_source": identity_anchor_source,
+                            "match_variant": match_variant,
+                            "match_type": match_type,
+                            "candidate_count": candidate_count,
+                            "query_count": query_count,
                         },
                     )
                 self._record_image_task_phase(
@@ -5460,6 +5653,18 @@ QQ快捷指令:
                         semantic_identity_anchor_source=str(
                             identity_evidence.get("anchor_source") or ""
                         ),
+                        semantic_identity_match_variant=str(
+                            identity_evidence.get("match_variant") or ""
+                        ),
+                        semantic_identity_match_type=str(
+                            identity_evidence.get("match_type") or ""
+                        ),
+                        semantic_identity_candidate_count=int(
+                            identity_evidence.get("candidate_count") or 0
+                        ),
+                        semantic_identity_query_count=int(
+                            identity_evidence.get("query_count") or 0
+                        ),
                     )
                     preparation = planner.prepare(
                         effective_request,
@@ -5503,6 +5708,18 @@ QQ快捷指令:
                         ),
                         "semantic_identity_anchor_source": (
                             effective_request.semantic_identity_anchor_source
+                        ),
+                        "semantic_identity_match_variant": (
+                            effective_request.semantic_identity_match_variant
+                        ),
+                        "semantic_identity_match_type": (
+                            effective_request.semantic_identity_match_type
+                        ),
+                        "semantic_identity_candidate_count": (
+                            effective_request.semantic_identity_candidate_count
+                        ),
+                        "semantic_identity_query_count": (
+                            effective_request.semantic_identity_query_count
                         ),
                         "ignored_control_directives": list(
                             effective_request.ignored_control_directives
@@ -5705,6 +5922,12 @@ QQ快捷指令:
                 preview_lines.append(
                     "安全提示：已忽略消息中的置信度阈值覆盖，插件继续使用内置安全门槛。"
                 )
+            if effective_request.semantic_identity_index_verified:
+                preview_lines.append(
+                    "Danbooru 检索：本地 character exact/唯一别名已确认 canonical；"
+                    f"匹配路径={effective_request.semantic_identity_match_variant or 'exact'}，"
+                    f"检查 {effective_request.semantic_identity_query_count} 个安全变体。"
+                )
             if plan.promoted_uncertain_count:
                 preview_lines.append(
                     "分类修复：已将 "
@@ -5752,6 +5975,11 @@ QQ快捷指令:
         if "confidence_override" in effective_request.ignored_control_directives:
             info_lines.append(
                 "已忽略用户文本中的置信度阈值覆盖，本次仍按插件内置安全门槛执行。"
+            )
+        if effective_request.semantic_identity_index_verified:
+            info_lines.append(
+                "本地 Danbooru character 索引已通过 exact/唯一别名确认目标 canonical；"
+                f"匹配路径={effective_request.semantic_identity_match_variant or 'exact'}。"
             )
         if plan.promoted_uncertain_count:
             info_lines.append(
