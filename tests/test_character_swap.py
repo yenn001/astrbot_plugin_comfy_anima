@@ -172,6 +172,45 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertEqual(request.prompt_expansion_mode, "ultra")
         self.assertEqual(request.steps, 20)
 
+    def test_text_character_change_parser_forwards_generation_swap_options(
+        self,
+    ) -> None:
+        request = parse_text_character_change_request(
+            "1girl, silver hair, long hair, beach，"
+            "把角色替换为目标角色鸣潮今汐",
+            preset="风格007",
+            mode=SWAP_MODE_TARGET_OUTFIT,
+            target_lora_strength=0.7,
+            preview=True,
+            use_target_lora=False,
+            width=512,
+            height=768,
+            negative_prompt="old identity",
+            pipeline="rtx",
+            prompt_expansion_mode="ultra",
+            seed=42,
+            steps=18,
+            cfg=4.5,
+            enable_upscale=True,
+            denoise=0.35,
+        )
+
+        self.assertEqual(request.target_query, "鸣潮今汐")
+        self.assertEqual(request.preset, "风格007")
+        self.assertEqual(request.mode, SWAP_MODE_TARGET_OUTFIT)
+        self.assertEqual(request.target_lora_strength, 0.7)
+        self.assertTrue(request.preview)
+        self.assertFalse(request.use_target_lora)
+        self.assertEqual((request.width, request.height), (512, 768))
+        self.assertEqual(request.negative_prompt, "old identity")
+        self.assertEqual(request.pipeline, "rtx")
+        self.assertEqual(request.prompt_expansion_mode, "ultra")
+        self.assertEqual(request.seed, 42)
+        self.assertEqual(request.steps, 18)
+        self.assertEqual(request.cfg, 4.5)
+        self.assertTrue(request.enable_upscale)
+        self.assertEqual(request.denoise, 0.35)
+
     def test_text_character_change_parser_consumes_trailing_no_lora_phrase(
         self,
     ) -> None:
@@ -814,6 +853,336 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         for tag in ("long white hair", "red eyes", "dragon horns"):
             self.assertNotIn(tag, guarded.prompt)
             self.assertIn(tag, trusted.prompt)
+
+    def test_exact_shared_long_hair_is_reauthorized_at_high_confidence(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "",
+                "鸣潮今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            positive_prompt=(
+                "1girl, source_character_(source_work), long hair, "
+                "school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=(
+                "jinhsi_(wuthering_waves)",
+                "long hair",
+            ),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1, 2],
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    target_appearance_trigger_ids=[1],
+                    confidence=0.96,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("source_character_(source_work)", plan.prompt)
+        self.assertIn("jinhsi_(wuthering_waves)", plan.prompt)
+        self.assertEqual(plan.prompt.count("long hair"), 1)
+        self.assertEqual(plan.reauthorized_appearance_terms, ("long hair",))
+
+    def test_target_candidate_long_silver_hair_reauthorizes_shared_fragment(
+        self,
+    ) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "",
+                "鸣潮今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            positive_prompt=(
+                "1girl, source_character_(source_work), silver hair, "
+                "school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=(
+                "jinhsi_(wuthering_waves)",
+                "long silver hair",
+            ),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1, 2],
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    target_appearance_trigger_ids=[1],
+                    confidence=0.96,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn(", silver hair,", f", {plan.prompt},")
+        self.assertIn("long silver hair", plan.prompt)
+        self.assertEqual(
+            plan.reauthorized_appearance_terms,
+            ("long silver hair",),
+        )
+
+    def test_non_target_candidate_fragment_leak_is_still_rejected(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "",
+                "鸣潮今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            positive_prompt=(
+                "1girl, source_character_(source_work), silver hair, "
+                "long silver hair, school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=(
+                "jinhsi_(wuthering_waves)",
+                "red eyes",
+            ),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1, 2],
+                    outfit_ids=[4],
+                    pose_action_ids=[5],
+                    scene_lighting_ids=[6],
+                    style_quality_ids=[0, 3, 7],
+                    target_appearance_trigger_ids=[1],
+                    confidence=0.96,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.finalize(preparation, classification)
+        self.assertEqual(raised.exception.code, "source_identity_leak")
+
+    def test_weighted_or_composite_shared_appearance_is_not_reauthorized(
+        self,
+    ) -> None:
+        source_terms = (
+            "(long hair:1.2)",
+            "(silver hair, long hair:1.1)",
+        )
+        for source_term in source_terms:
+            with self.subTest(source_term=source_term):
+                preparation = self.planner.prepare(
+                    CharacterSwapRequest(
+                        "",
+                        "鸣潮今汐",
+                        semantic_identity_confidence=0.95,
+                        semantic_identity_index_verified=True,
+                        semantic_identity_anchor_source="danbooru_exact",
+                    ),
+                    positive_prompt=(
+                        f"1girl, source_character_(source_work), {source_term}, "
+                        "school uniform, standing, beach, masterpiece"
+                    ),
+                    negative_prompt="",
+                    records=self.records,
+                    fallback_target_tags=(
+                        "jinhsi_(wuthering_waves)",
+                        source_term,
+                    ),
+                )
+                classification = self.planner.parse_classification(
+                    json.dumps(
+                        _classification_payload(
+                            len(preparation.tags),
+                            source_identity_ids=[1, 2],
+                            outfit_ids=[3],
+                            pose_action_ids=[4],
+                            scene_lighting_ids=[5],
+                            style_quality_ids=[0, 6],
+                            target_appearance_trigger_ids=[1],
+                            confidence=0.96,
+                        )
+                    ),
+                    tag_count=len(preparation.tags),
+                    target_trigger_count=len(preparation.target_trigger_words),
+                )
+
+                with self.assertRaises(CharacterSwapError) as raised:
+                    self.planner.finalize(preparation, classification)
+                self.assertEqual(raised.exception.code, "source_identity_leak")
+
+    def test_uncertain_atomic_appearance_is_cleaned_with_source_profile(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Kallen Kaslana"),
+            positive_prompt=(
+                "<lora:characters/denia:1.0>, 1girl, denia_wuwa, long hair, "
+                "school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1],
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    uncertain_ids=[2],
+                    target_appearance_trigger_ids=[1],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("long hair", plan.prompt)
+        self.assertEqual(plan.promoted_uncertain_count, 1)
+
+    def test_two_uncertain_atomic_traits_form_a_bounded_source_profile(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "",
+                "鸣潮今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            positive_prompt=(
+                "1girl, silver hair, blue eyes, school uniform, standing, "
+                "beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=("jinhsi_(wuthering_waves)",),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    uncertain_ids=[1, 2],
+                    confidence=0.96,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("silver hair", plan.prompt)
+        self.assertNotIn("blue eyes", plan.prompt)
+        self.assertEqual(plan.promoted_uncertain_count, 2)
+
+    def test_single_uncertain_atomic_trait_without_anchor_still_fails_closed(
+        self,
+    ) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "",
+                "鸣潮今汐",
+                semantic_identity_confidence=0.95,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            positive_prompt=(
+                "1girl, silver hair, school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=("jinhsi_(wuthering_waves)",),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    outfit_ids=[2],
+                    pose_action_ids=[3],
+                    scene_lighting_ids=[4],
+                    style_quality_ids=[0, 5],
+                    uncertain_ids=[1],
+                    confidence=0.96,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.finalize(preparation, classification)
+        self.assertEqual(raised.exception.code, "uncertain_tags")
+
+    def test_non_atomic_uncertain_terms_are_never_auto_promoted(self) -> None:
+        terms = (
+            "hair ornament",
+            "closed eyes",
+            "eye-level view",
+            "warm ink style",
+        )
+        for term in terms:
+            with self.subTest(term=term):
+                preparation = self.planner.prepare(
+                    CharacterSwapRequest("Denia", "Kallen Kaslana"),
+                    positive_prompt=(
+                        "<lora:characters/denia:1.0>, 1girl, denia_wuwa, "
+                        f"{term}, school uniform, standing, beach, masterpiece"
+                    ),
+                    negative_prompt="",
+                    records=self.records,
+                )
+                classification = self.planner.parse_classification(
+                    json.dumps(
+                        _classification_payload(
+                            len(preparation.tags),
+                            source_identity_ids=[1],
+                            outfit_ids=[3],
+                            pose_action_ids=[4],
+                            scene_lighting_ids=[5],
+                            style_quality_ids=[0, 6],
+                            uncertain_ids=[2],
+                            target_appearance_trigger_ids=[1],
+                        )
+                    ),
+                    tag_count=len(preparation.tags),
+                    target_trigger_count=len(preparation.target_trigger_words),
+                )
+
+                with self.assertRaises(CharacterSwapError) as raised:
+                    self.planner.finalize(preparation, classification)
+                self.assertEqual(raised.exception.code, "uncertain_tags")
 
     def test_explicit_no_character_lora_skips_existing_target_lora(self) -> None:
         request = CharacterSwapRequest(

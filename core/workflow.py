@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.9.1
+AstrBot Comfy Anima 插件 v1.9.2
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.9.1
+版本: 1.9.2
 日期: 2026-07-28
 """
 
@@ -905,6 +905,12 @@ def parse_generation_options(
     use_prompt_llm = None
     prompt_expansion_mode = "standard"
     prompt_edit_mode = ""
+    character_change_requested = False
+    raw_prompt_requested = False
+    character_swap_preview = False
+    character_swap_mode = ""
+    character_swap_use_target_lora = None
+    character_swap_target_lora_strength = None
     lora_preset = ""
     pipeline = ""
     inpaint_mode = ""
@@ -982,6 +988,11 @@ def parse_generation_options(
             if not 0.0 <= denoise <= 1.0:
                 raise ValueError("--denoise 必须在 0 到 1 之间")
         elif token == "--mode":
+            if mode_context == "generation":
+                raise ValueError(
+                    "--mode 不用于普通生图；文本换角请使用 --m k/t，"
+                    "底图控制请使用 --m p/d/l/r"
+                )
             raw_mode = require_value(token).strip().casefold()
             if mode_context == "semantic_redraw":
                 aliases = {
@@ -1013,6 +1024,29 @@ def parse_generation_options(
                 inpaint_mode = aliases.get(raw_mode, "")
                 if not inpaint_mode:
                     raise ValueError("--mode 仅支持 quick 或 lanpaint")
+        elif token == "--swap-mode":
+            if mode_context != "generation":
+                raise ValueError("换角模式选项只用于 /画图 与 /画图no")
+            character_swap_mode = require_value(token).strip().casefold()
+            if character_swap_mode not in {"keep-outfit", "target-outfit"}:
+                raise ValueError("换角模式只支持 keep-outfit 或 target-outfit")
+        elif token == "--swap-weight":
+            if mode_context != "generation":
+                raise ValueError("换角 LoRA 权重只用于 /画图 与 /画图no")
+            try:
+                character_swap_target_lora_strength = float(require_value(token))
+            except ValueError as exc:
+                raise ValueError("--weight 必须是数字") from exc
+            if not 0.55 <= character_swap_target_lora_strength <= 0.75:
+                raise ValueError("换角角色 LoRA 权重必须在 0.55 到 0.75 之间")
+        elif token == "--swap-preview":
+            if mode_context != "generation":
+                raise ValueError("换角预览只用于 /画图 与 /画图no")
+            character_swap_preview = True
+        elif token == "--swap-no-character-lora":
+            if mode_context != "generation":
+                raise ValueError("禁用目标角色 LoRA 只用于 /画图 与 /画图no")
+            character_swap_use_target_lora = False
         elif token == "--control-mode":
             if mode_context != "generation":
                 raise ValueError("--control-mode 只用于底图控制生成")
@@ -1033,6 +1067,7 @@ def parse_generation_options(
             use_prompt_llm = True
             if token == "--llm-character-change":
                 prompt_edit_mode = "character_change"
+                character_change_requested = True
             expansion_aliases = {
                 "s": "standard",
                 "standard": "standard",
@@ -1064,6 +1099,7 @@ def parse_generation_options(
                     continue
                 if raw_mode in character_change_aliases and mode_context == "generation":
                     prompt_edit_mode = "character_change"
+                    character_change_requested = True
                     index += 1
                     continue
                 if (
@@ -1073,10 +1109,12 @@ def parse_generation_options(
                     and tokens[index + 2].strip().casefold() == "change"
                 ):
                     prompt_edit_mode = "character_change"
+                    character_change_requested = True
                     index += 2
                     continue
                 break
         elif token in {"--raw", "--no-llm"}:
+            raw_prompt_requested = True
             use_prompt_llm = False
             prompt_expansion_mode = "standard"
             prompt_edit_mode = ""
@@ -1091,6 +1129,18 @@ def parse_generation_options(
     prompt = " ".join(prompt_parts).strip()
     if not prompt:
         raise ValueError("请输入绘图提示词")
+    swap_specific_requested = bool(
+        character_swap_preview
+        or character_swap_mode
+        or character_swap_use_target_lora is not None
+        or character_swap_target_lora_strength is not None
+    )
+    if character_change_requested and raw_prompt_requested:
+        raise ValueError("文本换角不能与 --raw/--no-llm 同时使用")
+    if swap_specific_requested and prompt_edit_mode != "character_change":
+        raise ValueError(
+            "换角专用选项需要同时使用 --llm c、--llmcc 或 --lcc"
+        )
     return GenerationOptions(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -1103,6 +1153,12 @@ def parse_generation_options(
         use_prompt_llm=use_prompt_llm,
         prompt_expansion_mode=prompt_expansion_mode,
         prompt_edit_mode=prompt_edit_mode,
+        character_swap_preview=character_swap_preview,
+        character_swap_mode=character_swap_mode,
+        character_swap_use_target_lora=character_swap_use_target_lora,
+        character_swap_target_lora_strength=(
+            character_swap_target_lora_strength
+        ),
         lora_preset=lora_preset,
         pipeline=pipeline,
         inpaint_mode=inpaint_mode,

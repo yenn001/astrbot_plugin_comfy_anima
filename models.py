@@ -784,6 +784,10 @@ class GenerationOptions:
     use_prompt_llm: Optional[bool] = None
     prompt_expansion_mode: str = "standard"
     prompt_edit_mode: str = ""
+    character_swap_preview: bool = False
+    character_swap_mode: str = ""
+    character_swap_use_target_lora: Optional[bool] = None
+    character_swap_target_lora_strength: Optional[float] = None
     dynamic_loras: tuple["LoraSelection", ...] = ()
     lora_preset: str = ""
     lora_injection_mode: Optional[str] = None

@@ -638,15 +638,89 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
                 self.assertEqual(result.prompt_expansion_mode, expansion_mode)
                 self.assertEqual(result.prompt, "old tags, replace with Ganyu")
 
-    def test_raw_clears_llm_character_change_mode(self) -> None:
-        result = parse_generation_options(
-            "old tags, replace with Ganyu --llm c --raw",
-            mode_context="generation",
+    def test_generation_character_change_options_work_before_or_after_switch(
+        self,
+    ) -> None:
+        prompt = (
+            "1girl, silver hair, long hair, beach，"
+            "把角色替换为目标角色鸣潮今汐"
+        )
+        cases = (
+            (
+                f"{prompt} --preview --no-lora --weight 0.7 "
+                "--mode target-outfit --llmcc",
+                "target-outfit",
+            ),
+            (
+                f"{prompt} --llmcc --v --nl --w 0.7 --m k",
+                "keep-outfit",
+            ),
+            (
+                f"{prompt} --v --nl --w 0.7 --m t --llmcc",
+                "target-outfit",
+            ),
         )
 
-        self.assertFalse(result.use_prompt_llm)
-        self.assertEqual(result.prompt_edit_mode, "")
-        self.assertEqual(result.prompt_expansion_mode, "standard")
+        for command, expected_mode in cases:
+            with self.subTest(command=command):
+                result = parse_generation_options(
+                    command,
+                    mode_context="generation",
+                )
+                self.assertEqual(result.prompt, prompt)
+                self.assertEqual(result.prompt_edit_mode, "character_change")
+                self.assertTrue(result.character_swap_preview)
+                self.assertFalse(result.character_swap_use_target_lora)
+                self.assertEqual(
+                    result.character_swap_target_lora_strength,
+                    0.7,
+                )
+                self.assertEqual(result.character_swap_mode, expected_mode)
+
+    def test_generation_rejects_orphan_character_change_options(self) -> None:
+        cases = (
+            "portrait --preview",
+            "portrait --v",
+            "portrait --no-lora",
+            "portrait --nl",
+            "portrait --weight 0.65",
+            "portrait --w 0.65",
+            "portrait --mode keep-outfit",
+            "portrait --m k",
+        )
+
+        for command in cases:
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError):
+                    parse_generation_options(command, mode_context="generation")
+
+    def test_generation_rejects_raw_combined_with_character_change_options(
+        self,
+    ) -> None:
+        cases = (
+            "old tags，把角色换成甘雨 --llmcc --preview --raw",
+            "old tags，把角色换成甘雨 --raw --preview --llmcc",
+            "old tags，把角色换成甘雨 --llmcc --no-lora --raw",
+        )
+
+        for command in cases:
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError):
+                    parse_generation_options(command, mode_context="generation")
+
+    def test_generation_mode_quick_cannot_reuse_inpaint_semantics(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--mode"):
+            parse_generation_options(
+                "portrait --mode quick",
+                mode_context="generation",
+            )
+
+    def test_raw_cannot_silently_cancel_llm_character_change_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--raw"):
+            parse_generation_options(
+                "old tags, replace with Ganyu --llm c --raw",
+                mode_context="generation",
+            )
 
     def test_character_change_compact_alias_is_generation_only(self) -> None:
         with self.assertRaisesRegex(ValueError, "仅用于 /画图"):

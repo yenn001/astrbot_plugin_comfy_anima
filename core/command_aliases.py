@@ -92,6 +92,17 @@ _CHARACTER_SWAP_OPTION_ALIASES = {
     "--nl": "--no-character-lora",
 }
 
+_GENERATION_CHARACTER_SWAP_OPTION_ALIASES = {
+    "--mode": "--swap-mode",
+    "--weight": "--swap-weight",
+    "--w": "--swap-weight",
+    "--preview": "--swap-preview",
+    "--v": "--swap-preview",
+    "--no-character-lora": "--swap-no-character-lora",
+    "--no-lora": "--swap-no-character-lora",
+    "--nl": "--swap-no-character-lora",
+}
+
 _PIPELINE_VALUES = {
     "b": "base",
     "base": "base",
@@ -159,6 +170,16 @@ _CHARACTER_SWAP_MODE_VALUES = {
 }
 
 _CONTROL_OPTIONS = frozenset({"--m", "--control", "--control-mode"})
+_CHARACTER_CHANGE_MODE_VALUES = frozenset(
+    {
+        "c",
+        "cc",
+        "char-change",
+        "char_change",
+        "character-change",
+        "character_change",
+    }
+)
 
 
 def _normalized_value(value: str) -> str:
@@ -205,6 +226,30 @@ def _normalize_control_modes(
     return tuple(modes), index
 
 
+def _generation_requests_character_swap(tokens: tuple[str, ...]) -> bool:
+    """Detect an explicit generation-scoped character-change activator."""
+
+    for index, token in enumerate(tokens):
+        normalized = token.casefold()
+        if normalized in {"--llmcc", "--lcc", "--llm-character-change"}:
+            return True
+        if normalized not in {"--llm", "--l"}:
+            continue
+        cursor = index + 1
+        while cursor < len(tokens) and not tokens[cursor].startswith("--"):
+            value = _normalized_value(tokens[cursor])
+            if value in _CHARACTER_CHANGE_MODE_VALUES:
+                return True
+            if (
+                value == "char"
+                and cursor + 1 < len(tokens)
+                and _normalized_value(tokens[cursor + 1]) == "change"
+            ):
+                return True
+            cursor += 1
+    return False
+
+
 def normalize_command_aliases(
     tokens: Iterable[str],
     *,
@@ -229,6 +274,10 @@ def normalize_command_aliases(
     output: list[str] = []
     seen_control_modes: set[str] = set()
     index = 0
+    generation_character_swap = bool(
+        normalized_context == CONTEXT_GENERATION
+        and _generation_requests_character_swap(source)
+    )
 
     if normalized_context == CONTEXT_CHARACTER_SWAP:
         option_aliases = _CHARACTER_SWAP_OPTION_ALIASES
@@ -242,6 +291,26 @@ def normalize_command_aliases(
             normalized_context == CONTEXT_GENERATION
             and token.casefold() in _CONTROL_OPTIONS
         ):
+            if (
+                generation_character_swap
+                and token.casefold() == "--m"
+                and index + 1 < len(source)
+                and _normalized_value(source[index + 1])
+                in _CHARACTER_SWAP_MODE_VALUES
+            ):
+                output.extend(
+                    (
+                        "--swap-mode",
+                        _normalize_enum_value(
+                            source[index + 1],
+                            _CHARACTER_SWAP_MODE_VALUES,
+                            option=token,
+                            supported="k/keep-outfit 或 t/target-outfit",
+                        ),
+                    )
+                )
+                index += 2
+                continue
             modes, next_index = _normalize_control_modes(source, index)
             for mode in modes:
                 if mode in seen_control_modes:
@@ -251,7 +320,11 @@ def normalize_command_aliases(
             index = next_index
             continue
 
-        canonical_option = option_aliases.get(token.casefold(), token)
+        canonical_option = (
+            _GENERATION_CHARACTER_SWAP_OPTION_ALIASES.get(token.casefold())
+            if generation_character_swap
+            else None
+        ) or option_aliases.get(token.casefold(), token)
         if (
             normalized_context in {CONTEXT_SEMANTIC_REDRAW, CONTEXT_INPAINT}
             and token.casefold() == "--m"
@@ -273,9 +346,12 @@ def normalize_command_aliases(
             index += 2
             continue
 
-        if canonical_option == "--mode":
+        if canonical_option in {"--mode", "--swap-mode"}:
             value = _require_value(source, index, token)
-            if normalized_context == CONTEXT_SEMANTIC_REDRAW:
+            if canonical_option == "--swap-mode":
+                aliases = _CHARACTER_SWAP_MODE_VALUES
+                supported = "k/keep-outfit 或 t/target-outfit"
+            elif normalized_context == CONTEXT_SEMANTIC_REDRAW:
                 aliases = _SEMANTIC_REDRAW_MODE_VALUES
                 supported = "p/preserve、b/balanced 或 f/free"
             elif normalized_context == CONTEXT_INPAINT:

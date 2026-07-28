@@ -250,6 +250,98 @@ _TRANSIENT_APPEARANCE_STATE_MARKERS = (
     "害羞",
     "惊讶",
 )
+_ATOMIC_APPEARANCE_EXCLUDED_MARKERS = (
+    "ornament",
+    "ribbon",
+    "bow",
+    "glasses",
+    "eyepatch",
+    "makeup",
+    "headwear",
+    "headpiece",
+    "collar",
+    "earrings",
+    "necklace",
+    "accessory",
+    "fake ears",
+    "fake horns",
+    "reflection",
+    "lighting",
+    "view",
+    "perspective",
+)
+_ATOMIC_HAIR_MODIFIERS = frozenset(
+    {
+        "black",
+        "blonde",
+        "blond",
+        "brown",
+        "red",
+        "blue",
+        "green",
+        "purple",
+        "pink",
+        "white",
+        "silver",
+        "grey",
+        "gray",
+        "orange",
+        "yellow",
+        "aqua",
+        "teal",
+        "cyan",
+        "dark",
+        "light",
+        "pale",
+        "vivid",
+        "short",
+        "medium",
+        "long",
+        "very",
+        "shoulder",
+        "waist",
+        "floor",
+        "length",
+        "messy",
+        "wavy",
+        "curly",
+        "straight",
+        "spiked",
+        "gradient",
+        "multicolored",
+        "two",
+        "tone",
+        "to",
+    }
+)
+_ATOMIC_EYE_MODIFIERS = frozenset(
+    {
+        "black",
+        "brown",
+        "red",
+        "blue",
+        "green",
+        "purple",
+        "pink",
+        "white",
+        "silver",
+        "grey",
+        "gray",
+        "orange",
+        "yellow",
+        "gold",
+        "golden",
+        "aqua",
+        "teal",
+        "cyan",
+        "amber",
+        "violet",
+        "dark",
+        "light",
+        "pale",
+        "bright",
+    }
+)
 _ORIGINAL_CHARACTER_RE = re.compile(
     r"(?:原创(?:角色|人物)?|自创(?:角色|人物)?|原创设定|自设|"
     r"(?<![a-z0-9])oc(?![a-z0-9])|original\s+character)",
@@ -450,6 +542,8 @@ class CharacterSwapPlan:
     added_terms: tuple[str, ...]
     suppressed_terms: tuple[str, ...]
     suppress_default_style: bool
+    promoted_uncertain_count: int = 0
+    reauthorized_appearance_terms: tuple[str, ...] = ()
 
     def preview_text(self) -> str:
         removed = "、".join(self.removed_terms[:12]) or "无"
@@ -501,6 +595,93 @@ def _is_stable_appearance_term(value: Any) -> bool:
     if any(marker in folded for marker in _TRANSIENT_APPEARANCE_STATE_MARKERS):
         return False
     return any(marker in folded for marker in _APPEARANCE_MARKERS)
+
+
+def _is_deterministic_source_appearance_term(value: Any) -> bool:
+    """Recognize only atomic, unweighted source-identity appearance tags.
+
+    This predicate is deliberately narrower than ``_is_stable_appearance_term``.
+    It is used only to repair a classifier's ``uncertain`` bucket and must not
+    absorb accessories, camera phrases, expressions or compound prompt groups.
+    """
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    if (
+        not raw
+        or any(character in raw for character in "()[]{}<>,，;；:\\")
+        or re.search(r"(?:^|\s)(?:and|break)(?:\s|$)", raw, re.IGNORECASE)
+        or any(marker in raw for marker in _TRANSIENT_APPEARANCE_STATE_MARKERS)
+        or any(marker in raw for marker in _OBVIOUS_OUTFIT_MARKERS)
+        or any(marker in raw for marker in _ATOMIC_APPEARANCE_EXCLUDED_MARKERS)
+    ):
+        return False
+    normalized = re.sub(r"[_-]+", " ", raw)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    if normalized.endswith(" hair"):
+        modifiers = normalized[:-5].split()
+        return bool(modifiers) and all(
+            token in _ATOMIC_HAIR_MODIFIERS for token in modifiers
+        )
+    if normalized in {
+        "ahoge",
+        "bangs",
+        "crossed bangs",
+        "hair between eyes",
+        "twin tails",
+        "twintails",
+        "ponytail",
+        "side ponytail",
+        "braid",
+        "braids",
+        "twin braids",
+        "hair bun",
+        "double bun",
+        "bob cut",
+        "hime cut",
+    }:
+        return True
+    if normalized.endswith(" eyes"):
+        modifiers = normalized[:-5].split()
+        return bool(modifiers) and all(
+            token in _ATOMIC_EYE_MODIFIERS for token in modifiers
+        )
+    if normalized in {
+        "heterochromia",
+        "slit pupils",
+        "round pupils",
+        "heart shaped pupils",
+    }:
+        return True
+    if re.fullmatch(
+        r"(?:fair|pale|light|dark|brown|black|white|tan|tanned|glowing) skin",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:(?:cat|fox|wolf|dog|horse|rabbit|bunny|elf|pointed|animal) ears|"
+        r"(?:(?:dragon|demon|oni|ram|bull) )?horns|"
+        r"(?:(?:cat|fox|wolf|dog|horse|rabbit|dragon|demon) )?tail|"
+        r"(?:(?:angel|demon|bat|bird|dragon) )?wings|"
+        r"angel|demon|elf|vampire)",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:petite|slender|slim|curvy|muscular|tall|short stature|"
+        r"small breasts|medium breasts|large breasts|wide hips|"
+        r"narrow waist|teenage girl|young woman|adult woman)",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:(?:small|button|sharp) nose|(?:thin|full) lips|freckles|"
+        r"(?:beauty mark|mole|scar|tattoo)(?: (?:under|below|beside|on) "
+        r"(?:the )?(?:left|right)? ?(?:eye|cheek|face))?)",
+        normalized,
+    ):
+        return True
+    return False
 
 
 def _is_meaningful_identity_key(value: str) -> bool:
@@ -1542,7 +1723,11 @@ can be proven to identify that exact character. Generic subject, physical appear
 outfit, pose, style and quality tags are invalid identities. Separately identify only
 stable physical appearance candidates and default-outfit candidates; leave pose,
 scene, style, quality and unknown candidates unselected. Do not invent any target
-tag. For target-outfit mode, select only candidates that explicitly describe the
+tag. An atomic source appearance tag remains source identity even when the target has
+the same trait, and contradictory atomic source appearance tags remain in the same
+source-identity bucket; overlap or same-bucket contradiction alone is not uncertainty.
+Use uncertain_ids only for one source term that genuinely mixes incompatible buckets
+or cannot be assigned without guessing. For target-outfit mode, select only candidates that explicitly describe the
 target's default outfit. For a known named character, one qualified
 ``character_(work)`` identity candidate is sufficient and physical appearance
 candidates are optional. Do not lower confidence merely because no target hair, eye,
@@ -1761,20 +1946,6 @@ explanations."""
                     ),
                 },
             )
-        if classification.uncertain_ids:
-            raise CharacterSwapError(
-                "部分 Tags 无法可靠区分身份与衣装，请先简化或使用 --preview 检查",
-                code="uncertain_tags",
-                details={"uncertain_count": len(classification.uncertain_ids)},
-            )
-        if (
-            not classification.source_identity_ids
-            and not preparation.removed_character_loras
-        ):
-            raise CharacterSwapError(
-                "没有找到可移除的原角色身份 Tag 或角色 LoRA",
-                code="source_identity_missing",
-            )
         source_identity_keys = {
             _prompt_term_key(value)
             for value in preparation.source_identity_hints
@@ -1788,7 +1959,47 @@ explanations."""
                 source_identity_keys.add(
                     _prompt_term_key(reliable_source_trigger)
                 )
-        classified_source_ids = set(classification.source_identity_ids)
+        source_identity_ids = set(classification.source_identity_ids)
+        promotable_uncertain_ids = {
+            index
+            for index in classification.uncertain_ids
+            if _is_deterministic_source_appearance_term(
+                preparation.tags[index]
+            )
+        }
+        has_reliable_source_profile = bool(
+            preparation.removed_character_loras
+            or preparation.source_record is not None
+            or source_identity_ids
+            or len(promotable_uncertain_ids) >= 2
+        )
+        promoted_uncertain_ids = (
+            promotable_uncertain_ids if has_reliable_source_profile else set()
+        )
+        source_identity_ids.update(promoted_uncertain_ids)
+        remaining_uncertain_ids = set(classification.uncertain_ids) - set(
+            promoted_uncertain_ids
+        )
+        if remaining_uncertain_ids:
+            raise CharacterSwapError(
+                "部分 Tags 仍无法可靠区分身份、衣装或画面属性；"
+                "可先使用 --preview 检查分类边界",
+                code="uncertain_tags",
+                details={
+                    "uncertain_count": len(classification.uncertain_ids),
+                    "promoted_source_appearance_count": len(
+                        promoted_uncertain_ids
+                    ),
+                    "remaining_uncertain_count": len(remaining_uncertain_ids),
+                    "remaining_uncertain_ids": sorted(remaining_uncertain_ids),
+                },
+            )
+        if not source_identity_ids and not preparation.removed_character_loras:
+            raise CharacterSwapError(
+                "没有找到可移除的原角色身份 Tag 或角色 LoRA",
+                code="source_identity_missing",
+            )
+        classified_source_ids = set(source_identity_ids)
         for index, term in enumerate(preparation.tags):
             nested_key = _identity_key(term)
             if index not in classified_source_ids and any(
@@ -1799,7 +2010,7 @@ explanations."""
                     "含有可靠原角色身份词的加权或复合 Tag 未被完整移除",
                     code="source_identity_group_misclassified",
                 )
-        for item_id in classification.source_identity_ids:
+        for item_id in sorted(source_identity_ids):
             term = preparation.tags[item_id]
             folded = unicodedata.normalize("NFKC", term).casefold()
             key = _prompt_term_key(term)
@@ -1814,6 +2025,7 @@ explanations."""
                 key not in source_identity_keys
                 and not _semantic_identity_anchor_candidate(term)
                 and not _is_stable_appearance_term(folded)
+                and not _is_deterministic_source_appearance_term(folded)
             ):
                 raise CharacterSwapError(
                     "分类模型把无法证明属于身份外观的 Tag 标为角色身份",
@@ -1831,7 +2043,7 @@ explanations."""
                 and _prompt_term_key(tag) == source_trigger_key
             }
             if source_trigger_ids and not source_trigger_ids.issubset(
-                set(classification.source_identity_ids)
+                source_identity_ids
             ):
                 raise CharacterSwapError(
                     "原角色的可靠身份触发词未被分类为身份，已停止改写",
@@ -1927,11 +2139,11 @@ explanations."""
                 )
         elif (
             preparation.target_record is None
-            and preparation.target_metadata_record is None
             and classification.confidence < 0.92
         ):
             # A known model-native character never needs appearance tags to prove
-            # identity. Ambiguous optional traits are dropped rather than guessed.
+            # identity. Optional metadata or Provider appearance below the stricter
+            # appearance threshold is dropped rather than guessed.
             target_appearance_ids = ()
 
         for trigger_id in target_appearance_ids:
@@ -1953,7 +2165,7 @@ explanations."""
                     code="unsafe_target_outfit_trigger",
                 )
 
-        removed_ids = set(classification.source_identity_ids)
+        removed_ids = set(source_identity_ids)
         if preparation.request.mode == SWAP_MODE_TARGET_OUTFIT:
             if not classification.target_default_outfit_trigger_ids:
                 raise CharacterSwapError(
@@ -1966,6 +2178,29 @@ explanations."""
         )
         removed_terms = tuple(
             tag for index, tag in enumerate(preparation.tags) if index in removed_ids
+        )
+        removed_term_keys = {
+            _prompt_term_key(term) for term in removed_terms if _prompt_term_key(term)
+        }
+        target_appearance_terms = tuple(
+            preparation.target_trigger_words[index]
+            for index in target_appearance_ids
+        )
+        reauthorized_appearance_terms = tuple(
+            term
+            for term in target_appearance_terms
+            if _is_deterministic_source_appearance_term(term)
+            and any(
+                _contains_identity_fragment(
+                    _prompt_term_key(term),
+                    removed_key,
+                )
+                or _contains_identity_fragment(
+                    removed_key,
+                    _prompt_term_key(term),
+                )
+                for removed_key in removed_term_keys
+            )
         )
 
         added_terms: list[str] = [target_trigger]
@@ -2039,6 +2274,7 @@ explanations."""
             records,
             target_trigger,
             suppressed_terms,
+            reauthorized_appearance_terms,
         )
         return CharacterSwapPlan(
             prompt=prompt,
@@ -2056,6 +2292,8 @@ explanations."""
                 str(record.category or "").casefold() in {"artist_style", "mixed"}
                 for record in preparation.preserved_lora_records
             ),
+            promoted_uncertain_count=len(promoted_uncertain_ids),
+            reauthorized_appearance_terms=reauthorized_appearance_terms,
         )
 
     @staticmethod
@@ -2067,6 +2305,7 @@ explanations."""
         records: Sequence[LoraRecord],
         target_trigger: str,
         suppressed_terms: Sequence[str],
+        reauthorized_appearance_terms: Sequence[str] = (),
     ) -> None:
         character_keys = {
             _canonical_key(record.name) for record in records if _is_character_record(record)
@@ -2103,14 +2342,34 @@ explanations."""
                 "目标身份触发词未正确进入正面提示词或仍存在于负面提示词",
                 code="target_trigger_conflict",
             )
-        leaked = {
+        reauthorized_keys = {
             _prompt_term_key(term)
-            for term in suppressed_terms
-            if any(
-                _contains_identity_fragment(key, _prompt_term_key(term))
-                for key in positive_keys
-            )
+            for term in reauthorized_appearance_terms
+            if _prompt_term_key(term)
         }
+        leaked: set[str] = set()
+        for term in suppressed_terms:
+            suppressed_key = _prompt_term_key(term)
+            if not suppressed_key:
+                continue
+            for positive_key in positive_keys:
+                if (
+                    positive_key in reauthorized_keys
+                    and (
+                        _contains_identity_fragment(
+                            positive_key,
+                            suppressed_key,
+                        )
+                        or _contains_identity_fragment(
+                            suppressed_key,
+                            positive_key,
+                        )
+                    )
+                ):
+                    continue
+                if _contains_identity_fragment(positive_key, suppressed_key):
+                    leaked.add(suppressed_key)
+                    break
         if leaked:
             raise CharacterSwapError(
                 "最终提示词仍残留原角色身份词",
@@ -2297,6 +2556,10 @@ def parse_text_character_change_request(
     prompt_text: str,
     *,
     preset: str = "",
+    mode: str = SWAP_MODE_KEEP_OUTFIT,
+    target_lora_strength: float = 0.65,
+    preview: bool = False,
+    use_target_lora: Optional[bool] = None,
     width: Optional[int] = None,
     height: Optional[int] = None,
     negative_prompt: str = "",
@@ -2374,16 +2637,39 @@ def parse_text_character_change_request(
             "目标角色不能为空",
             code="empty_character_query",
         )
+    normalized_mode = str(mode or SWAP_MODE_KEEP_OUTFIT).strip().casefold()
+    if normalized_mode not in SWAP_MODES:
+        raise CharacterSwapError(
+            "换角模式只支持 keep-outfit 或 target-outfit",
+            code="unsupported_swap_mode",
+        )
+    try:
+        normalized_strength = float(target_lora_strength)
+    except (TypeError, ValueError) as exc:
+        raise CharacterSwapError(
+            "语义换角的角色 LoRA 权重必须是数字",
+            code="unsafe_target_weight",
+        ) from exc
+    if not 0.55 <= normalized_strength <= 0.75:
+        raise CharacterSwapError(
+            "语义换角的角色 LoRA 权重必须在 0.55 到 0.75 之间",
+            code="unsafe_target_weight",
+        )
+    effective_use_target_lora = not no_lora
+    if use_target_lora is False:
+        effective_use_target_lora = False
     return CharacterSwapRequest(
         source_query=source_query,
         target_query=target_query,
         tags=tags,
-        mode=SWAP_MODE_KEEP_OUTFIT,
+        mode=normalized_mode,
+        target_lora_strength=normalized_strength,
         preset=str(preset or "").strip(),
         width=width,
         height=height,
         negative_prompt=str(negative_prompt or "").strip(" ,"),
-        use_target_lora=not no_lora,
+        preview=bool(preview),
+        use_target_lora=effective_use_target_lora,
         edit_requirement=edit_requirement,
         pipeline=str(pipeline or "").strip(),
         prompt_expansion_mode=(

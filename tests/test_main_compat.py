@@ -676,6 +676,66 @@ class MainCompatibilityTests(unittest.TestCase):
         _request, forward = captured[0]
         self.assertFalse(forward)
 
+    def test_draw_commands_forward_real_character_change_preview_without_submit(
+        self,
+    ) -> None:
+        real_prompt = (
+            "风格007\n"
+            "masterpiece, best quality, ultra-detailed, 1girl, teenage girl, "
+            "solo, silver hair, white hair, long hair, twin tails, "
+            "waist-length hair, messy hair, angel, profile, side view, "
+            "closed eyes, half-closed eyes, serene expression, glowing skin, "
+            "bare shoulders, white camisole, beach, seaside, ocean, sunlight, "
+            "lens flare, iridescent, rainbow reflection in hair, sparkling, "
+            "bokeh, depth of field, summer, holy, ethereal, dreamy atmosphere, "
+            "soft lighting, anime style, illustration "
+            "把角色替换为目标角色鸣潮今汐 --llmcc --preview"
+        )
+
+        async def run_case(command: str, expected_forward: bool) -> None:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._find_requested_style_preset = (
+                lambda text: "风格007" if "风格007" in text else ""
+            )
+            plugin._run_job = AsyncMock(
+                side_effect=AssertionError("preview must not submit ComfyUI")
+            )
+            captured = []
+
+            async def handle_swap(_event, request, *, forward=False):
+                captured.append((request, forward))
+                self.assertTrue(request.preview)
+                yield "preview-only"
+
+            plugin._handle_character_swap = handle_swap
+            event = types.SimpleNamespace(
+                message_str=f"/{command} {real_prompt}",
+                plain_result=lambda text: text,
+            )
+            handler = (
+                plugin.cmd_draw_forward
+                if expected_forward
+                else plugin.cmd_draw_direct
+            )
+            replies = [item async for item in handler(event, "")]
+
+            self.assertEqual(replies, ["preview-only"])
+            self.assertEqual(len(captured), 1)
+            request, forward = captured[0]
+            self.assertEqual(request.target_query, "鸣潮今汐")
+            self.assertEqual(request.preset, "风格007")
+            self.assertIn("silver hair", request.tags)
+            self.assertNotIn("--preview", request.tags)
+            self.assertEqual(forward, expected_forward)
+            plugin._run_job.assert_not_awaited()
+
+        asyncio.run(run_case("画图", True))
+        asyncio.run(run_case("画图no", False))
+
     def test_character_swap_optional_lora_errors_use_semantic_fallback(self) -> None:
         request = self.main.CharacterSwapRequest("", "冷门角色")
         checker = self.main.ComfyAnimaPlugin._character_swap_semantic_retry_allowed

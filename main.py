@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.1
+AstrBot Comfy Anima 插件 v1.9.2
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.1
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.1
+版本: 1.9.2
 日期: 2026-07-28
 """
 
@@ -74,6 +74,7 @@ from .services.character_swap import (
     CharacterSwapPlanner,
     CharacterSwapPreparation,
     CharacterSwapRequest,
+    SWAP_MODE_KEEP_OUTFIT,
     fit_canvas_to_aspect_ratio,
     is_explicit_lora_reference,
     is_original_character_query,
@@ -5521,7 +5522,34 @@ QQ快捷指令:
                     )
                 )
                 job.state = "validating_swap"
-                plan = planner.finalize(preparation, classification)
+                try:
+                    plan = planner.finalize(preparation, classification)
+                except CharacterSwapError as exc:
+                    if effective_request.preview and exc.code == "uncertain_tags":
+                        remaining_ids = tuple(
+                            int(index)
+                            for index in exc.details.get(
+                                "remaining_uncertain_ids",
+                                classification.uncertain_ids,
+                            )
+                            if isinstance(index, int)
+                            and 0 <= index < len(preparation.tags)
+                        )
+                        unresolved = tuple(
+                            preparation.tags[index]
+                            for index in remaining_ids
+                        )
+                        preview = "、".join(unresolved[:12]) or "未知"
+                        raise CharacterSwapError(
+                            "换角预览发现仍无法安全归类的 Tags："
+                            f"{preview}。这些内容不会提交 ComfyUI。",
+                            code="uncertain_tags_preview",
+                            details={
+                                **dict(exc.details),
+                                "preview_term_count": len(unresolved),
+                            },
+                        ) from exc
+                    raise
                 final_access_error = self._access_error(
                     event,
                     ", ".join(
@@ -5541,6 +5569,12 @@ QQ快捷指令:
                         "removed_term_count": len(plan.removed_terms),
                         "kept_term_count": len(plan.kept_terms),
                         "added_term_count": len(plan.added_terms),
+                        "promoted_uncertain_source_appearance_count": (
+                            plan.promoted_uncertain_count
+                        ),
+                        "reauthorized_shared_appearance_count": len(
+                            plan.reauthorized_appearance_terms
+                        ),
                         "semantic_canonical_only": bool(
                             plan.target_record is None
                             and not is_original_character_query(
@@ -5671,6 +5705,17 @@ QQ快捷指令:
                 preview_lines.append(
                     "安全提示：已忽略消息中的置信度阈值覆盖，插件继续使用内置安全门槛。"
                 )
+            if plan.promoted_uncertain_count:
+                preview_lines.append(
+                    "分类修复：已将 "
+                    f"{plan.promoted_uncertain_count} 项明确的原子稳定外貌"
+                    "确定为原角色身份并移除。"
+                )
+            if plan.reauthorized_appearance_terms:
+                preview_lines.append(
+                    "共享外貌：目标角色以高置信证据重新授权 "
+                    f"{len(plan.reauthorized_appearance_terms)} 项完全同词特征。"
+                )
             yield event.plain_result(
                 f"{MessageEmoji.INFO} " + "\n".join(preview_lines)
             )
@@ -5707,6 +5752,16 @@ QQ快捷指令:
         if "confidence_override" in effective_request.ignored_control_directives:
             info_lines.append(
                 "已忽略用户文本中的置信度阈值覆盖，本次仍按插件内置安全门槛执行。"
+            )
+        if plan.promoted_uncertain_count:
+            info_lines.append(
+                "已确定性清理 "
+                f"{plan.promoted_uncertain_count} 项分类器未决的原子稳定外貌。"
+            )
+        if plan.reauthorized_appearance_terms:
+            info_lines.append(
+                "目标角色已重新授权 "
+                f"{len(plan.reauthorized_appearance_terms)} 项与原角色完全同词的共享外貌。"
             )
         if effective_request.edit_requirement:
             info_lines.append("已同时应用新服装/属性要求，并清理与其冲突的原 Tags。")
@@ -5757,6 +5812,20 @@ QQ快捷指令:
                 swap_request = parse_text_character_change_request(
                     prompt,
                     preset=preset_name,
+                    mode=(
+                        parsed_options.character_swap_mode
+                        or SWAP_MODE_KEEP_OUTFIT
+                    ),
+                    target_lora_strength=(
+                        parsed_options.character_swap_target_lora_strength
+                        if parsed_options.character_swap_target_lora_strength
+                        is not None
+                        else 0.65
+                    ),
+                    preview=parsed_options.character_swap_preview,
+                    use_target_lora=(
+                        parsed_options.character_swap_use_target_lora
+                    ),
                     width=width,
                     height=height,
                     negative_prompt=parsed_options.negative_prompt,

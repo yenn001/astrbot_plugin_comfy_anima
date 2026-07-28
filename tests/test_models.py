@@ -228,7 +228,7 @@ class PluginSettingsTests(unittest.TestCase):
 
         self.assertTrue(global_fields.isdisjoint(ENVIRONMENT_FIELDS))
 
-    def test_v171_release_version_is_synchronized(self) -> None:
+    def test_release_version_is_synchronized(self) -> None:
         plugin_dir = Path(__file__).resolve().parents[1]
         metadata_lines = (plugin_dir / "metadata.yaml").read_text(
             encoding="utf-8"
@@ -243,7 +243,7 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "1.9.1")
+        self.assertEqual(PLUGIN_VERSION, "1.9.2")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
         self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-07-28", changelog)
