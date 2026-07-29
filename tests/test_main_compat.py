@@ -2103,12 +2103,105 @@ class GenerationReplyMetadataTests(unittest.TestCase):
         paths = GeneratedImagePaths()
         paths.extend([Path("one.png"), Path("two.png")])
         paths.elapsed_seconds = 12.345
+        paths.llm_elapsed_seconds = 2.125
+        paths.llm_call_count = 1
+        paths.comfy_elapsed_seconds = 8.5
         paths.gpu_name = "NVIDIA GeForce RTX 5060 Ti"
         summary = self.main.ComfyAnimaPlugin._generation_summary(paths, 42)
         self.assertIn("Seed: 42", summary)
         self.assertIn("12.35 秒", summary)
+        self.assertIn("LLM 提示词: 2.12 秒", summary)
+        self.assertIn("ComfyUI 生图: 8.50 秒", summary)
+        self.assertIn("准备/校验: 1.72 秒", summary)
         self.assertIn("NVIDIA GeForce RTX 5060 Ti", summary)
         self.assertIn("2 张", summary)
+
+    def test_generation_summary_marks_llm_as_unused(self) -> None:
+        paths = GeneratedImagePaths()
+        paths.append(Path("one.png"))
+        paths.elapsed_seconds = 3.0
+        paths.comfy_elapsed_seconds = 2.25
+        summary = self.main.ComfyAnimaPlugin._generation_summary(paths, 7)
+        self.assertIn("LLM 提示词: 未调用", summary)
+        self.assertIn("ComfyUI 生图: 2.25 秒", summary)
+        self.assertIn("准备/校验: 0.75 秒", summary)
+
+
+class GenerationTimingAccountingTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_timed_llm_call_accumulates_duration_and_count(self) -> None:
+        job = self.main.GenerationJob("u", "preview", 1.0)
+        result = await self.main.ComfyAnimaPlugin._timed_llm_call(
+            job,
+            asyncio.sleep(0.01, result="ok"),
+        )
+        self.assertEqual(result, "ok")
+        self.assertEqual(job.llm_call_count, 1)
+        self.assertGreaterEqual(job.llm_elapsed_seconds, 0.005)
+        self.assertLess(job.llm_elapsed_seconds, 1.0)
+
+    async def test_finalize_image_timings_uses_job_lifetime(self) -> None:
+        created_at = time.monotonic() - 15.0
+        job = self.main.GenerationJob("u", "preview", created_at)
+        job.llm_elapsed_seconds = 3.25
+        job.llm_call_count = 2
+        paths = GeneratedImagePaths()
+        paths.comfy_elapsed_seconds = 7.5
+        self.main.ComfyAnimaPlugin._finalize_image_timings(
+            paths,
+            job,
+            created_at + 5.0,
+        )
+        self.assertGreaterEqual(paths.elapsed_seconds, 15.0)
+        self.assertLess(paths.elapsed_seconds, 16.0)
+        self.assertEqual(paths.llm_elapsed_seconds, 3.25)
+        self.assertEqual(paths.llm_call_count, 2)
+        self.assertEqual(paths.comfy_elapsed_seconds, 7.5)
+
+    async def test_submit_wait_download_records_comfy_duration(self) -> None:
+        class Client:
+            @staticmethod
+            async def submit(_workflow):
+                await asyncio.sleep(0.005)
+                return "prompt-id"
+
+            @staticmethod
+            async def wait_for_images(_prompt_id, _preferred):
+                await asyncio.sleep(0.005)
+                return (object(),)
+
+            @staticmethod
+            async def download_image(_reference, job_dir):
+                await asyncio.sleep(0.005)
+                return job_dir / "result.png"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._client = Client()
+        plugin._generation_slots = asyncio.Semaphore(1)
+        plugin._temp_dir = Path(tempfile.mkdtemp())
+        paths = GeneratedImagePaths()
+        job = self.main.GenerationJob("u", "preview", time.monotonic())
+        await plugin._submit_wait_download(
+            job,
+            {"workflow": True},
+            ["out"],
+            paths,
+            active_state="generating",
+        )
+        self.assertEqual(len(paths), 1)
+        self.assertGreaterEqual(paths.comfy_elapsed_seconds, 0.01)
+        self.assertLess(paths.comfy_elapsed_seconds, 1.0)
+
+
+class GenerationReplyMetadataMutationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
     def test_explicit_lora_cleanup_updates_all_referencing_presets(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)

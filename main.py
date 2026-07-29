@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.4
+AstrBot Comfy Anima 插件 v1.9.5
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.9.4
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.4
-日期: 2026-07-28
+版本: 1.9.5
+日期: 2026-07-30
 """
 
 import asyncio
@@ -2081,11 +2081,19 @@ class ComfyAnimaPlugin(Star):
                 return
             style_preset = self._find_requested_style_preset(message)
             yield event.plain_result(f"{MessageEmoji.DRAW} 正在分析画面并整理提示词……")
+            director_started_at = time.monotonic()
+            director_elapsed = 0.0
             try:
-                (
-                    instruction,
-                    provider_id,
-                ) = await self._generate_directed_instruction(event, message)
+                try:
+                    (
+                        instruction,
+                        provider_id,
+                    ) = await self._generate_directed_instruction(event, message)
+                finally:
+                    director_elapsed = max(
+                        0.0,
+                        time.monotonic() - director_started_at,
+                    )
                 final_prompt = instruction.prompt
                 directed_negative = instruction.negative_prompt
                 selected_pipeline = requested_pipeline or instruction.pipeline
@@ -2106,6 +2114,10 @@ class ComfyAnimaPlugin(Star):
                         negative_prompt=directed_negative,
                         pipeline=selected_pipeline,
                     ),
+                )
+                self._add_pre_generation_llm_timing(
+                    image_paths,
+                    director_elapsed,
                 )
             except PromptDirectorError as exc:
                 logger.error(f"[{PLUGIN_NAME}] 自然语言分镜失败: {exc}", exc_info=True)
@@ -2292,6 +2304,8 @@ class ComfyAnimaPlugin(Star):
         final_prompt = positive_prompt
         directed_negative = ""
         director_provider = ""
+        director_elapsed = 0.0
+        director_calls = 0
         requested_pipeline = ""
         width, height = overrides.width, overrides.height
         preset_name = overrides.lora_preset
@@ -2340,12 +2354,20 @@ class ComfyAnimaPlugin(Star):
                     )
                 )
                 try:
-                    instruction, director_provider = (
-                        await self._generate_directed_instruction(
-                            event,
-                            director_request,
+                    director_started_at = time.monotonic()
+                    director_calls = 1
+                    try:
+                        instruction, director_provider = (
+                            await self._generate_directed_instruction(
+                                event,
+                                director_request,
+                            )
                         )
-                    )
+                    finally:
+                        director_elapsed = max(
+                            0.0,
+                            time.monotonic() - director_started_at,
+                        )
                 except PromptDirectorError as exc:
                     yield event.plain_result(
                         f"{MessageEmoji.ERROR} 方案追加要求编排失败: {exc.user_message}"
@@ -2413,6 +2435,11 @@ class ComfyAnimaPlugin(Star):
                     ),
                     denoise=overrides.denoise,
                 ),
+            )
+            self._add_pre_generation_llm_timing(
+                image_paths,
+                director_elapsed,
+                call_count=director_calls,
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
@@ -2706,12 +2733,15 @@ class ComfyAnimaPlugin(Star):
                     )
 
                 async with self._provider_slot():
-                    reverse_result, reverse_provider = await self._reverse_prompt.reverse(
-                        self.context,
-                        event,
-                        image_path,
-                        reverse_requirement,
-                        reverse_progress,
+                    reverse_result, reverse_provider = await self._timed_llm_call(
+                        job,
+                        self._reverse_prompt.reverse(
+                            self.context,
+                            event,
+                            image_path,
+                            reverse_requirement,
+                            reverse_progress,
+                        ),
                     )
                 job.state = "directing"
                 self._record_image_task_phase(
@@ -2735,9 +2765,12 @@ class ComfyAnimaPlugin(Star):
                         "Reverse analysis and user request: "
                         + director_request
                     )
-                instruction, director_provider = await self._generate_directed_instruction(
-                    event,
-                    director_request,
+                instruction, director_provider = await self._timed_llm_call(
+                    job,
+                    self._generate_directed_instruction(
+                        event,
+                        director_request,
+                    ),
                 )
                 final_prompt = instruction.prompt
                 directed_negative = instruction.negative_prompt
@@ -3104,17 +3137,20 @@ class ComfyAnimaPlugin(Star):
                     )
 
                 async with self._provider_slot():
-                    reverse_result, reverse_provider = await self._reverse_prompt.reverse(
-                        self.context,
-                        event,
-                        image_path,
-                        (
-                            "Analyze the source image exactly as shown before any edit. "
-                            "Prioritize current identity, outfit, accessories, expression, "
-                            "pose, composition, scene, lighting and style. Do not apply or "
-                            "imagine the requested future modification."
+                    reverse_result, reverse_provider = await self._timed_llm_call(
+                        job,
+                        self._reverse_prompt.reverse(
+                            self.context,
+                            event,
+                            image_path,
+                            (
+                                "Analyze the source image exactly as shown before any edit. "
+                                "Prioritize current identity, outfit, accessories, expression, "
+                                "pose, composition, scene, lighting and style. Do not apply or "
+                                "imagine the requested future modification."
+                            ),
+                            reverse_progress,
                         ),
-                        reverse_progress,
                     )
                 edit_contract = build_semantic_edit_contract(
                     requirement,
@@ -3140,11 +3176,12 @@ class ComfyAnimaPlugin(Star):
                     director_request = request_builder(requirement, mode)
                 else:
                     director_request = reverse_result.drawing_request(requirement)
-                instruction, director_provider = (
-                    await self._generate_directed_instruction(
+                instruction, director_provider = await self._timed_llm_call(
+                    job,
+                    self._generate_directed_instruction(
                         event,
                         director_request,
-                    )
+                    ),
                 )
                 contract_issues = edit_contract.validate(instruction.prompt)
                 if contract_issues:
@@ -3173,11 +3210,12 @@ class ComfyAnimaPlugin(Star):
                         + "\n\n"
                         + edit_contract.repair_instruction(contract_issues)
                     )
-                    instruction, director_provider = (
-                        await self._generate_directed_instruction(
+                    instruction, director_provider = await self._timed_llm_call(
+                        job,
+                        self._generate_directed_instruction(
                             event,
                             repair_request,
-                        )
+                        ),
                     )
                     contract_issues = edit_contract.validate(instruction.prompt)
                     if contract_issues:
@@ -4693,16 +4731,19 @@ QQ快捷指令:
                 try:
                     if hasattr(self.context, "llm_generate"):
                         response = await asyncio.wait_for(
-                            self._llm_generate_limited(
-                                chat_provider_id=provider_id,
-                                prompt=user_prompt + retry_suffix,
-                                system_prompt=system_prompt,
-                                temperature=0.0,
-                                max_tokens=max(
-                                    800,
-                                    min(
-                                        2000,
-                                        self.settings.prompt_llm_max_tokens,
+                            self._timed_llm_call(
+                                job,
+                                self._llm_generate_limited(
+                                    chat_provider_id=provider_id,
+                                    prompt=user_prompt + retry_suffix,
+                                    system_prompt=system_prompt,
+                                    temperature=0.0,
+                                    max_tokens=max(
+                                        800,
+                                        min(
+                                            2000,
+                                            self.settings.prompt_llm_max_tokens,
+                                        ),
                                     ),
                                 ),
                             ),
@@ -4717,16 +4758,19 @@ QQ快捷指令:
                                 code="swap_provider_unavailable",
                             )
                         response = await asyncio.wait_for(
-                            provider.text_chat(
-                                contexts=[],
-                                prompt=user_prompt + retry_suffix,
-                                system_prompt=system_prompt,
-                                temperature=0.0,
-                                max_tokens=max(
-                                    800,
-                                    min(
-                                        2000,
-                                        self.settings.prompt_llm_max_tokens,
+                            self._timed_llm_call(
+                                job,
+                                provider.text_chat(
+                                    contexts=[],
+                                    prompt=user_prompt + retry_suffix,
+                                    system_prompt=system_prompt,
+                                    temperature=0.0,
+                                    max_tokens=max(
+                                        800,
+                                        min(
+                                            2000,
+                                            self.settings.prompt_llm_max_tokens,
+                                        ),
                                     ),
                                 ),
                             ),
@@ -5083,12 +5127,15 @@ QQ快捷指令:
                 attempt_started = loop.time()
                 try:
                     response = await asyncio.wait_for(
-                        self._llm_generate_limited(
-                            chat_provider_id=provider_id,
-                            prompt=retry_prompt,
-                            system_prompt=system_prompt,
-                            temperature=0.0,
-                            max_tokens=500,
+                        self._timed_llm_call(
+                            job,
+                            self._llm_generate_limited(
+                                chat_provider_id=provider_id,
+                                prompt=retry_prompt,
+                                system_prompt=system_prompt,
+                                temperature=0.0,
+                                max_tokens=500,
+                            ),
                         ),
                         timeout=attempt_timeout,
                     )
@@ -5480,14 +5527,17 @@ QQ快捷指令:
 
                     async with self._provider_slot():
                         reverse_result, reverse_provider = (
-                            await self._reverse_prompt.reverse(
-                                self.context,
-                                event,
-                                image_path,
-                                "只记录单一人物、衣装、姿势、构图、背景和光线，"
-                                "不要执行换角或补造不可见事实。",
-                                reverse_progress,
-                                profile="swap",
+                            await self._timed_llm_call(
+                                job,
+                                self._reverse_prompt.reverse(
+                                    self.context,
+                                    event,
+                                    image_path,
+                                    "只记录单一人物、衣装、姿势、构图、背景和光线，"
+                                    "不要执行换角或补造不可见事实。",
+                                    reverse_progress,
+                                    profile="swap",
+                                ),
                             )
                         )
                     if len(reverse_result.characters) > 1:
@@ -5573,9 +5623,12 @@ QQ快捷指令:
                             f"{effective_request.edit_requirement}"
                         )
                     edit_instruction, edit_provider = (
-                        await self._generate_directed_instruction(
-                            event,
-                            director_request,
+                        await self._timed_llm_call(
+                            job,
+                            self._generate_directed_instruction(
+                                event,
+                                director_request,
+                            ),
                         )
                     )
                     positive_prompt = edit_instruction.prompt.strip(" ,")
@@ -6559,30 +6612,60 @@ QQ快捷指令:
 
     @staticmethod
     def _generation_summary(image_paths: list[Path], seed: int) -> str:
+        return (
+            f"{MessageEmoji.SUCCESS} 生成完成｜Seed: {seed}｜图片: {len(image_paths)} 张\n"
+            + ComfyAnimaPlugin._timing_summary_lines(
+                image_paths,
+                total_label="生成总耗时",
+                comfy_label="ComfyUI 生图",
+            )
+        )
+
+    @staticmethod
+    def _timing_summary_lines(
+        image_paths: list[Path],
+        *,
+        total_label: str,
+        comfy_label: str,
+    ) -> str:
+        """Render total, LLM, ComfyUI and residual preparation timings."""
+
         elapsed = max(
             0.0,
             float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
         )
+        llm_elapsed = max(
+            0.0,
+            float(getattr(image_paths, "llm_elapsed_seconds", 0.0) or 0.0),
+        )
+        comfy_elapsed = max(
+            0.0,
+            float(getattr(image_paths, "comfy_elapsed_seconds", 0.0) or 0.0),
+        )
+        preparation_elapsed = max(0.0, elapsed - llm_elapsed - comfy_elapsed)
+        llm_calls = max(
+            0,
+            int(getattr(image_paths, "llm_call_count", 0) or 0),
+        )
+        llm_text = f"{llm_elapsed:.2f} 秒" if llm_calls else "未调用"
         gpu_name = str(
             getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
         )
         return (
-            f"{MessageEmoji.SUCCESS} 生成完成｜Seed: {seed}｜图片: {len(image_paths)} 张\n"
-            f"生成耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+            f"{total_label}: {elapsed:.2f} 秒｜LLM 提示词: {llm_text}\n"
+            f"{comfy_label}: {comfy_elapsed:.2f} 秒｜"
+            f"准备/校验: {preparation_elapsed:.2f} 秒｜GPU: {gpu_name}"
         )
 
     @staticmethod
     def _upscale_summary(image_paths: list[Path], scale: float) -> str:
-        elapsed = max(
-            0.0,
-            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
-        )
-        gpu_name = str(
-            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
-        )
         return (
             f"{MessageEmoji.SUCCESS} RTX {scale:g}× 放大完成｜图片: {len(image_paths)} 张\n"
-            f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+            + ComfyAnimaPlugin._timing_summary_lines(
+                image_paths,
+                total_label="处理总耗时",
+                comfy_label="ComfyUI 放大",
+            )
         )
 
     @staticmethod
@@ -6592,13 +6675,6 @@ QQ快捷指令:
         modes: tuple[str, ...],
         pipeline: str,
     ) -> str:
-        elapsed = max(
-            0.0,
-            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
-        )
-        gpu_name = str(
-            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
-        )
         mode_labels = {
             "pose": "Pose",
             "depth": "Depth",
@@ -6614,22 +6690,23 @@ QQ快捷指令:
             f"{MessageEmoji.SUCCESS} 底图控制生成完成｜"
             f"模式: {' + '.join(mode_labels.get(mode, mode) for mode in modes)}｜"
             f"管线: {pipeline_label}｜Seed: {seed}\n"
-            f"生成耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+            + ComfyAnimaPlugin._timing_summary_lines(
+                image_paths,
+                total_label="生成总耗时",
+                comfy_label="ComfyUI 生图",
+            )
         )
 
     @staticmethod
     def _inpaint_summary(image_paths: list[Path], seed: int, mode: str) -> str:
-        elapsed = max(
-            0.0,
-            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
-        )
-        gpu_name = str(
-            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
-        )
         mode_label = "LanPaint 精细重绘" if mode == "lanpaint" else "快速局部重绘"
         return (
             f"{MessageEmoji.SUCCESS} {mode_label}完成｜Seed: {seed}｜图片: {len(image_paths)} 张\n"
-            f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}"
+            + ComfyAnimaPlugin._timing_summary_lines(
+                image_paths,
+                total_label="处理总耗时",
+                comfy_label="ComfyUI 重绘",
+            )
         )
 
     @staticmethod
@@ -6638,13 +6715,6 @@ QQ快捷指令:
         seed: int,
         mode: str,
     ) -> str:
-        elapsed = max(
-            0.0,
-            float(getattr(image_paths, "elapsed_seconds", 0.0) or 0.0),
-        )
-        gpu_name = str(
-            getattr(image_paths, "gpu_name", "未知 GPU") or "未知 GPU"
-        )
         mode_label = {
             "preserve": "保守",
             "balanced": "平衡",
@@ -6653,7 +6723,12 @@ QQ快捷指令:
         return (
             f"{MessageEmoji.SUCCESS} 整图语义重绘完成｜模式: {mode_label}｜"
             f"Seed: {seed}｜图片: {len(image_paths)} 张\n"
-            f"处理耗时: {elapsed:.2f} 秒｜GPU: {gpu_name}\n"
+            + ComfyAnimaPlugin._timing_summary_lines(
+                image_paths,
+                total_label="处理总耗时",
+                comfy_label="ComfyUI 重绘",
+            )
+            + "\n"
             "说明: 原图像素已接入 Anima img2img；不是蒙版局部修改，"
             "保真程度由模式与 denoise 决定。"
         )
@@ -11993,6 +12068,59 @@ QQ快捷指令:
         async with self._provider_slot():
             return await self.context.llm_generate(**kwargs)
 
+    @staticmethod
+    async def _timed_llm_call(job: GenerationJob, awaitable: Any) -> Any:
+        """Accumulate one plugin-owned LLM stage without exposing prompt content."""
+
+        started_at = time.monotonic()
+        job.llm_call_count = max(0, int(job.llm_call_count)) + 1
+        try:
+            return await awaitable
+        finally:
+            job.llm_elapsed_seconds = max(
+                0.0,
+                float(job.llm_elapsed_seconds),
+            ) + max(0.0, time.monotonic() - started_at)
+
+    @staticmethod
+    def _finalize_image_timings(
+        image_paths: GeneratedImagePaths,
+        job: GenerationJob,
+        fallback_started_at: float,
+    ) -> None:
+        """Copy task-level LLM metrics and compute end-to-end elapsed time."""
+
+        finished_at = time.monotonic()
+        started_at = float(getattr(job, "created_at", 0.0) or 0.0)
+        if not 0.0 < started_at <= finished_at:
+            started_at = fallback_started_at
+        image_paths.elapsed_seconds = max(0.0, finished_at - started_at)
+        image_paths.llm_elapsed_seconds = max(
+            0.0,
+            float(getattr(job, "llm_elapsed_seconds", 0.0) or 0.0),
+        )
+        image_paths.llm_call_count = max(
+            0,
+            int(getattr(job, "llm_call_count", 0) or 0),
+        )
+
+    @staticmethod
+    def _add_pre_generation_llm_timing(
+        image_paths: GeneratedImagePaths,
+        elapsed_seconds: float,
+        *,
+        call_count: int = 1,
+    ) -> None:
+        """Attach LLM work completed before the GenerationJob was created."""
+
+        elapsed = max(0.0, float(elapsed_seconds or 0.0))
+        calls = max(0, int(call_count or 0))
+        if not calls or not isinstance(image_paths, GeneratedImagePaths):
+            return
+        image_paths.llm_elapsed_seconds += elapsed
+        image_paths.llm_call_count += calls
+        image_paths.elapsed_seconds += elapsed
+
     async def _submit_wait_download(
         self,
         job: GenerationJob,
@@ -12007,20 +12135,27 @@ QQ快捷指令:
 
         assert self._client is not None
         async with self._generation_slot():
-            job.state = "submitting"
-            job.prompt_id = await self._client.submit(dict(workflow))
-            job.state = active_state
-            if callable(submitted_callback):
-                submitted_callback()
-            references = await self._client.wait_for_images(
-                job.prompt_id,
-                preferred_nodes,
-            )
-            job.state = "downloading"
-            job_dir = self._temp_dir / job.prompt_id
-            for reference in references:
-                image_paths.append(
-                    await self._client.download_image(reference, job_dir)
+            comfy_started_at = time.monotonic()
+            try:
+                job.state = "submitting"
+                job.prompt_id = await self._client.submit(dict(workflow))
+                job.state = active_state
+                if callable(submitted_callback):
+                    submitted_callback()
+                references = await self._client.wait_for_images(
+                    job.prompt_id,
+                    preferred_nodes,
+                )
+                job.state = "downloading"
+                job_dir = self._temp_dir / job.prompt_id
+                for reference in references:
+                    image_paths.append(
+                        await self._client.download_image(reference, job_dir)
+                    )
+            finally:
+                image_paths.comfy_elapsed_seconds += max(
+                    0.0,
+                    time.monotonic() - comfy_started_at,
                 )
 
     async def _safe_gpu_name(self) -> str:
@@ -12099,10 +12234,7 @@ QQ快捷指令:
                     active_state="upscaling",
                     submitted_callback=upscale_submitted,
                 )
-                image_paths.elapsed_seconds = max(
-                    0.0,
-                    time.monotonic() - started_at,
-                )
+                self._finalize_image_timings(image_paths, job, started_at)
                 image_paths.gpu_name = (
                     await gpu_task if gpu_task is not None else await self._safe_gpu_name()
                 ) or "未知 GPU"
@@ -12215,15 +12347,18 @@ QQ快捷指令:
                     )
 
                 async with self._provider_slot():
-                    reverse_result, reverse_provider = await self._reverse_prompt.reverse(
-                        self.context,
-                        event,
-                        source,
-                        (
-                            "Analyze the source exactly as shown for image control. "
-                            "Do not apply the requested future change during analysis."
+                    reverse_result, reverse_provider = await self._timed_llm_call(
+                        job,
+                        self._reverse_prompt.reverse(
+                            self.context,
+                            event,
+                            source,
+                            (
+                                "Analyze the source exactly as shown for image control. "
+                                "Do not apply the requested future change during analysis."
+                            ),
+                            control_reverse_progress,
                         ),
-                        control_reverse_progress,
                     )
                 effective_options = replace(
                     effective_options,
@@ -12513,9 +12648,12 @@ QQ快捷指令:
                 )
                 if use_llm:
                     job.state = "directing"
-                    instruction, provider_id = await self._generate_directed_edit_instruction(
-                        event,
-                        options.prompt,
+                    instruction, provider_id = await self._timed_llm_call(
+                        job,
+                        self._generate_directed_edit_instruction(
+                            event,
+                            options.prompt,
+                        ),
                     )
                     effective_prompt = instruction.prompt
                     director_negative = instruction.negative_prompt
@@ -12569,7 +12707,7 @@ QQ快捷指令:
                     active_state="inpainting",
                     submitted_callback=inpaint_submitted,
                 )
-                image_paths.elapsed_seconds = max(0.0, time.monotonic() - started_at)
+                self._finalize_image_timings(image_paths, job, started_at)
                 image_paths.gpu_name = (
                     await gpu_task if gpu_task is not None else await self._safe_gpu_name()
                 ) or "未知 GPU"
@@ -12664,10 +12802,13 @@ QQ快捷指令:
                                 "geometry. User request: "
                                 + options.prompt
                             )
-                        instruction, provider_id = await self._generate_directed_instruction(
-                            event,
-                            director_request,
-                            options.prompt_expansion_mode,
+                        instruction, provider_id = await self._timed_llm_call(
+                            job,
+                            self._generate_directed_instruction(
+                                event,
+                                director_request,
+                                options.prompt_expansion_mode,
+                            ),
                         )
                         effective_prompt = instruction.prompt
                         director_negative = instruction.negative_prompt
@@ -13109,7 +13250,7 @@ QQ快捷指令:
                     active_state="generating",
                     submitted_callback=generation_submitted,
                 )
-                image_paths.elapsed_seconds = max(0.0, time.monotonic() - started_at)
+                self._finalize_image_timings(image_paths, job, started_at)
                 image_paths.gpu_name = (
                     await gpu_task if gpu_task is not None else await self._safe_gpu_name()
                 ) or "未知 GPU"

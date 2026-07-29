@@ -845,6 +845,9 @@ class GeneratedImagePaths(list[Path]):
     def __init__(self) -> None:
         super().__init__()
         self.elapsed_seconds: float = 0.0
+        self.llm_elapsed_seconds: float = 0.0
+        self.llm_call_count: int = 0
+        self.comfy_elapsed_seconds: float = 0.0
         self.gpu_name: str = "未知 GPU"
 
 
@@ -862,3 +865,5 @@ class GenerationJob:
     failed_stage: str = ""
     lora_snapshot: Any = None
     prefetched_gpu_name: str = ""
+    llm_elapsed_seconds: float = 0.0
+    llm_call_count: int = 0
