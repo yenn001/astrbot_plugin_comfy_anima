@@ -1470,7 +1470,7 @@ def _trusted_identity_values(
                 and entry.analysis_confidence >= 0.85
             )
         )
-        aliases = tuple(
+        raw_aliases = tuple(
             fact.value
             for fact in entry.effective_facts("aliases")
             if fact.source == "manual"
@@ -1486,6 +1486,17 @@ def _trusted_identity_values(
             for fact in entry.effective_facts("source_works")
             if fact.source in {"manual", "observed"}
             or fact.confidence >= 0.9
+        )
+        work_keys = {
+            key
+            for work in (*record_works, *works)
+            if (key := _identity_key(work))
+        }
+        aliases = tuple(
+            alias
+            for alias in raw_aliases
+            if (alias_key := _identity_key(alias))
+            and alias_key not in work_keys
         )
         values.extend(names)
         values.extend(aliases)

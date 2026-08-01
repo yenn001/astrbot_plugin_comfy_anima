@@ -894,11 +894,24 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             source_work="Wrong Game",
         )
         wrong_entry = _semantic_entry(wrong_kei, "kei wrong game")
+        shun = _record(
+            "characters/shun_swimsuit_v2.safetensors",
+            "Shun/春原瞬",
+            "SHUN-SHA",
+            triggers=(r"shun \(swimsuit\) \(blue archive\)",),
+            source_work="Blue Archive/碧蓝档案",
+        )
+        shun_entry = replace(
+            _semantic_entry(shun, "Blue Archive"),
+            aliases=(SemanticFact("Blue Archive", "manual"),),
+            source_works=(SemanticFact("Blue Archive", "manual"),),
+        )
         planner = CharacterSwapPlanner(
             LoraSemanticIndex(
                 entries={
                     kei_entry.identity_key: kei_entry,
                     wrong_entry.identity_key: wrong_entry,
+                    shun_entry.identity_key: shun_entry,
                 },
             )
         )
@@ -913,7 +926,7 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                 "white thighhighs, solo"
             ),
             negative_prompt="",
-            records=(*self.records, kei, wrong_kei),
+            records=(*self.records, kei, wrong_kei, shun),
         )
         classification = planner.parse_classification(
             json.dumps(
@@ -948,7 +961,7 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                 ),
                 positive_prompt="shifty_(nikke), 1girl, gym uniform, solo",
                 negative_prompt="",
-                records=(*self.records, kei, wrong_kei),
+                records=(*self.records, kei, wrong_kei, shun),
             )
         self.assertEqual(
             wrong_work.exception.code,
@@ -967,7 +980,7 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                             "shifty_(nikke), 1girl, gym uniform, solo"
                         ),
                         negative_prompt="",
-                        records=(*self.records, kei, wrong_kei),
+                        records=(*self.records, kei, wrong_kei, shun),
                     )
                 self.assertEqual(
                     wrong_plain_work.exception.code,
