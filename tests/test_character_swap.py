@@ -9,6 +9,7 @@ from ..services.character_swap import (
     CharacterSwapPlanner,
     CharacterSwapRequest,
     SWAP_MODE_TARGET_OUTFIT,
+    _is_deterministic_outfit_term,
     fit_canvas_to_aspect_ratio,
     normalize_semantic_identity_payload,
     parse_character_swap_request,
@@ -151,6 +152,91 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertEqual(natural.source_query, "")
         self.assertEqual(natural.target_query, "赛马娘的米浴")
         self.assertFalse(natural.use_target_lora)
+
+    def test_required_character_lora_directive_is_not_treated_as_visual_edit(
+        self,
+    ) -> None:
+        request = parse_text_character_change_request(
+            "shifty \\(nikke\\), 1girl, blue hair, gym uniform, white thighhighs，"
+            "把角色换成目标角色：《BlueArchive》的凯伊（kei），请使用Lora。"
+        )
+
+        self.assertEqual(request.target_query, "《BlueArchive》的凯伊(kei)")
+        self.assertEqual(request.edit_requirement, "")
+        self.assertTrue(request.use_target_lora)
+        self.assertTrue(request.require_target_lora)
+
+        natural = parse_natural_character_swap(
+            "把图中的角色换成《BlueArchive》的凯伊，请务必使用角色 LoRA"
+        )
+        self.assertIsNotNone(natural)
+        assert natural is not None
+        self.assertEqual(natural.edit_requirement, "")
+        self.assertTrue(natural.require_target_lora)
+
+        command = parse_character_swap_request(
+            "Shifty -> 《BlueArchive》的凯伊（kei），请使用Lora | "
+            "shifty_(nikke), 1girl, gym uniform, white thighhighs"
+        )
+        self.assertEqual(command.target_query, "《BlueArchive》的凯伊(kei)")
+        self.assertTrue(command.require_target_lora)
+
+        style_phrase = parse_text_character_change_request(
+            "shifty_(nikke), 1girl, gym uniform，把角色换成凯伊，使用LoRA风格001"
+        )
+        self.assertFalse(style_phrase.require_target_lora)
+        self.assertEqual(style_phrase.edit_requirement, "使用LoRA风格001")
+        spaced_style_phrase = parse_text_character_change_request(
+            "shifty_(nikke), 1girl, gym uniform，把角色换成凯伊，使用 LoRA 风格001"
+        )
+        self.assertFalse(spaced_style_phrase.require_target_lora)
+
+        for optional in (
+            "可以使用角色 LoRA",
+            "有的话使用角色 LoRA",
+            "不建议使用角色 LoRA",
+        ):
+            with self.subTest(optional=optional):
+                optional_request = parse_text_character_change_request(
+                    "shifty_(nikke), 1girl, gym uniform，把角色换成凯伊，"
+                    + optional
+                )
+                self.assertFalse(optional_request.require_target_lora)
+
+        for negated in (
+            "不要强制使用角色 LoRA",
+            "不想使用角色 LoRA",
+            "不一定要使用角色 LoRA",
+            "别强制使用角色 LoRA",
+        ):
+            with self.subTest(negated=negated):
+                negated_request = parse_text_character_change_request(
+                    "shifty_(nikke), 1girl, gym uniform，把角色换成凯伊，"
+                    + negated
+                )
+                self.assertFalse(negated_request.use_target_lora)
+                self.assertFalse(negated_request.require_target_lora)
+
+        conflict = parse_text_character_change_request(
+            "shifty_(nikke), 1girl, gym uniform，把角色换成凯伊，"
+            "请使用角色 LoRA，不要使用角色 LoRA"
+        )
+        self.assertFalse(conflict.use_target_lora)
+        self.assertTrue(conflict.require_target_lora)
+
+        reverse_conflict = parse_text_character_change_request(
+            "shifty_(nikke), 1girl, gym uniform，把角色换成凯伊，"
+            "不要使用角色 LoRA，请使用角色 LoRA"
+        )
+        self.assertFalse(reverse_conflict.use_target_lora)
+        self.assertTrue(reverse_conflict.require_target_lora)
+
+        leading = parse_text_character_change_request(
+            "请使用角色 LoRA，shifty_(nikke), 1girl, gym uniform，"
+            "把角色换成凯伊"
+        )
+        self.assertTrue(leading.require_target_lora)
+        self.assertNotIn("LoRA", leading.tags)
 
     def test_text_character_change_parser_keeps_tags_and_edit_separate(self) -> None:
         request = parse_text_character_change_request(
@@ -718,6 +804,226 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         )
         self.assertNotIn("rice shower", plan.negative_prompt)
 
+    def test_required_target_lora_never_falls_back_to_semantic_tags(self) -> None:
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.prepare(
+                CharacterSwapRequest(
+                    "Denia",
+                    "Missing Character",
+                    require_target_lora=True,
+                ),
+                positive_prompt="1girl, denia_wuwa, black hair, standing",
+                negative_prompt="",
+                records=self.records,
+                fallback_target_tags=("missing_character_(work)",),
+            )
+
+        self.assertEqual(raised.exception.code, "required_target_lora_missing")
+
+        with self.assertRaises(CharacterSwapError) as conflict:
+            self.planner.prepare(
+                CharacterSwapRequest(
+                    "Denia",
+                    "Kallen Kaslana",
+                    use_target_lora=False,
+                    require_target_lora=True,
+                ),
+                positive_prompt="1girl, denia_wuwa, black hair, standing",
+                negative_prompt="",
+                records=self.records,
+            )
+        self.assertEqual(
+            conflict.exception.code,
+            "conflicting_target_lora_directives",
+        )
+
+    def test_uncertain_white_thighhighs_is_safely_preserved_as_outfit(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "Shifty",
+                "Kallen Kaslana",
+                require_target_lora=True,
+            ),
+            positive_prompt=(
+                "shifty_(nikke), 1girl, blue eyes, blue hair, buruma, "
+                "gym uniform, white thighhighs, solo"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[0, 2, 3],
+                    outfit_ids=[4, 5],
+                    style_quality_ids=[1, 7],
+                    uncertain_ids=[6],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIn("white thighhighs", plan.prompt)
+        self.assertEqual(plan.promoted_uncertain_outfit_count, 1)
+        self.assertIs(plan.target_record, self.kallen)
+        self.assertIn(
+            "characters/kallen.safetensors",
+            [selection.name for selection in plan.loras],
+        )
+
+    def test_required_kei_lora_preserves_escaped_identity_trigger(self) -> None:
+        kei = _record(
+            "characters/kei_student_blue_archive_anima-base-v1_0_lokr_f8-000012_fp32.safetensors",
+            "Kei/凯伊",
+            "KEI-SHA",
+            triggers=(r"kei \(student\) \(blue archive\)",),
+            aliases=("kei", "凯伊"),
+            source_work="Blue Archive/碧蓝档案/蔚蓝档案",
+        )
+        kei_entry = _semantic_entry(kei, "kei student blue archive")
+        wrong_kei = _record(
+            "characters/kei_wrong_game.safetensors",
+            "Kei/凯伊",
+            "WRONG-KEI-SHA",
+            triggers=(r"kei \(wrong game\)",),
+            aliases=("kei", "凯伊"),
+            source_work="Wrong Game",
+        )
+        wrong_entry = _semantic_entry(wrong_kei, "kei wrong game")
+        planner = CharacterSwapPlanner(
+            LoraSemanticIndex(
+                entries={
+                    kei_entry.identity_key: kei_entry,
+                    wrong_entry.identity_key: wrong_entry,
+                },
+            )
+        )
+        preparation = planner.prepare(
+            CharacterSwapRequest(
+                "Shifty",
+                "《BlueArchive》的凯伊(kei)",
+                require_target_lora=True,
+            ),
+            positive_prompt=(
+                "shifty_(nikke), 1girl, blue hair, gym uniform, "
+                "white thighhighs, solo"
+            ),
+            negative_prompt="",
+            records=(*self.records, kei, wrong_kei),
+        )
+        classification = planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[0, 2],
+                    outfit_ids=[3, 4],
+                    style_quality_ids=[1, 5],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = planner.finalize(preparation, classification)
+
+        self.assertIs(plan.target_record, kei)
+        self.assertIn(r"kei \(student\) \(blue archive\)", plan.prompt)
+        self.assertNotIn("kei (student) (blue archive)", plan.prompt)
+        self.assertNotIn("blue hair", plan.prompt)
+        self.assertLess(
+            plan.prompt.index(r"kei \(student\) \(blue archive\)"),
+            plan.prompt.index("gym uniform"),
+        )
+
+        with self.assertRaises(CharacterSwapError) as wrong_work:
+            planner.prepare(
+                CharacterSwapRequest(
+                    "Shifty",
+                    "《Fate》的凯伊(kei)",
+                    require_target_lora=True,
+                ),
+                positive_prompt="shifty_(nikke), 1girl, gym uniform, solo",
+                negative_prompt="",
+                records=(*self.records, kei, wrong_kei),
+            )
+        self.assertEqual(
+            wrong_work.exception.code,
+            "required_target_lora_missing",
+        )
+        for wrong_query in ("Fate的凯伊(kei)", "Fate里的凯伊"):
+            with self.subTest(wrong_query=wrong_query):
+                with self.assertRaises(CharacterSwapError) as wrong_plain_work:
+                    planner.prepare(
+                        CharacterSwapRequest(
+                            "Shifty",
+                            wrong_query,
+                            require_target_lora=True,
+                        ),
+                        positive_prompt=(
+                            "shifty_(nikke), 1girl, gym uniform, solo"
+                        ),
+                        negative_prompt="",
+                        records=(*self.records, kei, wrong_kei),
+                    )
+                self.assertEqual(
+                    wrong_plain_work.exception.code,
+                    "required_target_lora_missing",
+                )
+
+    def test_uncertain_bra_does_not_collide_with_twin_braids(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Kallen Kaslana"),
+            positive_prompt=(
+                "denia_wuwa, 1girl, twin braids, bra, standing, solo"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[0],
+                    style_quality_ids=[1, 5],
+                    pose_action_ids=[4],
+                    uncertain_ids=[2, 3],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("twin braids", plan.prompt)
+        self.assertIn("bra", plan.prompt)
+        self.assertEqual(plan.promoted_uncertain_count, 1)
+        self.assertEqual(plan.promoted_uncertain_outfit_count, 1)
+
+    def test_deterministic_outfit_repair_rejects_composite_identity_and_pose(self) -> None:
+        for term in (
+            "black hair ribbon",
+            "blue hair with red ribbon",
+            "ribbon braid",
+            "looking under skirt",
+            "dress blowing in wind",
+        ):
+            with self.subTest(term=term):
+                self.assertFalse(_is_deterministic_outfit_term(term))
+
+        for term in (
+            "white_thighhighs",
+            "gym uniform",
+            "black bra",
+            "white shirt",
+        ):
+            with self.subTest(term=term):
+                self.assertTrue(_is_deterministic_outfit_term(term))
+
     def test_slash_alias_is_not_an_explicit_lora_file_and_can_fallback(self) -> None:
         request = parse_character_swap_request(
             "Denia -> 目标角色《鸣潮》的今汐/今夕 | "
@@ -758,6 +1064,15 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "character_not_found")
+
+    def test_explicit_lora_prefix_resolves_exact_character_file(self) -> None:
+        resolved = resolve_character_record(
+            self.records,
+            "lora:characters/kallen.safetensors",
+            LoraSemanticIndex.empty(),
+        )
+
+        self.assertIs(resolved, self.kallen)
 
     def test_danbooru_exact_identity_allows_point85_classification(self) -> None:
         preparation = self._semantic_preparation(

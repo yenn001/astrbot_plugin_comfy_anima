@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.7
+AstrBot Comfy Anima 插件 v1.9.8
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.7
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.7
+版本: 1.9.8
 日期: 2026-08-01
 """
 
@@ -65,6 +65,7 @@ from .models import (
     GeneratedImagePaths,
     GenerationJob,
     GenerationOptions,
+    LoraSelection,
     PluginSettings,
 )
 from .services.comfy_client import ComfyClient, ComfyClientError
@@ -4457,7 +4458,7 @@ class ComfyAnimaPlugin(Star):
 格式: /画图 <完整原 Tags>，把角色换成<目标角色>[，额外覆盖要求] --lcc
 示例: /画图 1girl, roxy migurdia, blue hair, twin braids, school uniform, standing，把角色换成甘雨，穿JK制服 --lcc u
 该模式会清除旧角色姓名与稳定外貌；保留服装、动作、表情、构图和背景，除非后半句明确修改。
-目标 LoRA 可唯一确认时使用；缺失或同一身份有多个版本时使用纯语义 Tags。明确文件名或跨身份歧义不会猜选。
+目标 LoRA 可唯一确认时使用；缺失或同一身份有多个版本时使用纯语义 Tags。明确文件名或跨身份歧义不会猜选。写“请使用/必须使用角色 LoRA”会强制绑定，缺失时明确停止而不回退。
 已知角色以 character_(作品) canonical Tag 为主锚点；外貌只保留 0~4 项高置信稳定特征，模糊信息直接留空。
 本地 Danbooru character exact 会固定主锚点；“置信度100%”等用户文字不会覆盖安全阈值，今汐/今夕等斜杠别名也不会被误当作 LoRA 路径。
 
@@ -4483,6 +4484,7 @@ class ComfyAnimaPlugin(Star):
 /换角色 A -> B [选项] | <完整 Tags> - 对现有 Tags 语义换角
 /换角色会先刷新并精确查找目标角色 LoRA；LoRA 仅作可选增强，无法唯一选定同一目标身份的版本时改用普通语义 Tags；跨身份歧义或明确文件请求仍会停止。
 --no-character-lora / --no-lora - 强制不加载目标角色 LoRA，仅用语义 Tags；只支持 keep-outfit
+自然语言“请使用/必须使用角色 LoRA” - 强制使用最新清单中唯一命中的目标角色 LoRA
 /画图与 /画图no 可追加 --llm [u|ultra]、--preset <序号|名称> 及 --pipeline <管线>；文字换角另用 --llm c / --llmcc / --lcc
 短参数: --p b|r|i、--sz、--st、--sd、--c、--n、--pr、--l [u]；底图控制用 --m p d 等组合。
 
@@ -4638,6 +4640,7 @@ QQ快捷指令:
 --preset "画师/风格组合"
 --preview
 --no-character-lora / --no-lora（强制纯语义 Tags，不加载目标角色 LoRA；仅 keep-outfit）
+自然语言“请使用/必须使用角色 LoRA”（强制绑定唯一命中的目标 LoRA；缺失时不回退）
 目标角色 LoRA 完全未命中，或同一身份存在多个无法唯一选定的版本时，会自动改用纯语义 Tags；跨身份歧义、近似名称和显式文件请求仍会停止并要求确认。
 已知角色只要求一个经验证的 character_(作品) 主锚点；外貌可为 0~4 项且必须高置信。Danbooru character exact、LoRA exact、Provider 高置信和普通 Provider 结果使用分层校验阈值。
 用户正文中的置信度声明会被忽略；斜杠可用于角色别名，只有 lora: 前缀或 .safetensors/.ckpt/.pt/.bin 后缀才进入严格文件语义。
@@ -5624,7 +5627,8 @@ QQ快捷指令:
 
         explicit_target_lora = is_explicit_lora_reference(request.target_query)
         return bool(
-            not explicit_target_lora
+            not request.require_target_lora
+            and not explicit_target_lora
             and error_code
             in {
                 "character_not_found",
@@ -6011,6 +6015,12 @@ QQ快捷指令:
                         ),
                         "semantic_fallback": preparation.target_record is None,
                         "target_lora_requested": effective_request.use_target_lora,
+                        "target_lora_required": effective_request.require_target_lora,
+                        "target_lora_strength": (
+                            round(effective_request.target_lora_strength, 4)
+                            if preparation.target_record is not None
+                            else None
+                        ),
                         "target_metadata_present": (
                             preparation.target_metadata_record is not None
                         ),
@@ -6114,6 +6124,9 @@ QQ快捷指令:
                         "promoted_uncertain_source_appearance_count": (
                             plan.promoted_uncertain_count
                         ),
+                        "promoted_uncertain_outfit_count": (
+                            plan.promoted_uncertain_outfit_count
+                        ),
                         "reauthorized_shared_appearance_count": len(
                             plan.reauthorized_appearance_terms
                         ),
@@ -6165,6 +6178,11 @@ QQ快捷指令:
                             plan.target_record.name
                             if plan.target_record is not None
                             else ""
+                        ),
+                        character_swap_target_lora_strength=(
+                            effective_request.target_lora_strength
+                            if plan.target_record is not None
+                            else None
                         ),
                         character_swap_forbid_character_loras=(
                             plan.target_record is None
@@ -6265,6 +6283,12 @@ QQ快捷指令:
                     f"{plan.promoted_uncertain_count} 项明确的原子稳定外貌"
                     "确定为原角色身份并移除。"
                 )
+            if plan.promoted_uncertain_outfit_count:
+                preview_lines.append(
+                    "分类修复：已将 "
+                    f"{plan.promoted_uncertain_outfit_count} 项明确衣装 Tag"
+                    "确定为服装并按当前换角模式处理。"
+                )
             if plan.reauthorized_appearance_terms:
                 preview_lines.append(
                     "共享外貌：目标角色以高置信证据重新授权 "
@@ -6290,6 +6314,12 @@ QQ快捷指令:
             info_lines.append(
                 "当前清单未找到目标角色 LoRA，本次使用普通语义 Tags；"
                 "身份还原度可能低于 LoRA 模式。"
+            )
+        else:
+            info_lines.append(
+                "已加载目标角色 LoRA: "
+                f"{plan.target_record.name}，权重 "
+                f"{effective_request.target_lora_strength:.2f}。"
             )
         if (
             plan.target_record is None
@@ -13266,21 +13296,40 @@ QQ快捷指令:
                             options.character_swap_target_lora
                         ).casefold()
                         character_keys: list[str] = []
+                        target_selection: Optional[LoraSelection] = None
                         for selection in dynamic_loras:
                             record = resolved_record_for(selection.name)
                             if record is None:
                                 continue
                             role = str(record.category or "").casefold()
                             if role == "character" or bool(record.character_name):
-                                character_keys.append(
-                                    canonical_lora_name(record.name).casefold()
-                                )
+                                record_key = canonical_lora_name(record.name).casefold()
+                                character_keys.append(record_key)
+                                if record_key == target_key:
+                                    target_selection = selection
                         if (
                             set(character_keys) != {target_key}
                             or character_keys.count(target_key) != 1
                         ):
                             raise LoraWorkflowError(
                                 "提交前角色 LoRA 不变量失效：必须且只能保留目标角色"
+                            )
+                        expected_strength = (
+                            options.character_swap_target_lora_strength
+                        )
+                        if (
+                            expected_strength is not None
+                            and (
+                                target_selection is None
+                                or abs(
+                                    target_selection.strength
+                                    - expected_strength
+                                )
+                                > 1e-6
+                            )
+                        ):
+                            raise LoraWorkflowError(
+                                "提交前角色 LoRA 权重发生变化，已停止生成"
                             )
                     if options.character_swap_forbid_character_loras:
                         forbidden = []

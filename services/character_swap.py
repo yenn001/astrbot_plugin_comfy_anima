@@ -133,6 +133,25 @@ _OBVIOUS_OUTFIT_MARKERS = (
     "帽",
     "盔甲",
 )
+_DETERMINISTIC_OUTFIT_MARKERS = (
+    *_OBVIOUS_OUTFIT_MARKERS,
+    "underwear",
+    "bra",
+    "panties",
+    "buruma",
+    "blouse",
+    "sweater",
+    "hoodie",
+    "shorts",
+    "trousers",
+    "stockings",
+    "thighhighs",
+    "thigh highs",
+    "socks",
+    "sleeves",
+    "necktie",
+    "apron",
+)
 _APPEARANCE_MARKERS = (
     "hair",
     "braid",
@@ -442,10 +461,25 @@ _GENERIC_SOURCE_QUERY_KEYS = frozenset(
     }
 )
 _NO_CHARACTER_LORA_RE = re.compile(
-    r"(?:无需|不用|不要|别用|禁用|禁止(?:使用)?|"
-    r"不(?:需要|使用|加载|添加|挂载))"
-    r"(?:再)?(?:使用|加载|添加|挂载)?\s*"
+    r"(?:无需|不用|不要|别|勿|禁用|禁止|不想|不一定要|"
+    r"不需要|不使用|不加载|不添加|不挂载)"
+    r"(?:再)?(?:强制)?\s*(?:使用|加载|添加|挂载|用)?\s*"
     r"(?:任何\s*)?(?:目标\s*)?(?:角色\s*)?lo[-\s]?ra",
+    re.IGNORECASE,
+)
+_REQUIRE_CHARACTER_LORA_RE = re.compile(
+    r"(?<!不)(?<!别)(?<!勿)(?<!禁)"
+    r"(?:请|请务必|务必|必须|一定要|强制)?\s*"
+    r"(?:使用|加载|添加|挂载|用)\s*"
+    r"(?:目标\s*)?(?:角色\s*)?lo[-\s]?ra(?:文件|模型)?"
+    r"(?!\s*(?:风格|组合|预设|串|style|preset))"
+    r"(?=$|[\s,，。.;；、]|并|同时|然后|再)",
+    re.IGNORECASE,
+)
+_OPTIONAL_CHARACTER_LORA_RE = re.compile(
+    r"(?:可以|可|有的话|如果有|若有|不建议|建议)?\s*"
+    r"(?:使用|加载|添加|挂载|用)\s*"
+    r"(?:目标\s*)?(?:角色\s*)?lo[-\s]?ra(?:文件|模型)?",
     re.IGNORECASE,
 )
 
@@ -479,6 +513,7 @@ class CharacterSwapRequest:
     negative_prompt: str = ""
     preview: bool = False
     use_target_lora: bool = True
+    require_target_lora: bool = False
     edit_requirement: str = ""
     pipeline: str = ""
     prompt_expansion_mode: str = "standard"
@@ -552,6 +587,7 @@ class CharacterSwapPlan:
     suppressed_terms: tuple[str, ...]
     suppress_default_style: bool
     promoted_uncertain_count: int = 0
+    promoted_uncertain_outfit_count: int = 0
     reauthorized_appearance_terms: tuple[str, ...] = ()
 
     def preview_text(self) -> str:
@@ -693,10 +729,59 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
     return False
 
 
+def _is_deterministic_outfit_term(value: Any) -> bool:
+    """Recognize a bounded top-level garment term safe for deterministic repair."""
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    if (
+        not raw
+        or any(character in raw for character in "()[]{}<>,，;；:\\")
+        or re.search(r"(?:^|\s)(?:and|break)(?:\s|$)", raw, re.IGNORECASE)
+    ):
+        return False
+    normalized = re.sub(r"[_-]+", " ", raw)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if any(
+        re.search(rf"(?:^|\s){re.escape(marker)}(?:\s|$)", normalized)
+        for marker in _APPEARANCE_MARKERS
+        if marker.isascii()
+    ):
+        return False
+    if re.search(
+        r"(?:^|\s)(?:looking|holding|lifting|wearing|under|over|with|"
+        r"behind|beside|blowing|flowing|fluttering)(?:\s|$)",
+        normalized,
+    ):
+        return False
+    for marker in sorted(
+        (
+            item
+            for item in _DETERMINISTIC_OUTFIT_MARKERS
+            if item.isascii()
+        ),
+        key=len,
+        reverse=True,
+    ):
+        match = re.search(rf"(?:^|\s){re.escape(marker)}$", normalized)
+        if match is None:
+            continue
+        prefix = normalized[: match.start()].strip()
+        return len(prefix.split()) <= 5
+    return False
+
+
 def _is_meaningful_identity_key(value: str) -> bool:
     if re.search(r"[\u3400-\u9fff]", value):
         return len(value) >= 2
     return len(value) >= 3
+
+
+def _escape_lora_identity_trigger(value: str) -> str:
+    """Preserve a trained-word spelling while escaping Comfy prompt groups."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+    normalized = normalized.replace(r"\(", "(").replace(r"\)", ")")
+    return normalized.replace("(", r"\(").replace(")", r"\)")
 
 
 def _contains_identity_fragment(container: str, fragment: str) -> bool:
@@ -717,6 +802,33 @@ def _strip_no_character_lora_suffix(value: str) -> tuple[str, bool]:
         return normalized, False
     target = normalized[: match.start()].rstrip(" \t，,。；;、:-")
     return target, True
+
+
+def _strip_required_character_lora_directive(value: str) -> tuple[str, bool]:
+    """Consume a positive LoRA control phrase without treating it as an edit."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    masked = list(normalized)
+    for pattern in (_NO_CHARACTER_LORA_RE, _OPTIONAL_CHARACTER_LORA_RE):
+        for match in pattern.finditer(normalized):
+            if pattern is _OPTIONAL_CHARACTER_LORA_RE and not re.match(
+                r"(?:可以|可|有的话|如果有|若有|不建议|建议)",
+                match.group(0).lstrip(),
+            ):
+                continue
+            masked[match.start() : match.end()] = " " * (
+                match.end() - match.start()
+            )
+    positive_matches = list(_REQUIRE_CHARACTER_LORA_RE.finditer("".join(masked)))
+    if not positive_matches:
+        return normalized, False
+    cleaned = normalized
+    for match in reversed(positive_matches):
+        cleaned = cleaned[: match.start()] + " " + cleaned[match.end() :]
+    cleaned = re.sub(r"\s*([，,。.;；、])\s*", r"\1", cleaned)
+    cleaned = re.sub(r"[，,。.;；、]{2,}", "，", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t，,。.;；、:-")
+    return cleaned, True
 
 
 def is_explicit_lora_reference(value: str) -> bool:
@@ -1292,13 +1404,21 @@ def _dedupe_prompt_terms(values: Iterable[Any]) -> tuple[str, ...]:
 def _target_identity_insert_index(terms: Sequence[str]) -> int:
     """Place the target immediately after subject/cardinality anchors."""
 
-    subject_keys = {"1girl", "1boy", "1other", "solo"}
-    positions = [
-        index
-        for index, term in enumerate(terms)
-        if _prompt_term_key(term) in subject_keys
-    ]
-    return max(positions) + 1 if positions else 0
+    cardinality_keys = {"1girl", "1boy", "1other"}
+    for index, term in enumerate(terms):
+        if _prompt_term_key(term) not in cardinality_keys:
+            continue
+        insert_at = index + 1
+        if (
+            insert_at < len(terms)
+            and _prompt_term_key(terms[insert_at]) == "solo"
+        ):
+            insert_at += 1
+        return insert_at
+    for index, term in enumerate(terms):
+        if _prompt_term_key(term) == "solo":
+            return index + 1
+    return 0
 
 
 def _is_character_record(record: LoraRecord) -> bool:
@@ -1390,8 +1510,78 @@ def _query_identity_keys(value: str) -> tuple[str, ...]:
     variants.append(
         re.sub(r"(?:里面|里边|当中|之中|中)?的", " ", stripped).strip()
     )
+    decorated = re.sub(r"[《》〈〉【】「」『』\[\]]+", " ", stripped)
+    decorated = re.sub(r"\s+", " ", decorated).strip()
+    variants.append(decorated)
+    variants.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"[（(]([^（）()]{1,80})[）)]", decorated)
+        if match.group(1).strip()
+    )
+    without_alias = re.sub(r"[（(][^（）()]{1,80}[）)]", " ", decorated)
+    without_alias = re.sub(r"\s+", " ", without_alias).strip()
+    variants.append(without_alias)
+    variants.extend(
+        part.strip()
+        for part in re.split(r"(?:里面|里边|当中|之中|中)?的", without_alias)
+        if part.strip()
+    )
     return tuple(
         dict.fromkeys(key for item in variants if (key := _identity_key(item)))
+    )
+
+
+def _query_explicit_work_keys(value: str) -> tuple[str, ...]:
+    """Extract only explicitly bracketed work titles for cross-work guarding."""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    candidates = [
+        match.group(1)
+        for match in re.finditer(
+            r"[《〈【「『]([^》〉】」』]{1,80})[》〉】」』]",
+            text,
+        )
+    ]
+    candidates.extend(
+        match.group(1)
+        for match in re.finditer(
+            r"(?:^|[，,。.;；:：])\s*([0-9a-z][0-9a-z _-]{1,79}?)"
+            r"(?:里面的|里边的|当中的|之中的|里的|中的|的)"
+            r"(?=[^，,。.;；]{1,80}$)",
+            text,
+        )
+    )
+    candidates.extend(
+        match.group(1)
+        for match in re.finditer(
+            r"(?:^|[，,。.;；:：])\s*([\u3400-\u9fff][0-9a-z\u3400-\u9fff _-]{1,79}?)"
+            r"(?:里面的|里边的|当中的|之中的|里的|中的)"
+            r"(?=[^，,。.;；]{1,80}$)",
+            text,
+        )
+    )
+    return tuple(
+        dict.fromkeys(
+            key for candidate in candidates if (key := _identity_key(candidate))
+        )
+    )
+
+
+def _trusted_source_work_keys(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex,
+) -> frozenset[str]:
+    values = list(_split_names(record.source_work))
+    entry = semantic_index.entry_for(record)
+    if _entry_is_fresh(entry, record):
+        assert entry is not None
+        values.extend(
+            fact.value
+            for fact in entry.effective_facts("source_works")
+            if fact.source in {"manual", "observed"} or fact.confidence >= 0.9
+        )
+    return frozenset(
+        key for value in values if (key := _identity_key(value))
     )
 
 
@@ -1442,11 +1632,17 @@ def resolve_character_record(
     raw_query = unicodedata.normalize("NFKC", str(query or "")).strip().replace(
         "\\", "/"
     )
-    explicit_file = is_explicit_lora_reference(raw_query)
-    explicit_path = explicit_file and "/" in raw_query
-    query_keys = _query_identity_keys(
-        canonical_lora_name(raw_query) if explicit_file else raw_query
+    lookup_query = (
+        raw_query[5:].strip()
+        if raw_query.casefold().startswith("lora:")
+        else raw_query
     )
+    explicit_file = is_explicit_lora_reference(raw_query)
+    explicit_path = explicit_file and "/" in lookup_query
+    query_keys = _query_identity_keys(
+        canonical_lora_name(lookup_query) if explicit_file else lookup_query
+    )
+    requested_work_keys = _query_explicit_work_keys(lookup_query)
     if not query_keys:
         raise CharacterSwapError(
             f"{role_label}角色不能为空",
@@ -1455,6 +1651,11 @@ def resolve_character_record(
     matches: list[tuple[int, LoraRecord, str]] = []
     for record in records:
         if not _is_character_record(record):
+            continue
+        if requested_work_keys and not (
+            set(requested_work_keys)
+            & _trusted_source_work_keys(record, semantic_index)
+        ):
             continue
         canonical = canonical_lora_name(record.name)
         basename = PurePosixPath(canonical).name
@@ -1485,6 +1686,11 @@ def resolve_character_record(
         fuzzy_matches: list[tuple[int, LoraRecord, str]] = []
         for record in records:
             if not _is_character_record(record):
+                continue
+            if requested_work_keys and not (
+                set(requested_work_keys)
+                & _trusted_source_work_keys(record, semantic_index)
+            ):
                 continue
             best_distance = 2
             best_value = ""
@@ -1674,6 +1880,18 @@ class CharacterSwapPlanner:
             )
         target_metadata: Optional[LoraRecord] = None
         explicit_target = is_explicit_lora_reference(request.target_query)
+        if request.require_target_lora and not request.use_target_lora:
+            raise CharacterSwapError(
+                "不能同时要求使用目标角色 LoRA 和禁用目标角色 LoRA",
+                code="conflicting_target_lora_directives",
+            )
+        if request.require_target_lora and _is_original_character_query(
+            request.target_query
+        ):
+            raise CharacterSwapError(
+                "原创角色没有可精确绑定的现有角色 LoRA",
+                code="required_target_lora_missing",
+            )
         try:
             if not _is_original_character_query(request.target_query):
                 target_metadata = resolve_character_record(
@@ -1684,6 +1902,11 @@ class CharacterSwapPlanner:
                     allow_equivalent_variants=not request.use_target_lora,
                 )
         except CharacterSwapError as exc:
+            if request.require_target_lora and exc.code == "character_not_found":
+                raise CharacterSwapError(
+                    "用户明确要求使用目标角色 LoRA，但最新 LoRA Manager 清单中未找到可唯一确认的目标文件",
+                    code="required_target_lora_missing",
+                ) from exc
             # Pure semantic mode intentionally does not select a target LoRA file.
             # Multiple LoRA variants of the same requested character therefore do
             # not authorize or block the operation; the separately generated and
@@ -1713,7 +1936,8 @@ class CharacterSwapPlanner:
                 else:
                     equivalent_ambiguous_variants = True
             optional_lora_fallback = (
-                not explicit_target
+                not request.require_target_lora
+                and not explicit_target
                 and bool(fallback_target_tags)
                 and (
                     exc.code == "character_not_found"
@@ -2148,13 +2372,23 @@ explanations."""
         promoted_uncertain_ids = (
             promotable_uncertain_ids if has_reliable_source_profile else set()
         )
+        promoted_uncertain_outfit_ids = {
+            index
+            for index in classification.uncertain_ids
+            if _is_deterministic_outfit_term(preparation.tags[index])
+        }
         source_identity_ids.update(promoted_uncertain_ids)
         remaining_uncertain_ids = set(classification.uncertain_ids) - set(
             promoted_uncertain_ids
-        )
+        ) - promoted_uncertain_outfit_ids
         if remaining_uncertain_ids:
             raise CharacterSwapError(
-                "部分 Tags 仍无法可靠区分身份、衣装或画面属性；"
+                (
+                    "目标角色 LoRA 已确认，但"
+                    if preparation.target_record is not None
+                    else ""
+                )
+                + "部分 Tags 仍无法可靠区分身份、衣装或画面属性；"
                 "可先使用 --preview 检查分类边界",
                 code="uncertain_tags",
                 details={
@@ -2164,6 +2398,9 @@ explanations."""
                     ),
                     "remaining_uncertain_count": len(remaining_uncertain_ids),
                     "remaining_uncertain_ids": sorted(remaining_uncertain_ids),
+                    "promoted_outfit_count": len(
+                        promoted_uncertain_outfit_ids
+                    ),
                 },
             )
         if not source_identity_ids and not preparation.removed_character_loras:
@@ -2377,6 +2614,7 @@ explanations."""
                     code="target_outfit_metadata_missing",
                 )
             removed_ids.update(classification.outfit_ids)
+            removed_ids.update(promoted_uncertain_outfit_ids)
         kept_terms = tuple(
             tag for index, tag in enumerate(preparation.tags) if index not in removed_ids
         )
@@ -2407,12 +2645,12 @@ explanations."""
             )
         )
 
-        rendered_target_trigger = (
-            escape_prompt_tag(target_trigger)
-            if preparation.target_record is None
-            and preparation.request.semantic_identity_index_verified
-            else target_trigger
-        )
+        if preparation.target_record is not None:
+            rendered_target_trigger = _escape_lora_identity_trigger(target_trigger)
+        elif preparation.request.semantic_identity_index_verified:
+            rendered_target_trigger = escape_prompt_tag(target_trigger)
+        else:
+            rendered_target_trigger = target_trigger
         added_terms: list[str] = [rendered_target_trigger]
         if preparation.target_record is None:
             added_terms.extend(
@@ -2511,6 +2749,9 @@ explanations."""
                 for record in preparation.preserved_lora_records
             ),
             promoted_uncertain_count=len(promoted_uncertain_ids),
+            promoted_uncertain_outfit_count=len(
+                promoted_uncertain_outfit_ids
+            ),
             reauthorized_appearance_terms=reauthorized_appearance_terms,
         )
 
@@ -2730,9 +2971,10 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
             code="invalid_swap_mapping",
         )
     source_query = match.group("source").strip(" \"'，,")
-    target_text, natural_no_lora = _strip_no_character_lora_suffix(
+    target_text, required_lora = _strip_required_character_lora_directive(
         match.group("target")
     )
+    target_text, natural_no_lora = _strip_no_character_lora_suffix(target_text)
     target_query, ignored_control_directives = _normalize_target_character_query(
         target_text
     )
@@ -2766,6 +3008,7 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
         negative_prompt=negative_prompt,
         preview=preview,
         use_target_lora=use_target_lora,
+        require_target_lora=required_lora,
         ignored_control_directives=ignored_control_directives,
     )
 
@@ -2798,6 +3041,7 @@ def parse_text_character_change_request(
     """
 
     source = unicodedata.normalize("NFKC", str(prompt_text or "")).strip()
+    source, required_lora = _strip_required_character_lora_directive(source)
     match = re.search(
         r"(?P<tags>.*?)"
         r"(?:把|将)\s*(?P<source>[^，,。；;\n]{0,120}?)\s*"
@@ -2826,6 +3070,10 @@ def parse_text_character_change_request(
     ).strip()
 
     target_tail = match.group("target").strip(" \t，,。；;")
+    target_tail, target_required_lora = _strip_required_character_lora_directive(
+        target_tail
+    )
+    required_lora = required_lora or target_required_lora
     target_tail, no_lora = _strip_no_character_lora_suffix(target_tail)
     target_tail, ignored_control_directives = _normalize_target_character_query(
         target_tail
@@ -2888,6 +3136,7 @@ def parse_text_character_change_request(
         negative_prompt=str(negative_prompt or "").strip(" ,"),
         preview=bool(preview),
         use_target_lora=effective_use_target_lora,
+        require_target_lora=required_lora,
         edit_requirement=edit_requirement,
         pipeline=str(pipeline or "").strip(),
         prompt_expansion_mode=(
@@ -2906,6 +3155,7 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
     """Recognize only explicit A-to-B natural-language replacement requests."""
 
     source = unicodedata.normalize("NFKC", _clean_text(text, 1000))
+    source, required_lora = _strip_required_character_lora_directive(source)
     if not re.search(r"(?:替换成|替换为|换成|换为)", source):
         return None
     match = re.search(
@@ -2975,6 +3225,7 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
         target_query=target_query,
         mode=mode,
         use_target_lora=use_target_lora,
+        require_target_lora=required_lora,
         edit_requirement=edit_requirement,
         ignored_control_directives=ignored_control_directives,
     )

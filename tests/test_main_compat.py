@@ -760,6 +760,20 @@ class MainCompatibilityTests(unittest.TestCase):
             )
         )
 
+        required_request = self.main.CharacterSwapRequest(
+            "",
+            "凯伊",
+            require_target_lora=True,
+        )
+        for code in (
+            "character_not_found",
+            "ambiguous_character",
+            "semantic_target_tags_missing",
+            "missing_target_trigger",
+        ):
+            with self.subTest(required_code=code):
+                self.assertFalse(checker(required_request, code))
+
     def test_resolved_style_selector_is_consumed_before_swap_prompt(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         registry = self.main.LoraPresetRegistry([], max_loras=4)
@@ -3154,6 +3168,69 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     character_swap_target_lora=(
                         "characters/kallen.safetensors"
                     ),
+                ),
+                object(),
+            )
+        self.assertEqual(job.failed_stage, "building")
+
+    async def test_character_swap_rejects_target_weight_changed_before_submit(self) -> None:
+        current = self.catalog_module.LoraRecord(
+            "characters/kallen.safetensors",
+            sha256="aa11bb22",
+            category="character",
+            character_name="Kallen",
+            trigger_words=("kallen",),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+
+            async def refresh_for_operation(_self):
+                _self._cache = (current,)
+                _self._cache_expires_at = float("inf")
+                return (current,)
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return (current,)
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": False,
+                "default_style_preset": "",
+                "strict_lora_validation": True,
+                "max_dynamic_loras": 3,
+                "max_total_dynamic_loras": 12,
+                "max_prompt_length": 4000,
+            }
+        )
+        plugin._generation_slots = asyncio.Semaphore(1)
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        job = self.main.GenerationJob("u", "preview", 0.0)
+
+        with self.assertRaisesRegex(self.main.WorkflowError, "权重发生变化"):
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(
+                    prompt="1girl, kallen",
+                    use_prompt_llm=False,
+                    dynamic_loras=(
+                        LoraSelection("characters/kallen.safetensors", 0.55),
+                    ),
+                    lora_identity_expectations=(
+                        LoraIdentityExpectation(
+                            "characters/kallen.safetensors",
+                            sha256="aa11bb22",
+                        ),
+                    ),
+                    character_swap_target_lora=(
+                        "characters/kallen.safetensors"
+                    ),
+                    character_swap_target_lora_strength=0.65,
                 ),
                 object(),
             )

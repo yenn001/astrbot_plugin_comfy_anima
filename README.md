@@ -1,6 +1,6 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.7
+> 当前版本：v1.9.8
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
