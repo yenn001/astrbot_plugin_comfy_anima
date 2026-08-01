@@ -760,6 +760,86 @@ class MainCompatibilityTests(unittest.TestCase):
             )
         )
 
+    def test_resolved_style_selector_is_consumed_before_swap_prompt(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        registry.save(
+            name="风格006",
+            category="artist_style",
+            selections=(LoraSelection("style/example.safetensors", 0.8),),
+            aliases=("masterpiece", "anime"),
+        )
+        plugin._lora_presets = registry
+
+        cleaned = plugin._strip_resolved_style_reference(
+            "用风格006画图，masterpiece, anime style, best quality, 1girl, solo",
+            "风格006",
+        )
+
+        self.assertEqual(
+            cleaned,
+            "masterpiece, anime style, best quality, 1girl, solo",
+        )
+        self.assertNotIn("风格006", cleaned)
+
+    def test_named_style_selector_consumes_context_without_touching_visual_tags(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        registry.save(
+            name="GZC",
+            category="artist_style",
+            selections=(LoraSelection("style/example.safetensors", 0.8),),
+            aliases=("masterpiece",),
+        )
+        plugin._lora_presets = registry
+
+        cleaned = plugin._strip_resolved_style_reference(
+            "使用风格 GZC 绘图，masterpiece, 1girl",
+            "GZC",
+        )
+
+        self.assertEqual(cleaned, "masterpiece, 1girl")
+
+    def test_explicit_target_appearance_override_suppresses_default_profile_slot(
+        self,
+    ) -> None:
+        filtered = self.main.ComfyAnimaPlugin._filter_character_appearance_overrides(
+            ("black hair", "red eyes", "long hair", "halo"),
+            "把头发改成白色，眼睛改成金色",
+        )
+
+        self.assertEqual(filtered, ("halo",))
+
+    def test_danbooru_target_appearance_override_suppresses_default_profile_slot(
+        self,
+    ) -> None:
+        filtered = self.main.ComfyAnimaPlugin._filter_character_appearance_overrides(
+            ("black hair", "red eyes", "long hair", "halo"),
+            "white_hair, blue_eyes",
+        )
+
+        self.assertEqual(filtered, ("halo",))
+
+    def test_compact_chinese_target_override_suppresses_matching_profile_slots(
+        self,
+    ) -> None:
+        filtered = self.main.ComfyAnimaPlugin._filter_character_appearance_overrides(
+            (
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+                "animal ears",
+                "glasses",
+                "tail",
+            ),
+            "改成白发金瞳和短发猫耳，并去掉光环、眼镜和尾巴",
+        )
+
+        self.assertEqual(filtered, ())
+
     def test_known_style_does_not_hide_character_lora_lookup(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.settings = types.SimpleNamespace(
@@ -3366,6 +3446,80 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tags, ("toki_(blue_archive)",))
         self.assertTrue(evidence["index_verified"])
         self.assertEqual(evidence["match_variant"], "user_ascii_exact")
+
+    async def test_exact_rio_uses_public_stable_appearance_profile(self) -> None:
+        plugin, calls = self._plugin("provider must not run")
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "rio_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["tsukatsuki_rio"],
+                                "count": 12095,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            class Store:
+                saved = None
+
+                @staticmethod
+                def get(_canonical):
+                    return None
+
+                @classmethod
+                def put(cls, profile):
+                    cls.saved = profile
+
+            class Client:
+                @staticmethod
+                async def danbooru_character_posts(_canonical, *, limit=100):
+                    self.assertEqual(limit, 100)
+                    return [
+                        {
+                            "id": index + 1,
+                            "rating": "g",
+                            "tag_string_character": "rio_(blue_archive)",
+                            "tag_string_general": (
+                                "1girl solo black_hair red_eyes long_hair halo "
+                                "white_sweater large_breasts"
+                            ),
+                        }
+                        for index in range(100)
+                    ]
+
+            plugin._character_appearance_profiles = Store()
+            plugin._client = Client()
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "tsukatsuki_rio",
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(provider, "danbooru-local")
+        self.assertEqual(
+            tags,
+            (
+                "rio_(blue_archive)",
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+            ),
+        )
+        self.assertEqual(evidence["appearance_source"], "danbooru_gallery")
+        self.assertEqual(evidence["appearance_count"], 4)
+        self.assertEqual(evidence["appearance_sample_count"], 100)
+        self.assertIsNotNone(Store.saved)
 
     async def test_formatter_accepts_think_extra_fields_and_numeric_strings(self) -> None:
         plugin, _calls = self._plugin(

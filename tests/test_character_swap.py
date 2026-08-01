@@ -753,9 +753,154 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             ),
         )
 
-        self.assertIn("jinhsi_(wuthering_waves)", plan.prompt)
+        self.assertIn(r"jinhsi_\(wuthering_waves\)", plan.prompt)
         self.assertNotIn("white hair", plan.prompt)
         self.assertNotIn("red eyes", plan.prompt)
+
+    def test_danbooru_profile_pins_appearance_and_places_identity_after_subject(
+        self,
+    ) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "Blue Archive Rio",
+                semantic_identity_confidence=1.0,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+                semantic_appearance_source="danbooru_gallery",
+                semantic_appearance_count=4,
+                semantic_appearance_sample_count=100,
+            ),
+            (
+                "rio_(blue_archive)",
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+            ),
+        )
+
+        plan = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.85,
+                appearance_ids=(),
+            ),
+        )
+
+        terms = tuple(item.strip() for item in plan.prompt.split(","))
+        self.assertEqual(terms[:6], (
+            "1girl",
+            r"rio_\(blue_archive\)",
+            "black hair",
+            "red eyes",
+            "long hair",
+            "halo",
+        ))
+        self.assertNotIn("denia_wuwa", plan.prompt)
+        self.assertEqual(plan.prompt.count("black hair"), 1)
+
+    def test_danbooru_profile_ignores_classifier_outfit_mislabel(self) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Denia",
+                "Blue Archive Rio",
+                semantic_identity_confidence=1.0,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+                semantic_appearance_source="danbooru_gallery",
+                semantic_appearance_count=4,
+                semantic_appearance_sample_count=100,
+            ),
+            (
+                "rio_(blue_archive)",
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+            ),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1, 2],
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    target_default_outfit_trigger_ids=[1],
+                    confidence=0.85,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIn("black hair", plan.prompt)
+        self.assertIn(r"rio_\(blue_archive\)", plan.prompt)
+
+    def test_rio_dense_prompt_contract_removes_source_and_reinforces_target(
+        self,
+    ) -> None:
+        request = CharacterSwapRequest(
+            "",
+            "Blue Archive Rio",
+            semantic_identity_confidence=1.0,
+            semantic_identity_index_verified=True,
+            semantic_identity_anchor_source="danbooru_exact",
+            semantic_appearance_source="danbooru_gallery",
+            semantic_appearance_count=4,
+            semantic_appearance_sample_count=100,
+        )
+        preparation = self.planner.prepare(
+            request,
+            positive_prompt=(
+                "masterpiece, 1girl, solo, silver hair, white hair, twin tails, "
+                "profile, rainbow reflection in hair, beach"
+            ),
+            negative_prompt="black_hair, red_eyes, low quality",
+            records=self.records,
+            fallback_target_tags=(
+                "rio_(blue_archive)",
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+            ),
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[3, 4, 5],
+                    composition_ids=[6],
+                    scene_lighting_ids=[7, 8],
+                    style_quality_ids=[0, 1, 2],
+                    confidence=0.9,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("silver hair", plan.prompt)
+        self.assertNotIn("white hair", plan.prompt)
+        self.assertNotIn("twin tails", plan.prompt)
+        self.assertIn("rainbow reflection in hair", plan.prompt)
+        self.assertIn("beach", plan.prompt)
+        self.assertNotIn("black_hair", plan.negative_prompt)
+        self.assertNotIn("red_eyes", plan.negative_prompt)
+        self.assertIn("low quality", plan.negative_prompt)
+        self.assertIn(
+            "1girl, solo, rio_\\(blue_archive\\), black hair, red eyes, long hair, halo",
+            plan.prompt,
+        )
 
     def test_high_provider_confidence_allows_point82_classification_without_index(
         self,
@@ -894,7 +1039,7 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         plan = self.planner.finalize(preparation, classification)
 
         self.assertNotIn("source_character_(source_work)", plan.prompt)
-        self.assertIn("jinhsi_(wuthering_waves)", plan.prompt)
+        self.assertIn(r"jinhsi_\(wuthering_waves\)", plan.prompt)
         self.assertEqual(plan.prompt.count("long hair"), 1)
         self.assertEqual(plan.reauthorized_appearance_terms, ("long hair",))
 

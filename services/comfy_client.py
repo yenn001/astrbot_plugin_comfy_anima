@@ -98,6 +98,77 @@ class ComfyClient:
         path = f"/object_info/{quote(value, safe='')}" if value else "/object_info"
         return await self._request_json("GET", path)
 
+    @staticmethod
+    async def _read_bounded_content(
+        response: aiohttp.ClientResponse,
+        maximum_bytes: int,
+    ) -> bytes:
+        """Read a complete streamed body while enforcing a hard size limit.
+
+        ``StreamReader.read(n)`` may return fewer than ``n`` bytes before EOF.
+        Calling it once can therefore truncate chunked JSON responses from
+        extensions such as Danbooru Gallery.
+        """
+
+        content_length = response.content_length
+        if content_length is not None and content_length > maximum_bytes:
+            raise ComfyClientError("Danbooru 角色外观证据响应过大")
+        content = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            content.extend(chunk)
+            if len(content) > maximum_bytes:
+                raise ComfyClientError("Danbooru 角色外观证据响应过大")
+        return bytes(content)
+
+    async def danbooru_character_posts(
+        self,
+        canonical_tag: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return bounded safe-rated post metadata through Danbooru Gallery.
+
+        This endpoint is optional.  It is used only to derive stable appearance
+        evidence for an already exact-verified character; images and raw posts
+        are never persisted by the AstrBot plugin.
+        """
+
+        canonical = str(canonical_tag or "").strip().casefold()
+        if not re.fullmatch(r"[a-z0-9_().'\-]{1,160}", canonical):
+            raise ComfyClientError("角色 canonical Tag 无法用于外观证据查询")
+        bounded_limit = min(100, max(12, int(limit)))
+        session = await self._get_session()
+        params = {
+            "search[tags]": f"{canonical} solo",
+            "search[rating]": "g",
+            "limit": str(bounded_limit),
+            "page": "1",
+            "source": "danbooru",
+        }
+        try:
+            async with session.get(
+                f"{self._base_url}/danbooru_gallery/posts",
+                params=params,
+            ) as response:
+                if response.status >= 400:
+                    raise ComfyClientError(
+                        "Danbooru 角色外观证据接口不可用",
+                        f"Danbooru Gallery HTTP {response.status}",
+                    )
+                maximum_bytes = 12 * 1024 * 1024
+                content = await self._read_bounded_content(response, maximum_bytes)
+        except asyncio.TimeoutError as exc:
+            raise ComfyClientError("读取 Danbooru 角色外观证据超时") from exc
+        except aiohttp.ClientError as exc:
+            raise ComfyClientError("无法读取 Danbooru 角色外观证据", str(exc)) from exc
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ComfyClientError("Danbooru 角色外观证据格式无效") from exc
+        if not isinstance(payload, list):
+            raise ComfyClientError("Danbooru 角色外观证据不是列表")
+        return [item for item in payload[:bounded_limit] if isinstance(item, dict)]
+
     async def gpu_name(self) -> str:
         """Return the first ComfyUI GPU model without allocator decorations."""
         payload = await self.health()

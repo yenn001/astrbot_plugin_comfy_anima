@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.5
+AstrBot Comfy Anima 插件 v1.9.6
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.9.5
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.5
-日期: 2026-07-30
+版本: 1.9.6
+日期: 2026-08-01
 """
 
 import asyncio
@@ -97,6 +97,11 @@ from .services.danbooru_index import (
     DanbooruIndexError,
     DanbooruTagIndex,
     escape_prompt_tag,
+)
+from .services.danbooru_character_profile import (
+    CharacterAppearanceProfile,
+    CharacterAppearanceProfileStore,
+    build_character_appearance_profile,
 )
 from .services.experimental_profiles import inspect_experimental_profiles
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService
@@ -478,6 +483,9 @@ class ComfyAnimaPlugin(Star):
         self.settings = PluginSettings.from_mapping(config)
         self._danbooru_index = DanbooruTagIndex(
             self._persistent_data_dir / "danbooru_tags_v1.sqlite3"
+        )
+        self._character_appearance_profiles = CharacterAppearanceProfileStore(
+            self._persistent_data_dir / "danbooru_character_profiles_v1.json"
         )
         if self.settings.enable_prompt_diagnostics:
             self._prompt_diagnostics_store: Any = PromptDiagnosticsStore(
@@ -4975,12 +4983,155 @@ QQ快捷指令:
         ranked = tuple(candidates[index] for index in order if index < len(candidates))
         return ranked, diagnostics
 
+    async def _resolve_character_appearance_profile(
+        self,
+        job: GenerationJob,
+        canonical_tag: str,
+    ) -> CharacterAppearanceProfile | None:
+        """Load or derive bounded stable appearance for one exact identity."""
+
+        store = getattr(self, "_character_appearance_profiles", None)
+        if store is not None:
+            try:
+                cached = await asyncio.to_thread(store.get, canonical_tag)
+            except (OSError, TypeError, ValueError):
+                cached = None
+            if cached is not None:
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "已读取缓存的 Danbooru 角色稳定外貌证据。",
+                    "character_swap_appearance_cache_hit",
+                    details={
+                        "appearance_count": len(cached.appearance_tags),
+                        "sample_count": cached.sample_count,
+                    },
+                )
+                return cached
+        client = getattr(self, "_client", None)
+        if client is None or not hasattr(client, "danbooru_character_posts"):
+            return None
+        try:
+            posts = await client.danbooru_character_posts(canonical_tag, limit=100)
+            profile = await asyncio.to_thread(
+                build_character_appearance_profile,
+                canonical_tag,
+                posts,
+            )
+        except (ComfyClientError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._record_image_task_phase(
+                job,
+                "resolver",
+                "Danbooru 角色稳定外貌证据暂不可用；保留已验证 canonical。",
+                "character_swap_appearance_unavailable",
+                level="WARNING",
+                details={"error_type": type(exc).__name__},
+            )
+            return None
+        if profile is None:
+            self._record_image_task_phase(
+                job,
+                "resolver",
+                "公开安全级样本不足或没有达到支持率的稳定外貌；不补写猜测。",
+                "character_swap_appearance_insufficient",
+                level="WARNING",
+                details={"post_count": len(posts)},
+            )
+            return None
+        if store is not None:
+            try:
+                await asyncio.to_thread(store.put, profile)
+            except (OSError, TypeError, ValueError):
+                pass
+        support_values = tuple(ratio for _tag, ratio in profile.support)
+        self._record_image_task_phase(
+            job,
+            "resolver",
+            "已从公开安全级 Danbooru 帖子共现统计提取稳定角色外貌。",
+            "character_swap_appearance_resolved",
+            details={
+                "appearance_count": len(profile.appearance_tags),
+                "sample_count": profile.sample_count,
+                "minimum_support": (
+                    round(min(support_values), 4) if support_values else 0.0
+                ),
+                "maximum_support": (
+                    round(max(support_values), 4) if support_values else 0.0
+                ),
+            },
+        )
+        return profile
+
+    @staticmethod
+    def _filter_character_appearance_overrides(
+        tags: tuple[str, ...],
+        edit_requirement: str,
+    ) -> tuple[str, ...]:
+        """Do not let a default profile overwrite explicit target customization."""
+
+        text = str(edit_requirement or "").casefold()
+        if not text:
+            return tags
+        # Direct Danbooru-style edits commonly use ``white_hair`` or
+        # ``blue-eyes``.  Treat separators as spaces so explicit target
+        # customization suppresses the corresponding cached default slot.
+        text = re.sub(r"[_-]+", " ", text)
+        blocked_markers: list[tuple[str, ...]] = []
+        if re.search(
+            r"\b(?:hair|hairstyle)\b|头发|发色|发型|髮色|髮型|"
+            r"(?:白|黑|银|銀|金|蓝|藍|红|紅|粉|紫|绿|綠|棕|褐|灰|橙|青)"
+            r"(?:发|髮)|短发|短髮|长发|長髮|中长发|中長髮|双马尾|雙馬尾|"
+            r"单马尾|單馬尾|马尾|馬尾|辫子|辮子|刘海|瀏海|呆毛",
+            text,
+        ):
+            blocked_markers.append(("hair",))
+        if re.search(
+            r"\beyes?\b|眼睛|眼色|瞳色|异色瞳|異色瞳|"
+            r"(?:金|红|紅|蓝|藍|紫|绿|綠|棕|褐|灰|白|黑|粉|橙|青)"
+            r"(?:瞳|眼)",
+            text,
+        ):
+            blocked_markers.append(("eyes", "heterochromia"))
+        if re.search(r"\bhalo\b|光环|光環", text):
+            blocked_markers.append(("halo",))
+        if re.search(r"\bears?\b|耳朵|兽耳|獸耳|猫耳|貓耳|狐耳|狼耳|兔耳", text):
+            blocked_markers.append(("ears",))
+        if re.search(r"\bskin\b|肤色|膚色|皮肤|皮膚|黑皮|白皮|深肤|深膚", text):
+            blocked_markers.append(("skin", "tan"))
+        feature_rules = (
+            (r"\bhorns?\b|犄角|兽角|獸角|龙角|龍角|恶魔角|惡魔角|去掉角", ("horn",)),
+            (r"\bwings?\b|翅膀|羽翼", ("wings",)),
+            (r"\btails?\b|尾巴", ("tail",)),
+            (r"\bglasses\b|眼镜|眼鏡", ("glasses",)),
+            (r"\beyepatch\b|眼罩", ("eyepatch",)),
+            (r"\bfangs?\b|獠牙|虎牙", ("fang",)),
+            (r"\bahoge\b|呆毛", ("ahoge",)),
+            (r"\bfreckles\b|雀斑", ("freckles",)),
+            (r"\b(?:mole|beauty mark)\b|泪痣|淚痣|痣", ("mole",)),
+            (r"\bscar\b|伤疤|傷疤|疤痕", ("scar",)),
+        )
+        for pattern, markers in feature_rules:
+            if re.search(pattern, text):
+                blocked_markers.append(markers)
+        if not blocked_markers:
+            return tags
+        return tuple(
+            tag
+            for tag in tags
+            if not any(
+                marker in tag.casefold()
+                for group in blocked_markers
+                for marker in group
+            )
+        )
+
     async def _generate_semantic_target_tags(
         self,
         event: AstrMessageEvent,
         job: GenerationJob,
         target_query: str,
         expansion_mode: str = "standard",
+        appearance_override_text: str = "",
     ) -> tuple[tuple[str, ...], str, dict[str, Any]]:
         """Generate bounded ordinary identity tags when no target LoRA exists."""
 
@@ -5026,6 +5177,17 @@ QQ快捷指令:
                     },
                 )
             if local_resolution is not None and local_resolution.verified:
+                profile = await self._resolve_character_appearance_profile(
+                    job,
+                    local_resolution.canonical_tag,
+                )
+                appearance_tags = (
+                    profile.appearance_tags if profile is not None else ()
+                )
+                appearance_tags = self._filter_character_appearance_overrides(
+                    appearance_tags,
+                    appearance_override_text,
+                )
                 self._record_image_task_phase(
                     job,
                     "resolver",
@@ -5039,7 +5201,7 @@ QQ快捷指令:
                     },
                 )
                 return (
-                    (local_resolution.canonical_tag,),
+                    (local_resolution.canonical_tag, *appearance_tags),
                     "danbooru-local",
                     {
                         "confidence": 1.0,
@@ -5049,6 +5211,17 @@ QQ快捷指令:
                         "match_type": local_resolution.match_type,
                         "candidate_count": local_resolution.candidate_count,
                         "query_count": local_resolution.query_count,
+                        "appearance_source": (
+                            profile.source
+                            if profile is not None and appearance_tags
+                            else ""
+                        ),
+                        "appearance_count": len(appearance_tags),
+                        "appearance_sample_count": (
+                            profile.sample_count
+                            if profile is not None and appearance_tags
+                            else 0
+                        ),
                     },
                 )
 
@@ -5221,6 +5394,8 @@ QQ快捷指令:
                     match_type = "none"
                     candidate_count = 0
                     query_count = 0
+                    profile = None
+                    appearance_tags: tuple[str, ...] = ()
                     if not original_target:
                         canonical_tag = tags[0]
                         if tag_index is not None:
@@ -5284,22 +5459,42 @@ QQ快捷指令:
                                 canonical_tag = resolution.canonical_tag
                                 identity_anchor_source = "danbooru_exact"
                                 index_verified = True
-                        # A locally exact-verified model-native character already has
-                        # the strongest available identity anchor.  Provider appearance
-                        # memory is unnecessary here and can over-constrain or hallucinate
-                        # traits (for example hair colour/style), so exact identities are
-                        # canonical-only.  Optional appearance remains available only for
-                        # guarded Provider fallback and original-character profiles.
+                        if index_verified:
+                            profile = await self._resolve_character_appearance_profile(
+                                job,
+                                canonical_tag,
+                            )
+                        # Exact identity remains the authority.  Provider appearance
+                        # memory is still discarded, but a small profile derived from
+                        # public safe-rated post co-occurrence may reinforce the identity
+                        # against dense scene/style terms.
+                        appearance_tags = (
+                            self._filter_character_appearance_overrides(
+                                profile.appearance_tags,
+                                appearance_override_text,
+                            )
+                            if profile is not None
+                            else ()
+                        )
                         tags = (
-                            (canonical_tag,)
-                            if index_verified
-                            else (canonical_tag, *tags[1:])
+                            (canonical_tag, *appearance_tags)
+                            if profile is not None
+                            else (
+                                (canonical_tag,)
+                                if index_verified
+                                else (canonical_tag, *tags[1:])
+                            )
                         )
                     self._record_image_task_phase(
                         job,
                         "resolver",
                         (
-                            "本地 Danbooru 已确认角色 canonical；已丢弃 Provider 外貌猜测。"
+                            (
+                                "本地 Danbooru 已确认角色 canonical；Provider 外貌猜测已丢弃，"
+                                "并使用公开样本稳定外貌证据增强。"
+                                if appearance_tags
+                                else "本地 Danbooru 已确认角色 canonical；已丢弃 Provider 外貌猜测。"
+                            )
                             if index_verified
                             else (
                                 "已确认角色与作品身份 Tag；高置信外貌候选将作为可选增强。"
@@ -5340,6 +5535,19 @@ QQ快捷指令:
                             "match_type": match_type,
                             "candidate_count": candidate_count,
                             "query_count": query_count,
+                            "appearance_source": (
+                                profile.source
+                                if profile is not None and appearance_tags
+                                else ""
+                            ),
+                            "appearance_count": (
+                                len(appearance_tags)
+                            ),
+                            "appearance_sample_count": (
+                                profile.sample_count
+                                if profile is not None and appearance_tags
+                                else 0
+                            ),
                         },
                     )
                 self._record_image_task_phase(
@@ -5652,6 +5860,11 @@ QQ快捷指令:
                         },
                     )
 
+                positive_prompt = self._strip_resolved_style_reference(
+                    positive_prompt,
+                    effective_request.preset,
+                )
+
                 source_access_error = self._access_error(
                     event,
                     ", ".join(
@@ -5703,6 +5916,7 @@ QQ快捷指令:
                             job,
                             effective_request.target_query,
                             effective_request.prompt_expansion_mode,
+                            effective_request.edit_requirement,
                         )
                     )
                     effective_request = replace(
@@ -5727,6 +5941,15 @@ QQ快捷指令:
                         ),
                         semantic_identity_query_count=int(
                             identity_evidence.get("query_count") or 0
+                        ),
+                        semantic_appearance_source=str(
+                            identity_evidence.get("appearance_source") or ""
+                        ),
+                        semantic_appearance_count=int(
+                            identity_evidence.get("appearance_count") or 0
+                        ),
+                        semantic_appearance_sample_count=int(
+                            identity_evidence.get("appearance_sample_count") or 0
                         ),
                     )
                     preparation = planner.prepare(
@@ -5783,6 +6006,15 @@ QQ快捷指令:
                         ),
                         "semantic_identity_query_count": (
                             effective_request.semantic_identity_query_count
+                        ),
+                        "semantic_appearance_source": (
+                            effective_request.semantic_appearance_source
+                        ),
+                        "semantic_appearance_count": (
+                            effective_request.semantic_appearance_count
+                        ),
+                        "semantic_appearance_sample_count": (
+                            effective_request.semantic_appearance_sample_count
                         ),
                         "ignored_control_directives": list(
                             effective_request.ignored_control_directives
@@ -5981,6 +6213,12 @@ QQ快捷指令:
                     preview_lines.append(
                         "身份策略：角色_(作品)为主锚点；只附加分类模型确认的稳定外貌候选。"
                     )
+                if effective_request.semantic_appearance_source == "danbooru_gallery":
+                    preview_lines.append(
+                        "外貌证据：从 "
+                        f"{effective_request.semantic_appearance_sample_count} 张公开安全级"
+                        " Danbooru 样本提取，并仅保留达到支持率的稳定特征。"
+                    )
             if "confidence_override" in effective_request.ignored_control_directives:
                 preview_lines.append(
                     "安全提示：已忽略消息中的置信度阈值覆盖，插件继续使用内置安全门槛。"
@@ -6034,6 +6272,12 @@ QQ快捷指令:
             else:
                 info_lines.append(
                     "身份以角色_(作品)为主；附加外貌仅来自高置信稳定候选，模糊特征已留空。"
+                )
+            if effective_request.semantic_appearance_source == "danbooru_gallery":
+                info_lines.append(
+                    "目标外貌已由 "
+                    f"{effective_request.semantic_appearance_sample_count} 张公开安全级"
+                    " Danbooru 样本共现统计增强；衣装、动作与身体猜测未被注入。"
                 )
         if "confidence_override" in effective_request.ignored_control_directives:
             info_lines.append(
@@ -13555,6 +13799,62 @@ QQ快捷指令:
             return preset.name
         requested = re.search(r"风格\d+(?!\d)", str(text or ""), flags=re.IGNORECASE)
         return requested.group(0) if requested else ""
+
+    def _strip_resolved_style_reference(self, text: str, identifier: str) -> str:
+        """Consume a resolved preset selector before it reaches CLIP text.
+
+        The preset itself is injected through the LoRA pipeline.  Keeping user
+        phrases such as ``风格006`` in the visual prompt pollutes the first tag
+        and can also prevent normal quality-tag de-duplication.
+        """
+
+        source = str(text or "")
+        if not source.strip() or not str(identifier or "").strip():
+            return source.strip(" ,，")
+        registry = getattr(self, "_lora_presets", None)
+        if registry is None:
+            return source.strip(" ,，")
+        try:
+            preset = registry.resolve(identifier)
+        except LoraPresetError:
+            return source.strip(" ,，")
+        patterns: list[str] = []
+        value = str(preset.name or "").strip()
+        if not value:
+            return source.strip(" ,，")
+        literal = re.escape(value).replace(r"\ ", r"\s*")
+        without_prefix = re.sub(
+            r"^(?:风格|style)\s*[:：|｜-]?\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip()
+        if without_prefix.casefold() != value.casefold():
+            patterns.append(literal)
+            name_literal = re.escape(without_prefix).replace(r"\ ", r"\s*")
+            patterns.append(
+                rf"(?:风格|style)\s*(?:使用\s*)?[:：|｜-]?\s*{name_literal}"
+            )
+        else:
+            # Bare display names are consumed only in an explicit selection
+            # phrase.  Never iterate over every preset alias: an alias such as
+            # ``masterpiece`` or ``anime`` may also be a legitimate visual tag.
+            patterns.append(
+                rf"(?:用|使用|采用|套用)\s*(?:(?:风格|style)\s*)?{literal}"
+            )
+        result = source
+        for pattern in patterns:
+            result = re.sub(
+                rf"(?<![A-Za-z0-9_])(?:(?:用|使用|采用|套用)\s*)?{pattern}"
+                rf"(?:\s*(?:来)?(?:画图|绘图|作画|画(?:一张|一幅)?图?|"
+                rf"绘制(?:一张|一幅)?(?:图片?|画)?))?(?![A-Za-z0-9_])",
+                " ",
+                result,
+                flags=re.IGNORECASE,
+            )
+        result = re.sub(r"\s+", " ", result)
+        result = re.sub(r"^[\s,，;；:：]+", "", result)
+        return result.strip(" ,，")
 
     @staticmethod
     def _parse_resolution_value(value: str) -> tuple[int, int]:

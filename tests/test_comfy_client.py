@@ -11,7 +11,7 @@ AstrBot Comfy Anima 插件 v1.2.0
 
 import unittest
 
-from ..services.comfy_client import ComfyClient
+from ..services.comfy_client import ComfyClient, ComfyClientError
 
 
 class ComfyClientTests(unittest.TestCase):
@@ -31,6 +31,47 @@ class ComfyClientTests(unittest.TestCase):
         self.assertEqual(len(images), 1)
         self.assertEqual(images[0].filename, "final.png")
         self.assertEqual(images[0].node_id, "285")
+
+
+class _ChunkedContent:
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        self._chunks = chunks
+
+    async def iter_chunked(self, _size: int):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _ChunkedResponse:
+    def __init__(
+        self,
+        chunks: tuple[bytes, ...],
+        *,
+        content_length: int | None = None,
+    ) -> None:
+        self.content = _ChunkedContent(chunks)
+        self.content_length = content_length
+
+
+class ComfyClientAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bounded_reader_consumes_all_stream_chunks(self) -> None:
+        response = _ChunkedResponse((b'[{"id":1},', b'{"id":2}]'))
+
+        content = await ComfyClient._read_bounded_content(response, 1024)
+
+        self.assertEqual(content, b'[{"id":1},{"id":2}]')
+
+    async def test_bounded_reader_rejects_stream_that_exceeds_limit(self) -> None:
+        response = _ChunkedResponse((b"1234", b"5678"))
+
+        with self.assertRaises(ComfyClientError):
+            await ComfyClient._read_bounded_content(response, 7)
+
+    async def test_bounded_reader_rejects_large_content_length(self) -> None:
+        response = _ChunkedResponse((), content_length=2048)
+
+        with self.assertRaises(ComfyClientError):
+            await ComfyClient._read_bounded_content(response, 1024)
 
 
 if __name__ == "__main__":

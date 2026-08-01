@@ -23,6 +23,7 @@ from ..core.command_aliases import (
 )
 from ..core.lora import LoraWorkflowError, canonical_lora_name, extract_lora_selections
 from ..models import LoraIdentityExpectation, LoraSelection
+from .danbooru_index import escape_prompt_tag
 from .lora_catalog import LoraRecord
 from .lora_prompting import (
     choose_character_identity_trigger,
@@ -162,6 +163,7 @@ _APPEARANCE_MARKERS = (
     "horns",
     "wings",
     "tail",
+    "halo",
     "fangs",
     "species",
     "petite",
@@ -492,6 +494,9 @@ class CharacterSwapRequest:
     semantic_identity_match_type: str = ""
     semantic_identity_candidate_count: int = 0
     semantic_identity_query_count: int = 0
+    semantic_appearance_source: str = ""
+    semantic_appearance_count: int = 0
+    semantic_appearance_sample_count: int = 0
     ignored_control_directives: tuple[str, ...] = ()
 
     @property
@@ -1216,7 +1221,32 @@ def _split_prompt_terms(prompt: str) -> tuple[str, ...]:
 def _prompt_term_key(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
     text = text.strip("()[]{}<>‘’“”\"' ")
+    text = re.sub(r"[_-]+", " ", text)
     return _identity_key(text)
+
+
+def _dedupe_prompt_terms(values: Iterable[Any]) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _clean_text(value)
+        key = _prompt_term_key(text)
+        if text and key and key not in seen:
+            seen.add(key)
+            result.append(text)
+    return tuple(result)
+
+
+def _target_identity_insert_index(terms: Sequence[str]) -> int:
+    """Place the target immediately after subject/cardinality anchors."""
+
+    subject_keys = {"1girl", "1boy", "1other", "solo"}
+    positions = [
+        index
+        for index, term in enumerate(terms)
+        if _prompt_term_key(term) in subject_keys
+    ]
+    return max(positions) + 1 if positions else 0
 
 
 def _is_character_record(record: LoraRecord) -> bool:
@@ -2216,7 +2246,35 @@ explanations."""
                         code="ambiguous_target_trigger",
                     )
 
-        target_appearance_ids = classification.target_appearance_trigger_ids
+        evidence_appearance_ids: tuple[int, ...] = ()
+        if (
+            preparation.request.semantic_identity_index_verified
+            and preparation.request.semantic_appearance_source
+            == "danbooru_gallery"
+            and preparation.request.semantic_appearance_count > 0
+        ):
+            evidence_appearance_ids = tuple(
+                range(
+                    1,
+                    min(
+                        len(preparation.target_trigger_words),
+                        1 + preparation.request.semantic_appearance_count,
+                    ),
+                )
+            )
+        target_appearance_ids = tuple(
+            dict.fromkeys(
+                (
+                    *classification.target_appearance_trigger_ids,
+                    *evidence_appearance_ids,
+                )
+            )
+        )
+        target_default_outfit_ids = tuple(
+            trigger_id
+            for trigger_id in classification.target_default_outfit_trigger_ids
+            if trigger_id not in evidence_appearance_ids
+        )
         if semantic_original:
             if len(target_appearance_ids) < 3:
                 raise CharacterSwapError(
@@ -2230,6 +2288,7 @@ explanations."""
         elif (
             preparation.target_record is None
             and classification.confidence < 0.92
+            and not evidence_appearance_ids
         ):
             # A known model-native character never needs appearance tags to prove
             # identity. Optional metadata or Provider appearance below the stricter
@@ -2246,7 +2305,7 @@ explanations."""
                     "目标外观触发词没有可验证的外观证据",
                     code="unsafe_target_appearance_trigger",
                 )
-        for trigger_id in classification.target_default_outfit_trigger_ids:
+        for trigger_id in target_default_outfit_ids:
             trigger = preparation.target_trigger_words[trigger_id]
             folded = unicodedata.normalize("NFKC", trigger).casefold()
             if not any(marker in folded for marker in _OBVIOUS_OUTFIT_MARKERS):
@@ -2257,7 +2316,7 @@ explanations."""
 
         removed_ids = set(source_identity_ids)
         if preparation.request.mode == SWAP_MODE_TARGET_OUTFIT:
-            if not classification.target_default_outfit_trigger_ids:
+            if not target_default_outfit_ids:
                 raise CharacterSwapError(
                     "目标 LoRA 元数据不足，无法可靠应用默认服装",
                     code="target_outfit_metadata_missing",
@@ -2293,7 +2352,13 @@ explanations."""
             )
         )
 
-        added_terms: list[str] = [target_trigger]
+        rendered_target_trigger = (
+            escape_prompt_tag(target_trigger)
+            if preparation.target_record is None
+            and preparation.request.semantic_identity_index_verified
+            else target_trigger
+        )
+        added_terms: list[str] = [rendered_target_trigger]
         if preparation.target_record is None:
             added_terms.extend(
                 preparation.target_trigger_words[index]
@@ -2302,10 +2367,18 @@ explanations."""
         if preparation.request.mode == SWAP_MODE_TARGET_OUTFIT:
             added_terms.extend(
                 preparation.target_trigger_words[index]
-                for index in classification.target_default_outfit_trigger_ids
+                for index in target_default_outfit_ids
             )
         added_terms = list(_dedupe_text(added_terms))
-        prompt = ", ".join((*kept_terms, *added_terms)).strip(" ,")
+        insert_at = _target_identity_insert_index(kept_terms)
+        final_terms = _dedupe_prompt_terms(
+            (
+                *kept_terms[:insert_at],
+                *added_terms,
+                *kept_terms[insert_at:],
+            )
+        )
+        prompt = ", ".join(final_terms).strip(" ,")
         if not prompt:
             raise CharacterSwapError(
                 "语义换角后的正面提示词为空",
@@ -2330,7 +2403,7 @@ explanations."""
             term
             for term in negative_terms
             if not any(
-                _contains_identity_fragment(_identity_key(term), target_key)
+                _contains_identity_fragment(_prompt_term_key(term), target_key)
                 for target_key in target_negative_keys
             )
         )
