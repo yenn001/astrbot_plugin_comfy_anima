@@ -804,10 +804,60 @@ def _semantic_identity_anchor_candidate(value: str) -> bool:
     return True
 
 
-def _target_identity_anchor_candidate(value: str, target_query: str) -> bool:
+def _semantic_identity_discovery_anchor_candidate(value: str) -> bool:
+    """Accept a safe unqualified character-name candidate for local lookup only.
+
+    Some canonical Danbooru characters, including ``hatsune_miku``, do not use
+    a ``character_(work)`` qualifier.  LoRA-oriented trigger heuristics can
+    reject those names because a proper-name fragment happens to contain an
+    outfit word (``hat`` in ``hatsune``).  This predicate deliberately checks
+    whole tokens instead.  It never authorizes the identity by itself; callers
+    must require an exact local ``character`` index hit before using it.
+    """
+
+    folded = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    key = _prompt_term_key(folded)
+    if (
+        not key
+        or key in _GENERIC_NON_IDENTITY_KEYS
+        or "(" in folded
+        or ")" in folded
+        or not re.fullmatch(r"[a-z0-9][a-z0-9_.' /&+\-:]{1,79}", folded)
+    ):
+        return False
+    name_tokens = tuple(
+        token for token in re.split(r"[^a-z0-9]+", folded) if token
+    )
+    if not name_tokens or all(
+        token in _CONCEPT_DESCRIPTOR_TOKENS
+        or token in _GENERIC_IDENTITY_QUALIFIERS
+        for token in name_tokens
+    ):
+        return False
+    return True
+
+
+def semantic_identity_anchor_requires_local_exact(value: str) -> bool:
+    """Return whether an unqualified discovery anchor needs exact authorization."""
+
+    folded = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    return bool(
+        _semantic_identity_discovery_anchor_candidate(folded)
+        and not re.search(r"_?\([^()]+\)$", folded)
+    )
+
+
+def _target_identity_anchor_candidate(
+    value: str,
+    target_query: str,
+    *,
+    locally_verified: bool = False,
+) -> bool:
     """Accept a proven named identity or an explicitly requested original OC."""
 
     if _semantic_identity_anchor_candidate(value):
+        return True
+    if locally_verified and _semantic_identity_discovery_anchor_candidate(value):
         return True
     return bool(
         _is_original_character_query(target_query)
@@ -1137,7 +1187,9 @@ def normalize_semantic_identity_payload(
         allow_original and _prompt_term_key(tags[0] if tags else "") == "originalcharacter"
     )
     if not tags or not (
-        _semantic_identity_anchor_candidate(tags[0]) or original_anchor
+        _semantic_identity_anchor_candidate(tags[0])
+        or _semantic_identity_discovery_anchor_candidate(tags[0])
+        or original_anchor
     ):
         raise CharacterSwapError(
             "纯语义身份首项不是可验证的角色身份锚点",
@@ -2188,6 +2240,9 @@ explanations."""
                 not _target_identity_anchor_candidate(
                     target_trigger,
                     preparation.request.target_query,
+                    locally_verified=bool(
+                        preparation.request.semantic_identity_index_verified
+                    ),
                 )
                 or target_key in _GENERIC_NON_IDENTITY_KEYS
             ):
@@ -2966,6 +3021,7 @@ __all__ = [
     "is_explicit_lora_reference",
     "is_original_character_query",
     "normalize_semantic_identity_payload",
+    "semantic_identity_anchor_requires_local_exact",
     "semantic_identity_lookup_hints",
     "parse_character_swap_request",
     "parse_natural_character_swap",

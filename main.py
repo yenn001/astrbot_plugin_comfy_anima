@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.6
+AstrBot Comfy Anima 插件 v1.9.7
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.6
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.6
+版本: 1.9.7
 日期: 2026-08-01
 """
 
@@ -79,6 +79,7 @@ from .services.character_swap import (
     is_explicit_lora_reference,
     is_original_character_query,
     normalize_semantic_identity_payload,
+    semantic_identity_anchor_requires_local_exact,
     semantic_identity_lookup_hints,
     parse_character_swap_request,
     parse_natural_character_swap,
@@ -5386,6 +5387,10 @@ QQ快捷指令:
                     last_error = str(exc) or type(exc).__name__
                 else:
                     provider_tag_count = len(tags)
+                    requires_local_exact = bool(
+                        not original_target
+                        and semantic_identity_anchor_requires_local_exact(tags[0])
+                    )
                     identity_anchor_source = (
                         "original_profile" if original_target else "provider_qualified"
                     )
@@ -5459,6 +5464,24 @@ QQ快捷指令:
                                 canonical_tag = resolution.canonical_tag
                                 identity_anchor_source = "danbooru_exact"
                                 index_verified = True
+                        if requires_local_exact and not index_verified:
+                            last_error = "semantic_target_identity_unverified"
+                            self._record_image_task_phase(
+                                job,
+                                "resolver",
+                                "Provider 返回了无限定角色名，但本地 Danbooru character 索引未能精确授权。",
+                                "character_swap_semantic_target_unverified",
+                                level="WARNING" if attempt == 1 else "ERROR",
+                                details={
+                                    "attempt": attempt,
+                                    "provider_id": provider_id,
+                                    "validation_code": last_error,
+                                    "will_retry": attempt == 1,
+                                    "candidate_count": candidate_count,
+                                    "query_count": query_count,
+                                },
+                            )
+                            continue
                         if index_verified:
                             profile = await self._resolve_character_appearance_profile(
                                 job,
@@ -5575,6 +5598,13 @@ QQ快捷指令:
             )
         if last_error == "semantic_target_non_ascii":
             message = "目标角色身份 Tags 含非英文内容，请补充英文角色名或作品名后重试"
+        elif last_error == "semantic_target_identity_unverified":
+            raise CharacterSwapError(
+                "模型返回了无限定角色名，但本地 Danbooru character 索引无法精确确认；"
+                "请补充英文角色名或作品名后重试",
+                code="semantic_target_identity_unverified",
+                details={"last_error_code": last_error},
+            )
         else:
             message = (
                 "纯语义身份 Tags 规划未返回可验证结果，已停止且不会回退加载角色 LoRA"

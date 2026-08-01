@@ -308,6 +308,37 @@ class CharacterSwapRequestTests(unittest.TestCase):
             "semantic_target_appearance_excessive",
         )
 
+    def test_unqualified_character_canonical_is_discovery_only(self) -> None:
+        tags, confidence, ignored = normalize_semantic_identity_payload(
+            {
+                "canonical_identity_tag": "hatsune_miku",
+                "identity_candidates": ["hatsune_miku"],
+                "work_hints": ["vocaloid"],
+                "appearance_tags": [],
+                "confidence": 0.99,
+            }
+        )
+
+        self.assertEqual(tags, ("hatsune_miku",))
+        self.assertEqual(confidence, 0.99)
+        self.assertEqual(ignored, 0)
+
+    def test_generic_unqualified_anchors_remain_rejected(self) -> None:
+        for anchor in ("blue_hair", "1girl", "school_uniform", "masterpiece"):
+            with self.subTest(anchor=anchor):
+                with self.assertRaises(CharacterSwapError) as raised:
+                    normalize_semantic_identity_payload(
+                        {
+                            "canonical_identity_tag": anchor,
+                            "appearance_tags": [],
+                            "confidence": 0.99,
+                        }
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "semantic_target_identity_anchor",
+                )
+
     def test_canvas_preserves_ratio_near_one_megapixel(self) -> None:
         width, height = fit_canvas_to_aspect_ratio(4000, 2000)
         self.assertEqual(width % 64, 0)
@@ -756,6 +787,31 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         self.assertIn(r"jinhsi_\(wuthering_waves\)", plan.prompt)
         self.assertNotIn("white hair", plan.prompt)
         self.assertNotIn("red eyes", plan.prompt)
+
+    def test_danbooru_exact_unqualified_identity_survives_final_validation(
+        self,
+    ) -> None:
+        preparation = self._semantic_preparation(
+            CharacterSwapRequest(
+                "Shifty",
+                "初音未来",
+                semantic_identity_confidence=0.99,
+                semantic_identity_index_verified=True,
+                semantic_identity_anchor_source="danbooru_exact",
+            ),
+            ("hatsune_miku",),
+        )
+
+        plan = self.planner.finalize(
+            preparation,
+            self._semantic_classification(
+                preparation,
+                confidence=0.85,
+                appearance_ids=(),
+            ),
+        )
+
+        self.assertIn("hatsune_miku", plan.prompt)
 
     def test_danbooru_profile_pins_appearance_and_places_identity_after_subject(
         self,

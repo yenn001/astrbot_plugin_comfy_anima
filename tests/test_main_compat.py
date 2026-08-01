@@ -3365,6 +3365,93 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence["index_verified"])
         self.assertEqual(evidence["anchor_source"], "danbooru_exact")
 
+    async def test_unqualified_hatsune_miku_requires_and_passes_local_exact(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "hatsune_miku",
+                    "identity_candidates": ["hatsune_miku"],
+                    "work_hints": ["vocaloid"],
+                    "appearance_tags": [],
+                    "confidence": 0.99,
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "hatsune_miku",
+                                "category": "character",
+                                "aliases": ["miku_hatsune"],
+                                "count": 128767,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "初音未来",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags, ("hatsune_miku",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "danbooru_exact")
+        self.assertEqual(evidence["match_variant"], "canonical_exact")
+
+    async def test_unknown_unqualified_character_cannot_bypass_local_exact(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "unknown_fake_character",
+                    "identity_candidates": ["unknown_fake_character"],
+                    "work_hints": [],
+                    "appearance_tags": [],
+                    "confidence": 0.99,
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "hatsune_miku",
+                                "category": "character",
+                                "count": 128767,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            with self.assertRaises(self.main.CharacterSwapError) as raised:
+                await plugin._generate_semantic_target_tags(
+                    object(),
+                    self.main.GenerationJob("u", "swap", 0.0),
+                    "不存在的角色",
+                )
+
+        self.assertEqual(
+            raised.exception.code,
+            "semantic_target_identity_unverified",
+        )
+        self.assertEqual(len(calls), 2)
+
     async def test_danbooru_alias_without_work_resolves_asuma_toki(self) -> None:
         plugin, calls = self._plugin(
             json.dumps(

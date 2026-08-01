@@ -2,6 +2,14 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.7] - 2026-08-01
+
+### 无作品限定 Danbooru 角色换角热修复
+
+- 修复 `hatsune_miku` 等合法角色 canonical 因名称片段碰巧包含服装词而被 LoRA 触发词启发式误拦截的问题；纯中文“初音未来”现在可先由 Provider 给出 discovery canonical，再由本地 Danbooru `character` exact 索引授权。
+- 无限定 canonical 只作为检索候选，绝不会仅凭 Provider 回答直接放行。未知角色名、本地索引缺失、分类不是 `character` 或候选冲突都会安全停止；`blue_hair`、`school_uniform`、`1girl` 和质量词仍不能伪装成角色身份。
+- 统一前段 JSON 校验与最终换角规划器的身份合同，避免角色在解析阶段 exact 成功后又被第二道 LoRA 规则误判。
+
 ## [1.9.6] - 2026-08-01
 
 ### 密集提示词下的语义换角身份增强
