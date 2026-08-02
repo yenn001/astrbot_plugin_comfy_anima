@@ -2,6 +2,16 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.11] - 2026-08-02
+
+### 密集 Danbooru Tags 换角分类修复
+
+- 修复最终残留误报：顶层 Tag 改用精确匹配，只有加权或复合组继续使用有边界的包含校验，避免 `black hair -> black hairband`、`animal ears -> fake animal ears`、`tongue -> tongue out` 等误伤。
+- 增加严格 Danbooru 角色 lineage 清理：相同角色名、相同最终 Copyright 的 costume variant 与独立 Copyright 上下文会随源角色一起移除，不会把其他作品角色误并入。
+- 对分类结果增加确定性覆盖：稳定源外貌统一清理，明确衣装和普通暴露、表情、状态 Tags 自动纠正并保留，模型把 `official alternate costume`、`areola slip` 等误分为身份时不再误删。
+- 仅在当前精确角色 LoRA、确定性触发词、单主体、无未决 Tag 且所有删除项通过严格校验时，将分类最低置信度放宽到 `0.75`；`0.74`、仅元数据、Danbooru/Provider 纯语义路径继续按原门槛拒绝。
+- 任务时间线新增分类实际置信度、安全门槛、角色变体归并数及普通画面 Tag 修复数，便于定位每次换角的真实处理阶段。
+
 ## [1.9.10] - 2026-08-02
 
 ### 真实 LoRA/Danbooru 短名桥接修复

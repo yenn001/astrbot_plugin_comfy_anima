@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.10
+AstrBot Comfy Anima 插件 v1.9.11
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.10
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.10
+版本: 1.9.11
 日期: 2026-08-02
 """
 
@@ -6151,6 +6151,20 @@ QQ快捷指令:
                         "promoted_uncertain_outfit_count": (
                             plan.promoted_uncertain_outfit_count
                         ),
+                        "promoted_uncertain_visual_count": (
+                            plan.promoted_uncertain_visual_count
+                        ),
+                        "promoted_source_canonical_count": (
+                            plan.promoted_source_canonical_count
+                        ),
+                        "classification_confidence": round(
+                            plan.classification_confidence,
+                            4,
+                        ),
+                        "effective_confidence_floor": round(
+                            plan.effective_confidence_floor,
+                            4,
+                        ),
                         "reauthorized_shared_appearance_count": len(
                             plan.reauthorized_appearance_terms
                         ),
@@ -6313,6 +6327,22 @@ QQ快捷指令:
                     f"{plan.promoted_uncertain_outfit_count} 项明确衣装 Tag"
                     "确定为服装并按当前换角模式处理。"
                 )
+            if plan.promoted_uncertain_visual_count:
+                preview_lines.append(
+                    "分类修复：已保留 "
+                    f"{plan.promoted_uncertain_visual_count} 项明确的普通画面/状态 Tag，"
+                    "未将其误删为角色身份。"
+                )
+            if plan.promoted_source_canonical_count:
+                preview_lines.append(
+                    "角色变体：已按相同角色名与作品归并 "
+                    f"{plan.promoted_source_canonical_count} 项源角色 canonical。"
+                )
+            preview_lines.append(
+                "分类置信度："
+                f"{plan.classification_confidence:.2f} / 安全门槛 "
+                f"{plan.effective_confidence_floor:.2f}。"
+            )
             if plan.reauthorized_appearance_terms:
                 preview_lines.append(
                     "共享外貌：目标角色以高置信证据重新授权 "
@@ -6376,6 +6406,16 @@ QQ快捷指令:
             info_lines.append(
                 "已确定性清理 "
                 f"{plan.promoted_uncertain_count} 项分类器未决的原子稳定外貌。"
+            )
+        if plan.promoted_uncertain_visual_count:
+            info_lines.append(
+                "已保留 "
+                f"{plan.promoted_uncertain_visual_count} 项分类器未决的普通画面/状态 Tag。"
+            )
+        if plan.promoted_source_canonical_count:
+            info_lines.append(
+                "已按相同角色名与作品清理 "
+                f"{plan.promoted_source_canonical_count} 项源角色变体 canonical。"
             )
         if plan.reauthorized_appearance_terms:
             info_lines.append(

@@ -152,6 +152,7 @@ _DETERMINISTIC_OUTFIT_MARKERS = (
     "sleeves",
     "necktie",
     "apron",
+    "cap",
 )
 _APPEARANCE_MARKERS = (
     "hair",
@@ -286,11 +287,42 @@ _ATOMIC_APPEARANCE_EXCLUDED_MARKERS = (
     "necklace",
     "accessory",
     "fake ears",
+    "fake animal ears",
+    "fake rabbit ears",
+    "fake bunny ears",
+    "fake cat ears",
+    "fake fox ears",
+    "fake wolf ears",
     "fake horns",
     "reflection",
     "lighting",
     "view",
     "perspective",
+)
+_DETERMINISTIC_PRESERVED_VISUAL_TERMS = frozenset(
+    {
+        "1girl",
+        "1boy",
+        "1other",
+        "solo",
+        "areola slip",
+        "areolae",
+        "bare shoulders",
+        "breasts",
+        "cleavage",
+        "covered nipples",
+        "feet",
+        "foot focus",
+        "navel",
+        "nipples",
+        "saliva",
+        "saliva trail",
+        "spread legs",
+        "thighs",
+        "toes",
+        "tongue",
+        "tongue out",
+    }
 )
 _ATOMIC_HAIR_MODIFIERS = frozenset(
     {
@@ -589,6 +621,10 @@ class CharacterSwapPlan:
     suppress_default_style: bool
     promoted_uncertain_count: int = 0
     promoted_uncertain_outfit_count: int = 0
+    promoted_uncertain_visual_count: int = 0
+    promoted_source_canonical_count: int = 0
+    classification_confidence: float = 0.0
+    effective_confidence_floor: float = 0.0
     reauthorized_appearance_terms: tuple[str, ...] = ()
 
     def preview_text(self) -> str:
@@ -661,6 +697,8 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
         or any(marker in raw for marker in _ATOMIC_APPEARANCE_EXCLUDED_MARKERS)
     ):
         return False
+    if re.fullmatch(r"fake(?: [a-z]+)? (?:ears|horns|tail|wings)", raw):
+        return False
     normalized = re.sub(r"[_-]+", " ", raw)
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
@@ -715,7 +753,8 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
         return True
     if re.fullmatch(
         r"(?:petite|slender|slim|curvy|muscular|tall|short stature|"
-        r"small breasts|medium breasts|large breasts|wide hips|"
+        r"small breasts|medium breasts|large breasts|huge breasts|"
+        r"small areolae|large areolae|wide hips|"
         r"narrow waist|teenage girl|young woman|adult woman)",
         normalized,
     ):
@@ -769,6 +808,160 @@ def _is_deterministic_outfit_term(value: Any) -> bool:
         prefix = normalized[: match.start()].strip()
         return len(prefix.split()) <= 5
     return False
+
+
+def _is_deterministic_preserved_visual_term(value: Any) -> bool:
+    """Recognize atomic non-identity visual state safe to keep.
+
+    These terms describe exposure, transient mouth/eye state, pose or generic
+    subject anatomy.  They must not become source identity merely because an
+    LLM placed them in ``source_identity_ids`` or ``uncertain_ids``.
+    """
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    if (
+        not raw
+        or any(character in raw for character in "()[]{}<>,，;；:\\")
+        or re.search(r"(?:^|\s)(?:and|break)(?:\s|$)", raw, re.IGNORECASE)
+    ):
+        return False
+    normalized = re.sub(r"[_-]+", " ", raw)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in _DETERMINISTIC_PRESERVED_VISUAL_TERMS:
+        return True
+    return any(marker == normalized for marker in _TRANSIENT_APPEARANCE_STATE_MARKERS)
+
+
+def _danbooru_character_parts(value: Any) -> Optional[tuple[str, tuple[str, ...]]]:
+    """Parse a bounded Danbooru ``character_(variant)_(work)`` canonical."""
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    raw = _WEIGHT_SUFFIX_RE.sub("", raw)
+    raw = raw.replace(r"\(", "(").replace(r"\)", ")")
+    match = re.fullmatch(
+        r"(?P<base>[a-z0-9][a-z0-9_.' /&+\-:]{0,79}?)"
+        r"[_\s]*(?P<groups>(?:\([^()]{1,80}\)[_\s]*){1,4})",
+        raw,
+    )
+    if match is None:
+        return None
+    base = _prompt_term_key(match.group("base"))
+    qualifiers = tuple(
+        _prompt_term_key(item)
+        for item in re.findall(r"\(([^()]+)\)", match.group("groups"))
+        if _prompt_term_key(item)
+    )
+    if (
+        not base
+        or base in _GENERIC_NON_IDENTITY_KEYS
+        or not qualifiers
+        or qualifiers[-1] in _GENERIC_IDENTITY_QUALIFIERS
+    ):
+        return None
+    return base, qualifiers
+
+
+def _matches_source_character_lineage(value: Any, anchors: Sequence[Any]) -> bool:
+    """Match a character variant only to the same base name and copyright."""
+
+    value_key = _prompt_term_key(str(value or ""))
+    parsed = _danbooru_character_parts(value)
+    if not value_key or parsed is None:
+        return False
+    base, qualifiers = parsed
+    for anchor in anchors:
+        anchor_key = _prompt_term_key(str(anchor or ""))
+        if not anchor_key:
+            continue
+        if value_key == anchor_key or base == anchor_key:
+            return True
+        anchor_parts = _danbooru_character_parts(anchor)
+        if anchor_parts is None:
+            continue
+        anchor_base, anchor_qualifiers = anchor_parts
+        if base == anchor_base and qualifiers[-1] == anchor_qualifiers[-1]:
+            return True
+    return False
+
+
+def _matches_source_copyright_context(value: Any, anchors: Sequence[Any]) -> bool:
+    """Recognize a standalone copyright duplicated beside a source canonical."""
+
+    value_key = _prompt_term_key(str(value or ""))
+    if not value_key:
+        return False
+    return any(
+        parts is not None and value_key == parts[1][-1]
+        for parts in (_danbooru_character_parts(anchor) for anchor in anchors)
+    )
+
+
+def _is_weighted_or_composite_prompt_term(value: Any) -> bool:
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not raw or _danbooru_character_parts(raw) is not None:
+        return False
+    if _WEIGHT_SUFFIX_RE.search(raw):
+        return True
+    if any(character in raw for character in "[]{}<>,，;；"):
+        return True
+    return bool(
+        (raw.startswith("(") and raw.endswith(")"))
+        or re.search(r"(?:^|\s)(?:AND|BREAK)(?:\s|$)", raw)
+    )
+
+
+def _is_composite_source_appearance_term(value: Any) -> bool:
+    """Accept only groups whose every component is atomic source appearance."""
+
+    if not _is_weighted_or_composite_prompt_term(value):
+        return False
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if raw.startswith("(") and raw.endswith(")"):
+        raw = raw[1:-1].strip()
+    raw = _WEIGHT_SUFFIX_RE.sub("", raw)
+    parts = tuple(
+        part.strip()
+        for part in re.split(r"[,，;；]|(?:^|\s)(?:AND|BREAK)(?:\s|$)", raw)
+        if part.strip()
+    )
+    return bool(parts) and all(
+        _is_deterministic_source_appearance_term(part) for part in parts
+    )
+
+
+def _is_strict_unqualified_source_canonical(value: Any) -> bool:
+    """Recognize Danbooru-style unqualified names without concept phrases."""
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    normalized = re.sub(r"[_-]+", " ", raw)
+    return bool(
+        "_" in raw
+        and " " not in raw
+        and _semantic_identity_discovery_anchor_candidate(raw)
+        and not any(
+            marker in normalized for marker in _ATOMIC_APPEARANCE_EXCLUDED_MARKERS
+        )
+        and not _is_deterministic_source_appearance_term(raw)
+        and not _is_deterministic_outfit_term(raw)
+        and not _is_deterministic_preserved_visual_term(raw)
+    )
+
+
+def _source_identity_leaks_into_term(container: Any, suppressed: Any) -> bool:
+    """Check exact top-level leaks while keeping compound groups fail-closed."""
+
+    container_key = _prompt_term_key(str(container or ""))
+    suppressed_key = _prompt_term_key(str(suppressed or ""))
+    if not container_key or not suppressed_key:
+        return False
+    if container_key == suppressed_key:
+        return True
+    if not _is_weighted_or_composite_prompt_term(container):
+        return False
+    return _contains_identity_fragment(
+        _identity_key(container),
+        _identity_key(suppressed),
+    )
 
 
 def _is_meaningful_identity_key(value: str) -> bool:
@@ -2741,25 +2934,6 @@ explanations."""
         else:
             evidence_tier = "provider_guarded"
             minimum_confidence = 0.90
-        if classification.confidence < minimum_confidence:
-            raise CharacterSwapError(
-                "换角分类置信度 "
-                f"{classification.confidence:.2f} 低于当前身份证据要求 "
-                f"{minimum_confidence:.2f}，已停止自动改写",
-                code="low_classification_confidence",
-                details={
-                    "actual_confidence": round(classification.confidence, 4),
-                    "minimum_confidence": minimum_confidence,
-                    "evidence_tier": evidence_tier,
-                    "resolver_confidence": round(
-                        preparation.request.semantic_identity_confidence,
-                        4,
-                    ),
-                    "index_verified": bool(
-                        preparation.request.semantic_identity_index_verified
-                    ),
-                },
-            )
         source_identity_keys = {
             _prompt_term_key(value)
             for value in preparation.source_identity_hints
@@ -2773,32 +2947,88 @@ explanations."""
                 source_identity_keys.add(
                     _prompt_term_key(reliable_source_trigger)
                 )
-        source_identity_ids = set(classification.source_identity_ids)
-        promotable_uncertain_ids = {
+        classified_source_identity_ids = set(classification.source_identity_ids)
+        classified_source_canonical_ids = {
+            index
+            for index in classified_source_identity_ids
+            if _danbooru_character_parts(preparation.tags[index]) is not None
+        }
+        lineage_anchors = (
+            *preparation.source_identity_hints,
+            *(
+                preparation.tags[index]
+                for index in sorted(classified_source_canonical_ids)
+            ),
+        )
+        promoted_source_canonical_ids = {
+            index
+            for index, term in enumerate(preparation.tags)
+            if index not in classified_source_identity_ids
+            and (
+                _matches_source_character_lineage(term, lineage_anchors)
+                or _matches_source_copyright_context(term, lineage_anchors)
+            )
+        }
+        deterministic_appearance_ids = {
+            index
+            for index, term in enumerate(preparation.tags)
+            if _is_deterministic_source_appearance_term(term)
+        }
+        deterministic_outfit_ids = {
+            index
+            for index, term in enumerate(preparation.tags)
+            if _is_deterministic_outfit_term(term)
+        }
+        deterministic_preserved_visual_ids = {
+            index
+            for index, term in enumerate(preparation.tags)
+            if _is_deterministic_preserved_visual_term(term)
+        }
+        reliable_classified_source_ids = {
+            index
+            for index in classified_source_identity_ids
+            if (
+                _prompt_term_key(preparation.tags[index]) in source_identity_keys
+                or index in classified_source_canonical_ids
+                or index in deterministic_appearance_ids
+            )
+        }
+        uncertain_appearance_ids = {
             index
             for index in classification.uncertain_ids
-            if _is_deterministic_source_appearance_term(
-                preparation.tags[index]
-            )
+            if index in deterministic_appearance_ids
         }
         has_reliable_source_profile = bool(
             preparation.removed_character_loras
             or preparation.source_record is not None
-            or source_identity_ids
-            or len(promotable_uncertain_ids) >= 2
+            or reliable_classified_source_ids
+            or promoted_source_canonical_ids
+            or len(uncertain_appearance_ids) >= 2
         )
-        promoted_uncertain_ids = (
-            promotable_uncertain_ids if has_reliable_source_profile else set()
+        forced_source_appearance_ids = (
+            deterministic_appearance_ids if has_reliable_source_profile else set()
         )
-        promoted_uncertain_outfit_ids = {
-            index
-            for index in classification.uncertain_ids
-            if _is_deterministic_outfit_term(preparation.tags[index])
-        }
-        source_identity_ids.update(promoted_uncertain_ids)
-        remaining_uncertain_ids = set(classification.uncertain_ids) - set(
-            promoted_uncertain_ids
-        ) - promoted_uncertain_outfit_ids
+        promoted_uncertain_ids = set(classification.uncertain_ids) & set(
+            forced_source_appearance_ids
+        )
+        promoted_uncertain_outfit_ids = set(classification.uncertain_ids) & set(
+            deterministic_outfit_ids
+        )
+        promoted_uncertain_visual_ids = set(classification.uncertain_ids) & set(
+            deterministic_preserved_visual_ids
+        )
+        source_identity_ids = set(classified_source_identity_ids)
+        source_identity_ids.difference_update(deterministic_outfit_ids)
+        source_identity_ids.difference_update(deterministic_preserved_visual_ids)
+        source_identity_ids.update(forced_source_appearance_ids)
+        source_identity_ids.update(promoted_source_canonical_ids)
+        remaining_uncertain_ids = (
+            set(classification.uncertain_ids)
+            - set(promoted_uncertain_ids)
+            - promoted_uncertain_outfit_ids
+            - promoted_uncertain_visual_ids
+            - set(promoted_source_canonical_ids)
+        )
         if remaining_uncertain_ids:
             raise CharacterSwapError(
                 (
@@ -2819,6 +3049,12 @@ explanations."""
                     "promoted_outfit_count": len(
                         promoted_uncertain_outfit_ids
                     ),
+                    "promoted_visual_count": len(
+                        promoted_uncertain_visual_ids
+                    ),
+                    "promoted_source_canonical_count": len(
+                        promoted_source_canonical_ids
+                    ),
                 },
             )
         if not source_identity_ids and not preparation.removed_character_loras:
@@ -2829,9 +3065,13 @@ explanations."""
         classified_source_ids = set(source_identity_ids)
         for index, term in enumerate(preparation.tags):
             nested_key = _identity_key(term)
-            if index not in classified_source_ids and any(
-                _contains_identity_fragment(nested_key, source_key)
-                for source_key in source_identity_keys
+            if (
+                index not in classified_source_ids
+                and _is_weighted_or_composite_prompt_term(term)
+                and any(
+                    _contains_identity_fragment(nested_key, source_key)
+                    for source_key in source_identity_keys
+                )
             ):
                 raise CharacterSwapError(
                     "含有可靠原角色身份词的加权或复合 Tag 未被完整移除",
@@ -2850,9 +3090,11 @@ explanations."""
                 )
             if (
                 key not in source_identity_keys
-                and not _semantic_identity_anchor_candidate(term)
-                and not _is_stable_appearance_term(folded)
+                and _danbooru_character_parts(term) is None
+                and not _matches_source_copyright_context(term, lineage_anchors)
+                and not _is_strict_unqualified_source_canonical(term)
                 and not _is_deterministic_source_appearance_term(folded)
+                and not _is_composite_source_appearance_term(term)
             ):
                 raise CharacterSwapError(
                     "分类模型把无法证明属于身份外观的 Tag 标为角色身份",
@@ -2876,6 +3118,45 @@ explanations."""
                     "原角色的可靠身份触发词未被分类为身份，已停止改写",
                     code="source_trigger_misclassified",
                 )
+
+        exact_lora_relaxation = bool(
+            preparation.target_record is not None
+            and preparation.deterministic_target_trigger
+            and source_identity_ids
+            and not remaining_uncertain_ids
+        )
+        effective_confidence_floor = (
+            0.75 if exact_lora_relaxation else minimum_confidence
+        )
+        if classification.confidence < effective_confidence_floor:
+            raise CharacterSwapError(
+                "换角分类置信度 "
+                f"{classification.confidence:.2f} 低于当前身份证据要求 "
+                f"{effective_confidence_floor:.2f}，已停止自动改写",
+                code="low_classification_confidence",
+                details={
+                    "actual_confidence": round(classification.confidence, 4),
+                    "minimum_confidence": effective_confidence_floor,
+                    "evidence_tier": evidence_tier,
+                    "exact_lora_relaxation": exact_lora_relaxation,
+                    "resolver_confidence": round(
+                        preparation.request.semantic_identity_confidence,
+                        4,
+                    ),
+                    "index_verified": bool(
+                        preparation.request.semantic_identity_index_verified
+                    ),
+                    "deterministic_source_identity_count": len(
+                        forced_source_appearance_ids
+                    ),
+                    "deterministic_outfit_count": len(
+                        deterministic_outfit_ids
+                    ),
+                    "deterministic_preserved_visual_count": len(
+                        deterministic_preserved_visual_ids
+                    ),
+                },
+            )
 
         target_trigger = preparation.deterministic_target_trigger
         if preparation.target_record is None:
@@ -3032,7 +3313,7 @@ explanations."""
                     code="target_outfit_metadata_missing",
                 )
             removed_ids.update(classification.outfit_ids)
-            removed_ids.update(promoted_uncertain_outfit_ids)
+            removed_ids.update(deterministic_outfit_ids)
         kept_terms = tuple(
             tag for index, tag in enumerate(preparation.tags) if index not in removed_ids
         )
@@ -3170,6 +3451,14 @@ explanations."""
             promoted_uncertain_outfit_count=len(
                 promoted_uncertain_outfit_ids
             ),
+            promoted_uncertain_visual_count=len(
+                promoted_uncertain_visual_ids
+            ),
+            promoted_source_canonical_count=len(
+                promoted_source_canonical_ids
+            ),
+            classification_confidence=classification.confidence,
+            effective_confidence_floor=effective_confidence_floor,
             reauthorized_appearance_terms=reauthorized_appearance_terms,
         )
 
@@ -3205,7 +3494,8 @@ explanations."""
                     "目标角色 LoRA 必须且只能注入一次",
                     code="target_lora_count_invalid",
                 )
-        positive_keys = {_prompt_term_key(term) for term in _split_prompt_terms(prompt)}
+        positive_terms = _split_prompt_terms(prompt)
+        positive_keys = {_prompt_term_key(term) for term in positive_terms}
         negative_keys = {
             _prompt_term_key(term) for term in _split_prompt_terms(negative_prompt)
         }
@@ -3229,7 +3519,8 @@ explanations."""
             suppressed_key = _prompt_term_key(term)
             if not suppressed_key:
                 continue
-            for positive_key in positive_keys:
+            for positive_term in positive_terms:
+                positive_key = _prompt_term_key(positive_term)
                 if (
                     positive_key in reauthorized_keys
                     and (
@@ -3244,7 +3535,7 @@ explanations."""
                     )
                 ):
                     continue
-                if _contains_identity_fragment(positive_key, suppressed_key):
+                if _source_identity_leaks_into_term(positive_term, term):
                     leaked.add(suppressed_key)
                     break
         if leaked:

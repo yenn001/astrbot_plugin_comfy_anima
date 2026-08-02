@@ -10,6 +10,7 @@ from ..services.character_swap import (
     CharacterSwapRequest,
     SWAP_MODE_TARGET_OUTFIT,
     _is_deterministic_outfit_term,
+    _source_identity_leaks_into_term,
     character_lookup_hints_for_query,
     fit_canvas_to_aspect_ratio,
     normalize_semantic_identity_payload,
@@ -632,6 +633,39 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             target_trigger_count=len(preparation.target_trigger_words),
         )
 
+    @staticmethod
+    def _named_classification(
+        planner,
+        preparation,
+        *,
+        source=(),
+        outfit=(),
+        uncertain=(),
+        confidence=0.96,
+    ):
+        def ids(values):
+            return [preparation.tags.index(value) for value in values]
+
+        source_ids = ids(source)
+        outfit_ids = ids(outfit)
+        uncertain_ids = ids(uncertain)
+        used = set(source_ids) | set(outfit_ids) | set(uncertain_ids)
+        payload = _classification_payload(
+            len(preparation.tags),
+            source_identity_ids=source_ids,
+            outfit_ids=outfit_ids,
+            style_quality_ids=[
+                index for index in range(len(preparation.tags)) if index not in used
+            ],
+            uncertain_ids=uncertain_ids,
+            confidence=confidence,
+        )
+        return planner.parse_classification(
+            json.dumps(payload),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
     def _semantic_preparation(
         self,
         request: CharacterSwapRequest,
@@ -1215,6 +1249,243 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             ["characters/viola-000020.safetensors"],
         )
 
+    def test_viola_exact_lora_repairs_dense_z11_nurse_prompt(self) -> None:
+        viola = _record(
+            "characters/viola-000020.safetensors",
+            "Viola",
+            "VIOLA-DENSE-SHA",
+            triggers=("Viola",),
+            source_work="BanG Dream!",
+        )
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        preparation = planner.prepare(
+            CharacterSwapRequest("Z11", "Viola"),
+            positive_prompt=(
+                "azur lane, z11 \\(azur lane\\), "
+                "z11 \\(cheer up ms nurse!\\) \\(azur lane\\), "
+                "1girl, areola slip, black hair, blush, breasts, cleavage, "
+                "covered nipples, hat, huge breasts, large areolae, long hair, "
+                "looking at viewer, nipples, nurse cap, official alternate costume, "
+                "open mouth, panties, purple eyes, short sleeves, smile, solo, "
+                "spread legs, thighhighs, thighs, underwear, white panties, "
+                "white thighhighs"
+            ),
+            negative_prompt="",
+            records=(*self.records, viola),
+        )
+        classification = self._named_classification(
+            planner,
+            preparation,
+            source=(
+                "z11 \\(azur lane\\)",
+                "black hair",
+                "official alternate costume",
+                "areola slip",
+            ),
+            outfit=("hat", "panties", "white thighhighs"),
+            uncertain=(
+                "z11 \\(cheer up ms nurse!\\) \\(azur lane\\)",
+                "covered nipples",
+                "nurse cap",
+            ),
+            confidence=0.75,
+        )
+
+        plan = planner.finalize(preparation, classification)
+
+        for removed in (
+            "azur lane",
+            "z11 \\(azur lane\\)",
+            "z11 \\(cheer up ms nurse!\\) \\(azur lane\\)",
+            "black hair",
+            "huge breasts",
+            "large areolae",
+            "long hair",
+            "purple eyes",
+        ):
+            self.assertNotIn(f", {removed},", f", {plan.prompt},")
+        for preserved in (
+            "areola slip",
+            "breasts",
+            "cleavage",
+            "covered nipples",
+            "nipples",
+            "nurse cap",
+            "official alternate costume",
+            "panties",
+            "white thighhighs",
+        ):
+            self.assertIn(f", {preserved},", f", {plan.prompt},")
+        self.assertIn("Viola", plan.prompt)
+        self.assertEqual(plan.effective_confidence_floor, 0.75)
+        self.assertEqual(plan.promoted_uncertain_visual_count, 1)
+        self.assertGreaterEqual(plan.promoted_source_canonical_count, 2)
+
+    def test_viola_exact_lora_dense_prompt_floor_is_bounded(self) -> None:
+        viola = _record(
+            "characters/viola-000020.safetensors",
+            "Viola",
+            "VIOLA-FLOOR-SHA",
+            triggers=("Viola",),
+        )
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        preparation = planner.prepare(
+            CharacterSwapRequest("Z11", "Viola"),
+            positive_prompt=(
+                "z11 \\(azur lane\\), 1girl, black hair, long hair, "
+                "nurse cap, standing, solo"
+            ),
+            negative_prompt="",
+            records=(*self.records, viola),
+        )
+
+        for confidence, succeeds in ((0.74, False), (0.75, True), (0.80, True)):
+            with self.subTest(confidence=confidence):
+                classification = self._named_classification(
+                    planner,
+                    preparation,
+                    source=("z11 \\(azur lane\\)", "black hair"),
+                    outfit=("nurse cap",),
+                    confidence=confidence,
+                )
+                if succeeds:
+                    plan = planner.finalize(preparation, classification)
+                    self.assertEqual(plan.effective_confidence_floor, 0.75)
+                else:
+                    with self.assertRaises(CharacterSwapError) as raised:
+                        planner.finalize(preparation, classification)
+                    self.assertEqual(
+                        raised.exception.code,
+                        "low_classification_confidence",
+                    )
+
+    def test_metadata_only_target_does_not_receive_exact_lora_floor(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "Denia",
+                "Kallen Kaslana",
+                use_target_lora=False,
+            ),
+            positive_prompt=(
+                "1girl, denia_wuwa, black hair, school uniform, standing, solo"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self._named_classification(
+            self.planner,
+            preparation,
+            source=("denia_wuwa", "black hair"),
+            outfit=("school uniform",),
+            confidence=0.80,
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.finalize(preparation, classification)
+
+        self.assertEqual(raised.exception.code, "low_classification_confidence")
+        self.assertEqual(raised.exception.details["minimum_confidence"], 0.82)
+
+    def test_unrelated_uncertain_character_variant_is_not_promoted(self) -> None:
+        viola = _record(
+            "characters/viola-000020.safetensors",
+            "Viola",
+            "VIOLA-LINEAGE-SHA",
+            triggers=("Viola",),
+        )
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        preparation = planner.prepare(
+            CharacterSwapRequest("Z11", "Viola"),
+            positive_prompt=(
+                "z11 \\(azur lane\\), kei \\(blue archive\\), 1girl, "
+                "black hair, standing, solo"
+            ),
+            negative_prompt="",
+            records=(*self.records, viola),
+        )
+        classification = self._named_classification(
+            planner,
+            preparation,
+            source=("z11 \\(azur lane\\)", "black hair"),
+            uncertain=("kei \\(blue archive\\)",),
+            confidence=0.90,
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            planner.finalize(preparation, classification)
+
+        self.assertEqual(raised.exception.code, "uncertain_tags")
+
+    def test_source_identity_prefixes_do_not_leak_into_safe_top_level_tags(
+        self,
+    ) -> None:
+        safe_pairs = (
+            ("black hairband", "black hair"),
+            ("fake animal ears", "animal ears"),
+            ("rabbit ears ribbon", "rabbit ears"),
+            ("tongue out", "tongue"),
+            ("saliva trail", "saliva"),
+        )
+        for container, suppressed in safe_pairs:
+            with self.subTest(container=container, suppressed=suppressed):
+                self.assertFalse(
+                    _source_identity_leaks_into_term(container, suppressed)
+                )
+
+        self.assertTrue(
+            _source_identity_leaks_into_term("(black hair:1.2)", "black hair")
+        )
+        self.assertTrue(
+            _source_identity_leaks_into_term(
+                "(black hair, long hair:1.1)",
+                "black hair",
+            )
+        )
+
+    def test_exact_lora_bunny_prompt_keeps_accessory_prefixes(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Kallen Kaslana"),
+            positive_prompt=(
+                "denia_wuwa, 1girl, black hair, long hair, orange eyes, "
+                "animal ears, rabbit ears, large breasts, fake animal ears, "
+                "black hairband, rabbit ears ribbon, hair ornament, headband, "
+                "black leotard, tongue out, saliva trail, solo"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self._named_classification(
+            self.planner,
+            preparation,
+            source=("denia_wuwa", "black hair", "animal ears"),
+            outfit=("black leotard",),
+            confidence=0.75,
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        for removed in (
+            "denia_wuwa",
+            "black hair",
+            "long hair",
+            "orange eyes",
+            "animal ears",
+            "rabbit ears",
+            "large breasts",
+        ):
+            self.assertNotIn(f", {removed},", f", {plan.prompt},")
+        for preserved in (
+            "fake animal ears",
+            "black hairband",
+            "rabbit ears ribbon",
+            "hair ornament",
+            "headband",
+            "black leotard",
+            "tongue out",
+            "saliva trail",
+        ):
+            self.assertIn(f", {preserved},", f", {plan.prompt},")
+
     def test_uncertain_bra_does_not_collide_with_twin_braids(self) -> None:
         preparation = self.planner.prepare(
             CharacterSwapRequest("Denia", "Kallen Kaslana"),
@@ -1703,7 +1974,9 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             ("long silver hair",),
         )
 
-    def test_non_target_candidate_fragment_leak_is_still_rejected(self) -> None:
+    def test_deterministic_appearance_closure_removes_nested_source_trait(
+        self,
+    ) -> None:
         preparation = self.planner.prepare(
             CharacterSwapRequest(
                 "",
@@ -1740,9 +2013,11 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             target_trigger_count=len(preparation.target_trigger_words),
         )
 
-        with self.assertRaises(CharacterSwapError) as raised:
-            self.planner.finalize(preparation, classification)
-        self.assertEqual(raised.exception.code, "source_identity_leak")
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("silver hair", plan.prompt)
+        self.assertNotIn("long silver hair", plan.prompt)
+        self.assertIn("red eyes", plan.prompt)
 
     def test_weighted_or_composite_shared_appearance_is_not_reauthorized(
         self,
@@ -1905,7 +2180,6 @@ class CharacterSwapPlanningTests(unittest.TestCase):
     def test_non_atomic_uncertain_terms_are_never_auto_promoted(self) -> None:
         terms = (
             "hair ornament",
-            "closed eyes",
             "eye-level view",
             "warm ink style",
         )
@@ -1940,6 +2214,38 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                 with self.assertRaises(CharacterSwapError) as raised:
                     self.planner.finalize(preparation, classification)
                 self.assertEqual(raised.exception.code, "uncertain_tags")
+
+    def test_transient_uncertain_visual_state_is_preserved(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Kallen Kaslana"),
+            positive_prompt=(
+                "<lora:characters/denia:1.0>, 1girl, denia_wuwa, "
+                "closed eyes, school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1],
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    uncertain_ids=[2],
+                    target_appearance_trigger_ids=[1],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIn("closed eyes", plan.prompt)
+        self.assertEqual(plan.promoted_uncertain_visual_count, 1)
 
     def test_explicit_no_character_lora_skips_existing_target_lora(self) -> None:
         request = CharacterSwapRequest(
@@ -2433,7 +2739,7 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                 target_trigger_count=len(preparation.target_trigger_words),
             )
 
-    def test_obvious_outfit_cannot_be_deleted_as_source_identity(self) -> None:
+    def test_obvious_outfit_misclassification_is_corrected_and_preserved(self) -> None:
         preparation = self._prepare()
         payload = _classification_payload(
             len(preparation.tags),
@@ -2450,8 +2756,10 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             target_trigger_count=len(preparation.target_trigger_words),
         )
 
-        with self.assertRaisesRegex(CharacterSwapError, "明显衣装"):
-            self.planner.finalize(preparation, classification)
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIn("school uniform", plan.prompt)
+        self.assertNotIn("denia_wuwa", plan.prompt)
 
     def test_obvious_multi_subject_prompt_is_rejected(self) -> None:
         with self.assertRaisesRegex(CharacterSwapError, "单角色"):
