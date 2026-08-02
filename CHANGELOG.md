@@ -2,6 +2,16 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.12] - 2026-08-02
+
+### 本地 Danbooru 四分类接入语义换角
+
+- 在换角分类前批量 exact 查询源提示词的本地 Danbooru 分类，并把 `Character`、`Copyright`、`Artist`、`General` 证据传给受约束分类模型。
+- `Character` 与源作品 `Copyright` 由确定性规划强制清理；`Artist` 保留为风格；`General` 只有稳定头发、眼睛、物种、halo、体型等外貌会删除，衣装、附件、动作、镜头、场景和暴露状态会纠偏保留。
+- 修复 75 项密集 Eri 兔耳提示词连续触发 `unsafe_source_identity_classification`：即使模型把 hairband、leotard、earrings、afterimage、pose、background 等 General Tag 放入身份或未决桶，本地 exact 类别也会覆盖错误归类。
+- 扩充确定性外貌与附件边界：支持 breast-size wrapper、low ponytail、side/single braid、hair streaks、halo 颜色/形态、眉形、species-girl；fake ears、hairband、bow、collar、earrings、jewelry 与 leotard 按附件/衣装处理。
+- 任务时间线新增源 Tag exact 四分类数量与 General/Artist 纠偏计数；不可用时记录降级并继续原严格路径，不保存完整提示词或 Provider 响应。
+
 ## [1.9.11] - 2026-08-02
 
 ### 密集 Danbooru Tags 换角分类修复

@@ -3,6 +3,7 @@
 import json
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 
 from ..services.character_swap import (
     CharacterSwapError,
@@ -1486,6 +1487,153 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         ):
             self.assertIn(f", {preserved},", f", {plan.prompt},")
 
+    def test_exact_danbooru_categories_repair_dense_eri_prompt(self) -> None:
+        viola = _record(
+            "characters/viola-000020.safetensors",
+            "Viola",
+            "VIOLA-ERI-SHA",
+            triggers=("Viola",),
+        )
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        prompt = (
+            "blue archive, eri \\(blue archive\\), 1girl, :d, ^ ^ ^, "
+            "afterimage, alternate breast size \\(larger\\), alternate costume, "
+            "animal ear hairband, animal ears, areola slip, armpit crease, "
+            "bare shoulders, black hairband, black leotard, blush, bow, bowtie, "
+            "braid, breasts, collarbone, covered navel, cowboy shot, crossed bangs, "
+            "detached collar, earrings, fake animal ears, grey hair, groin, "
+            "hair between eyes, hairband, halo, hands up, huge breasts, jewelry, "
+            "leotard, leotard pull, long hair, looking at self, low ponytail, "
+            "multicolored hair, nervous smile, nipples, one breast out, open mouth, "
+            "orange eyes, playboy bunny, ponytail, puffy nipples, rabbit ear hairband, "
+            "rabbit ears, rabbit girl, rabbit tail, red bow, red bowtie, red streaks, "
+            "side braid, simple background, single braid, smile, solo, standing, "
+            "strapless, strapless leotard, streaked hair, sweat, tail, tilted halo, "
+            "triangle earrings, twitter username, v-shaped eyebrows, very long hair, "
+            "w arms, white background, yellow halo"
+        )
+        preparation = planner.prepare(
+            CharacterSwapRequest("", "Viola"),
+            positive_prompt=prompt,
+            negative_prompt="",
+            records=(*self.records, viola),
+        )
+        lookups = []
+        for tag in preparation.tags:
+            if tag == "eri \\(blue archive\\)":
+                category = "character"
+                canonical = "eri_(blue_archive)"
+                verified = True
+            elif tag == "blue archive":
+                category = "copyright"
+                canonical = "blue_archive"
+                verified = True
+            elif tag == "^ ^ ^":
+                category = ""
+                canonical = ""
+                verified = False
+            else:
+                category = "general"
+                canonical = tag.replace(" ", "_")
+                verified = True
+            lookups.append(
+                SimpleNamespace(
+                    verified=verified,
+                    category=category,
+                    canonical_tag=canonical,
+                )
+            )
+        preparation = planner.attach_source_tag_evidence(preparation, lookups)
+        classification = self._named_classification(
+            planner,
+            preparation,
+            source=(
+                "eri \\(blue archive\\)",
+                ":d",
+                "afterimage",
+                "alternate breast size \\(larger\\)",
+                "animal ear hairband",
+                "animal ears",
+                "armpit crease",
+                "black hairband",
+                "black leotard",
+                "bow",
+                "collarbone",
+                "fake animal ears",
+                "grey hair",
+                "hairband",
+                "halo",
+                "hands up",
+                "huge breasts",
+                "jewelry",
+                "leotard",
+                "low ponytail",
+                "puffy nipples",
+                "rabbit girl",
+                "red streaks",
+                "side braid",
+                "simple background",
+                "streaked hair",
+                "v-shaped eyebrows",
+                "yellow halo",
+            ),
+            uncertain=("^ ^ ^", "looking at self", "twitter username"),
+            confidence=0.75,
+        )
+
+        plan = planner.finalize(preparation, classification)
+
+        for removed in (
+            "blue archive",
+            "eri \\(blue archive\\)",
+            "alternate breast size \\(larger\\)",
+            "animal ears",
+            "grey hair",
+            "halo",
+            "huge breasts",
+            "low ponytail",
+            "rabbit girl",
+            "red streaks",
+            "side braid",
+            "streaked hair",
+            "v-shaped eyebrows",
+            "yellow halo",
+        ):
+            self.assertNotIn(f", {removed},", f", {plan.prompt},")
+        for preserved in (
+            ":d",
+            "afterimage",
+            "animal ear hairband",
+            "armpit crease",
+            "black hairband",
+            "black leotard",
+            "bow",
+            "collarbone",
+            "fake animal ears",
+            "hairband",
+            "hands up",
+            "jewelry",
+            "leotard",
+            "looking at self",
+            "puffy nipples",
+            "simple background",
+            "twitter username",
+        ):
+            self.assertIn(f", {preserved},", f", {plan.prompt},")
+        self.assertIn("Viola", plan.prompt)
+        self.assertEqual(plan.danbooru_verified_tag_count, 74)
+        self.assertEqual(plan.danbooru_character_tag_count, 1)
+        self.assertEqual(plan.danbooru_copyright_tag_count, 1)
+        self.assertGreaterEqual(plan.corrected_general_source_count, 8)
+        self.assertEqual(plan.effective_confidence_floor, 0.75)
+
+        _system, user = planner.classification_prompts(preparation)
+        payload = json.loads(user.split("\n", 1)[1])
+        source = payload["source_tags"]
+        self.assertEqual(source[0]["danbooru_category"], "copyright")
+        self.assertEqual(source[1]["danbooru_category"], "character")
+        self.assertEqual(source[2]["danbooru_category"], "general")
+
     def test_uncertain_bra_does_not_collide_with_twin_braids(self) -> None:
         preparation = self.planner.prepare(
             CharacterSwapRequest("Denia", "Kallen Kaslana"),
@@ -2179,7 +2327,6 @@ class CharacterSwapPlanningTests(unittest.TestCase):
 
     def test_non_atomic_uncertain_terms_are_never_auto_promoted(self) -> None:
         terms = (
-            "hair ornament",
             "eye-level view",
             "warm ink style",
         )
@@ -2214,6 +2361,38 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                 with self.assertRaises(CharacterSwapError) as raised:
                     self.planner.finalize(preparation, classification)
                 self.assertEqual(raised.exception.code, "uncertain_tags")
+
+    def test_uncertain_hair_ornament_is_preserved_as_accessory(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Kallen Kaslana"),
+            positive_prompt=(
+                "<lora:characters/denia:1.0>, 1girl, denia_wuwa, "
+                "hair ornament, school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[1],
+                    outfit_ids=[3],
+                    pose_action_ids=[4],
+                    scene_lighting_ids=[5],
+                    style_quality_ids=[0, 6],
+                    uncertain_ids=[2],
+                    target_appearance_trigger_ids=[1],
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIn("hair ornament", plan.prompt)
+        self.assertEqual(plan.promoted_uncertain_outfit_count, 1)
 
     def test_transient_uncertain_visual_state_is_preserved(self) -> None:
         preparation = self.planner.prepare(

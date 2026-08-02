@@ -13,7 +13,7 @@ import math
 import re
 import shlex
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -305,6 +305,7 @@ _DETERMINISTIC_PRESERVED_VISUAL_TERMS = frozenset(
         "1boy",
         "1other",
         "solo",
+        "^ ^ ^",
         "areola slip",
         "areolae",
         "bare shoulders",
@@ -361,6 +362,7 @@ _ATOMIC_HAIR_MODIFIERS = frozenset(
         "curly",
         "straight",
         "spiked",
+        "streaked",
         "gradient",
         "multicolored",
         "two",
@@ -603,6 +605,9 @@ class CharacterSwapPreparation:
     target_trigger_words: tuple[str, ...]
     source_identity_hints: tuple[str, ...]
     target_identity_hints: tuple[str, ...]
+    source_tag_categories: tuple[str, ...] = ()
+    source_tag_verified: tuple[bool, ...] = ()
+    source_tag_canonicals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -623,6 +628,10 @@ class CharacterSwapPlan:
     promoted_uncertain_outfit_count: int = 0
     promoted_uncertain_visual_count: int = 0
     promoted_source_canonical_count: int = 0
+    corrected_general_source_count: int = 0
+    danbooru_verified_tag_count: int = 0
+    danbooru_character_tag_count: int = 0
+    danbooru_copyright_tag_count: int = 0
     classification_confidence: float = 0.0
     effective_confidence_floor: float = 0.0
     reauthorized_appearance_terms: tuple[str, ...] = ()
@@ -688,6 +697,12 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
     """
 
     raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    unescaped = raw.replace(r"\(", "(").replace(r"\)", ")")
+    if re.fullmatch(
+        r"alternate breast size\s*\((?:smaller|small|medium|large|larger|huge)\)",
+        unescaped,
+    ):
+        return True
     if (
         not raw
         or any(character in raw for character in "()[]{}<>,，;；:\\")
@@ -716,9 +731,13 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
         "twintails",
         "ponytail",
         "side ponytail",
+        "low ponytail",
+        "high ponytail",
         "braid",
         "braids",
         "twin braids",
+        "side braid",
+        "single braid",
         "hair bun",
         "double bun",
         "bob cut",
@@ -739,6 +758,28 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
         return True
     if re.fullmatch(
         r"(?:fair|pale|light|dark|brown|black|white|tan|tanned|glowing) skin",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:(?:black|blonde|blond|brown|red|blue|green|purple|pink|white|"
+        r"silver|grey|gray|orange|yellow|aqua|teal|cyan) )?streaks",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:(?:black|blue|brown|gold|golden|green|orange|pink|purple|red|"
+        r"silver|white|yellow|tilted|broken|double|round|rectangular) )*halo",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:(?:v shaped|thick|thin|short|long|arched|straight) )?eyebrows",
+        normalized,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:animal|cat|fox|wolf|dog|horse|rabbit|bunny|dragon|demon|angel) girl",
         normalized,
     ):
         return True
@@ -769,6 +810,64 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
     return False
 
 
+def _is_deterministic_accessory_or_garment_term(value: Any) -> bool:
+    """Recognize atomic Danbooru garments/accessories before hair/ear checks."""
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    if (
+        not raw
+        or any(character in raw for character in "()[]{}<>,，;；:\\")
+        or re.search(r"(?:^|\s)(?:and|break)(?:\s|$)", raw, re.IGNORECASE)
+    ):
+        return False
+    normalized = re.sub(r"[_-]+", " ", raw)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in {
+        "bow",
+        "bowtie",
+        "fake animal ears",
+        "fake bunny ears",
+        "fake cat ears",
+        "fake fox ears",
+        "fake rabbit ears",
+        "fake wolf ears",
+        "hair ornament",
+        "hairband",
+        "headband",
+        "jewelry",
+        "playboy bunny",
+        "strapless",
+    }:
+        return True
+    for marker in (
+        "hairband",
+        "headband",
+        "bowtie",
+        "collar",
+        "earrings",
+        "leotard",
+        "choker",
+        "necklace",
+        "bracelet",
+        "anklet",
+        "ribbon",
+    ):
+        match = re.search(rf"(?:^|\s){re.escape(marker)}$", normalized)
+        if match is None:
+            continue
+        prefix = normalized[: match.start()].strip()
+        if re.search(
+            r"(?:^|\s)(?:with|looking|holding|blowing|flowing|fluttering)"
+            r"(?:\s|$)",
+            prefix,
+        ):
+            return False
+        if marker == "ribbon" and re.search(r"(?:^|\s)hair(?:\s|$)", prefix):
+            return False
+        return len(prefix.split()) <= 4
+    return False
+
+
 def _is_deterministic_outfit_term(value: Any) -> bool:
     """Recognize a bounded top-level garment term safe for deterministic repair."""
 
@@ -781,6 +880,8 @@ def _is_deterministic_outfit_term(value: Any) -> bool:
         return False
     normalized = re.sub(r"[_-]+", " ", raw)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    if _is_deterministic_accessory_or_garment_term(normalized):
+        return True
     if any(
         re.search(rf"(?:^|\s){re.escape(marker)}(?:\s|$)", normalized)
         for marker in _APPEARANCE_MARKERS
@@ -845,7 +946,10 @@ def _danbooru_character_parts(value: Any) -> Optional[tuple[str, tuple[str, ...]
     )
     if match is None:
         return None
-    base = _prompt_term_key(match.group("base"))
+    raw_base = match.group("base").strip(" _")
+    if " " in raw_base:
+        return None
+    base = _prompt_term_key(raw_base)
     qualifiers = tuple(
         _prompt_term_key(item)
         for item in re.findall(r"\(([^()]+)\)", match.group("groups"))
@@ -2422,6 +2526,46 @@ class CharacterSwapPlanner:
     def __init__(self, semantic_index: LoraSemanticIndex) -> None:
         self._semantic_index = semantic_index
 
+    @staticmethod
+    def attach_source_tag_evidence(
+        preparation: CharacterSwapPreparation,
+        lookups: Sequence[Any],
+    ) -> CharacterSwapPreparation:
+        """Attach exact local Danbooru categories without trusting suggestions."""
+
+        if len(lookups) != len(preparation.tags):
+            raise CharacterSwapError(
+                "本地 Danbooru Tag 证据数量与源提示词不一致",
+                code="source_tag_evidence_mismatch",
+            )
+        categories: list[str] = []
+        verified: list[bool] = []
+        canonicals: list[str] = []
+        for lookup in lookups:
+            is_verified = bool(getattr(lookup, "verified", False))
+            category = (
+                str(getattr(lookup, "category", "") or "").strip().casefold()
+                if is_verified
+                else ""
+            )
+            if category not in {"artist", "copyright", "character", "general"}:
+                category = ""
+                is_verified = False
+            canonical = (
+                str(getattr(lookup, "canonical_tag", "") or "").strip()
+                if is_verified
+                else ""
+            )
+            categories.append(category)
+            verified.append(is_verified)
+            canonicals.append(canonical)
+        return replace(
+            preparation,
+            source_tag_categories=tuple(categories),
+            source_tag_verified=tuple(verified),
+            source_tag_canonicals=tuple(canonicals),
+        )
+
     def prepare(
         self,
         request: CharacterSwapRequest,
@@ -2706,6 +2850,16 @@ transient expression or gaze such as smile, blush, open mouth, closed eyes,
 looking direction and tears, plus camera, composition, scene, lighting, style
 and quality. Weighted tag
 groups that mix incompatible buckets must go to uncertain_ids. Also verify the
+The payload may include an exact local Danbooru category for a source tag. Treat
+that evidence as authoritative: ``character`` is a source identity token,
+``copyright`` is source work context, and ``artist`` is style. A ``general`` tag
+is never a character-name token, but stable hair/eye/face/species/body appearance
+within General still belongs to source identity; clothing and accessories belong
+to outfit; exposure, anatomy visibility, expression, pose, camera, scene and effects
+must be preserved. Fake ears, hairbands, bows, collars, earrings and jewelry are
+accessories, not species identity. Halo color/shape, hair streaks/styles, eyebrows
+and species-girl traits are stable appearance. Do not override an exact local
+category with a guess. Also verify the
 numbered target candidates against the exact requested target character and select
 exactly one unique identity token when it is supported. Return null when no candidate
 can be proven to identify that exact character. Generic subject, physical appearance,
@@ -2749,7 +2903,24 @@ explanations."""
             ),
             "mode": preparation.request.mode,
             "source_tags": [
-                {"id": index, "tag": tag}
+                {
+                    "id": index,
+                    "tag": tag,
+                    "danbooru_exact": bool(
+                        index < len(preparation.source_tag_verified)
+                        and preparation.source_tag_verified[index]
+                    ),
+                    "danbooru_category": (
+                        preparation.source_tag_categories[index]
+                        if index < len(preparation.source_tag_categories)
+                        else ""
+                    ),
+                    "danbooru_canonical": (
+                        preparation.source_tag_canonicals[index]
+                        if index < len(preparation.source_tag_canonicals)
+                        else ""
+                    ),
+                }
                 for index, tag in enumerate(preparation.tags)
             ],
             "target_metadata_triggers": [
@@ -2947,12 +3118,41 @@ explanations."""
                 source_identity_keys.add(
                     _prompt_term_key(reliable_source_trigger)
                 )
+        verified_tag_ids = {
+            index
+            for index, verified in enumerate(preparation.source_tag_verified)
+            if verified and index < len(preparation.tags)
+        }
+        exact_character_ids = {
+            index
+            for index in verified_tag_ids
+            if index < len(preparation.source_tag_categories)
+            and preparation.source_tag_categories[index] == "character"
+        }
+        exact_copyright_ids = {
+            index
+            for index in verified_tag_ids
+            if index < len(preparation.source_tag_categories)
+            and preparation.source_tag_categories[index] == "copyright"
+        }
+        exact_general_ids = {
+            index
+            for index in verified_tag_ids
+            if index < len(preparation.source_tag_categories)
+            and preparation.source_tag_categories[index] == "general"
+        }
+        exact_artist_ids = {
+            index
+            for index in verified_tag_ids
+            if index < len(preparation.source_tag_categories)
+            and preparation.source_tag_categories[index] == "artist"
+        }
         classified_source_identity_ids = set(classification.source_identity_ids)
         classified_source_canonical_ids = {
             index
             for index in classified_source_identity_ids
             if _danbooru_character_parts(preparation.tags[index]) is not None
-        }
+        } | exact_character_ids
         lineage_anchors = (
             *preparation.source_identity_hints,
             *(
@@ -2968,7 +3168,7 @@ explanations."""
                 _matches_source_character_lineage(term, lineage_anchors)
                 or _matches_source_copyright_context(term, lineage_anchors)
             )
-        }
+        } | exact_character_ids | exact_copyright_ids
         deterministic_appearance_ids = {
             index
             for index, term in enumerate(preparation.tags)
@@ -3017,9 +3217,18 @@ explanations."""
         promoted_uncertain_visual_ids = set(classification.uncertain_ids) & set(
             deterministic_preserved_visual_ids
         )
+        promoted_uncertain_general_ids = set(classification.uncertain_ids) & (
+            (exact_general_ids - set(forced_source_appearance_ids))
+            | exact_artist_ids
+        )
         source_identity_ids = set(classified_source_identity_ids)
         source_identity_ids.difference_update(deterministic_outfit_ids)
         source_identity_ids.difference_update(deterministic_preserved_visual_ids)
+        corrected_general_source_ids = source_identity_ids & (
+            (exact_general_ids - set(forced_source_appearance_ids))
+            | exact_artist_ids
+        )
+        source_identity_ids.difference_update(corrected_general_source_ids)
         source_identity_ids.update(forced_source_appearance_ids)
         source_identity_ids.update(promoted_source_canonical_ids)
         remaining_uncertain_ids = (
@@ -3027,6 +3236,7 @@ explanations."""
             - set(promoted_uncertain_ids)
             - promoted_uncertain_outfit_ids
             - promoted_uncertain_visual_ids
+            - promoted_uncertain_general_ids
             - set(promoted_source_canonical_ids)
         )
         if remaining_uncertain_ids:
@@ -3051,6 +3261,9 @@ explanations."""
                     ),
                     "promoted_visual_count": len(
                         promoted_uncertain_visual_ids
+                    ),
+                    "promoted_general_count": len(
+                        promoted_uncertain_general_ids
                     ),
                     "promoted_source_canonical_count": len(
                         promoted_source_canonical_ids
@@ -3087,9 +3300,12 @@ explanations."""
                 raise CharacterSwapError(
                     "分类模型把通用主体或明显衣装 Tag 误判为角色身份",
                     code="unsafe_source_identity_classification",
+                    details={"term_id": item_id},
                 )
             if (
                 key not in source_identity_keys
+                and item_id not in exact_character_ids
+                and item_id not in exact_copyright_ids
                 and _danbooru_character_parts(term) is None
                 and not _matches_source_copyright_context(term, lineage_anchors)
                 and not _is_strict_unqualified_source_canonical(term)
@@ -3099,6 +3315,15 @@ explanations."""
                 raise CharacterSwapError(
                     "分类模型把无法证明属于身份外观的 Tag 标为角色身份",
                     code="unsafe_source_identity_classification",
+                    details={
+                        "term_id": item_id,
+                        "danbooru_category": (
+                            preparation.source_tag_categories[item_id]
+                            if item_id < len(preparation.source_tag_categories)
+                            else ""
+                        ),
+                        "danbooru_verified": item_id in verified_tag_ids,
+                    },
                 )
         if preparation.source_record is not None:
             source_trigger = choose_character_identity_trigger(
@@ -3457,6 +3682,13 @@ explanations."""
             promoted_source_canonical_count=len(
                 promoted_source_canonical_ids
             ),
+            corrected_general_source_count=(
+                len(corrected_general_source_ids)
+                + len(promoted_uncertain_general_ids)
+            ),
+            danbooru_verified_tag_count=len(verified_tag_ids),
+            danbooru_character_tag_count=len(exact_character_ids),
+            danbooru_copyright_tag_count=len(exact_copyright_ids),
             classification_confidence=classification.confidence,
             effective_confidence_floor=effective_confidence_floor,
             reauthorized_appearance_terms=reauthorized_appearance_terms,

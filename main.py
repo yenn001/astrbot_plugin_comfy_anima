@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.11
+AstrBot Comfy Anima 插件 v1.9.12
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.11
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.11
+版本: 1.9.12
 日期: 2026-08-02
 """
 
@@ -6018,6 +6018,63 @@ QQ快捷指令:
                         replace_source_style=replace_source_style,
                         fallback_target_tags=fallback_tags,
                     )
+                source_tag_evidence = {
+                    "available": False,
+                    "verified_count": 0,
+                    "character_count": 0,
+                    "copyright_count": 0,
+                    "general_count": 0,
+                    "artist_count": 0,
+                }
+                if self._danbooru_index_ready():
+                    try:
+                        source_lookups = await asyncio.to_thread(
+                            self._danbooru_index.lookup_many,
+                            preparation.tags,
+                        )
+                        preparation = planner.attach_source_tag_evidence(
+                            preparation,
+                            source_lookups,
+                        )
+                        categories = tuple(
+                            category
+                            for category, verified in zip(
+                                preparation.source_tag_categories,
+                                preparation.source_tag_verified,
+                            )
+                            if verified
+                        )
+                        source_tag_evidence = {
+                            "available": True,
+                            "verified_count": len(categories),
+                            "character_count": categories.count("character"),
+                            "copyright_count": categories.count("copyright"),
+                            "general_count": categories.count("general"),
+                            "artist_count": categories.count("artist"),
+                        }
+                        self._record_image_task_phase(
+                            job,
+                            "resolver",
+                            "源 Tags 已通过本地 Danbooru exact 四分类校验。",
+                            "character_swap_source_tags_indexed",
+                            details=source_tag_evidence,
+                        )
+                    except (
+                        CharacterSwapError,
+                        DanbooruIndexError,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ) as exc:
+                        source_tag_evidence["error_type"] = type(exc).__name__
+                        self._record_image_task_phase(
+                            job,
+                            "resolver",
+                            "本地 Danbooru 源 Tag 分类不可用，继续使用严格旧路径。",
+                            "character_swap_source_tags_unavailable",
+                            level="WARNING",
+                            details=source_tag_evidence,
+                        )
                 self._record_image_task_phase(
                     job,
                     "resolver",
@@ -6048,6 +6105,7 @@ QQ快捷指令:
                         "target_metadata_present": (
                             preparation.target_metadata_record is not None
                         ),
+                        "source_tag_evidence": source_tag_evidence,
                         "source_lora_present": preparation.source_record is not None,
                         "semantic_identity_confidence": round(
                             effective_request.semantic_identity_confidence,
@@ -6156,6 +6214,18 @@ QQ快捷指令:
                         ),
                         "promoted_source_canonical_count": (
                             plan.promoted_source_canonical_count
+                        ),
+                        "corrected_general_source_count": (
+                            plan.corrected_general_source_count
+                        ),
+                        "danbooru_verified_tag_count": (
+                            plan.danbooru_verified_tag_count
+                        ),
+                        "danbooru_character_tag_count": (
+                            plan.danbooru_character_tag_count
+                        ),
+                        "danbooru_copyright_tag_count": (
+                            plan.danbooru_copyright_tag_count
                         ),
                         "classification_confidence": round(
                             plan.classification_confidence,
@@ -6338,6 +6408,19 @@ QQ快捷指令:
                     "角色变体：已按相同角色名与作品归并 "
                     f"{plan.promoted_source_canonical_count} 项源角色 canonical。"
                 )
+            if plan.corrected_general_source_count:
+                preview_lines.append(
+                    "Danbooru 纠偏：已保留 "
+                    f"{plan.corrected_general_source_count} 项被模型误放入身份/未决桶的"
+                    " exact General/Artist Tag。"
+                )
+            if plan.danbooru_verified_tag_count:
+                preview_lines.append(
+                    "本地四分类："
+                    f"{plan.danbooru_verified_tag_count} 项 exact；"
+                    f"Character {plan.danbooru_character_tag_count}，"
+                    f"Copyright {plan.danbooru_copyright_tag_count}。"
+                )
             preview_lines.append(
                 "分类置信度："
                 f"{plan.classification_confidence:.2f} / 安全门槛 "
@@ -6416,6 +6499,11 @@ QQ快捷指令:
             info_lines.append(
                 "已按相同角色名与作品清理 "
                 f"{plan.promoted_source_canonical_count} 项源角色变体 canonical。"
+            )
+        if plan.corrected_general_source_count:
+            info_lines.append(
+                "本地 Danbooru 四分类已纠正 "
+                f"{plan.corrected_general_source_count} 项被模型误判的 General/Artist Tag。"
             )
         if plan.reauthorized_appearance_terms:
             info_lines.append(
