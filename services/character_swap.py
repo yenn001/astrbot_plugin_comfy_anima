@@ -627,6 +627,7 @@ class CharacterSwapPreparation:
     source_identity_hints: tuple[str, ...]
     target_identity_hints: tuple[str, ...]
     verified_target_appearance_terms: tuple[str, ...] = ()
+    verified_target_appearance_evidence: tuple[tuple[str, str], ...] = ()
     source_tag_categories: tuple[str, ...] = ()
     source_tag_verified: tuple[bool, ...] = ()
     source_tag_canonicals: tuple[str, ...] = ()
@@ -661,8 +662,11 @@ class CharacterSwapPlan:
     feature_swap_removed_count: int = 0
     target_appearance_terms: tuple[str, ...] = ()
     target_appearance_source: str = ""
+    target_appearance_evidence_sources: tuple[str, ...] = ()
     target_feature_categories: tuple[str, ...] = ()
     missing_target_feature_categories: tuple[str, ...] = ()
+    model_native_fallback_categories: tuple[str, ...] = ()
+    target_slot_decisions: tuple[tuple[str, str], ...] = ()
 
     def preview_text(self) -> str:
         removed = "、".join(self.removed_terms[:12]) or "无"
@@ -2694,6 +2698,41 @@ def _target_trigger_candidates(
     return semantic if len(semantic) == 1 else ()
 
 
+def _trusted_lora_appearance_terms(
+    record: Optional[LoraRecord],
+    trigger_candidates: Sequence[str],
+) -> tuple[str, ...]:
+    """Extract bounded physical traits from the matched LoRA trigger group.
+
+    The record itself has already been uniquely resolved against the current
+    loadable catalog. Even then, only atomic stable appearance terms are
+    accepted here: identity, outfit, pose, scene and quality triggers remain
+    outside the appearance evidence package.
+    """
+
+    if record is None:
+        return ()
+    identity_keys = {
+        _prompt_term_key(value)
+        for value in character_identity_trigger_candidates(record)
+        if _prompt_term_key(value)
+    }
+    accepted: list[str] = []
+    for term in trigger_candidates:
+        key = _prompt_term_key(term)
+        folded = unicodedata.normalize("NFKC", str(term or "")).casefold()
+        if (
+            not key
+            or key in identity_keys
+            or not _character_feature_categories_for_term(term)
+            or not _is_stable_appearance_term(folded)
+            or any(marker in folded for marker in _OBVIOUS_OUTFIT_MARKERS)
+        ):
+            continue
+        accepted.append(str(term).strip())
+    return _dedupe_text(accepted)
+
+
 def _unrequested_multi_character_variant(
     record: LoraRecord,
     semantic_index: LoraSemanticIndex,
@@ -3256,10 +3295,49 @@ class CharacterSwapPlanner:
             max(0, request.semantic_appearance_count),
             max(0, len(verified_fallback_tags) - 1),
         )
-        verified_appearance_terms = (
+        gallery_appearance_terms = (
             tuple(verified_fallback_tags[-appearance_count:])
             if appearance_count
             else ()
+        )
+        lora_appearance_terms = _trusted_lora_appearance_terms(
+            target_metadata,
+            metadata_target_triggers,
+        )
+        evidence_by_key: dict[str, tuple[str, list[str]]] = {}
+
+        def add_appearance_evidence(
+            terms: Sequence[str],
+            source: str,
+        ) -> None:
+            for term in terms:
+                key = _prompt_term_key(term)
+                if not key:
+                    continue
+                if key not in evidence_by_key:
+                    evidence_by_key[key] = (str(term).strip(), [source])
+                    continue
+                existing_term, sources = evidence_by_key[key]
+                if source not in sources:
+                    sources.append(source)
+                evidence_by_key[key] = (existing_term, sources)
+
+        if lora_appearance_terms:
+            add_appearance_evidence(
+                lora_appearance_terms,
+                (
+                    "civitai_trained_words"
+                    if target_metadata is not None and target_metadata.from_civitai
+                    else "lora_manager_triggers"
+                ),
+            )
+        add_appearance_evidence(gallery_appearance_terms, "danbooru_gallery")
+        verified_appearance_evidence = tuple(
+            (term, "+".join(sources))
+            for term, sources in evidence_by_key.values()
+        )
+        verified_appearance_terms = tuple(
+            term for term, _source in verified_appearance_evidence
         )
         return CharacterSwapPreparation(
             request=request,
@@ -3276,6 +3354,7 @@ class CharacterSwapPlanner:
             source_identity_hints=source_hints,
             target_identity_hints=target_hints,
             verified_target_appearance_terms=verified_appearance_terms,
+            verified_target_appearance_evidence=verified_appearance_evidence,
         )
 
     @staticmethod
@@ -3948,6 +4027,11 @@ explanations."""
             for term in preparation.verified_target_appearance_terms
             if _prompt_term_key(term)
         }
+        verified_appearance_source_by_key = {
+            _prompt_term_key(term): source
+            for term, source in preparation.verified_target_appearance_evidence
+            if _prompt_term_key(term) and str(source or "").strip()
+        }
         evidence_appearance_ids = tuple(
             index
             for index, term in enumerate(preparation.target_trigger_words)
@@ -4027,6 +4111,17 @@ explanations."""
             preparation.target_trigger_words[index]
             for index in target_appearance_ids
         )
+        target_appearance_evidence_sources = tuple(
+            dict.fromkeys(
+                source
+                for term in target_appearance_terms
+                for source in verified_appearance_source_by_key.get(
+                    _prompt_term_key(term),
+                    "provider_classified",
+                ).split("+")
+                if source
+            )
+        )
         target_feature_categories = frozenset(
             category
             for term in target_appearance_terms
@@ -4042,25 +4137,70 @@ explanations."""
         required_replacement_categories = frozenset(
             {FEATURE_HAIR_STYLE, FEATURE_HAIR_COLOR, FEATURE_EYE_COLOR}
         )
+        unfilled_removed_feature_categories = (
+            removed_feature_categories - target_feature_categories
+        )
         missing_target_feature_categories = tuple(
             sorted(
-                (removed_feature_categories & required_replacement_categories)
-                - target_feature_categories
+                unfilled_removed_feature_categories
+                & required_replacement_categories
             )
+        )
+        model_native_identity_authorized = bool(
+            not semantic_original
+            and (
+                preparation.target_record is not None
+                or preparation.request.semantic_identity_index_verified
+            )
+        )
+        model_native_fallback_categories = (
+            tuple(sorted(unfilled_removed_feature_categories))
+            if model_native_identity_authorized
+            else ()
         )
         if (
             preparation.request.require_target_appearance_slots
             and missing_target_feature_categories
+            and not model_native_identity_authorized
         ):
             raise CharacterSwapError(
-                "目标角色证据缺少已被移除的核心外貌槽位；已停止以避免只删不加",
+                "目标角色的核心外貌槽位缺少可信替代证据，且身份不足以启用模型原生兜底",
                 code="target_appearance_slots_missing",
                 details={
                     "missing_categories": list(missing_target_feature_categories),
                     "target_appearance_count": len(target_appearance_terms),
                     "appearance_source": preparation.request.semantic_appearance_source,
+                    "appearance_sample_count": (
+                        preparation.request.semantic_appearance_sample_count
+                    ),
+                    "target_lora_matched": bool(preparation.target_record),
+                    "identity_index_verified": bool(
+                        preparation.request.semantic_identity_index_verified
+                    ),
                 },
             )
+        category_sources: dict[str, list[str]] = {}
+        for term in target_appearance_terms:
+            sources = verified_appearance_source_by_key.get(
+                _prompt_term_key(term),
+                "provider_classified",
+            ).split("+")
+            for category in _character_feature_categories_for_term(term):
+                category_sources.setdefault(category, [])
+                for source in sources:
+                    if source and source not in category_sources[category]:
+                        category_sources[category].append(source)
+        target_slot_decisions: list[tuple[str, str]] = []
+        for category in sorted(removed_feature_categories):
+            if category in target_feature_categories:
+                sources = category_sources.get(category, ["verified"])
+                target_slot_decisions.append(
+                    (category, "evidence:" + "+".join(sources))
+                )
+            elif category in model_native_fallback_categories:
+                target_slot_decisions.append((category, "model_native"))
+            else:
+                target_slot_decisions.append((category, "unfilled"))
         reauthorized_appearance_terms = tuple(
             term
             for term in target_appearance_terms
@@ -4216,9 +4356,16 @@ explanations."""
                 set(removed_ids) & set(feature_source_ids)
             ),
             target_appearance_terms=target_appearance_terms,
-            target_appearance_source=preparation.request.semantic_appearance_source,
+            target_appearance_source=(
+                "+".join(target_appearance_evidence_sources)
+                if target_appearance_evidence_sources
+                else preparation.request.semantic_appearance_source
+            ),
+            target_appearance_evidence_sources=target_appearance_evidence_sources,
             target_feature_categories=tuple(sorted(target_feature_categories)),
             missing_target_feature_categories=missing_target_feature_categories,
+            model_native_fallback_categories=model_native_fallback_categories,
+            target_slot_decisions=tuple(target_slot_decisions),
         )
 
     @staticmethod

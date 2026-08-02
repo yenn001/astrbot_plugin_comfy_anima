@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.16
+AstrBot Comfy Anima 插件 v1.9.17
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.16
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.16
+版本: 1.9.17
 日期: 2026-08-02
 """
 
@@ -6551,6 +6551,30 @@ QQ快捷指令:
                             },
                         ) from exc
                     raise
+                if plan.model_native_fallback_categories:
+                    self._record_image_task_phase(
+                        job,
+                        "validation",
+                        "目标身份已精确确认；部分源外貌槽位已清除，但没有可靠目标值，"
+                        "本次不猜测具体特征并交由目标 canonical/LoRA 原生知识完成。",
+                        "character_swap_model_native_slot_fallback",
+                        level="WARNING",
+                        details={
+                            "fallback_categories": list(
+                                plan.model_native_fallback_categories
+                            ),
+                            "missing_core_categories": list(
+                                plan.missing_target_feature_categories
+                            ),
+                            "target_lora_matched": bool(plan.target_record),
+                            "identity_index_verified": bool(
+                                effective_request.semantic_identity_index_verified
+                            ),
+                            "appearance_sample_count": (
+                                effective_request.semantic_appearance_sample_count
+                            ),
+                        },
+                    )
                 final_access_error = self._access_error(
                     event,
                     ", ".join(
@@ -6564,7 +6588,7 @@ QQ快捷指令:
                 self._record_image_task_phase(
                     job,
                     "validation",
-                    "语义换角不变量已通过：唯一目标角色、目标外貌入栈、原身份清除、场景栈保留。",
+                    "语义换角不变量已通过：唯一目标角色、逐槽位外貌决策、原身份清除、场景栈保留。",
                     "character_swap_plan_validated",
                     details={
                         "removed_term_count": len(plan.removed_terms),
@@ -6609,12 +6633,22 @@ QQ快捷指令:
                             plan.target_appearance_terms
                         ),
                         "target_appearance_source": plan.target_appearance_source,
+                        "target_appearance_evidence_sources": list(
+                            plan.target_appearance_evidence_sources
+                        ),
                         "target_feature_categories": list(
                             plan.target_feature_categories
                         ),
                         "missing_target_feature_categories": list(
                             plan.missing_target_feature_categories
                         ),
+                        "model_native_fallback_categories": list(
+                            plan.model_native_fallback_categories
+                        ),
+                        "target_slot_decisions": [
+                            {"category": category, "decision": decision}
+                            for category, decision in plan.target_slot_decisions
+                        ],
                         "semantic_canonical_only": bool(
                             plan.target_record is None
                             and not is_original_character_query(
@@ -6766,11 +6800,41 @@ QQ快捷指令:
                     preview_lines.append(
                         "身份策略：角色_(作品)为主锚点；只附加分类模型确认的稳定外貌候选。"
                     )
-                if plan.target_appearance_source == "danbooru_gallery":
+                if "danbooru_gallery" in plan.target_appearance_evidence_sources:
                     preview_lines.append(
                         "外貌证据：从 "
                         f"{effective_request.semantic_appearance_sample_count} 张公开安全级"
                         " Danbooru 样本提取，并仅保留达到支持率的稳定特征。"
+                    )
+                if any(
+                    source in {
+                        "lora_manager_triggers",
+                        "civitai_trained_words",
+                    }
+                    for source in plan.target_appearance_evidence_sources
+                ):
+                    preview_lines.append(
+                        "LoRA 证据：已从当前唯一命中的 LoRA 触发词中提取"
+                        "可验证的原子外貌特征；衣装、动作和质量词不会进入外貌槽位。"
+                    )
+                if plan.model_native_fallback_categories:
+                    fallback_labels = {
+                        "hair_style": "发型",
+                        "hair_color": "发色",
+                        "hair_ornament": "发饰",
+                        "eye_color": "瞳色",
+                        "unique_body_parts": "独特身体特征",
+                        "body_shape": "体型",
+                        "ear_shape": "耳型",
+                    }
+                    preview_lines.append(
+                        "模型原生兜底："
+                        + "、".join(
+                            fallback_labels.get(category, category)
+                            for category in plan.model_native_fallback_categories
+                        )
+                        + "缺少可信目标值；已删除对应源角色特征，不会猜写，"
+                        "由已确认的 canonical/角色 LoRA 决定。"
                     )
             if "confidence_override" in effective_request.ignored_control_directives:
                 preview_lines.append(
@@ -6895,11 +6959,40 @@ QQ快捷指令:
                 info_lines.append(
                     "身份以角色_(作品)为主；附加外貌仅来自高置信稳定候选，模糊特征已留空。"
                 )
-            if plan.target_appearance_source == "danbooru_gallery":
+            if "danbooru_gallery" in plan.target_appearance_evidence_sources:
                 info_lines.append(
                     "目标外貌已由 "
                     f"{effective_request.semantic_appearance_sample_count} 张公开安全级"
                     " Danbooru 样本共现统计增强；衣装、动作与身体猜测未被注入。"
+                )
+            if any(
+                source in {
+                    "lora_manager_triggers",
+                    "civitai_trained_words",
+                }
+                for source in plan.target_appearance_evidence_sources
+            ):
+                info_lines.append(
+                    "当前目标 LoRA 的可信触发词也已参与外貌槽位补全；"
+                    "通用质量、动作与衣装词已排除。"
+                )
+            if plan.model_native_fallback_categories:
+                fallback_labels = {
+                    "hair_style": "发型",
+                    "hair_color": "发色",
+                    "hair_ornament": "发饰",
+                    "eye_color": "瞳色",
+                    "unique_body_parts": "独特身体特征",
+                    "body_shape": "体型",
+                    "ear_shape": "耳型",
+                }
+                info_lines.append(
+                    "未猜测的外貌槽位："
+                    + "、".join(
+                        fallback_labels.get(category, category)
+                        for category in plan.model_native_fallback_categories
+                    )
+                    + "。对应源特征已经移除，交由已确认的角色 canonical/LoRA 原生知识决定。"
                 )
         if "confidence_override" in effective_request.ignored_control_directives:
             info_lines.append(

@@ -1,10 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.16
+> 当前版本：v1.9.17
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
-v1.9.16 把 A佬工作流中的 Danbooru Gallery 真正接入换角证据链：最新 LoRA 只负责发现候选和加载文件，本地索引或 Gallery Character exact 负责确认 canonical，公开安全级单角色帖子负责建立稳定外貌档案。目标 LoRA、canonical 与发色、瞳色、发型、发饰、永久标记等可信特征会合并注入；已删除源核心槽位却缺少目标槽位时会停止，不再出现“删除几十项、只新增角色名”仍宣称成功。
+v1.9.17 重做换角的外貌槽位决策。Gallery 稳定外貌与当前唯一角色 LoRA 的可信触发词会按来源合并；精确 LoRA 或 Danbooru Character exact 已确认时，缺失槽位不再整单失败，而是删除旧角色对应特征、不猜写目标值并交给角色 canonical/LoRA 的原生知识。无精确身份的 Provider 模糊路径仍然保持 fail closed。任务中心、预览和 QQ 结果会显示每个槽位的证据来源、缺失项与模型原生兜底情况。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 

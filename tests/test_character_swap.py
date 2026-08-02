@@ -785,8 +785,103 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         self.assertNotIn("twin braids", plan.prompt)
         self.assertNotIn("white hair", plan.negative_prompt)
         self.assertNotIn("red eyes", plan.negative_prompt)
-        self.assertEqual(plan.target_appearance_source, "danbooru_gallery")
+        self.assertIn("danbooru_gallery", plan.target_appearance_evidence_sources)
+        self.assertIn("lora_manager_triggers", plan.target_appearance_evidence_sources)
         self.assertEqual(len(plan.target_appearance_terms), 3)
+
+    def test_exact_target_lora_missing_gallery_eye_uses_model_native_fallback(
+        self,
+    ) -> None:
+        request = CharacterSwapRequest(
+            source_query="Denia",
+            target_query="Kallen Kaslana",
+            semantic_identity_confidence=1.0,
+            semantic_identity_index_verified=True,
+            semantic_identity_canonical_tag="kallen_kaslana_(honkai_impact)",
+            semantic_appearance_source="danbooru_gallery",
+            semantic_appearance_count=2,
+            semantic_appearance_sample_count=12,
+            require_target_appearance_slots=True,
+            feature_swap_enabled=True,
+            feature_swap_categories=("hair_style", "hair_color", "eye_color"),
+        )
+        preparation = self.planner.prepare(
+            request,
+            positive_prompt=(
+                "1girl, denia_wuwa, blue hair, twin braids, blue eyes, "
+                "school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="white hair, low quality",
+            records=self.records,
+            fallback_target_tags=(
+                "kallen_kaslana_(honkai_impact)",
+                "long hair",
+                "hair ribbon",
+            ),
+        )
+        classification = self._named_classification(
+            self.planner,
+            preparation,
+            source=("denia_wuwa", "blue hair", "twin braids", "blue eyes"),
+            outfit=("school uniform",),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("blue hair", plan.prompt)
+        self.assertNotIn("blue eyes", plan.prompt)
+        self.assertIn("white hair", plan.prompt)
+        self.assertIn("long hair", plan.prompt)
+        self.assertIn("hair ribbon", plan.prompt)
+        self.assertEqual(plan.missing_target_feature_categories, ("eye_color",))
+        self.assertIn("eye_color", plan.model_native_fallback_categories)
+        self.assertIn(("eye_color", "model_native"), plan.target_slot_decisions)
+        self.assertIn(
+            "lora_manager_triggers",
+            plan.target_appearance_evidence_sources,
+        )
+        self.assertIn(
+            "danbooru_gallery",
+            plan.target_appearance_evidence_sources,
+        )
+
+    def test_unverified_semantic_missing_core_slot_still_fails_closed(self) -> None:
+        request = CharacterSwapRequest(
+            source_query="Denia",
+            target_query="Unknown Hero",
+            use_target_lora=False,
+            semantic_identity_confidence=0.99,
+            semantic_appearance_source="provider",
+            semantic_appearance_count=1,
+            require_target_appearance_slots=True,
+            feature_swap_enabled=True,
+            feature_swap_categories=("hair_style", "hair_color", "eye_color"),
+        )
+        preparation = self.planner.prepare(
+            request,
+            positive_prompt=(
+                "1girl, denia_wuwa, blue hair, twin braids, blue eyes, "
+                "school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="",
+            records=self.records,
+            fallback_target_tags=(
+                "unknown_hero_(example_series)",
+                "white hair",
+            ),
+        )
+        classification = self._named_classification(
+            self.planner,
+            preparation,
+            source=("denia_wuwa", "blue hair", "twin braids", "blue eyes"),
+            outfit=("school uniform",),
+        )
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            self.planner.finalize(preparation, classification)
+
+        self.assertEqual(raised.exception.code, "target_appearance_slots_missing")
+        self.assertIn("eye_color", raised.exception.details["missing_categories"])
 
     def test_character_change_removes_extended_identity_but_keeps_expression(self) -> None:
         preparation = self.planner.prepare(
