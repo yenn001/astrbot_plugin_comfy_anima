@@ -2187,13 +2187,21 @@ class CharacterSwapClassifierRoutingTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("Provider classifier must be bypassed")
 
         plugin._classify_character_swap = provider_must_not_run
-        classification = types.SimpleNamespace(confidence=1.0, subject_count=1)
+        classification = types.SimpleNamespace(
+            confidence=1.0,
+            subject_count=1,
+            source_identity_ids=(0, 1),
+        )
         planner = types.SimpleNamespace(
             deterministic_classification=lambda _preparation: classification
         )
         preparation = types.SimpleNamespace(
             tags=("eri \\(blue archive\\)", "grey hair"),
             target_trigger_words=("Viola",),
+            request=types.SimpleNamespace(
+                feature_swap_enabled=False,
+                feature_swap_categories=(),
+            ),
         )
         job = self.main.GenerationJob("tester", "character swap", 0.0)
 
@@ -2210,6 +2218,55 @@ class CharacterSwapClassifierRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(phases[0][1], "character_swap_classifier_bypassed")
         self.assertFalse(phases[0][2]["llm_called"])
 
+    async def test_feature_scoped_local_route_reports_transform_without_provider(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        phases = []
+        plugin._record_image_task_phase = (
+            lambda _job, phase, _message, event_code, **kwargs: phases.append(
+                (phase, event_code, kwargs.get("details", {}))
+            )
+        )
+
+        async def provider_must_not_run(*_args, **_kwargs):
+            raise AssertionError("Provider classifier must be bypassed")
+
+        plugin._classify_character_swap = provider_must_not_run
+        classification = types.SimpleNamespace(
+            confidence=1.0,
+            subject_count=1,
+            source_identity_ids=(3, 4),
+        )
+        planner = types.SimpleNamespace(
+            deterministic_classification=lambda _preparation: classification
+        )
+        preparation = types.SimpleNamespace(
+            tags=("1girl", "stage", "spot light", "pink hair", "side braid"),
+            target_trigger_words=("rio_(blue_archive)",),
+            request=types.SimpleNamespace(
+                feature_swap_enabled=True,
+                feature_swap_categories=("hair_style", "hair_color"),
+            ),
+        )
+        job = self.main.GenerationJob("tester", "character swap", 0.0)
+
+        result, source = await plugin._resolve_character_swap_classification(
+            object(),
+            job,
+            planner,
+            preparation,
+        )
+
+        self.assertIs(result, classification)
+        self.assertEqual(source, "local:character-feature-swap")
+        self.assertEqual(
+            phases[0][1],
+            "character_swap_feature_transform_ready",
+        )
+        self.assertEqual(phases[0][2]["selected_source_term_count"], 2)
+        self.assertFalse(phases[0][2]["llm_called"])
+
     async def test_incomplete_local_evidence_uses_provider_classifier(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         expected = types.SimpleNamespace(confidence=0.85, subject_count=1)
@@ -2223,7 +2280,14 @@ class CharacterSwapClassifierRoutingTests(unittest.IsolatedAsyncioTestCase):
         planner = types.SimpleNamespace(
             deterministic_classification=lambda _preparation: None
         )
-        preparation = types.SimpleNamespace(tags=("unknown",), target_trigger_words=())
+        preparation = types.SimpleNamespace(
+            tags=("unknown",),
+            target_trigger_words=(),
+            request=types.SimpleNamespace(
+                feature_swap_enabled=False,
+                feature_swap_categories=(),
+            ),
+        )
         job = self.main.GenerationJob("tester", "character swap", 0.0)
         event = object()
 

@@ -42,6 +42,23 @@ SWAP_MODE_KEEP_OUTFIT = "keep-outfit"
 SWAP_MODE_TARGET_OUTFIT = "target-outfit"
 SWAP_MODES = frozenset({SWAP_MODE_KEEP_OUTFIT, SWAP_MODE_TARGET_OUTFIT})
 
+FEATURE_HAIR_STYLE = "hair_style"
+FEATURE_HAIR_COLOR = "hair_color"
+FEATURE_HAIR_ORNAMENT = "hair_ornament"
+FEATURE_EYE_COLOR = "eye_color"
+FEATURE_UNIQUE_BODY_PARTS = "unique_body_parts"
+FEATURE_BODY_SHAPE = "body_shape"
+FEATURE_EAR_SHAPE = "ear_shape"
+DEFAULT_CHARACTER_FEATURE_SWAP_CATEGORIES = (
+    FEATURE_HAIR_STYLE,
+    FEATURE_HAIR_COLOR,
+    FEATURE_HAIR_ORNAMENT,
+    FEATURE_EYE_COLOR,
+    FEATURE_UNIQUE_BODY_PARTS,
+    FEATURE_BODY_SHAPE,
+    FEATURE_EAR_SHAPE,
+)
+
 _CLASSIFICATION_FIELDS = (
     "source_identity_ids",
     "outfit_ids",
@@ -568,6 +585,8 @@ class CharacterSwapRequest:
     semantic_appearance_count: int = 0
     semantic_appearance_sample_count: int = 0
     ignored_control_directives: tuple[str, ...] = ()
+    feature_swap_enabled: bool = False
+    feature_swap_categories: tuple[str, ...] = ()
 
     @property
     def source_kind(self) -> str:
@@ -635,6 +654,8 @@ class CharacterSwapPlan:
     classification_confidence: float = 0.0
     effective_confidence_floor: float = 0.0
     reauthorized_appearance_terms: tuple[str, ...] = ()
+    feature_swap_categories: tuple[str, ...] = ()
+    feature_swap_removed_count: int = 0
 
     def preview_text(self) -> str:
         removed = "、".join(self.removed_terms[:12]) or "无"
@@ -808,6 +829,175 @@ def _is_deterministic_source_appearance_term(value: Any) -> bool:
     ):
         return True
     return False
+
+
+def _character_feature_categories_for_term(value: Any) -> frozenset[str]:
+    """Classify one atomic prompt term into the workflow's feature families.
+
+    The upstream ``CharacterFeatureSwapNode`` delegates this decision to an
+    unconstrained LLM.  Here the same seven-category scope is deterministic:
+    uncertain ordinary terms are left untouched, while weighted/composite
+    appearance groups are sent back to the strict classifier path.
+    """
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    raw = raw.replace(r"\(", "(").replace(r"\)", ")")
+    if not raw or _is_weighted_or_composite_prompt_term(raw):
+        return frozenset()
+    normalized = re.sub(r"[_-]+", " ", raw)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if any(marker in normalized for marker in _TRANSIENT_APPEARANCE_STATE_MARKERS):
+        return frozenset()
+
+    categories: set[str] = set()
+    hair_colors = {
+        "black",
+        "blonde",
+        "blond",
+        "brown",
+        "red",
+        "blue",
+        "green",
+        "purple",
+        "pink",
+        "white",
+        "silver",
+        "grey",
+        "gray",
+        "orange",
+        "yellow",
+        "aqua",
+        "teal",
+        "cyan",
+        "gold",
+        "golden",
+        "lavender",
+        "multicolored",
+        "gradient",
+        "two tone",
+        "streaked",
+    }
+    hair_styles = {
+        "short",
+        "medium",
+        "long",
+        "very long",
+        "shoulder length",
+        "waist length",
+        "floor length",
+        "messy",
+        "wavy",
+        "curly",
+        "straight",
+        "spiked",
+    }
+    if normalized.endswith(" hair"):
+        prefix = normalized[:-5].strip()
+        if any(
+            re.search(rf"(?:^|\s){re.escape(color)}(?:\s|$)", prefix)
+            for color in hair_colors
+        ):
+            categories.add(FEATURE_HAIR_COLOR)
+        if any(
+            re.search(rf"(?:^|\s){re.escape(style)}(?:\s|$)", prefix)
+            for style in hair_styles
+        ):
+            categories.add(FEATURE_HAIR_STYLE)
+    if normalized in {
+        "ahoge",
+        "bangs",
+        "crossed bangs",
+        "parted bangs",
+        "hair between eyes",
+        "twin tails",
+        "twintails",
+        "ponytail",
+        "side ponytail",
+        "low ponytail",
+        "high ponytail",
+        "braid",
+        "braids",
+        "twin braids",
+        "side braid",
+        "single braid",
+        "hair bun",
+        "double bun",
+        "bob cut",
+        "hime cut",
+    }:
+        categories.add(FEATURE_HAIR_STYLE)
+    if re.fullmatch(
+        r"(?:(?:black|blue|brown|gold|golden|green|orange|pink|purple|red|"
+        r"silver|white|yellow|rabbit ear|animal ear) )?"
+        r"(?:hair ornament|hair ornaments|hairclip|hairclips|hair ribbon|"
+        r"hair bow|hair flower|hair pin|hairband|headband)",
+        normalized,
+    ):
+        categories.add(FEATURE_HAIR_ORNAMENT)
+
+    if normalized == "heterochromia" or normalized.endswith(" eyes"):
+        eye_prefix = normalized[:-5].strip() if normalized.endswith(" eyes") else ""
+        if normalized == "heterochromia" or any(
+            re.search(rf"(?:^|\s){re.escape(color)}(?:\s|$)", eye_prefix)
+            for color in _ATOMIC_EYE_MODIFIERS
+        ):
+            categories.add(FEATURE_EYE_COLOR)
+
+    if not normalized.startswith("fake ") and re.fullmatch(
+        r"(?:(?:black|blue|brown|gold|golden|green|orange|pink|purple|red|"
+        r"silver|white|yellow|tilted|broken|double|round|rectangular) )*halo|"
+        r"(?:(?:dragon|demon|oni|ram|bull) )?horns|"
+        r"(?:(?:cat|fox|wolf|dog|horse|rabbit|dragon|demon) )?tail|"
+        r"(?:(?:angel|demon|bat|bird|dragon) )?wings|"
+        r"fangs?|freckles|beauty mark|mole|scar|tattoo|"
+        r"angel|demon|elf|vampire|"
+        r"(?:animal|cat|fox|wolf|dog|horse|rabbit|bunny|dragon|demon) girl",
+        normalized,
+    ):
+        categories.add(FEATURE_UNIQUE_BODY_PARTS)
+
+    if re.fullmatch(
+        r"(?:petite|slender|slim|curvy|muscular|tall|short stature|"
+        r"small breasts|medium breasts|large breasts|huge breasts|"
+        r"wide hips|narrow waist|pear shaped figure|hourglass figure|"
+        r"teenage girl|young woman|adult woman)",
+        normalized,
+    ) or re.fullmatch(
+        r"alternate breast size \((?:smaller|small|medium|large|larger|huge)\)",
+        normalized,
+    ):
+        categories.add(FEATURE_BODY_SHAPE)
+
+    if not normalized.startswith("fake ") and not any(
+        marker in normalized
+        for marker in (
+            "earring",
+            "ear piercing",
+            "earpiece",
+            "earphone",
+            "headphone",
+            "in ear",
+            "monitor",
+        )
+    ) and re.fullmatch(
+        r"(?:animal|cat|fox|wolf|dog|horse|rabbit|bunny|elf|pointed) ears",
+        normalized,
+    ):
+        categories.add(FEATURE_EAR_SHAPE)
+    return frozenset(categories)
+
+
+def _normalized_feature_swap_categories(values: Sequence[Any]) -> tuple[str, ...]:
+    requested = {
+        str(value or "").strip().casefold()
+        for value in values
+        if str(value or "").strip()
+    }
+    return tuple(
+        category
+        for category in DEFAULT_CHARACTER_FEATURE_SWAP_CATEGORIES
+        if category in requested
+    )
 
 
 def _is_deterministic_accessory_or_garment_term(value: Any) -> bool:
@@ -2582,6 +2772,111 @@ class CharacterSwapPlanner:
 
         if preparation.request.mode != SWAP_MODE_KEEP_OUTFIT:
             return None
+        feature_categories = _normalized_feature_swap_categories(
+            preparation.request.feature_swap_categories
+        )
+        if preparation.request.feature_swap_enabled and feature_categories:
+            if not (
+                preparation.deterministic_target_trigger
+                or preparation.request.semantic_identity_index_verified
+            ):
+                return None
+            tag_count = len(preparation.tags)
+            if not tag_count:
+                return None
+            has_complete_evidence = bool(
+                len(preparation.source_tag_categories) == tag_count
+                and len(preparation.source_tag_verified) == tag_count
+                and len(preparation.source_tag_canonicals) == tag_count
+            )
+            exact_character_ids = tuple(
+                index
+                for index in range(tag_count)
+                if has_complete_evidence
+                and preparation.source_tag_verified[index]
+                and preparation.source_tag_categories[index] == "character"
+            )
+            if len(exact_character_ids) > 1:
+                return None
+            lineage_anchors = (
+                *preparation.source_identity_hints,
+                *(preparation.tags[index] for index in exact_character_ids),
+            )
+            source_hint_keys = {
+                _prompt_term_key(value)
+                for value in preparation.source_identity_hints
+                if _prompt_term_key(value)
+            }
+            selected = frozenset(feature_categories)
+            source_identity_ids: list[int] = []
+            outfit_ids: list[int] = []
+            pose_action_ids: list[int] = []
+            composition_ids: list[int] = []
+            scene_lighting_ids: list[int] = []
+            style_quality_ids: list[int] = []
+            for index, term in enumerate(preparation.tags):
+                verified = bool(
+                    has_complete_evidence
+                    and preparation.source_tag_verified[index]
+                )
+                category = (
+                    preparation.source_tag_categories[index] if verified else ""
+                )
+                if category == "character":
+                    source_identity_ids.append(index)
+                    continue
+                if category == "copyright":
+                    if _matches_source_copyright_context(term, lineage_anchors):
+                        source_identity_ids.append(index)
+                    else:
+                        style_quality_ids.append(index)
+                    continue
+                if category == "artist":
+                    style_quality_ids.append(index)
+                    continue
+
+                term_key = _prompt_term_key(term)
+                if term_key and term_key in source_hint_keys:
+                    source_identity_ids.append(index)
+                    continue
+                term_features = _character_feature_categories_for_term(term)
+                if term_features & selected:
+                    source_identity_ids.append(index)
+                    continue
+                if _is_weighted_or_composite_prompt_term(term) and any(
+                    marker in unicodedata.normalize(
+                        "NFKC", str(term or "")
+                    ).casefold()
+                    for marker in _APPEARANCE_MARKERS
+                ):
+                    # A weighted mixed feature may hide both identity and visual
+                    # content.  Keep the strict Provider path for this rare case.
+                    return None
+                if _is_deterministic_outfit_term(term):
+                    outfit_ids.append(index)
+                elif _is_deterministic_preserved_visual_term(term):
+                    pose_action_ids.append(index)
+                else:
+                    # This is the important divergence from the old full-bucket
+                    # contract: unknown scene, material and descriptive terms are
+                    # preserved instead of becoming a task-wide hard failure.
+                    style_quality_ids.append(index)
+
+            target_identity_id = 0 if preparation.target_trigger_words else None
+            return CharacterSwapClassification(
+                source_identity_ids=tuple(source_identity_ids),
+                outfit_ids=tuple(outfit_ids),
+                pose_action_ids=tuple(pose_action_ids),
+                composition_ids=tuple(composition_ids),
+                scene_lighting_ids=tuple(scene_lighting_ids),
+                style_quality_ids=tuple(style_quality_ids),
+                uncertain_ids=(),
+                target_identity_trigger_id=target_identity_id,
+                target_appearance_trigger_ids=(),
+                target_default_outfit_trigger_ids=(),
+                subject_count=1,
+                confidence=1.0,
+            )
         tag_count = len(preparation.tags)
         if (
             not tag_count
@@ -3205,6 +3500,13 @@ explanations."""
             preparation.target_record is None
             and _is_original_character_query(preparation.request.target_query)
         )
+        feature_swap_categories = _normalized_feature_swap_categories(
+            preparation.request.feature_swap_categories
+        )
+        feature_swap_enabled = bool(
+            preparation.request.feature_swap_enabled and feature_swap_categories
+        )
+        selected_feature_categories = frozenset(feature_swap_categories)
         if preparation.target_record is not None:
             evidence_tier = "lora_exact"
             minimum_confidence = 0.82
@@ -3278,6 +3580,17 @@ explanations."""
                 for index in sorted(classified_source_canonical_ids)
             ),
         )
+        matching_source_copyright_ids = {
+            index
+            for index in exact_copyright_ids
+            if _matches_source_copyright_context(
+                preparation.tags[index],
+                lineage_anchors,
+            )
+        }
+        classified_source_identity_ids.difference_update(
+            exact_copyright_ids - matching_source_copyright_ids
+        )
         promoted_source_canonical_ids = {
             index
             for index, term in enumerate(preparation.tags)
@@ -3286,12 +3599,23 @@ explanations."""
                 _matches_source_character_lineage(term, lineage_anchors)
                 or _matches_source_copyright_context(term, lineage_anchors)
             )
-        } | exact_character_ids | exact_copyright_ids
-        deterministic_appearance_ids = {
+        } | exact_character_ids
+        all_deterministic_appearance_ids = {
             index
             for index, term in enumerate(preparation.tags)
             if _is_deterministic_source_appearance_term(term)
         }
+        feature_source_ids = {
+            index
+            for index, term in enumerate(preparation.tags)
+            if _character_feature_categories_for_term(term)
+            & selected_feature_categories
+        }
+        deterministic_appearance_ids = (
+            feature_source_ids
+            if feature_swap_enabled
+            else all_deterministic_appearance_ids
+        )
         deterministic_outfit_ids = {
             index
             for index, term in enumerate(preparation.tags)
@@ -3317,7 +3641,8 @@ explanations."""
             if index in deterministic_appearance_ids
         }
         has_reliable_source_profile = bool(
-            preparation.removed_character_loras
+            feature_swap_enabled
+            or preparation.removed_character_loras
             or preparation.source_record is not None
             or reliable_classified_source_ids
             or promoted_source_canonical_ids
@@ -3388,7 +3713,11 @@ explanations."""
                     ),
                 },
             )
-        if not source_identity_ids and not preparation.removed_character_loras:
+        if (
+            not feature_swap_enabled
+            and not source_identity_ids
+            and not preparation.removed_character_loras
+        ):
             raise CharacterSwapError(
                 "没有找到可移除的原角色身份 Tag 或角色 LoRA",
                 code="source_identity_missing",
@@ -3429,6 +3758,7 @@ explanations."""
                 and not _is_strict_unqualified_source_canonical(term)
                 and not _is_deterministic_source_appearance_term(folded)
                 and not _is_composite_source_appearance_term(term)
+                and item_id not in feature_source_ids
             ):
                 raise CharacterSwapError(
                     "分类模型把无法证明属于身份外观的 Tag 标为角色身份",
@@ -3673,7 +4003,13 @@ explanations."""
         reauthorized_appearance_terms = tuple(
             term
             for term in target_appearance_terms
-            if _is_deterministic_source_appearance_term(term)
+            if (
+                _is_deterministic_source_appearance_term(term)
+                or bool(
+                    _character_feature_categories_for_term(term)
+                    & selected_feature_categories
+                )
+            )
             and any(
                 _contains_identity_fragment(
                     _prompt_term_key(term),
@@ -3810,6 +4146,12 @@ explanations."""
             classification_confidence=classification.confidence,
             effective_confidence_floor=effective_confidence_floor,
             reauthorized_appearance_terms=reauthorized_appearance_terms,
+            feature_swap_categories=(
+                feature_swap_categories if feature_swap_enabled else ()
+            ),
+            feature_swap_removed_count=len(
+                set(removed_ids) & set(feature_source_ids)
+            ),
         )
 
     @staticmethod
@@ -4069,6 +4411,8 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
         use_target_lora=use_target_lora,
         require_target_lora=required_lora,
         ignored_control_directives=ignored_control_directives,
+        feature_swap_enabled=True,
+        feature_swap_categories=DEFAULT_CHARACTER_FEATURE_SWAP_CATEGORIES,
     )
 
 
@@ -4207,6 +4551,8 @@ def parse_text_character_change_request(
         enable_upscale=enable_upscale,
         denoise=denoise,
         ignored_control_directives=ignored_control_directives,
+        feature_swap_enabled=True,
+        feature_swap_categories=DEFAULT_CHARACTER_FEATURE_SWAP_CATEGORIES,
     )
 
 
@@ -4287,6 +4633,8 @@ def parse_natural_character_swap(text: str) -> Optional[CharacterSwapRequest]:
         require_target_lora=required_lora,
         edit_requirement=edit_requirement,
         ignored_control_directives=ignored_control_directives,
+        feature_swap_enabled=True,
+        feature_swap_categories=DEFAULT_CHARACTER_FEATURE_SWAP_CATEGORIES,
     )
 
 

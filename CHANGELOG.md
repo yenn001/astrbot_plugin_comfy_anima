@@ -2,6 +2,17 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.15] - 2026-08-02
+
+### 限定范围的角色特征替换器
+
+- 消化 A佬工作流 `CharacterFeatureSwapNode` 的有效设计：显式换角默认只替换发型、发色、发饰、瞳色、独特身体特征、体型与耳型，不再要求每个普通 Tag 都完成身份/衣装/画面全量分桶。
+- 新增 `local:character-feature-swap` 确定性路径。目标角色仍须由当前 LoRA 或本地 Danbooru character exact 证明；源 Prompt 即使没有 Character Tag，也可以删除明确的旧角色特征并插入目标身份。
+- 未索引的场景、材质和描述词默认保留，因此 `spot light`、`leather texture` 等普通词不会再触发整单 `uncertain_tags`；加权或复合外貌组、多角色和目标身份不确定仍回退严格 Provider 路径。
+- 发饰与耳型边界独立处理：hairband、hair ornament、rabbit ear hairband 可替换，ear piercing、earrings、in-ear monitor 等耳部附件保留；衣装、动作、镜头、背景与材质不受角色特征替换影响。
+- 修复 Copyright 清理范围：只有能与明确源 Character lineage 对齐的作品 Tag 才随源角色删除，未匹配的 Copyright 不再因分类模型误判而被无条件移除。
+- 任务中心和 QQ 结果会显示“角色特征替换器（未调用 LLM）”、七类替换范围与实际删除数量。新增真实 Rio 舞台 Prompt、无源 Character、未索引普通词、耳饰边界、Copyright 守恒及入口路由回归。
+
 ## [1.9.14] - 2026-08-02
 
 ### 换角分类入口路由验证

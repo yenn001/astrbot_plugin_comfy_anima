@@ -103,6 +103,8 @@ class CharacterSwapRequestTests(unittest.TestCase):
         self.assertEqual((request.width, request.height), (832, 1216))
         self.assertTrue(request.preview)
         self.assertIn("school uniform", request.tags)
+        self.assertTrue(request.feature_swap_enabled)
+        self.assertIn("hair_color", request.feature_swap_categories)
 
     def test_rejects_unsafe_weight(self) -> None:
         with self.assertRaisesRegex(CharacterSwapError, "0.55"):
@@ -1698,6 +1700,180 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         preparation = planner.attach_source_tag_evidence(preparation, lookups)
 
         self.assertIsNone(planner.deterministic_classification(preparation))
+
+    def test_feature_scoped_swap_handles_unindexed_scene_without_source_character(
+        self,
+    ) -> None:
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        request = CharacterSwapRequest(
+            "",
+            "调月莉音 Rio",
+            use_target_lora=False,
+            semantic_identity_index_verified=True,
+            semantic_identity_confidence=1.0,
+            semantic_appearance_source="danbooru_gallery",
+            semantic_appearance_count=2,
+            semantic_appearance_sample_count=83,
+            feature_swap_enabled=True,
+            feature_swap_categories=(
+                "hair_style",
+                "hair_color",
+                "hair_ornament",
+                "eye_color",
+                "unique_body_parts",
+                "body_shape",
+                "ear_shape",
+            ),
+        )
+        prompt = (
+            "1girl, real life, photorealistic, short hair, light pink hair, "
+            "lavender hair, side braid, bangs, ear piercing, drop earring, "
+            "in-ear monitor, black leather jacket, biker jacket, black dress, "
+            "black top, rings, black nails, holding microphone, standing, "
+            "smiling, looking away, waist up, medium shot, three-quarter view, "
+            "live performance, stage, dark background, microphone stand, "
+            "bass guitar, stage equipment, stage lighting, spot light, "
+            "leather texture, unrelated_work"
+        )
+        preparation = planner.prepare(
+            request,
+            positive_prompt=prompt,
+            negative_prompt="",
+            records=(self.style,),
+            fallback_target_tags=(
+                "rio_(blue_archive)",
+                "long black hair",
+                "blue eyes",
+            ),
+        )
+        lookups = []
+        for tag in preparation.tags:
+            if tag == "unrelated_work":
+                category = "copyright"
+                verified = True
+            elif tag in {"spot light", "leather texture"}:
+                category = ""
+                verified = False
+            else:
+                category = "general"
+                verified = True
+            lookups.append(
+                SimpleNamespace(
+                    verified=verified,
+                    category=category,
+                    canonical_tag=tag.replace(" ", "_") if verified else "",
+                )
+            )
+        preparation = planner.attach_source_tag_evidence(preparation, lookups)
+
+        classification = planner.deterministic_classification(preparation)
+
+        self.assertIsNotNone(classification)
+        assert classification is not None
+        self.assertEqual(classification.confidence, 1.0)
+        self.assertEqual(classification.uncertain_ids, ())
+        plan = planner.finalize(preparation, classification)
+        for removed in (
+            "short hair",
+            "light pink hair",
+            "lavender hair",
+            "side braid",
+            "bangs",
+        ):
+            self.assertNotIn(f", {removed},", f", {plan.prompt},")
+        for preserved in (
+            "ear piercing",
+            "drop earring",
+            "in-ear monitor",
+            "black leather jacket",
+            "holding microphone",
+            "stage",
+            "spot light",
+            "leather texture",
+            "unrelated_work",
+        ):
+            self.assertIn(f", {preserved},", f", {plan.prompt},")
+        self.assertIn(r"rio_\(blue_archive\)", plan.prompt)
+        self.assertIn("long black hair", plan.prompt)
+        self.assertIn("blue eyes", plan.prompt)
+        self.assertEqual(plan.feature_swap_removed_count, 5)
+        self.assertEqual(
+            plan.feature_swap_categories,
+            request.feature_swap_categories,
+        )
+
+    def test_feature_scoped_swap_replaces_hair_ornament_but_not_ear_accessories(
+        self,
+    ) -> None:
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        request = CharacterSwapRequest(
+            "",
+            "Kallen Kaslana",
+            feature_swap_enabled=True,
+            feature_swap_categories=("hair_ornament", "ear_shape"),
+        )
+        preparation = planner.prepare(
+            request,
+            positive_prompt=(
+                "1girl, black hairband, rabbit ear hairband, rabbit ears, "
+                "ear piercing, triangle earrings, in-ear monitor, standing"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+
+        classification = planner.deterministic_classification(preparation)
+
+        self.assertIsNotNone(classification)
+        assert classification is not None
+        plan = planner.finalize(preparation, classification)
+        for removed in ("black hairband", "rabbit ear hairband", "rabbit ears"):
+            self.assertNotIn(f", {removed},", f", {plan.prompt},")
+        for preserved in ("ear piercing", "triangle earrings", "in-ear monitor"):
+            self.assertIn(f", {preserved},", f", {plan.prompt},")
+
+    def test_unrelated_exact_copyright_is_preserved_when_classifier_marks_identity(
+        self,
+    ) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Kallen Kaslana"),
+            positive_prompt=(
+                "denia_wuwa, unrelated_work, 1girl, black hair, "
+                "school uniform, standing"
+            ),
+            negative_prompt="",
+            records=self.records,
+        )
+        preparation = self.planner.attach_source_tag_evidence(
+            preparation,
+            tuple(
+                SimpleNamespace(
+                    verified=True,
+                    category=(
+                        "character"
+                        if tag == "denia_wuwa"
+                        else "copyright"
+                        if tag == "unrelated_work"
+                        else "general"
+                    ),
+                    canonical_tag=tag,
+                )
+                for tag in preparation.tags
+            ),
+        )
+        classification = self._named_classification(
+            self.planner,
+            preparation,
+            source=("denia_wuwa", "unrelated_work", "black hair"),
+            outfit=("school uniform",),
+            confidence=0.96,
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertIn("unrelated_work", plan.prompt)
+        self.assertNotIn("denia_wuwa", plan.prompt)
+        self.assertNotIn("black hair", plan.prompt)
 
     def test_uncertain_bra_does_not_collide_with_twin_braids(self) -> None:
         preparation = self.planner.prepare(

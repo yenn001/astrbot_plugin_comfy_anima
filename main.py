@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.14
+AstrBot Comfy Anima 插件 v1.9.15
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.14
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.14
+版本: 1.9.15
 日期: 2026-08-02
 """
 
@@ -4687,12 +4687,28 @@ QQ快捷指令:
                 preparation,
             )
         job.state = "classifying_swap"
-        classifier_source = "local:danbooru-exact"
+        feature_swap = bool(
+            preparation.request.feature_swap_enabled
+            and preparation.request.feature_swap_categories
+        )
+        classifier_source = (
+            "local:character-feature-swap"
+            if feature_swap
+            else "local:danbooru-exact"
+        )
         self._record_image_task_phase(
             job,
             "classifier",
-            "本地 Danbooru 证据已完整覆盖，跳过 LLM 分类。",
-            "character_swap_classifier_bypassed",
+            (
+                "角色特征替换器已按限定类别完成改写，普通未知 Tags 保守保留。"
+                if feature_swap
+                else "本地 Danbooru 证据已完整覆盖，跳过 LLM 分类。"
+            ),
+            (
+                "character_swap_feature_transform_ready"
+                if feature_swap
+                else "character_swap_classifier_bypassed"
+            ),
             details={
                 "classifier_source": classifier_source,
                 "tag_count": len(preparation.tags),
@@ -4700,6 +4716,14 @@ QQ快捷指令:
                 "confidence": classification.confidence,
                 "subject_count": classification.subject_count,
                 "llm_called": False,
+                "feature_categories": list(
+                    preparation.request.feature_swap_categories
+                    if feature_swap
+                    else ()
+                ),
+                "selected_source_term_count": len(
+                    classification.source_identity_ids
+                ),
             },
         )
         return classification, classifier_source
@@ -6392,6 +6416,27 @@ QQ快捷指令:
 
         if effective_request.preview:
             preview_lines = [plan.preview_text()]
+            if classifier_provider == "local:character-feature-swap":
+                feature_labels = {
+                    "hair_style": "发型",
+                    "hair_color": "发色",
+                    "hair_ornament": "发饰",
+                    "eye_color": "瞳色",
+                    "unique_body_parts": "独特身体特征",
+                    "body_shape": "体型",
+                    "ear_shape": "耳型",
+                }
+                preview_lines.append(
+                    "换角路径：角色特征替换器（未调用 LLM）。"
+                )
+                preview_lines.append(
+                    "替换特征："
+                    + "、".join(
+                        feature_labels.get(category, category)
+                        for category in plan.feature_swap_categories
+                    )
+                    + f"；已移除 {plan.feature_swap_removed_count} 项源特征。"
+                )
             if (
                 plan.target_record is None
                 and not is_original_character_query(effective_request.target_query)
@@ -6477,11 +6522,31 @@ QQ快捷指令:
         info_lines = [
             "语义换角完成：仅替换角色身份，未执行局部或像素级编辑。",
             (
-                "换角分类路径: 本地 Danbooru 确定性分类（未调用 LLM）"
+                "换角路径: 角色特征替换器（未调用 LLM）"
+                if classifier_provider == "local:character-feature-swap"
+                else "换角分类路径: 本地 Danbooru 确定性分类（未调用 LLM）"
                 if classifier_provider == "local:danbooru-exact"
                 else f"换角分类模型: {classifier_provider}"
             ),
         ]
+        if plan.feature_swap_categories:
+            feature_labels = {
+                "hair_style": "发型",
+                "hair_color": "发色",
+                "hair_ornament": "发饰",
+                "eye_color": "瞳色",
+                "unique_body_parts": "独特身体特征",
+                "body_shape": "体型",
+                "ear_shape": "耳型",
+            }
+            info_lines.append(
+                "替换特征: "
+                + "、".join(
+                    feature_labels.get(category, category)
+                    for category in plan.feature_swap_categories
+                )
+                + f"；本次移除 {plan.feature_swap_removed_count} 项源特征。"
+            )
         if not effective_request.use_target_lora:
             info_lines.append(
                 "已按请求禁用角色 LoRA，本次只使用经验证的普通身份与稳定外观 Tags。"
