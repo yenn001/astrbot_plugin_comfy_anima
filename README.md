@@ -1,10 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.12
+> 当前版本：v1.9.14
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
-v1.9.12 将本地 Danbooru 四分类正式接入语义换角：每个源 Tag 在分类前批量 exact 查询，`Character` 与相关 `Copyright` 作为源身份上下文清理，`Artist` 保留为风格，`General` 再按稳定外貌、衣装附件、动作画面分层。这样即使 LLM 把 hairband、leotard、earrings、afterimage、pose 或 background 误放进身份桶，也会被本地证据纠正；头发、眼睛、兔耳、halo、体型和发色 streak 等稳定外貌仍会正确移除。
+v1.9.14 在本地 Danbooru 四分类完整覆盖时直接执行确定性换角分类，不再等待 LLM 重复判断已经 exact 证明的 Tags。密集 Eri → Viola 案例可跳过约一分钟的分类调用，并避免 Provider 把 General 标签误放身份桶；存在未索引或复合歧义时仍自动回到原严格 LLM 路径。命令入口级测试同时证明完整本地证据必定绕过 Provider、证据不足必定回退 Provider。失败任务还会保存脱敏后的具体 Tag ID、Danbooru 类别与验证状态，方便直接定位而不记录完整提示词。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 

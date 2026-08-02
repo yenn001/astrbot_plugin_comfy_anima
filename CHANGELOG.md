@@ -2,6 +2,23 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.14] - 2026-08-02
+
+### 换角分类入口路由验证
+
+- 将“本地确定性分类优先、LLM 分类兜底”提取为独立入口路由，普通 QQ 换角命令与底层规划器使用同一决策路径。
+- 新增入口级异步回归：完整本地证据时 Provider 调用必须为零并记录 `character_swap_classifier_bypassed`；不完整证据必须调用原严格 Provider 分类。
+- 保留 v1.9.13 的本地 Danbooru 快路径和脱敏失败证据，并避免同版本不同构建覆盖已部署包。
+
+## [1.9.13] - 2026-08-02
+
+### 本地确定性换角快路径与失败证据
+
+- 当源提示词已由本地 Danbooru exact 四分类完整覆盖、目标身份可确定且处于普通保留衣装模式时，直接构造完整换角分类，跳过 LLM Provider 调用。
+- 快路径只接受一个可证明的源角色；Character 与匹配 Copyright 清理，稳定外貌清理，General 衣装、附件、动作、镜头、场景、效果与状态保留。未索引或复合歧义项自动回退原严格 LLM 分类，不放宽安全边界。
+- 截图中的 75 项 Eri → Viola 提示词可由 74 项 exact 证据加一个受控表情 Tag 全本地完成，目标 LoRA 与触发词保持 `viola-000020.safetensors + Viola`。
+- `image_task_failed` 新增经过任务存储脱敏的 CharacterSwapError 详情，可显示具体 Tag ID、Danbooru 类别和验证状态，同时继续屏蔽完整 Prompt、Provider 正文、路径和凭据。
+
 ## [1.9.12] - 2026-08-02
 
 ### 本地 Danbooru 四分类接入语义换角

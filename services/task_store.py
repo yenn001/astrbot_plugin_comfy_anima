@@ -63,9 +63,11 @@ _RAW_CONTENT_KEYS = frozenset(
         "system_prompt",
         "user_prompt",
         "raw_prompt",
+        "prompt_text",
         "response",
         "raw_response",
         "llm_response",
+        "response_text",
         "completion",
         "completion_text",
     }

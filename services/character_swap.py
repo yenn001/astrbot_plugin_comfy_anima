@@ -2566,6 +2566,124 @@ class CharacterSwapPlanner:
             source_tag_canonicals=tuple(canonicals),
         )
 
+    @staticmethod
+    def deterministic_classification(
+        preparation: CharacterSwapPreparation,
+    ) -> Optional[CharacterSwapClassification]:
+        """Build a complete local classification when exact evidence is enough.
+
+        This path intentionally covers only the ordinary keep-outfit swap.  It
+        requires one provable source identity, a deterministic target identity,
+        exact Danbooru evidence for every non-trivial term, and allows only a
+        small bounded set of unindexed visual syntax such as emoticon Tags.
+        Anything ambiguous returns ``None`` and continues through the LLM
+        classifier instead of weakening the existing fail-closed behavior.
+        """
+
+        if preparation.request.mode != SWAP_MODE_KEEP_OUTFIT:
+            return None
+        tag_count = len(preparation.tags)
+        if (
+            not tag_count
+            or len(preparation.source_tag_categories) != tag_count
+            or len(preparation.source_tag_verified) != tag_count
+            or len(preparation.source_tag_canonicals) != tag_count
+        ):
+            return None
+        if not (
+            preparation.deterministic_target_trigger
+            or preparation.request.semantic_identity_index_verified
+        ):
+            return None
+
+        exact_character_ids = tuple(
+            index
+            for index, (category, verified) in enumerate(
+                zip(
+                    preparation.source_tag_categories,
+                    preparation.source_tag_verified,
+                )
+            )
+            if verified and category == "character"
+        )
+        if len(exact_character_ids) > 1:
+            return None
+        source_authorized = bool(
+            exact_character_ids
+            or preparation.source_record is not None
+            or preparation.removed_character_loras
+        )
+        if not source_authorized:
+            return None
+
+        lineage_anchors = (
+            *preparation.source_identity_hints,
+            *(preparation.tags[index] for index in exact_character_ids),
+        )
+        source_identity_ids: list[int] = []
+        outfit_ids: list[int] = []
+        pose_action_ids: list[int] = []
+        composition_ids: list[int] = []
+        scene_lighting_ids: list[int] = []
+        style_quality_ids: list[int] = []
+
+        for index, term in enumerate(preparation.tags):
+            verified = preparation.source_tag_verified[index]
+            category = preparation.source_tag_categories[index]
+            if verified and category == "character":
+                source_identity_ids.append(index)
+                continue
+            if verified and category == "copyright":
+                if _matches_source_copyright_context(term, lineage_anchors):
+                    source_identity_ids.append(index)
+                else:
+                    style_quality_ids.append(index)
+                continue
+            if verified and category == "artist":
+                style_quality_ids.append(index)
+                continue
+            if verified and category == "general":
+                if _is_deterministic_outfit_term(term):
+                    outfit_ids.append(index)
+                elif _is_deterministic_source_appearance_term(term):
+                    source_identity_ids.append(index)
+                elif _is_deterministic_preserved_visual_term(term):
+                    pose_action_ids.append(index)
+                else:
+                    # Exact General proves that this is not a character-name or
+                    # Copyright token.  The keep-outfit mode preserves it even
+                    # when no narrower visual bucket can be derived locally.
+                    style_quality_ids.append(index)
+                continue
+            if verified:
+                return None
+
+            if _is_deterministic_outfit_term(term):
+                outfit_ids.append(index)
+            elif _is_deterministic_preserved_visual_term(term):
+                pose_action_ids.append(index)
+            else:
+                # Do not guess about an unindexed atomic or composite term.
+                return None
+
+        if not source_identity_ids:
+            return None
+        target_identity_id = 0 if preparation.target_trigger_words else None
+        return CharacterSwapClassification(
+            source_identity_ids=tuple(source_identity_ids),
+            outfit_ids=tuple(outfit_ids),
+            pose_action_ids=tuple(pose_action_ids),
+            composition_ids=tuple(composition_ids),
+            scene_lighting_ids=tuple(scene_lighting_ids),
+            style_quality_ids=tuple(style_quality_ids),
+            uncertain_ids=(),
+            target_identity_trigger_id=target_identity_id,
+            target_appearance_trigger_ids=(),
+            target_default_outfit_trigger_ids=(),
+            subject_count=1,
+            confidence=1.0,
+        )
+
     def prepare(
         self,
         request: CharacterSwapRequest,

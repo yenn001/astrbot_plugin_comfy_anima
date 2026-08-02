@@ -2103,6 +2103,141 @@ class AuxiliaryImageTaskFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(failed[0]["details"]["final_state"], "failed")
             store.close()
 
+    async def test_character_swap_failure_persists_sanitized_term_evidence(self) -> None:
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+        class Event:
+            @staticmethod
+            def get_sender_id():
+                return "tester"
+
+            @staticmethod
+            def is_admin():
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._jobs_lock = asyncio.Lock()
+            plugin._active_jobs = {}
+            plugin._last_request_at = {}
+            plugin._task_store = store
+            plugin._client = None
+            plugin.settings = types.SimpleNamespace(
+                admin_ignore_cooldown=False,
+                user_cooldown=0,
+            )
+
+            async def operation(job):
+                job.state = "validating_swap"
+                raise self.main.CharacterSwapError(
+                    "source classification rejected",
+                    code="unsafe_source_identity_classification",
+                    details={
+                        "term_id": 17,
+                        "danbooru_category": "general",
+                        "danbooru_verified": True,
+                        "prompt_text": "PRIVATE_PROMPT",
+                    },
+                )
+
+            with self.assertRaises(self.main.CharacterSwapError):
+                await plugin._run_auxiliary_job(
+                    Event(),
+                    "character swap",
+                    operation,
+                )
+
+            task = store.recent_tasks(limit=1)[0]
+            events = store.read_events(run_id=task["run_id"], limit=50)["entries"]
+            failed = next(
+                item
+                for item in events
+                if item["event_code"] == "image_task_failed"
+            )
+            self.assertEqual(failed["details"]["term_id"], 17)
+            self.assertEqual(failed["details"]["danbooru_category"], "general")
+            self.assertTrue(failed["details"]["danbooru_verified"])
+            self.assertEqual(
+                failed["details"]["prompt_text"],
+                {"omitted": True, "chars": len("PRIVATE_PROMPT")},
+            )
+            self.assertNotIn("PRIVATE_PROMPT", str(events))
+            store.close()
+
+
+class CharacterSwapClassifierRoutingTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_complete_local_evidence_skips_provider_classifier(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        phases = []
+        plugin._record_image_task_phase = (
+            lambda _job, phase, _message, event_code, **kwargs: phases.append(
+                (phase, event_code, kwargs.get("details", {}))
+            )
+        )
+
+        async def provider_must_not_run(*_args, **_kwargs):
+            raise AssertionError("Provider classifier must be bypassed")
+
+        plugin._classify_character_swap = provider_must_not_run
+        classification = types.SimpleNamespace(confidence=1.0, subject_count=1)
+        planner = types.SimpleNamespace(
+            deterministic_classification=lambda _preparation: classification
+        )
+        preparation = types.SimpleNamespace(
+            tags=("eri \\(blue archive\\)", "grey hair"),
+            target_trigger_words=("Viola",),
+        )
+        job = self.main.GenerationJob("tester", "character swap", 0.0)
+
+        result, source = await plugin._resolve_character_swap_classification(
+            object(),
+            job,
+            planner,
+            preparation,
+        )
+
+        self.assertIs(result, classification)
+        self.assertEqual(source, "local:danbooru-exact")
+        self.assertEqual(job.state, "classifying_swap")
+        self.assertEqual(phases[0][1], "character_swap_classifier_bypassed")
+        self.assertFalse(phases[0][2]["llm_called"])
+
+    async def test_incomplete_local_evidence_uses_provider_classifier(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        expected = types.SimpleNamespace(confidence=0.85, subject_count=1)
+        calls = []
+
+        async def provider_classifier(event, job, planner, preparation):
+            calls.append((event, job, planner, preparation))
+            return expected, "provider-id"
+
+        plugin._classify_character_swap = provider_classifier
+        planner = types.SimpleNamespace(
+            deterministic_classification=lambda _preparation: None
+        )
+        preparation = types.SimpleNamespace(tags=("unknown",), target_trigger_words=())
+        job = self.main.GenerationJob("tester", "character swap", 0.0)
+        event = object()
+
+        result, source = await plugin._resolve_character_swap_classification(
+            event,
+            job,
+            planner,
+            preparation,
+        )
+
+        self.assertIs(result, expected)
+        self.assertEqual(source, "provider-id")
+        self.assertEqual(calls, [(event, job, planner, preparation)])
+
 
 class ReverseDrawAccessTests(unittest.IsolatedAsyncioTestCase):
     @classmethod

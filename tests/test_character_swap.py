@@ -1544,6 +1544,24 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                 )
             )
         preparation = planner.attach_source_tag_evidence(preparation, lookups)
+        local_classification = planner.deterministic_classification(preparation)
+        self.assertIsNotNone(local_classification)
+        assert local_classification is not None
+        self.assertEqual(local_classification.confidence, 1.0)
+        self.assertEqual(local_classification.uncertain_ids, ())
+        local_plan = planner.finalize(preparation, local_classification)
+        self.assertTrue(
+            local_plan.target_record.name.endswith("viola-000020.safetensors")
+        )
+        self.assertEqual(local_plan.target_identity_trigger, "Viola")
+        self.assertEqual(local_plan.danbooru_verified_tag_count, 74)
+        self.assertEqual(local_plan.danbooru_character_tag_count, 1)
+        self.assertEqual(local_plan.danbooru_copyright_tag_count, 1)
+        self.assertIn("animal ear hairband", local_plan.prompt)
+        self.assertIn("black leotard", local_plan.prompt)
+        self.assertNotIn(r"eri \(blue archive\)", local_plan.prompt)
+        self.assertNotIn("grey hair", local_plan.prompt)
+
         classification = self._named_classification(
             planner,
             preparation,
@@ -1633,6 +1651,53 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         self.assertEqual(source[0]["danbooru_category"], "copyright")
         self.assertEqual(source[1]["danbooru_category"], "character")
         self.assertEqual(source[2]["danbooru_category"], "general")
+
+    def test_local_classification_falls_back_for_unindexed_ambiguous_tag(self) -> None:
+        viola = _record(
+            "characters/viola-000020.safetensors",
+            "Viola",
+            "VIOLA-AMBIGUOUS-SHA",
+            triggers=("Viola",),
+        )
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        preparation = planner.prepare(
+            CharacterSwapRequest("", "Viola"),
+            positive_prompt=(
+                r"eri \(blue archive\), 1girl, grey hair, "
+                "identity-flavored mystery token, school uniform"
+            ),
+            negative_prompt="",
+            records=(*self.records, viola),
+        )
+        lookups = []
+        for tag in preparation.tags:
+            if tag == r"eri \(blue archive\)":
+                lookups.append(
+                    SimpleNamespace(
+                        verified=True,
+                        category="character",
+                        canonical_tag="eri_(blue_archive)",
+                    )
+                )
+            elif tag == "identity-flavored mystery token":
+                lookups.append(
+                    SimpleNamespace(
+                        verified=False,
+                        category="",
+                        canonical_tag="",
+                    )
+                )
+            else:
+                lookups.append(
+                    SimpleNamespace(
+                        verified=True,
+                        category="general",
+                        canonical_tag=tag.replace(" ", "_"),
+                    )
+                )
+        preparation = planner.attach_source_tag_evidence(preparation, lookups)
+
+        self.assertIsNone(planner.deterministic_classification(preparation))
 
     def test_uncertain_bra_does_not_collide_with_twin_braids(self) -> None:
         preparation = self.planner.prepare(

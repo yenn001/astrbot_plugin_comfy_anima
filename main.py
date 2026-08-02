@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.12
+AstrBot Comfy Anima 插件 v1.9.14
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.12
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.12
+版本: 1.9.14
 日期: 2026-08-02
 """
 
@@ -4669,6 +4669,41 @@ QQ快捷指令:
 """
         yield event.plain_result(help_text)
 
+    async def _resolve_character_swap_classification(
+        self,
+        event: AstrMessageEvent,
+        job: GenerationJob,
+        planner: CharacterSwapPlanner,
+        preparation: CharacterSwapPreparation,
+    ) -> tuple[Any, str]:
+        """Prefer complete local evidence and call the Provider only if needed."""
+
+        classification = planner.deterministic_classification(preparation)
+        if classification is None:
+            return await self._classify_character_swap(
+                event,
+                job,
+                planner,
+                preparation,
+            )
+        job.state = "classifying_swap"
+        classifier_source = "local:danbooru-exact"
+        self._record_image_task_phase(
+            job,
+            "classifier",
+            "本地 Danbooru 证据已完整覆盖，跳过 LLM 分类。",
+            "character_swap_classifier_bypassed",
+            details={
+                "classifier_source": classifier_source,
+                "tag_count": len(preparation.tags),
+                "target_trigger_count": len(preparation.target_trigger_words),
+                "confidence": classification.confidence,
+                "subject_count": classification.subject_count,
+                "llm_called": False,
+            },
+        )
+        return classification, classifier_source
+
     async def _classify_character_swap(
         self,
         event: AstrMessageEvent,
@@ -6148,7 +6183,7 @@ QQ快捷指令:
                     },
                 )
                 classification, classifier_provider = (
-                    await self._classify_character_swap(
+                    await self._resolve_character_swap_classification(
                         event,
                         job,
                         planner,
@@ -6441,7 +6476,11 @@ QQ快捷指令:
             yield event.plain_result(f"{MessageEmoji.WARNING} {director_warning}")
         info_lines = [
             "语义换角完成：仅替换角色身份，未执行局部或像素级编辑。",
-            f"换角分类模型: {classifier_provider}",
+            (
+                "换角分类路径: 本地 Danbooru 确定性分类（未调用 LLM）"
+                if classifier_provider == "local:danbooru-exact"
+                else f"换角分类模型: {classifier_provider}"
+            ),
         ]
         if not effective_request.use_target_lora:
             info_lines.append(
@@ -12425,6 +12464,12 @@ QQ快捷指令:
                         safe_message = str(
                             getattr(exc, "user_message", type(exc).__name__)
                         )[:500]
+                        exception_details = (
+                            dict(exc.details)
+                            if isinstance(exc, CharacterSwapError)
+                            and isinstance(exc.details, Mapping)
+                            else {}
+                        )
                         self._task_store.append_event(
                             job.task_run_id,
                             "run",
@@ -12432,6 +12477,7 @@ QQ快捷指令:
                             level="ERROR",
                             event_code="image_task_failed",
                             details={
+                                **exception_details,
                                 "final_state": job.state,
                                 "failed_stage": failed_stage,
                                 "error_type": type(exc).__name__,
