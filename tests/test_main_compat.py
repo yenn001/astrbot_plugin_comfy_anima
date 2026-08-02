@@ -3575,6 +3575,79 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         plugin._record_image_task_phase = lambda *_args, **_kwargs: None
         return plugin, calls
 
+    async def test_gallery_exact_builds_profile_for_existing_target_lora(self) -> None:
+        class Client:
+            @staticmethod
+            async def danbooru_gallery_health():
+                return {"connected": True, "source": "danbooru"}
+
+            @staticmethod
+            async def danbooru_character_autocomplete(query, *, limit=20):
+                del limit
+                if query == "viola":
+                    return [
+                        {
+                            "name": "viola_(pokemon)",
+                            "category": 4,
+                            "post_count": 314,
+                        },
+                        {
+                            "name": "viola_(majo_no_ie)",
+                            "category": 4,
+                            "post_count": 151,
+                        },
+                    ]
+                return []
+
+            @staticmethod
+            async def danbooru_character_posts(_canonical, *, limit=100):
+                del limit
+                return [
+                    {
+                        "id": index + 1,
+                        "rating": "g",
+                        "tag_string_character": "viola_(bang_dream!)",
+                        "tag_string_general": (
+                            "1girl solo green_hair green_eyes long_hair "
+                            "single_side_bun x_hair_ornament mole_under_mouth"
+                        ),
+                        "is_deleted": False,
+                        "is_pending": False,
+                        "is_flagged": False,
+                        "is_banned": False,
+                    }
+                    for index in range(12)
+                ]
+
+        plugin, _calls = self._plugin("unused")
+        plugin._client = Client()
+        plugin._danbooru_index = None
+        plugin._character_appearance_profiles = None
+        plugin._runtime_semantic_index = lambda: LoraSemanticIndex.empty()
+        record = LoraRecord(
+            name="viola-000020.safetensors",
+            sha256="viola-sha",
+            category="character",
+            character_name="Viola",
+            trigger_words=("Viola",),
+            source_work="bang_dream!",
+        )
+
+        tags, evidence = await plugin._resolve_character_evidence_without_provider(
+            self.main.GenerationJob("u", "swap", 0.0),
+            "Viola",
+            (record,),
+        )
+
+        self.assertEqual(tags[0], "viola_(bang_dream!)")
+        self.assertIn("green hair", tags)
+        self.assertIn("green eyes", tags)
+        self.assertIn("single side bun", tags)
+        self.assertIn("x hair ornament", tags)
+        self.assertIn("mole under mouth", tags)
+        self.assertEqual(evidence["anchor_source"], "danbooru_gallery_exact")
+        self.assertEqual(evidence["appearance_source"], "danbooru_gallery")
+
     async def test_valid_payload_uses_json_wrapped_target_data(self) -> None:
         plugin, calls = self._plugin(
             json.dumps(

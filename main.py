@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.15
+AstrBot Comfy Anima 插件 v1.9.16
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.15
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.15
+版本: 1.9.16
 日期: 2026-08-02
 """
 
@@ -89,7 +89,10 @@ from .services.character_swap import (
     response_text as character_swap_response_text,
 )
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
-from .services.character_identity import resolve_character_identity
+from .services.character_identity import (
+    character_identity_lookup_candidates,
+    resolve_character_identity,
+)
 from .services.control_modes import (
     CONTROL_MODES,
     extract_command_control_modes,
@@ -100,6 +103,7 @@ from .services.danbooru_index import (
     DanbooruIndexError,
     DanbooruTagIndex,
     escape_prompt_tag,
+    normalize_tag,
 )
 from .services.danbooru_character_profile import (
     CharacterAppearanceProfile,
@@ -488,7 +492,7 @@ class ComfyAnimaPlugin(Star):
             self._persistent_data_dir / "danbooru_tags_v1.sqlite3"
         )
         self._character_appearance_profiles = CharacterAppearanceProfileStore(
-            self._persistent_data_dir / "danbooru_character_profiles_v1.json"
+            self._persistent_data_dir / "danbooru_character_profiles_v2.json"
         )
         if self.settings.enable_prompt_diagnostics:
             self._prompt_diagnostics_store: Any = PromptDiagnosticsStore(
@@ -5129,6 +5133,253 @@ QQ快捷指令:
         )
         return profile
 
+    async def _resolve_character_evidence_without_provider(
+        self,
+        job: GenerationJob,
+        target_query: str,
+        records: tuple[LoraRecord, ...],
+        appearance_override_text: str = "",
+    ) -> tuple[tuple[str, ...], dict[str, Any]]:
+        """Resolve exact identity plus stable appearance before any LLM fallback.
+
+        Current exact LoRA metadata is discovery evidence, while the local
+        Danbooru index or Gallery Character autocomplete supplies the canonical
+        identity.  Gallery posts then supply only aggregate safe-rated appearance.
+        """
+
+        if is_original_character_query(target_query):
+            return (), {}
+        identity_candidates, work_hints = character_lookup_hints_for_query(
+            records,
+            target_query,
+            self._runtime_semantic_index(),
+        )
+        canonical = ""
+        match_variant = "none"
+        match_type = "none"
+        query_count = 0
+        candidate_count = 0
+        anchor_source = ""
+        direct_profiles: dict[str, CharacterAppearanceProfile] = {}
+        tag_index = getattr(self, "_danbooru_index", None)
+        if tag_index is not None:
+            try:
+                resolution = await asyncio.to_thread(
+                    resolve_character_identity,
+                    tag_index,
+                    target_query=target_query,
+                    identity_candidates=identity_candidates,
+                    work_hints=work_hints,
+                    allow_discovery=False,
+                )
+            except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+                resolution = None
+            if resolution is not None:
+                query_count = resolution.query_count
+                candidate_count = resolution.candidate_count
+                if resolution.ambiguous:
+                    return (), {}
+                if resolution.verified:
+                    canonical = resolution.canonical_tag
+                    match_variant = resolution.match_variant
+                    match_type = resolution.match_type
+                    anchor_source = "danbooru_exact"
+
+        if not canonical:
+            client = getattr(self, "_client", None)
+            if client is None or not hasattr(client, "danbooru_character_autocomplete"):
+                return (), {}
+            try:
+                health = await client.danbooru_gallery_health()
+            except (ComfyClientError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "Danbooru Gallery 状态不可用；不会把画廊当作角色身份证据。",
+                    "character_swap_gallery_unavailable",
+                    level="WARNING",
+                    details={"error_type": type(exc).__name__},
+                )
+                return (), {}
+            if not bool(health.get("connected")):
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "Danbooru Gallery 当前未连接上游；跳过远程角色验证。",
+                    "character_swap_gallery_offline",
+                    level="WARNING",
+                    details={"source": str(health.get("source") or "")[:32]},
+                )
+                return (), {}
+            lookup_candidates = character_identity_lookup_candidates(
+                target_query=target_query,
+                identity_candidates=identity_candidates,
+                work_hints=work_hints,
+            )
+            exact_hits: set[str] = set()
+            matched_queries: dict[str, str] = {}
+            for candidate in lookup_candidates[:12]:
+                try:
+                    rows = await client.danbooru_character_autocomplete(candidate)
+                except (ComfyClientError, OSError, RuntimeError, TypeError, ValueError):
+                    continue
+                candidate_tag = normalize_tag(candidate)
+                candidate_root = re.sub(r"_\([^()]+\)$", "", candidate_tag)
+                row_matches: set[str] = set()
+                for row in rows:
+                    category = str(row.get("category") or "").strip().casefold()
+                    if category not in {"4", "character"}:
+                        continue
+                    row_tag = normalize_tag(
+                        str(
+                            row.get("value")
+                            or row.get("name")
+                            or row.get("tag")
+                            or row.get("label")
+                            or ""
+                        )
+                    )
+                    row_root = re.sub(r"_\([^()]+\)$", "", row_tag)
+                    if not row_tag or not (
+                        row_tag == candidate_tag
+                        or (
+                            "_(" not in candidate_tag
+                            and candidate_root
+                            and row_root == candidate_root
+                        )
+                    ):
+                        continue
+                    row_matches.add(row_tag)
+                if candidate_tag in row_matches:
+                    exact_hits.add(candidate_tag)
+                    matched_queries.setdefault(candidate_tag, candidate_tag)
+                elif "_(" not in candidate_tag and len(row_matches) == 1:
+                    row_tag = next(iter(row_matches))
+                    exact_hits.add(row_tag)
+                    matched_queries.setdefault(row_tag, candidate_tag)
+            # Gallery autocomplete may use a stale local tag snapshot.  A fully
+            # qualified candidate derived from the current exact LoRA and trusted
+            # work metadata can still be proven by safe posts themselves: the
+            # profile builder accepts only solo posts whose Character field is
+            # exactly that candidate and rejects all alternate/cosplay variants.
+            qualified_candidates = tuple(
+                candidate
+                for candidate in lookup_candidates
+                if "_(" in normalize_tag(candidate)
+            )[:4]
+            profile_store = getattr(self, "_character_appearance_profiles", None)
+            for candidate in qualified_candidates:
+                candidate_tag = normalize_tag(candidate)
+                if candidate_tag in exact_hits:
+                    continue
+                cached_profile = None
+                if profile_store is not None:
+                    try:
+                        cached_profile = await asyncio.to_thread(
+                            profile_store.get,
+                            candidate_tag,
+                        )
+                    except (OSError, TypeError, ValueError):
+                        cached_profile = None
+                if cached_profile is not None:
+                    exact_hits.add(candidate_tag)
+                    matched_queries.setdefault(candidate_tag, candidate_tag)
+                    direct_profiles[candidate_tag] = cached_profile
+                    continue
+                try:
+                    posts = await client.danbooru_character_posts(
+                        candidate_tag,
+                        limit=100,
+                    )
+                    direct_profile = await asyncio.to_thread(
+                        build_character_appearance_profile,
+                        candidate_tag,
+                        posts,
+                    )
+                except (
+                    ComfyClientError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+                if direct_profile is None:
+                    continue
+                exact_hits.add(candidate_tag)
+                matched_queries.setdefault(candidate_tag, candidate_tag)
+                direct_profiles[candidate_tag] = direct_profile
+            candidate_count = len(exact_hits)
+            query_count = len(lookup_candidates[:12])
+            if len(exact_hits) != 1:
+                if exact_hits:
+                    self._record_image_task_phase(
+                        job,
+                        "resolver",
+                        "Danbooru Gallery 返回多个角色身份；已停止使用画廊证据且不会猜选。",
+                        "character_swap_gallery_ambiguous",
+                        level="WARNING",
+                        details={
+                            "candidate_count": len(exact_hits),
+                            "query_count": query_count,
+                        },
+                    )
+                return (), {}
+            canonical = next(iter(exact_hits))
+            match_variant = matched_queries.get(canonical, "gallery_exact")
+            match_type = "gallery_character_exact"
+            anchor_source = "danbooru_gallery_exact"
+            self._record_image_task_phase(
+                job,
+                "resolver",
+                "目标角色已由 Danbooru Gallery Character 精确结果确认。",
+                "character_swap_gallery_exact",
+                details={
+                    "query_count": query_count,
+                    "candidate_count": candidate_count,
+                    "source": str(health.get("source") or "danbooru")[:32],
+                },
+            )
+
+        profile = (
+            direct_profiles.get(canonical)
+            if not anchor_source == "danbooru_exact"
+            else None
+        )
+        if profile is None:
+            profile = await self._resolve_character_appearance_profile(job, canonical)
+        else:
+            store = getattr(self, "_character_appearance_profiles", None)
+            if store is not None:
+                try:
+                    await asyncio.to_thread(store.put, profile)
+                except (OSError, TypeError, ValueError):
+                    pass
+        appearance_tags = self._filter_character_appearance_overrides(
+            profile.appearance_tags if profile is not None else (),
+            appearance_override_text,
+        )
+        return (
+            (canonical, *appearance_tags),
+            {
+                "confidence": 1.0,
+                "index_verified": True,
+                "canonical_tag": canonical,
+                "anchor_source": anchor_source,
+                "match_variant": match_variant,
+                "match_type": match_type,
+                "candidate_count": candidate_count,
+                "query_count": query_count,
+                "appearance_source": (
+                    profile.source if profile is not None and appearance_tags else ""
+                ),
+                "appearance_count": len(appearance_tags),
+                "appearance_sample_count": (
+                    profile.sample_count if profile is not None and appearance_tags else 0
+                ),
+            },
+        )
+
     @staticmethod
     def _filter_character_appearance_overrides(
         tags: tuple[str, ...],
@@ -5286,6 +5537,7 @@ QQ快捷指令:
                     {
                         "confidence": 1.0,
                         "index_verified": True,
+                        "canonical_tag": local_resolution.canonical_tag,
                         "anchor_source": "danbooru_exact",
                         "match_variant": local_resolution.match_variant,
                         "match_type": local_resolution.match_type,
@@ -5637,6 +5889,7 @@ QQ快捷指令:
                         {
                             "confidence": confidence_value,
                             "index_verified": index_verified,
+                            "canonical_tag": tags[0] if tags else "",
                             "anchor_source": identity_anchor_source,
                             "match_variant": match_variant,
                             "match_type": match_type,
@@ -6012,30 +6265,19 @@ QQ快捷指令:
                 )
                 planner = CharacterSwapPlanner(self._runtime_semantic_index())
                 job.state = "planning_swap"
-                try:
-                    preparation = planner.prepare(
-                        effective_request,
-                        positive_prompt=positive_prompt,
-                        negative_prompt=negative_prompt,
-                        records=records,
-                        replace_source_style=replace_source_style,
+                fallback_tags, identity_evidence = (
+                    await self._resolve_character_evidence_without_provider(
+                        job,
+                        effective_request.target_query,
+                        records,
+                        effective_request.edit_requirement,
                     )
-                except CharacterSwapError as exc:
-                    if not self._character_swap_semantic_retry_allowed(
-                        effective_request,
-                        exc.code,
-                    ):
-                        raise
-                    fallback_tags, _fallback_provider, identity_evidence = (
-                        await self._generate_semantic_target_tags(
-                            event,
-                            job,
-                            effective_request.target_query,
-                            effective_request.prompt_expansion_mode,
-                            effective_request.edit_requirement,
-                            records,
-                        )
-                    )
+                )
+                effective_request = replace(
+                    effective_request,
+                    require_target_appearance_slots=True,
+                )
+                if fallback_tags:
                     effective_request = replace(
                         effective_request,
                         semantic_identity_confidence=float(
@@ -6043,6 +6285,72 @@ QQ快捷指令:
                         ),
                         semantic_identity_index_verified=bool(
                             identity_evidence.get("index_verified")
+                        ),
+                        semantic_identity_canonical_tag=str(
+                            identity_evidence.get("canonical_tag") or ""
+                        ),
+                        semantic_identity_anchor_source=str(
+                            identity_evidence.get("anchor_source") or ""
+                        ),
+                        semantic_identity_match_variant=str(
+                            identity_evidence.get("match_variant") or ""
+                        ),
+                        semantic_identity_match_type=str(
+                            identity_evidence.get("match_type") or ""
+                        ),
+                        semantic_identity_candidate_count=int(
+                            identity_evidence.get("candidate_count") or 0
+                        ),
+                        semantic_identity_query_count=int(
+                            identity_evidence.get("query_count") or 0
+                        ),
+                        semantic_appearance_source=str(
+                            identity_evidence.get("appearance_source") or ""
+                        ),
+                        semantic_appearance_count=int(
+                            identity_evidence.get("appearance_count") or 0
+                        ),
+                        semantic_appearance_sample_count=int(
+                            identity_evidence.get("appearance_sample_count") or 0
+                        ),
+                    )
+                try:
+                    preparation = planner.prepare(
+                        effective_request,
+                        positive_prompt=positive_prompt,
+                        negative_prompt=negative_prompt,
+                        records=records,
+                        replace_source_style=replace_source_style,
+                        fallback_target_tags=fallback_tags,
+                    )
+                except CharacterSwapError as exc:
+                    if not self._character_swap_semantic_retry_allowed(
+                        effective_request,
+                        exc.code,
+                    ):
+                        raise
+                    if not fallback_tags:
+                        fallback_tags, _fallback_provider, identity_evidence = (
+                            await self._generate_semantic_target_tags(
+                                event,
+                                job,
+                                effective_request.target_query,
+                                effective_request.prompt_expansion_mode,
+                                effective_request.edit_requirement,
+                                records,
+                            )
+                        )
+                    effective_request = replace(
+                        effective_request,
+                        semantic_identity_confidence=float(
+                            identity_evidence.get("confidence") or 0.0
+                        ),
+                        semantic_identity_index_verified=bool(
+                            identity_evidence.get("index_verified")
+                        ),
+                        semantic_identity_canonical_tag=str(
+                            identity_evidence.get("canonical_tag")
+                            or (fallback_tags[0] if fallback_tags else "")
                         ),
                         semantic_identity_anchor_source=str(
                             identity_evidence.get("anchor_source") or ""
@@ -6256,7 +6564,7 @@ QQ快捷指令:
                 self._record_image_task_phase(
                     job,
                     "validation",
-                    "语义换角不变量已通过：唯一目标角色、原身份清除、场景栈保留。",
+                    "语义换角不变量已通过：唯一目标角色、目标外貌入栈、原身份清除、场景栈保留。",
                     "character_swap_plan_validated",
                     details={
                         "removed_term_count": len(plan.removed_terms),
@@ -6296,6 +6604,16 @@ QQ快捷指令:
                         ),
                         "reauthorized_shared_appearance_count": len(
                             plan.reauthorized_appearance_terms
+                        ),
+                        "target_appearance_added_count": len(
+                            plan.target_appearance_terms
+                        ),
+                        "target_appearance_source": plan.target_appearance_source,
+                        "target_feature_categories": list(
+                            plan.target_feature_categories
+                        ),
+                        "missing_target_feature_categories": list(
+                            plan.missing_target_feature_categories
                         ),
                         "semantic_canonical_only": bool(
                             plan.target_record is None
@@ -6438,8 +6756,7 @@ QQ快捷指令:
                     + f"；已移除 {plan.feature_swap_removed_count} 项源特征。"
                 )
             if (
-                plan.target_record is None
-                and not is_original_character_query(effective_request.target_query)
+                not is_original_character_query(effective_request.target_query)
             ):
                 if len(plan.added_terms) == 1:
                     preview_lines.append(
@@ -6449,7 +6766,7 @@ QQ快捷指令:
                     preview_lines.append(
                         "身份策略：角色_(作品)为主锚点；只附加分类模型确认的稳定外貌候选。"
                     )
-                if effective_request.semantic_appearance_source == "danbooru_gallery":
+                if plan.target_appearance_source == "danbooru_gallery":
                     preview_lines.append(
                         "外貌证据：从 "
                         f"{effective_request.semantic_appearance_sample_count} 张公开安全级"
@@ -6461,7 +6778,8 @@ QQ快捷指令:
                 )
             if effective_request.semantic_identity_index_verified:
                 preview_lines.append(
-                    "Danbooru 检索：本地 character exact/唯一别名已确认 canonical；"
+                    "Danbooru 检索：Character exact 已确认 canonical；"
+                    f"来源={effective_request.semantic_identity_anchor_source or 'danbooru_exact'}，"
                     f"匹配路径={effective_request.semantic_identity_match_variant or 'exact'}，"
                     f"检查 {effective_request.semantic_identity_query_count} 个安全变体。"
                 )
@@ -6547,6 +6865,12 @@ QQ快捷指令:
                 )
                 + f"；本次移除 {plan.feature_swap_removed_count} 项源特征。"
             )
+        if plan.target_appearance_terms:
+            info_lines.append(
+                "目标外貌已补入 "
+                f"{len(plan.target_appearance_terms)} 项稳定特征；来源 "
+                f"{plan.target_appearance_source or 'verified'}。"
+            )
         if not effective_request.use_target_lora:
             info_lines.append(
                 "已按请求禁用角色 LoRA，本次只使用经验证的普通身份与稳定外观 Tags。"
@@ -6562,10 +6886,7 @@ QQ快捷指令:
                 f"{plan.target_record.name}，权重 "
                 f"{effective_request.target_lora_strength:.2f}。"
             )
-        if (
-            plan.target_record is None
-            and not is_original_character_query(effective_request.target_query)
-        ):
+        if not is_original_character_query(effective_request.target_query):
             if len(plan.added_terms) == 1:
                 info_lines.append(
                     "身份采用角色_(作品)主锚点；未补写任何拿不准的眼睛、五官、耳朵或发色特征。"
@@ -6574,7 +6895,7 @@ QQ快捷指令:
                 info_lines.append(
                     "身份以角色_(作品)为主；附加外貌仅来自高置信稳定候选，模糊特征已留空。"
                 )
-            if effective_request.semantic_appearance_source == "danbooru_gallery":
+            if plan.target_appearance_source == "danbooru_gallery":
                 info_lines.append(
                     "目标外貌已由 "
                     f"{effective_request.semantic_appearance_sample_count} 张公开安全级"
@@ -6586,7 +6907,8 @@ QQ快捷指令:
             )
         if effective_request.semantic_identity_index_verified:
             info_lines.append(
-                "本地 Danbooru character 索引已通过 exact/唯一别名确认目标 canonical；"
+                "Danbooru Character exact 已确认目标 canonical；"
+                f"来源 {effective_request.semantic_identity_anchor_source or 'danbooru_exact'}；"
                 f"匹配路径={effective_request.semantic_identity_match_variant or 'exact'}。"
             )
         if plan.promoted_uncertain_count:

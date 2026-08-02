@@ -23,12 +23,14 @@ from .danbooru_index import normalize_tag
 
 
 PROFILE_SCHEMA = "astrbot-comfy-anima-character-profile"
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 DEFAULT_PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60
 MIN_PROFILE_SAMPLES = 12
 MIN_PROFILE_SUPPORT = 0.65
-MAX_PROFILE_TAGS = 4
+MAX_PROFILE_TAGS = 10
 MAX_PROFILE_RECORDS = 2048
+MIN_EXCLUSIVE_SLOT_COVERAGE = 0.25
+MIN_ADDITIVE_SLOT_COVERAGE = 0.50
 
 _HAIR_COLOURS = frozenset(
     {
@@ -77,24 +79,39 @@ _HAIR_STYLES = frozenset(
     {
         "bob_cut",
         "braid",
+        "double_bun",
         "drill_hair",
+        "hair_bun",
         "high_ponytail",
         "hime_cut",
         "low_ponytail",
+        "one_side_up",
         "ponytail",
         "short_twintails",
         "side_braid",
+        "side_ponytail",
         "single_braid",
+        "single_side_bun",
         "twin_braids",
         "twintails",
     }
 )
-_DISTINCTIVE_FEATURES = frozenset(
+_HAIR_ORNAMENTS = frozenset(
+    {
+        "hair_bow",
+        "hair_flower",
+        "hair_ornament",
+        "hair_pin",
+        "hair_ribbon",
+        "hairband",
+        "hairclip",
+        "x_hair_ornament",
+    }
+)
+_FACIAL_OR_BODY_MARKS = frozenset(
     {
         "ahoge",
-        "animal_ears",
         "dark_skin",
-        "elf",
         "eyepatch",
         "facial_mark",
         "fang",
@@ -102,13 +119,36 @@ _DISTINCTIVE_FEATURES = frozenset(
         "glasses",
         "halo",
         "heterochromia",
-        "horns",
         "mole",
-        "pointy_ears",
+        "mole_under_eye",
+        "mole_under_mouth",
         "scar",
-        "tail",
         "tan",
+        "tattoo",
+    }
+)
+_SPECIES_OR_UNIQUE_PARTS = frozenset(
+    {
+        "animal_ears",
+        "cat_ears",
+        "demon_horns",
+        "elf",
+        "fox_ears",
+        "horns",
+        "pointy_ears",
+        "rabbit_ears",
+        "tail",
         "wings",
+    }
+)
+_BODY_SHAPES = frozenset({"petite", "slender", "tall", "short_stature"})
+_DEFAULT_VARIANT_TAGS = frozenset(
+    {
+        "alternate_hair_color",
+        "alternate_hairstyle",
+        "cosplay",
+        "genderbend",
+        "palette_swap",
     }
 )
 
@@ -124,10 +164,13 @@ _ALLOWED_PROFILE_TAGS = frozenset(
         | _EYE_COLOURS
         | _HAIR_LENGTHS
         | _HAIR_STYLES
-        | _DISTINCTIVE_FEATURES
+        | _HAIR_ORNAMENTS
+        | _FACIAL_OR_BODY_MARKS
+        | _SPECIES_OR_UNIQUE_PARTS
+        | _BODY_SHAPES
     )
 )
-_CANONICAL_TAG_RE = re.compile(r"[a-z0-9_().'\-]{1,160}")
+_CANONICAL_TAG_RE = re.compile(r"[a-z0-9_().!'&+:/\-]{1,160}")
 
 
 @dataclass(frozen=True)
@@ -214,21 +257,30 @@ def _flag_is_true(value: Any) -> bool:
     return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
-def _best_supported(
+def _slot_supported(
     counts: Mapping[str, int],
+    valid_posts: Sequence[set[str]],
     candidates: frozenset[str],
     sample_count: int,
     minimum_support: float,
-) -> tuple[str, float] | None:
+    *,
+    minimum_coverage: float,
+    limit: int = 1,
+    specificity: Mapping[str, int] | None = None,
+) -> tuple[tuple[str, float], ...]:
+    slot_total = sum(1 for tags in valid_posts if tags & candidates)
+    if slot_total <= 0 or slot_total / sample_count < minimum_coverage:
+        return ()
+    specificity = specificity or {}
     ranked = sorted(
         (
-            (tag, count / sample_count)
+            (tag, count / slot_total)
             for tag, count in counts.items()
-            if tag in candidates and count / sample_count >= minimum_support
+            if tag in candidates and count / slot_total >= minimum_support
         ),
-        key=lambda item: (-item[1], item[0]),
+        key=lambda item: (-specificity.get(item[0], 0), -item[1], item[0]),
     )
-    return ranked[0] if ranked else None
+    return tuple(ranked[: max(1, limit)])
 
 
 def build_character_appearance_profile(
@@ -256,7 +308,7 @@ def build_character_appearance_profile(
         rating = str(post.get("rating") or "").strip().casefold()
         if rating != "g" or any(
             _flag_is_true(post.get(field))
-            for field in ("is_deleted", "is_pending", "is_flagged")
+            for field in ("is_deleted", "is_pending", "is_flagged", "is_banned")
         ):
             continue
         try:
@@ -279,6 +331,8 @@ def build_character_appearance_profile(
         }
         if "solo" not in general_tags:
             continue
+        if general_tags & _DEFAULT_VARIANT_TAGS:
+            continue
         seen_post_ids.add(post_id)
         valid_posts.append(general_tags)
     sample_count = len(valid_posts)
@@ -289,24 +343,69 @@ def build_character_appearance_profile(
         for tag in tags:
             counts[tag] = counts.get(tag, 0) + 1
 
+    slot_specs = (
+        (_HAIR_COLOURS, MIN_EXCLUSIVE_SLOT_COVERAGE, 1, {}),
+        (_EYE_COLOURS, MIN_EXCLUSIVE_SLOT_COVERAGE, 1, {}),
+        (_HAIR_LENGTHS, MIN_EXCLUSIVE_SLOT_COVERAGE, 1, {}),
+        (
+            _HAIR_STYLES,
+            MIN_ADDITIVE_SLOT_COVERAGE,
+            2,
+            {
+                "single_side_bun": 4,
+                "double_bun": 4,
+                "one_side_up": 3,
+                "hair_bun": 2,
+                "side_ponytail": 2,
+                "ponytail": 1,
+                "braid": 1,
+            },
+        ),
+        (
+            _HAIR_ORNAMENTS,
+            MIN_ADDITIVE_SLOT_COVERAGE,
+            2,
+            {
+                "x_hair_ornament": 4,
+                "hairclip": 3,
+                "hair_pin": 3,
+                "hair_flower": 3,
+                "hair_bow": 2,
+                "hair_ribbon": 2,
+                "hair_ornament": 1,
+            },
+        ),
+        (
+            _FACIAL_OR_BODY_MARKS,
+            MIN_ADDITIVE_SLOT_COVERAGE,
+            2,
+            {
+                "mole_under_mouth": 4,
+                "mole_under_eye": 4,
+                "facial_mark": 3,
+                "mole": 1,
+            },
+        ),
+        (_SPECIES_OR_UNIQUE_PARTS, MIN_ADDITIVE_SLOT_COVERAGE, 2, {}),
+        (_BODY_SHAPES, MIN_ADDITIVE_SLOT_COVERAGE, 1, {}),
+    )
     selected: list[tuple[str, float]] = []
-    for group in (
-        _HAIR_COLOURS,
-        _EYE_COLOURS,
-        _HAIR_LENGTHS,
-        frozenset({"halo"}),
-        _DISTINCTIVE_FEATURES - {"halo"},
-        _HAIR_STYLES,
-    ):
-        candidate = _best_supported(
+    for group, coverage, limit, specificity in slot_specs:
+        for candidate in _slot_supported(
             counts,
+            valid_posts,
             group,
             sample_count,
             minimum_support,
-        )
-        if candidate is None or candidate[0] in {item[0] for item in selected}:
-            continue
-        selected.append(candidate)
+            minimum_coverage=coverage,
+            limit=limit,
+            specificity=specificity,
+        ):
+            if candidate[0] in {item[0] for item in selected}:
+                continue
+            selected.append(candidate)
+            if len(selected) >= maximum_tags:
+                break
         if len(selected) >= maximum_tags:
             break
     if len(selected) < 2:

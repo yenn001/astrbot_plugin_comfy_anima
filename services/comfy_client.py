@@ -134,7 +134,7 @@ class ComfyClient:
         """
 
         canonical = str(canonical_tag or "").strip().casefold()
-        if not re.fullmatch(r"[a-z0-9_().'\-]{1,160}", canonical):
+        if not re.fullmatch(r"[a-z0-9_().!'&+:/\-]{1,160}", canonical):
             raise ComfyClientError("角色 canonical Tag 无法用于外观证据查询")
         bounded_limit = min(100, max(12, int(limit)))
         session = await self._get_session()
@@ -168,6 +168,49 @@ class ComfyClient:
         if not isinstance(payload, list):
             raise ComfyClientError("Danbooru 角色外观证据不是列表")
         return [item for item in payload[:bounded_limit] if isinstance(item, dict)]
+
+    async def danbooru_character_autocomplete(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return bounded Gallery autocomplete rows for exact verification."""
+
+        normalized = str(query or "").strip().casefold()
+        if not re.fullmatch(r"[a-z0-9_().!'&+:/\-]{1,160}", normalized):
+            raise ComfyClientError("角色候选 Tag 无法用于画廊精确查询")
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self._base_url}/danbooru_gallery/autocomplete",
+                params={"query": normalized, "limit": str(min(50, max(1, limit)))},
+            ) as response:
+                if response.status >= 400:
+                    raise ComfyClientError(
+                        "Danbooru 角色候选接口不可用",
+                        f"Danbooru Gallery HTTP {response.status}",
+                    )
+                content = await self._read_bounded_content(response, 2 * 1024 * 1024)
+        except asyncio.TimeoutError as exc:
+            raise ComfyClientError("读取 Danbooru 角色候选超时") from exc
+        except aiohttp.ClientError as exc:
+            raise ComfyClientError("无法读取 Danbooru 角色候选", str(exc)) from exc
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ComfyClientError("Danbooru 角色候选格式无效") from exc
+        if not isinstance(payload, list):
+            raise ComfyClientError("Danbooru 角色候选不是列表")
+        return [item for item in payload[:limit] if isinstance(item, dict)]
+
+    async def danbooru_gallery_health(self) -> dict[str, Any]:
+        """Return the optional Gallery network state without exposing secrets."""
+
+        payload = await self._request_json("GET", "/danbooru_gallery/check_network")
+        if not isinstance(payload, dict):
+            raise ComfyClientError("Danbooru Gallery 状态格式无效")
+        return payload
 
     async def gpu_name(self) -> str:
         """Return the first ComfyUI GPU model without allocator decorations."""

@@ -119,6 +119,79 @@ class DanbooruCharacterProfileTests(unittest.TestCase):
             ("black hair", "red eyes", "long hair", "halo"),
         )
 
+    def test_viola_profile_uses_slot_denominators_and_specific_traits(self) -> None:
+        posts = []
+        for index in range(44):
+            tags = ["1girl", "solo"]
+            if index < 22:
+                tags.append("green_hair")
+            if index < 16:
+                tags.append("green_eyes")
+            if index < 36:
+                tags.append("long_hair")
+            if index < 37:
+                tags.append("hair_bun")
+            if index < 34:
+                tags.append("single_side_bun")
+            if index < 29:
+                tags.append("one_side_up")
+            if index < 42:
+                tags.append("hair_ornament")
+            if index < 37:
+                tags.append("hairclip")
+            if index < 29:
+                tags.append("x_hair_ornament")
+            if index < 33:
+                tags.append("mole")
+            if index < 28:
+                tags.append("mole_under_mouth")
+            posts.append(_post(*tags, character="viola_(bang_dream!)"))
+
+        profile = build_character_appearance_profile(
+            "viola_(bang_dream!)",
+            posts,
+        )
+
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        for expected in (
+            "green hair",
+            "green eyes",
+            "long hair",
+            "single side bun",
+            "one side up",
+            "x hair ornament",
+            "hairclip",
+            "mole under mouth",
+            "mole",
+        ):
+            self.assertIn(expected, profile.appearance_tags)
+
+    def test_banned_and_alternate_variant_posts_are_excluded(self) -> None:
+        valid = [
+            _post("solo", "green_hair", "green_eyes", "long_hair")
+            for _ in range(12)
+        ]
+        invalid = [
+            _post(
+                "solo",
+                "red_hair",
+                "blue_eyes",
+                "alternate_hair_color",
+            ),
+            _post("solo", "red_hair", "blue_eyes", is_banned=True),
+        ]
+
+        profile = build_character_appearance_profile(
+            "rio_(blue_archive)",
+            (*valid, *invalid),
+        )
+
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.sample_count, 12)
+        self.assertNotIn("red hair", profile.appearance_tags)
+
     def test_duplicate_post_ids_cannot_satisfy_minimum_samples(self) -> None:
         posts = [
             _post(

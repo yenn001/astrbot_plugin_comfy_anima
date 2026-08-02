@@ -19,8 +19,8 @@ from .danbooru_index import DanbooruTagIndex, TagCandidate, TagLookup, normalize
 
 _QUALIFIER_RE = re.compile(r"_\(([^()]*)\)")
 _TRAILING_QUALIFIER_RE = re.compile(r"_\(([^()]*)\)$")
-_ASCII_LOOKUP_RE = re.compile(r"[A-Za-z][A-Za-z0-9_ .()'&+:/-]{0,79}")
-_SAFE_LOOKUP_RE = re.compile(r"[a-z0-9_().+'&:/-]{1,80}")
+_ASCII_LOOKUP_RE = re.compile(r"[A-Za-z][A-Za-z0-9_ .()!'&+:/-]{0,79}")
+_SAFE_LOOKUP_RE = re.compile(r"[a-z0-9_().!'&+:/-]{1,80}")
 
 
 @dataclass(frozen=True)
@@ -97,13 +97,43 @@ def _safe_lookup_value(value: Any) -> str:
 def _ascii_query_segments(value: str) -> tuple[str, ...]:
     segments: list[str] = []
     for raw in re.split(r"[/|、；;\n]+", unicodedata.normalize("NFKC", value)):
-        stripped = raw.strip(" ，,:：()[]{}<>\"'")
+        # Parentheses may be the meaningful Danbooru work qualifier in an
+        # explicit value such as ``viola (bang_dream!)``.  Strip only wrapper
+        # punctuation here; ``normalize_tag`` will canonicalize the qualifier.
+        stripped = raw.strip(" ，,:：[]{}<>\"'")
         if not stripped or not stripped.isascii() or not _ASCII_LOOKUP_RE.fullmatch(stripped):
             continue
         safe = _safe_lookup_value(stripped)
         if safe:
             segments.append(safe)
     return _dedupe(segments)
+
+
+def character_identity_lookup_candidates(
+    *,
+    target_query: str,
+    canonical_tag: str = "",
+    identity_candidates: Sequence[str] = (),
+    work_hints: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Expose the bounded exact candidates for optional Gallery verification.
+
+    The Gallery remains a discovery/evidence source.  Callers must require an
+    exact Character-category response for these already-safe candidates and
+    must still reject cross-identity ambiguity.
+    """
+
+    return tuple(
+        dict.fromkeys(
+            spec.value
+            for spec in _lookup_specs(
+                target_query,
+                canonical_tag,
+                identity_candidates,
+                work_hints,
+            )
+        )
+    )
 
 
 def _lookup_specs(
@@ -327,5 +357,6 @@ def resolve_character_identity(
 
 __all__ = [
     "CharacterIdentityResolution",
+    "character_identity_lookup_candidates",
     "resolve_character_identity",
 ]

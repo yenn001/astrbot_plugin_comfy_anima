@@ -2,6 +2,16 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.16] - 2026-08-02
+
+### Danbooru Gallery 角色证据与槽位化换角
+
+- 直接调用 ComfyUI-Danbooru-Gallery 的网络状态、Character autocomplete 与帖子接口；LoRA 已精确命中时也必须解析 canonical 和稳定外貌，不再只给纯语义回退使用。
+- 角色外貌缓存升级为 v2。只接收 safe、solo、单一精确 Character 的有效帖子，排除删除、待审、封禁以及 alternate hair、palette swap、genderbend、cosplay 等非默认变体。
+- 发色与瞳色使用“该槽位有标注的样本数”作为支持率分母，同时保留覆盖率门槛；新增发髻、单侧髻、发饰、X 发饰、发夹、嘴下痣等具体槽位，具体 Tag 优先于泛化 Tag。
+- 修复目标 LoRA 触发词与 Gallery 外貌二选一、加载目标 LoRA 时主动丢弃外貌、最终校验不检查目标外貌三项根因。目标 LoRA、canonical 与可信外貌现在合并写入正面提示词，并从负面提示词清理。
+- 新增槽位守恒：运行入口删除源发型、发色或瞳色后，若目标证据缺少对应核心槽位则停止提交 ComfyUI；任务中心与 QQ 结果显示目标外貌数量、来源和特征类别。
+
 ## [1.9.15] - 2026-08-02
 
 ### 限定范围的角色特征替换器

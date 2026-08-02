@@ -737,6 +737,57 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         )
         self.assertTrue(plan.suppress_default_style)
 
+    def test_exact_target_lora_keeps_gallery_canonical_and_appearance(self) -> None:
+        request = CharacterSwapRequest(
+            source_query="Denia",
+            target_query="Kallen Kaslana",
+            semantic_identity_confidence=1.0,
+            semantic_identity_index_verified=True,
+            semantic_identity_canonical_tag="kallen_kaslana_(honkai_impact)",
+            semantic_appearance_source="danbooru_gallery",
+            semantic_appearance_count=3,
+            semantic_appearance_sample_count=44,
+            require_target_appearance_slots=True,
+            feature_swap_enabled=True,
+            feature_swap_categories=("hair_style", "hair_color", "eye_color"),
+        )
+        preparation = self.planner.prepare(
+            request,
+            positive_prompt=(
+                "1girl, denia_wuwa, blue hair, twin braids, blue eyes, "
+                "school uniform, standing, beach, masterpiece"
+            ),
+            negative_prompt="white hair, red eyes, low quality",
+            records=self.records,
+            fallback_target_tags=(
+                "kallen_kaslana_(honkai_impact)",
+                "white hair",
+                "red eyes",
+                "long hair",
+            ),
+        )
+        classification = self._named_classification(
+            self.planner,
+            preparation,
+            source=("denia_wuwa", "blue hair", "twin braids", "blue eyes"),
+            outfit=("school uniform",),
+        )
+
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertEqual(plan.target_record, self.kallen)
+        self.assertEqual(len([item for item in plan.loras if item.name == self.kallen.name]), 1)
+        self.assertIn(r"kallen_kaslana_\(honkai_impact\)", plan.prompt)
+        self.assertIn("white hair", plan.prompt)
+        self.assertIn("red eyes", plan.prompt)
+        self.assertIn("long hair", plan.prompt)
+        self.assertNotIn("blue hair", plan.prompt)
+        self.assertNotIn("twin braids", plan.prompt)
+        self.assertNotIn("white hair", plan.negative_prompt)
+        self.assertNotIn("red eyes", plan.negative_prompt)
+        self.assertEqual(plan.target_appearance_source, "danbooru_gallery")
+        self.assertEqual(len(plan.target_appearance_terms), 3)
+
     def test_character_change_removes_extended_identity_but_keeps_expression(self) -> None:
         preparation = self.planner.prepare(
             CharacterSwapRequest("", "Kallen Kaslana"),
@@ -2784,7 +2835,10 @@ class CharacterSwapPlanningTests(unittest.TestCase):
 
         self.assertIsNone(preparation.target_record)
         self.assertIn(preparation.target_metadata_record, (rice_a, rice_b))
-        self.assertEqual(preparation.target_trigger_words, ("rice_shower_(umamusume)",))
+        self.assertEqual(
+            preparation.target_trigger_words,
+            ("rice_shower_(umamusume)", "brown hair"),
+        )
 
     def test_optional_target_lora_uses_semantic_fallback_for_same_character_variants(
         self,

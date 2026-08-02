@@ -1,10 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.15
+> 当前版本：v1.9.16
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
-v1.9.15 将 A佬工作流的“角色特征替换”思路改造成插件内的确定性换角器：显式换角只清理发型、发色、发饰、瞳色、独特身体特征、体型和耳型，同时保留衣装、动作、镜头、场景、材质与无法归类的普通描述。目标角色仍必须由最新 LoRA 或本地 Danbooru character exact 证明；加权复合外貌、多角色和目标身份不确定仍走严格 Provider。这样即使原 Prompt 没有 Character Tag，`spot light`、`leather texture` 等未索引词也不会再令整次换角失败。
+v1.9.16 把 A佬工作流中的 Danbooru Gallery 真正接入换角证据链：最新 LoRA 只负责发现候选和加载文件，本地索引或 Gallery Character exact 负责确认 canonical，公开安全级单角色帖子负责建立稳定外貌档案。目标 LoRA、canonical 与发色、瞳色、发型、发饰、永久标记等可信特征会合并注入；已删除源核心槽位却缺少目标槽位时会停止，不再出现“删除几十项、只新增角色名”仍宣称成功。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 
@@ -43,10 +43,10 @@ v1.9.15 将 A佬工作流的“角色特征替换”思路改造成插件内的�
 - 自然语言绘图：由 AstrBot 中已配置的聊天 Provider 生成画面意图，再由本地 Prompt Composer v2 整理为“硬控制与 LoRA / 视觉短语 / 英文场景关系句”三层提示词；不增加第二次 LLM 调用。
 - 直接 Tags：`/画图` 和 `/画图no` 默认跳过 LLM，直接把用户输入写入工作流；显式 `--llm c` / `--llmcc` / `--lcc` 可对一段完整旧 Tags 执行受控文字换角。
 - 图片反推：使用 AstrBot 多模态 Provider 提取结构化 Tags、构图、角色候选和置信度。
-- 精确角色检索：换角会先查本地 Danbooru character canonical 与唯一 alias，再让绘图模型提供最多八个同角色罗马字候选并批量 exact；作品限定必须一致。Prefix、keyword、Embedding 与 Rerank 只负责有限候选发现和排序，最终身份必须重新通过本地 exact，多个角色冲突时停止而不猜选。
+- 精确角色检索：换角会先查本地 Danbooru Character canonical 与唯一 alias；本地快照没有新角色时，再用 ComfyUI Danbooru Gallery 的 Character autocomplete 对 LoRA 元数据和用户名称产生的有限候选做 exact 验证。Prefix、keyword、Embedding 与 Rerank 只负责候选发现和排序，多个不同角色冲突时停止而不猜选。
 - 底图控制生成：Pose 锁定人体姿态，Depth 约束空间结构，Lineart 按线稿生成上色成图，Reference 柔和参考外观、配色与画风；支持组合与自然语言。
 - 无蒙版整图改图：引用一张图后直接说换衣、换背景、换表情或重新画一张；原图像素接入 img2img，插件按保守、平衡或自由模式控制改动幅度。
-- 单角色语义换角：从图片或完整 Tags 中移除原角色身份，保留服装、姿势、构图、背景和风格，再以目标 LoRA 或纯语义 Tags 重建整张图。纯语义模式会把 exact canonical 放入主体区，并可从 ComfyUI 的 Danbooru Gallery 公开安全级帖子中统计最多四项稳定外貌，避免密集场景和强风格 LoRA 压过角色身份；只缓存聚合结果，不保存帖子或图片。
+- 单角色语义换角：从图片或完整 Tags 中移除原角色身份，保留服装、姿势、构图、背景和风格，再以目标 LoRA、exact canonical 与槽位化稳定外貌重建整张图。Gallery 档案使用安全级、solo、单一精确 Character 样本，排除 alternate hair、palette swap、genderbend 与 cosplay；按发色、瞳色、发长、发型、发饰、永久标记和独特部件聚合最多十项，只缓存档案与支持率，不保存帖子或图片。
 - LoRA 实时刷新：查询、保存组合、换角和提交任务前读取 LoRA Manager 与 ComfyUI 当前实际可加载清单。
 - LoRA 管理：搜索、Civitai 元数据、语义建档、中英文别名、人工审核、组合预设、下载、受控删除，以及带文件指纹和本地缩略图的视觉清单。
 - 视觉提示词资产库：导入管理员审核过的角色、画师、服装、背景与姿势 JSON/CSV，保留来源并支持搜索、收藏和自定义项。

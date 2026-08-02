@@ -9,6 +9,8 @@ AstrBot Comfy Anima 插件 v1.2.0
 日期: 2026-07-14
 """
 
+import json
+from types import SimpleNamespace
 import unittest
 
 from ..services.comfy_client import ComfyClient, ComfyClientError
@@ -53,6 +55,28 @@ class _ChunkedResponse:
         self.content_length = content_length
 
 
+class _JsonResponse(_ChunkedResponse):
+    def __init__(self, payload, *, status=200) -> None:
+        super().__init__((json.dumps(payload).encode("utf-8"),))
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _Session:
+    def __init__(self, response) -> None:
+        self.response = response
+        self.calls = []
+
+    def get(self, url, *, params):
+        self.calls.append((url, params))
+        return self.response
+
+
 class ComfyClientAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_bounded_reader_consumes_all_stream_chunks(self) -> None:
         response = _ChunkedResponse((b'[{"id":1},', b'{"id":2}]'))
@@ -72,6 +96,52 @@ class ComfyClientAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ComfyClientError):
             await ComfyClient._read_bounded_content(response, 1024)
+
+    async def test_gallery_autocomplete_is_bounded_and_parsed(self) -> None:
+        client = ComfyClient(
+            SimpleNamespace(comfyui_url="http://127.0.0.1:8188")
+        )
+        session = _Session(
+            _JsonResponse(
+                [{"value": "viola_(bang_dream!)", "category": 4}]
+            )
+        )
+        client._get_session = lambda: _async_value(session)
+
+        rows = await client.danbooru_character_autocomplete("Viola", limit=20)
+
+        self.assertEqual(rows[0]["value"], "viola_(bang_dream!)")
+        self.assertEqual(session.calls[0][1]["query"], "viola")
+
+    async def test_gallery_autocomplete_rejects_unsafe_query(self) -> None:
+        client = ComfyClient(
+            SimpleNamespace(comfyui_url="http://127.0.0.1:8188")
+        )
+
+        with self.assertRaises(ComfyClientError):
+            await client.danbooru_character_autocomplete("<lora:bad:1>")
+
+    async def test_gallery_posts_accepts_punctuated_canonical(self) -> None:
+        client = ComfyClient(
+            SimpleNamespace(comfyui_url="http://127.0.0.1:8188")
+        )
+        session = _Session(_JsonResponse([{"id": 1}]))
+        client._get_session = lambda: _async_value(session)
+
+        rows = await client.danbooru_character_posts(
+            "viola_(bang_dream!)",
+            limit=12,
+        )
+
+        self.assertEqual(rows, [{"id": 1}])
+        self.assertEqual(
+            session.calls[0][1]["search[tags]"],
+            "viola_(bang_dream!) solo",
+        )
+
+
+async def _async_value(value):
+    return value
 
 
 if __name__ == "__main__":

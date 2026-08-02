@@ -581,9 +581,11 @@ class CharacterSwapRequest:
     semantic_identity_match_type: str = ""
     semantic_identity_candidate_count: int = 0
     semantic_identity_query_count: int = 0
+    semantic_identity_canonical_tag: str = ""
     semantic_appearance_source: str = ""
     semantic_appearance_count: int = 0
     semantic_appearance_sample_count: int = 0
+    require_target_appearance_slots: bool = False
     ignored_control_directives: tuple[str, ...] = ()
     feature_swap_enabled: bool = False
     feature_swap_categories: tuple[str, ...] = ()
@@ -624,6 +626,7 @@ class CharacterSwapPreparation:
     target_trigger_words: tuple[str, ...]
     source_identity_hints: tuple[str, ...]
     target_identity_hints: tuple[str, ...]
+    verified_target_appearance_terms: tuple[str, ...] = ()
     source_tag_categories: tuple[str, ...] = ()
     source_tag_verified: tuple[bool, ...] = ()
     source_tag_canonicals: tuple[str, ...] = ()
@@ -656,6 +659,10 @@ class CharacterSwapPlan:
     reauthorized_appearance_terms: tuple[str, ...] = ()
     feature_swap_categories: tuple[str, ...] = ()
     feature_swap_removed_count: int = 0
+    target_appearance_terms: tuple[str, ...] = ()
+    target_appearance_source: str = ""
+    target_feature_categories: tuple[str, ...] = ()
+    missing_target_feature_categories: tuple[str, ...] = ()
 
     def preview_text(self) -> str:
         removed = "、".join(self.removed_terms[:12]) or "无"
@@ -706,7 +713,10 @@ def _is_stable_appearance_term(value: Any) -> bool:
     folded = unicodedata.normalize("NFKC", str(value or "")).casefold()
     if any(marker in folded for marker in _TRANSIENT_APPEARANCE_STATE_MARKERS):
         return False
-    return any(marker in folded for marker in _APPEARANCE_MARKERS)
+    return bool(
+        any(marker in folded for marker in _APPEARANCE_MARKERS)
+        or _character_feature_categories_for_term(folded)
+    )
 
 
 def _is_deterministic_source_appearance_term(value: Any) -> bool:
@@ -903,6 +913,12 @@ def _character_feature_categories_for_term(value: Any) -> frozenset[str]:
             for style in hair_styles
         ):
             categories.add(FEATURE_HAIR_STYLE)
+    if re.fullmatch(
+        r"(?:(?:black|blue|brown|gold|golden|green|orange|pink|purple|red|"
+        r"silver|white|yellow|multicolored|colored|color) )?(?:hair )?streaks?",
+        normalized,
+    ):
+        categories.add(FEATURE_HAIR_COLOR)
     if normalized in {
         "ahoge",
         "bangs",
@@ -922,6 +938,8 @@ def _character_feature_categories_for_term(value: Any) -> frozenset[str]:
         "single braid",
         "hair bun",
         "double bun",
+        "single side bun",
+        "one side up",
         "bob cut",
         "hime cut",
     }:
@@ -929,7 +947,7 @@ def _character_feature_categories_for_term(value: Any) -> frozenset[str]:
     if re.fullmatch(
         r"(?:(?:black|blue|brown|gold|golden|green|orange|pink|purple|red|"
         r"silver|white|yellow|rabbit ear|animal ear) )?"
-        r"(?:hair ornament|hair ornaments|hairclip|hairclips|hair ribbon|"
+        r"(?:x hair ornament|hair ornament|hair ornaments|hairclip|hairclips|hair ribbon|"
         r"hair bow|hair flower|hair pin|hairband|headband)",
         normalized,
     ):
@@ -949,7 +967,7 @@ def _character_feature_categories_for_term(value: Any) -> frozenset[str]:
         r"(?:(?:dragon|demon|oni|ram|bull) )?horns|"
         r"(?:(?:cat|fox|wolf|dog|horse|rabbit|dragon|demon) )?tail|"
         r"(?:(?:angel|demon|bat|bird|dragon) )?wings|"
-        r"fangs?|freckles|beauty mark|mole|scar|tattoo|"
+        r"fangs?|freckles|beauty mark|mole(?: under (?:mouth|eye))?|scar|tattoo|"
         r"angel|demon|elf|vampire|"
         r"(?:animal|cat|fox|wolf|dog|horse|rabbit|bunny|dragon|demon) girl",
         normalized,
@@ -3201,8 +3219,9 @@ class CharacterSwapPlanner:
             )
         _reject_obvious_multi_subject(tags)
 
-        target_triggers = metadata_target_triggers or _dedupe_text(
-            fallback_target_tags
+        verified_fallback_tags = _dedupe_text(fallback_target_tags)
+        target_triggers = _dedupe_text(
+            (*metadata_target_triggers, *verified_fallback_tags)
         )
         deterministic_trigger = (
             metadata_target_triggers[0]
@@ -3229,6 +3248,19 @@ class CharacterSwapPlanner:
             if target_metadata is not None
             else _dedupe_text((request.target_query,))
         )
+        if request.semantic_identity_canonical_tag:
+            target_hints = _dedupe_text(
+                (*target_hints, request.semantic_identity_canonical_tag)
+            )
+        appearance_count = min(
+            max(0, request.semantic_appearance_count),
+            max(0, len(verified_fallback_tags) - 1),
+        )
+        verified_appearance_terms = (
+            tuple(verified_fallback_tags[-appearance_count:])
+            if appearance_count
+            else ()
+        )
         return CharacterSwapPreparation(
             request=request,
             tags=tags,
@@ -3243,6 +3275,7 @@ class CharacterSwapPlanner:
             target_trigger_words=target_triggers,
             source_identity_hints=source_hints,
             target_identity_hints=target_hints,
+            verified_target_appearance_terms=verified_appearance_terms,
         )
 
     @staticmethod
@@ -3910,22 +3943,16 @@ explanations."""
                         code="ambiguous_target_trigger",
                     )
 
-        evidence_appearance_ids: tuple[int, ...] = ()
-        if (
-            preparation.request.semantic_identity_index_verified
-            and preparation.request.semantic_appearance_source
-            == "danbooru_gallery"
-            and preparation.request.semantic_appearance_count > 0
-        ):
-            evidence_appearance_ids = tuple(
-                range(
-                    1,
-                    min(
-                        len(preparation.target_trigger_words),
-                        1 + preparation.request.semantic_appearance_count,
-                    ),
-                )
-            )
+        verified_appearance_keys = {
+            _prompt_term_key(term)
+            for term in preparation.verified_target_appearance_terms
+            if _prompt_term_key(term)
+        }
+        evidence_appearance_ids = tuple(
+            index
+            for index, term in enumerate(preparation.target_trigger_words)
+            if _prompt_term_key(term) in verified_appearance_keys
+        )
         target_appearance_ids = tuple(
             dict.fromkeys(
                 (
@@ -4000,6 +4027,40 @@ explanations."""
             preparation.target_trigger_words[index]
             for index in target_appearance_ids
         )
+        target_feature_categories = frozenset(
+            category
+            for term in target_appearance_terms
+            for category in _character_feature_categories_for_term(term)
+        )
+        removed_feature_categories = frozenset(
+            category
+            for index in removed_ids
+            for category in _character_feature_categories_for_term(
+                preparation.tags[index]
+            )
+        )
+        required_replacement_categories = frozenset(
+            {FEATURE_HAIR_STYLE, FEATURE_HAIR_COLOR, FEATURE_EYE_COLOR}
+        )
+        missing_target_feature_categories = tuple(
+            sorted(
+                (removed_feature_categories & required_replacement_categories)
+                - target_feature_categories
+            )
+        )
+        if (
+            preparation.request.require_target_appearance_slots
+            and missing_target_feature_categories
+        ):
+            raise CharacterSwapError(
+                "目标角色证据缺少已被移除的核心外貌槽位；已停止以避免只删不加",
+                code="target_appearance_slots_missing",
+                details={
+                    "missing_categories": list(missing_target_feature_categories),
+                    "target_appearance_count": len(target_appearance_terms),
+                    "appearance_source": preparation.request.semantic_appearance_source,
+                },
+            )
         reauthorized_appearance_terms = tuple(
             term
             for term in target_appearance_terms
@@ -4030,11 +4091,12 @@ explanations."""
         else:
             rendered_target_trigger = target_trigger
         added_terms: list[str] = [rendered_target_trigger]
-        if preparation.target_record is None:
-            added_terms.extend(
-                preparation.target_trigger_words[index]
-                for index in target_appearance_ids
-            )
+        canonical_tag = preparation.request.semantic_identity_canonical_tag.strip()
+        if canonical_tag and _prompt_term_key(canonical_tag) != _prompt_term_key(
+            target_trigger
+        ):
+            added_terms.append(escape_prompt_tag(canonical_tag))
+        added_terms.extend(target_appearance_terms)
         if preparation.request.mode == SWAP_MODE_TARGET_OUTFIT:
             added_terms.extend(
                 preparation.target_trigger_words[index]
@@ -4109,6 +4171,7 @@ explanations."""
             target_trigger,
             suppressed_terms,
             reauthorized_appearance_terms,
+            target_appearance_terms,
         )
         return CharacterSwapPlan(
             prompt=prompt,
@@ -4152,6 +4215,10 @@ explanations."""
             feature_swap_removed_count=len(
                 set(removed_ids) & set(feature_source_ids)
             ),
+            target_appearance_terms=target_appearance_terms,
+            target_appearance_source=preparation.request.semantic_appearance_source,
+            target_feature_categories=tuple(sorted(target_feature_categories)),
+            missing_target_feature_categories=missing_target_feature_categories,
         )
 
     @staticmethod
@@ -4164,6 +4231,7 @@ explanations."""
         target_trigger: str,
         suppressed_terms: Sequence[str],
         reauthorized_appearance_terms: Sequence[str] = (),
+        target_appearance_terms: Sequence[str] = (),
     ) -> None:
         character_keys = {
             _canonical_key(record.name) for record in records if _is_character_record(record)
@@ -4200,6 +4268,18 @@ explanations."""
             raise CharacterSwapError(
                 "目标身份触发词未正确进入正面提示词或仍存在于负面提示词",
                 code="target_trigger_conflict",
+            )
+        missing_target_appearance = tuple(
+            term
+            for term in target_appearance_terms
+            if _prompt_term_key(term) not in positive_keys
+            or _prompt_term_key(term) in negative_keys
+        )
+        if missing_target_appearance:
+            raise CharacterSwapError(
+                "可信目标外貌未完整进入正面提示词或仍残留于负面提示词",
+                code="target_appearance_dropped",
+                details={"missing_count": len(missing_target_appearance)},
             )
         reauthorized_keys = {
             _prompt_term_key(term)

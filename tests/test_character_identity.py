@@ -5,7 +5,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from ..services.character_identity import resolve_character_identity
+from ..services.character_identity import (
+    character_identity_lookup_candidates,
+    resolve_character_identity,
+)
 from ..services.danbooru_index import DanbooruTagIndex
 
 
@@ -182,6 +185,15 @@ class CharacterIdentityResolverTests(unittest.TestCase):
 
         self.assertTrue(result.verified)
         self.assertEqual(result.canonical_tag, "jinhsi_(wuthering_waves)")
+
+    def test_punctuated_work_builds_safe_qualified_candidate(self) -> None:
+        candidates = character_identity_lookup_candidates(
+            target_query="Viola",
+            identity_candidates=("Viola",),
+            work_hints=("BanG Dream!",),
+        )
+
+        self.assertIn("viola_(bang_dream!)", candidates)
 
 
 if __name__ == "__main__":
