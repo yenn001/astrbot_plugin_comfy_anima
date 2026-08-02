@@ -61,6 +61,43 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             "kallen_kaslana",
         )
 
+    def test_multi_character_trained_words_require_query_specific_identity(self) -> None:
+        record = LoraRecord(
+            "characters/baarmed_4in1_v1.safetensors",
+            category="character",
+            character_name="Himari / Eimi / Rio / Toki",
+            trigger_words=(
+                r"himari \(armed\) \(blue archive\), white bodysuit",
+                r"eimi \(armed\) \(blue archive\), black sports bra",
+                r"rio \(armed\) \(blue archive\), black bodysuit, skin tight",
+                r"toki \(armed\) \(blue archive\), hooded jacket",
+            ),
+        )
+
+        self.assertEqual(choose_character_identity_trigger(record), "")
+        self.assertEqual(
+            choose_character_identity_trigger(record, ("rio",)),
+            "rio (armed) (blue archive)",
+        )
+
+    def test_character_trigger_plan_splits_compound_civitai_trained_word(self) -> None:
+        record = LoraRecord(
+            "characters/rio.safetensors",
+            category="character",
+            character_name="Rio",
+            trigger_words=(
+                r"rio \(blue archive\), black bodysuit, skin tight",
+            ),
+        )
+        plan = build_lora_trigger_plan(
+            prompt="1girl, solo",
+            negative_prompt="",
+            selections=(LoraSelection("characters/rio", 0.7),),
+            records_by_name={"characters/rio": record},
+        )
+
+        self.assertEqual(plan.added, ("rio (blue archive)",))
+
     def test_style_gets_all_triggers_but_character_gets_identity_only(self) -> None:
         selections = (
             LoraSelection("styles/base", 0.5),

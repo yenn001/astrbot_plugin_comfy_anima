@@ -208,13 +208,34 @@ def is_character_identity_trigger_candidate(trigger: str) -> bool:
     return True
 
 
-def choose_character_identity_trigger(record: LoraRecord) -> str:
-    candidates = tuple(
-        cleaned
-        for trigger in record.trigger_words
-        if (cleaned := _clean_metadata_trigger(trigger))
-    )
+def _metadata_trigger_terms(record: LoraRecord) -> tuple[str, ...]:
+    """Return atomic prompt terms from Manager/Civitai trained-word entries.
+
+    Civitai commonly stores one trained-word item as ``identity, outfit, detail``.
+    Treating that whole string as one identity breaks prompt validation and lets a
+    multi-character LoRA silently select the first character.  Split every entry
+    before identity classification while preserving first-seen order.
+    """
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in record.trigger_words:
+        cleaned = _clean_metadata_trigger(raw)
+        for term in _split_trigger_text(cleaned):
+            key = _term_key(term)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            terms.append(term)
+    return tuple(terms)
+
+
+def character_identity_trigger_candidates(record: LoraRecord) -> tuple[str, ...]:
+    """Return every metadata term that is proven to name this record's character."""
+
+    candidates = _metadata_trigger_terms(record)
     identities = _identity_terms(record)
+    result: list[str] = []
     for trigger in candidates:
         trigger_key = _term_key(trigger)
         comparable_trigger = trigger_key.replace("_", "")
@@ -226,7 +247,55 @@ def choose_character_identity_trigger(record: LoraRecord) -> str:
             )
             for identity in identities
         ):
-            return trigger
+            result.append(trigger)
+    if not result:
+        fallback = tuple(
+            trigger
+            for trigger in candidates
+            if is_character_identity_trigger_candidate(trigger)
+        )
+        if len(fallback) == 1:
+            return fallback
+    return tuple(result)
+
+
+def choose_character_identity_trigger(
+    record: LoraRecord,
+    identity_hints: Iterable[str] = (),
+) -> str:
+    """Choose one identity term, never the first character by accident.
+
+    ``identity_hints`` are query-derived names, not authority.  They only select
+    among identity terms already proven by the current record metadata.  Without
+    hints, a multi-character LoRA is intentionally ambiguous.
+    """
+
+    candidates = character_identity_trigger_candidates(record)
+    if not candidates:
+        return ""
+    if len(candidates) == 1:
+        return candidates[0]
+    hint_keys = tuple(
+        dict.fromkeys(
+            key for value in identity_hints if (key := _term_key(str(value or "")))
+        )
+    )
+    if hint_keys:
+        matched = tuple(
+            trigger
+            for trigger in candidates
+            if any(
+                hint == (trigger_key := _term_key(trigger))
+                or hint in trigger_key
+                or trigger_key in hint
+                for hint in hint_keys
+                if len(hint) >= 3
+            )
+        )
+        unique = tuple(dict.fromkeys(_term_key(item) for item in matched))
+        if len(unique) == 1:
+            return matched[0]
+        return ""
     return ""
 
 
@@ -307,8 +376,7 @@ def build_lora_trigger_plan(
         if not is_character_role:
             continue
         identity_trigger_key = _term_key(choose_character_identity_trigger(record))
-        for raw_trigger in record.trigger_words:
-            trigger = _clean_metadata_trigger(raw_trigger)
+        for trigger in _metadata_trigger_terms(record):
             trigger_key = _term_key(trigger)
             if (
                 trigger_key
@@ -342,11 +410,7 @@ def build_lora_trigger_plan(
         if record is None:
             skipped.append(f"{selection.name}: no fresh metadata record")
             continue
-        triggers = tuple(
-            cleaned
-            for trigger in record.trigger_words
-            if (cleaned := _clean_metadata_trigger(trigger))
-        )
+        triggers = _metadata_trigger_terms(record)
         if not triggers:
             skipped.append(f"{selection.name}: no metadata trigger words")
             continue
@@ -392,6 +456,7 @@ __all__ = [
     "LoraMergePlan",
     "LoraTriggerPlan",
     "build_lora_trigger_plan",
+    "character_identity_trigger_candidates",
     "choose_character_identity_trigger",
     "is_character_identity_trigger_candidate",
     "merge_runtime_lora_selections",

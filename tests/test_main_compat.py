@@ -18,6 +18,13 @@ from PIL import Image
 from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
 from ..services.danbooru_index import DanbooruTagIndex
 from ..services.lora_catalog import LoraRecord
+from ..services.lora_semantic import (
+    LoraSemanticIndex,
+    SemanticEntry,
+    SemanticFact,
+    semantic_identity_key,
+    semantic_source_fingerprint,
+)
 from ..services.reverse_prompt import ReversePromptResult
 
 
@@ -746,6 +753,7 @@ class MainCompatibilityTests(unittest.TestCase):
             "ambiguous_character",
             "semantic_target_tags_missing",
             "missing_target_trigger",
+            "character_variant_lora_requires_semantic",
         ):
             with self.subTest(code=code):
                 self.assertTrue(checker(request, code))
@@ -770,6 +778,7 @@ class MainCompatibilityTests(unittest.TestCase):
             "ambiguous_character",
             "semantic_target_tags_missing",
             "missing_target_trigger",
+            "character_variant_lora_requires_semantic",
         ):
             with self.subTest(required_code=code):
                 self.assertFalse(checker(required_request, code))
@@ -3610,6 +3619,89 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tags, ("toki_(blue_archive)",))
         self.assertTrue(evidence["index_verified"])
         self.assertEqual(evidence["match_variant"], "user_ascii_exact")
+
+    async def test_lora_archive_bridges_localized_rio_to_character_category(self) -> None:
+        plugin, calls = self._plugin("provider must not run")
+        record = LoraRecord(
+            "baarmed_4in1_v1.safetensors",
+            sha256="rio-armed",
+            category="character",
+            character_name="莉音 / Rio",
+            source_work="Blue Archive / 蔚蓝档案",
+            trigger_words=(
+                r"rio \(armed\) \(blue archive\), black bodysuit",
+            ),
+        )
+        record = replace(
+            record,
+            source_fingerprint=semantic_source_fingerprint(record),
+        )
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(record.name, record.sha256),
+            canonical_name=record.name,
+            sha256=record.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "llm_inferred", confidence=0.95),),
+            character_names=(
+                SemanticFact("莉音", "llm_inferred", confidence=0.95),
+                SemanticFact("Rio", "llm_inferred", confidence=0.95),
+            ),
+            source_works=(
+                SemanticFact("Blue Archive", "llm_inferred", confidence=0.95),
+            ),
+            analysis_summary="莉音(Rio) from Blue Archive.",
+            analysis_confidence=0.95,
+            source_fingerprint=record.source_fingerprint,
+        )
+        plugin._semantic_index = LoraSemanticIndex(
+            entries={entry.identity_key: entry}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "rio_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["rio"],
+                                "count": 12095,
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                                "count": 500000,
+                            },
+                            {
+                                "tag": "black_hair",
+                                "category": "general",
+                                "count": 900000,
+                            },
+                            {
+                                "tag": "rio_artist",
+                                "category": "artist",
+                                "count": 100,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "《BlueArchive》的调月莉音",
+                records=(record,),
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(provider, "danbooru-local")
+        self.assertEqual(tags, ("rio_(blue_archive)",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "danbooru_exact")
 
     async def test_exact_rio_uses_public_stable_appearance_profile(self) -> None:
         plugin, calls = self._plugin("provider must not run")

@@ -26,6 +26,7 @@ from ..models import LoraIdentityExpectation, LoraSelection
 from .danbooru_index import escape_prompt_tag
 from .lora_catalog import LoraRecord
 from .lora_prompting import (
+    character_identity_trigger_candidates,
     choose_character_identity_trigger,
     is_character_identity_trigger_candidate,
 )
@@ -1007,7 +1008,7 @@ def _trusted_identity_signature(
                         target.add(key)
     triggers = {
         _prompt_term_key(value)
-        for value in _target_trigger_candidates(record)
+        for value in character_identity_trigger_candidates(record)
         if _semantic_identity_anchor_candidate(value)
         and "(" in unicodedata.normalize("NFKC", value)
     }
@@ -1524,14 +1525,26 @@ def _query_identity_keys(value: str) -> tuple[str, ...]:
     decorated = re.sub(r"[《》〈〉【】「」『』\[\]]+", " ", stripped)
     decorated = re.sub(r"\s+", " ", decorated).strip()
     variants.append(decorated)
-    variants.extend(
+    parenthetical = tuple(
         match.group(1).strip()
         for match in re.finditer(r"[（(]([^（）()]{1,80})[）)]", decorated)
         if match.group(1).strip()
     )
+    variants.extend(parenthetical)
+    for item in parenthetical:
+        variants.extend(
+            part.strip()
+            for part in re.split(r"\s*[-–—]\s*", item)
+            if part.strip()
+        )
     without_alias = re.sub(r"[（(][^（）()]{1,80}[）)]", " ", decorated)
     without_alias = re.sub(r"\s+", " ", without_alias).strip()
     variants.append(without_alias)
+    variants.extend(
+        part.strip()
+        for part in re.split(r"\s*[-–—]\s*", without_alias)
+        if part.strip()
+    )
     variants.extend(
         part.strip()
         for part in re.split(r"(?:里面|里边|当中|之中|中)?的", without_alias)
@@ -1539,6 +1552,26 @@ def _query_identity_keys(value: str) -> tuple[str, ...]:
     )
     return tuple(
         dict.fromkeys(key for item in variants if (key := _identity_key(item)))
+    )
+
+
+def _query_key_matches_identity(
+    query_keys: Sequence[str],
+    identity_key: str,
+    *,
+    allow_cjk_suffix: bool,
+) -> bool:
+    if not identity_key:
+        return False
+    if identity_key in query_keys:
+        return True
+    if not allow_cjk_suffix or not re.search(r"[\u3400-\u9fff]", identity_key):
+        return False
+    if len(identity_key) < 2:
+        return False
+    return any(
+        query_key.endswith(identity_key) or identity_key in query_key
+        for query_key in query_keys
     )
 
 
@@ -1594,6 +1627,186 @@ def _trusted_source_work_keys(
     return frozenset(
         key for value in values if (key := _identity_key(value))
     )
+
+
+def _trusted_semantic_character_facts(
+    entry: Optional[SemanticEntry],
+    record: LoraRecord,
+) -> tuple[Any, ...]:
+    if not _entry_is_fresh(entry, record):
+        return ()
+    assert entry is not None
+    return tuple(
+        fact
+        for fact in entry.effective_facts("character_names")
+        if fact.source in {"manual", "observed"}
+        or (
+            fact.confidence >= 0.85
+            and entry.analysis_confidence >= 0.85
+        )
+    )
+
+
+def _semantic_pair_identity_hints(
+    entry: Optional[SemanticEntry],
+    record: LoraRecord,
+    query_keys: Sequence[str],
+    *,
+    allow_cjk_suffix: bool,
+) -> tuple[str, ...]:
+    """Map a trusted localized name to its adjacent romanized metadata name.
+
+    The result remains discovery-only.  Callers must exact-check it against the
+    local Danbooru ``character`` category before it can authorize identity.
+    """
+
+    facts = _trusted_semantic_character_facts(entry, record)
+    hints: list[str] = []
+    for index, fact in enumerate(facts):
+        fact_value = str(fact.value or "").strip()
+        key = _identity_key(fact_value)
+        if not _query_key_matches_identity(
+            query_keys,
+            key,
+            allow_cjk_suffix=allow_cjk_suffix,
+        ):
+            continue
+        if fact_value.isascii() and re.search(r"[A-Za-z]", fact_value):
+            # Some archives group all romanized names before all localized
+            # names. An explicitly matched ASCII fact is already the answer;
+            # borrowing its neighbour would turn ``Rio`` into ``Toki``.
+            hints.append(fact_value)
+            continue
+        # Archives list localized/romanized pairs in order.  Prefer the next
+        # ASCII fact so the previous character's romanization is never borrowed.
+        for neighbor in (index + 1, index - 1):
+            if not 0 <= neighbor < len(facts):
+                continue
+            value = str(facts[neighbor].value or "").strip()
+            if value.isascii() and re.search(r"[A-Za-z]", value):
+                hints.append(value)
+                break
+
+    if entry is not None and entry.analysis_confidence >= 0.85:
+        summary = unicodedata.normalize("NFKC", entry.analysis_summary)
+        pairs = re.findall(
+            r"([\u3400-\u9fff][\u3400-\u9fff·・]{1,20})\s*"
+            r"(?:[（(]([A-Za-z][A-Za-z0-9_ .'-]{1,40})[）)]|"
+            r"[/／]([A-Za-z][A-Za-z0-9_ .'-]{1,40}))",
+            summary,
+        )
+        for localized, parenthetical, slash_name in pairs:
+            localized_key = _identity_key(localized)
+            if _query_key_matches_identity(
+                query_keys,
+                localized_key,
+                allow_cjk_suffix=allow_cjk_suffix,
+            ):
+                hints.append(parenthetical or slash_name)
+    return _dedupe_text(hints)
+
+
+def _explicit_ascii_identity_hints(value: str) -> tuple[str, ...]:
+    """Extract bounded user-written romanized identity hints.
+
+    A parenthetical value such as ``(Viola-bang_dream!_yumemita)`` carries a
+    useful leading identity token even when the complete compound is not a
+    Danbooru canonical. These hints only select within one already-resolved
+    current LoRA record or become candidates for a later local exact check.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    raw_values: list[str] = []
+    for match in re.finditer(r"[（(]([^（）()]{1,80})[）)]", text):
+        raw = match.group(1).strip()
+        if not raw or not raw.isascii() or not re.search(r"[A-Za-z]", raw):
+            continue
+        raw_values.append(raw)
+        raw_values.extend(
+            part.strip()
+            for part in re.split(r"\s*[-–—/|]\s*", raw)
+            if part.strip() and part.strip().isascii()
+        )
+    return _dedupe_text(
+        item
+        for item in raw_values
+        if 2 <= len(_identity_key(item)) <= 80
+    )[:8]
+
+
+def character_lookup_hints_for_query(
+    records: Sequence[LoraRecord],
+    query: str,
+    semantic_index: LoraSemanticIndex,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return LoRA-derived Danbooru discovery hints for one target query.
+
+    LoRA metadata may bridge a localized name to a romanized candidate, but it
+    never authorizes identity by itself.  The caller must still require an exact
+    local Danbooru ``character`` result and use source works only as copyright
+    constraints.
+    """
+
+    try:
+        record = resolve_character_record(
+            records,
+            query,
+            semantic_index,
+            allow_equivalent_variants=True,
+        )
+    except CharacterSwapError:
+        return (), ()
+    query_keys = _query_identity_keys(query)
+    requested_work_keys = _query_explicit_work_keys(query)
+    entry = semantic_index.entry_for(record)
+    hints: list[str] = list(
+        _semantic_pair_identity_hints(
+            entry,
+            record,
+            query_keys,
+            allow_cjk_suffix=bool(requested_work_keys),
+        )
+    )
+    for fact in _trusted_semantic_character_facts(entry, record):
+        value = str(fact.value or "").strip()
+        key = _identity_key(value)
+        if (
+            value.isascii()
+            and re.search(r"[A-Za-z]", value)
+            and _query_key_matches_identity(
+                query_keys,
+                key,
+                allow_cjk_suffix=False,
+            )
+        ):
+            hints.append(value)
+    paired_keys = {_identity_key(value) for value in hints if _identity_key(value)}
+    for trigger in character_identity_trigger_candidates(record):
+        trigger_key = _identity_key(trigger)
+        if not any(key in trigger_key for key in paired_keys if len(key) >= 3):
+            continue
+        root = re.split(r"[\s_(]", trigger, maxsplit=1)[0].strip()
+        if root:
+            hints.append(root)
+    works = tuple(
+        value
+        for value in _split_names(record.source_work)
+        if _identity_key(value)
+    )
+    if _entry_is_fresh(entry, record):
+        assert entry is not None
+        works = _dedupe_text(
+            (
+                *works,
+                *(
+                    fact.value
+                    for fact in entry.effective_facts("source_works")
+                    if fact.source in {"manual", "observed"}
+                    or fact.confidence >= 0.9
+                ),
+            )
+        )
+    return _dedupe_text(hints)[:8], works[:4]
 
 
 def _bounded_edit_distance(left: str, right: str, limit: int = 1) -> int:
@@ -1687,7 +1900,14 @@ def resolve_character_record(
         best_value = ""
         for score, value in candidates:
             key = _identity_key(value)
-            if key and key in query_keys and score > best_score:
+            if (
+                _query_key_matches_identity(
+                    query_keys,
+                    key,
+                    allow_cjk_suffix=bool(requested_work_keys),
+                )
+                and score > best_score
+            ):
                 best_score = score
                 best_value = value
         if best_score:
@@ -1848,8 +2068,151 @@ def _reject_obvious_multi_subject(tags: Sequence[str]) -> None:
         )
 
 
-def _target_trigger_candidates(record: LoraRecord) -> tuple[str, ...]:
-    return _dedupe_text(record.trigger_words)
+def _semantic_alias_trigger_candidates(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex,
+    query: str,
+) -> tuple[str, ...]:
+    entry = semantic_index.entry_for(record)
+    if not _entry_is_fresh(entry, record):
+        return ()
+    assert entry is not None
+    base_query_keys = _query_identity_keys(query)
+    paired_hints = _semantic_pair_identity_hints(
+        entry,
+        record,
+        base_query_keys,
+        allow_cjk_suffix=bool(_query_explicit_work_keys(query)),
+    )
+    query_keys = tuple(
+        dict.fromkeys(
+            (
+                *base_query_keys,
+                *(
+                    key
+                    for value in _explicit_ascii_identity_hints(query)
+                    if (key := _identity_key(value))
+                ),
+                *(
+                    key
+                    for value in paired_hints
+                    if (key := _identity_key(value))
+                ),
+            )
+        )
+    )
+    work_keys = _trusted_source_work_keys(record, semantic_index)
+    candidates: list[str] = []
+    for field_name in ("character_names", "aliases"):
+        field_candidates: list[str] = []
+        for fact in entry.effective_facts(field_name):
+            if not (
+                fact.source in {"manual", "observed"}
+                or (
+                    fact.confidence >= 0.9
+                    and entry.analysis_confidence >= 0.85
+                )
+            ):
+                continue
+            value = str(fact.value or "").strip()
+            key = _identity_key(value)
+            if (
+                not value
+                or not value.isascii()
+                or key in work_keys
+                or not is_character_identity_trigger_candidate(value)
+                or not _query_key_matches_identity(
+                    query_keys,
+                    key,
+                    allow_cjk_suffix=False,
+                )
+            ):
+                continue
+            field_candidates.append(value)
+        if field_candidates:
+            candidates.extend(field_candidates)
+            # A trusted character_names match is stronger than broad archive
+            # aliases such as ``bang_dream!_yumemita``. Do not let a work or
+            # package alias create a second competing identity trigger.
+            if field_name == "character_names":
+                break
+    return _dedupe_text(candidates)
+
+
+def _target_trigger_candidates(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex,
+    query: str,
+) -> tuple[str, ...]:
+    query_keys = _query_identity_keys(query)
+    entry = semantic_index.entry_for(record)
+    paired_hints = _semantic_pair_identity_hints(
+        entry,
+        record,
+        query_keys,
+        allow_cjk_suffix=bool(_query_explicit_work_keys(query)),
+    )
+    explicit_ascii_hints = _explicit_ascii_identity_hints(query)
+    if not explicit_ascii_hints and str(query or "").isascii():
+        explicit_ascii_hints = (str(query).strip(),)
+    query_hints = explicit_ascii_hints or paired_hints or query_keys
+    selected = choose_character_identity_trigger(record, query_hints)
+    if selected:
+        selected_key = _prompt_term_key(selected)
+        all_identity_candidates = character_identity_trigger_candidates(record)
+        if len(all_identity_candidates) == 1:
+            all_terms = tuple(
+                term.replace(r"\(", "(").replace(r"\)", ")")
+                for raw in record.trigger_words
+                for term in _split_prompt_terms(raw)
+            )
+            return _dedupe_text(
+                (
+                    selected,
+                    *(term for term in all_terms if _prompt_term_key(term) != selected_key),
+                )
+            )
+        for raw in record.trigger_words:
+            terms = tuple(
+                term.replace(r"\(", "(").replace(r"\)", ")")
+                for term in _split_prompt_terms(raw)
+            )
+            if any(_prompt_term_key(term) == selected_key for term in terms):
+                return _dedupe_text(
+                    (
+                        selected,
+                        *(term for term in terms if _prompt_term_key(term) != selected_key),
+                    )
+                )
+        return (selected,)
+    semantic = _semantic_alias_trigger_candidates(record, semantic_index, query)
+    return semantic if len(semantic) == 1 else ()
+
+
+def _unrequested_multi_character_variant(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex,
+    query: str,
+    identity_trigger: str,
+) -> bool:
+    identities = character_identity_trigger_candidates(record)
+    if len(identities) <= 1:
+        return False
+    work_keys = _trusted_source_work_keys(record, semantic_index)
+    query_keys = _query_identity_keys(query)
+    qualifiers = tuple(
+        _identity_key(value)
+        for value in re.findall(r"[（(]([^（）()]{1,80})[）)]", identity_trigger)
+        if _identity_key(value)
+    )
+    variant_keys = tuple(key for key in qualifiers if key not in work_keys)
+    return bool(
+        variant_keys
+        and not any(
+            any(variant in query_key for query_key in query_keys)
+            for variant in variant_keys
+        )
+    )
 
 
 def _expectation(record: LoraRecord) -> LoraIdentityExpectation:
@@ -1957,6 +2320,37 @@ class CharacterSwapPlanner:
             )
             if not (semantic_metadata_optional or optional_lora_fallback):
                 raise
+        metadata_target_triggers = (
+            _target_trigger_candidates(
+                target_metadata,
+                self._semantic_index,
+                request.target_query,
+            )
+            if target_metadata is not None
+            else ()
+        )
+        if (
+            target_metadata is not None
+            and request.use_target_lora
+            and not request.require_target_lora
+            and metadata_target_triggers
+            and _unrequested_multi_character_variant(
+                target_metadata,
+                self._semantic_index,
+                request.target_query,
+                metadata_target_triggers[0],
+            )
+        ):
+            if fallback_target_tags:
+                target_metadata = None
+                metadata_target_triggers = ()
+            else:
+                raise CharacterSwapError(
+                    "当前唯一角色 LoRA 是多角色变体包，且其触发词包含用户未要求的变体；"
+                    "将先用该归档辅助确认 Danbooru 身份，不会直接加载错误变体",
+                    code="character_variant_lora_requires_semantic",
+                    details={"candidate_lora": target_metadata.name},
+                )
         target = target_metadata if request.use_target_lora else None
         if (
             (target is None or not request.use_target_lora)
@@ -2057,17 +2451,12 @@ class CharacterSwapPlanner:
             )
         _reject_obvious_multi_subject(tags)
 
-        metadata_target_triggers = (
-            _target_trigger_candidates(target_metadata)
-            if target_metadata is not None
-            else ()
-        )
         target_triggers = metadata_target_triggers or _dedupe_text(
             fallback_target_tags
         )
         deterministic_trigger = (
-            choose_character_identity_trigger(target)
-            if target is not None
+            metadata_target_triggers[0]
+            if target is not None and metadata_target_triggers
             else ""
         )
         if not target_triggers:
@@ -2201,6 +2590,7 @@ explanations."""
         *,
         tag_count: int,
         target_trigger_count: int,
+        deterministic_target_identity_id: Optional[int] = None,
     ) -> CharacterSwapClassification:
         payload = _strict_json_object(text)
         required = set(_CLASSIFICATION_FIELDS) | {
@@ -2262,6 +2652,23 @@ explanations."""
             target_trigger_count,
             "target_default_outfit_trigger_ids",
         )
+        if deterministic_target_identity_id is not None:
+            if not 0 <= deterministic_target_identity_id < target_trigger_count:
+                raise CharacterSwapError(
+                    "可信目标身份触发词 ID 越界",
+                    code="target_trigger_invalid",
+                )
+            target_identity_id = deterministic_target_identity_id
+            target_appearance_ids = tuple(
+                item
+                for item in target_appearance_ids
+                if item != deterministic_target_identity_id
+            )
+            target_outfit_ids = tuple(
+                item
+                for item in target_outfit_ids
+                if item != deterministic_target_identity_id
+            )
         if target_identity_id is not None and (
             target_identity_id in target_outfit_ids
             or target_identity_id in target_appearance_ids
@@ -3279,6 +3686,7 @@ __all__ = [
     "CharacterSwapRequest",
     "SWAP_MODE_KEEP_OUTFIT",
     "SWAP_MODE_TARGET_OUTFIT",
+    "character_lookup_hints_for_query",
     "fit_canvas_to_aspect_ratio",
     "is_explicit_lora_reference",
     "is_original_character_query",

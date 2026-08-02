@@ -10,6 +10,7 @@ from ..services.character_swap import (
     CharacterSwapRequest,
     SWAP_MODE_TARGET_OUTFIT,
     _is_deterministic_outfit_term,
+    character_lookup_hints_for_query,
     fit_canvas_to_aspect_ratio,
     normalize_semantic_identity_payload,
     parse_character_swap_request,
@@ -986,6 +987,233 @@ class CharacterSwapPlanningTests(unittest.TestCase):
                     wrong_plain_work.exception.code,
                     "required_target_lora_missing",
                 )
+
+    def test_rio_multi_character_variant_is_query_selected_then_semantic_by_default(
+        self,
+    ) -> None:
+        armed = _record(
+            "characters/baarmed_4in1_v1.safetensors",
+            "英美 / Eimi / 日鞠 / Himari / 莉音 / Rio / 小时 / Toki",
+            "RIO-ARMED-SHA",
+            triggers=(
+                r"himari \(armed\) \(blue archive\), white bodysuit",
+                r"eimi \(armed\) \(blue archive\), black sports bra",
+                r"rio \(armed\) \(blue archive\), black bodysuit, skin tight",
+                r"toki \(armed\) \(blue archive\), hooded jacket",
+            ),
+            source_work="Blue Archive / 碧蓝档案 / 蔚蓝档案",
+        )
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(armed.name, armed.sha256),
+            canonical_name=armed.name,
+            sha256=armed.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "llm_inferred", confidence=0.95),),
+            character_names=tuple(
+                SemanticFact(value, "llm_inferred", confidence=0.95)
+                for value in (
+                    "英美",
+                    "Eimi",
+                    "日鞠",
+                    "Himari",
+                    "莉音",
+                    "Rio",
+                    "小时",
+                    "Toki",
+                )
+            ),
+            source_works=(
+                SemanticFact("Blue Archive", "llm_inferred", confidence=0.95),
+            ),
+            analysis_summary=(
+                "《蔚蓝档案》临战 4in1，包含英美(Eimi)、日鞠(Himari)、"
+                "莉音(Rio)、小时(Toki)。"
+            ),
+            analysis_confidence=0.95,
+            source_fingerprint=armed.source_fingerprint,
+        )
+        semantic_index = LoraSemanticIndex(entries={entry.identity_key: entry})
+        planner = CharacterSwapPlanner(semantic_index)
+        records = (*self.records, armed)
+
+        identities, works = character_lookup_hints_for_query(
+            records,
+            "《BlueArchive》的调月莉音",
+            semantic_index,
+        )
+        self.assertIn("Rio", identities)
+        self.assertIn("Blue Archive", works)
+
+        explicit_identities, _ = character_lookup_hints_for_query(
+            records,
+            "《BlueArchive》的调月莉音（rio）",
+            semantic_index,
+        )
+        self.assertIn("Rio", explicit_identities)
+        self.assertNotIn("Toki", explicit_identities)
+
+        with self.assertRaises(CharacterSwapError) as raised:
+            planner.prepare(
+                CharacterSwapRequest("Shifty", "《BlueArchive》的调月莉音"),
+                positive_prompt=(
+                    "shifty_(nikke), 1girl, blue hair, buruma, solo"
+                ),
+                negative_prompt="rio_(blue_archive), low quality",
+                records=records,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "character_variant_lora_requires_semantic",
+        )
+
+        semantic_request = CharacterSwapRequest(
+            "Shifty",
+            "《BlueArchive》的调月莉音",
+            semantic_identity_confidence=1.0,
+            semantic_identity_index_verified=True,
+            semantic_identity_anchor_source="danbooru_exact",
+        )
+        preparation = planner.prepare(
+            semantic_request,
+            positive_prompt="shifty_(nikke), 1girl, blue hair, buruma, solo",
+            negative_prompt="rio_(blue_archive), low quality",
+            records=records,
+            fallback_target_tags=(
+                "rio_(blue_archive)",
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+            ),
+        )
+        self.assertIsNone(preparation.target_record)
+        classification = planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[0, 2],
+                    outfit_ids=[3],
+                    style_quality_ids=[1, 4],
+                    confidence=0.9,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+        plan = planner.finalize(preparation, classification)
+        self.assertIn(r"rio_\(blue_archive\)", plan.prompt)
+        self.assertNotIn("rio_(blue_archive)", plan.negative_prompt)
+        self.assertNotIn("baarmed", " ".join(item.name for item in plan.loras))
+
+        required = planner.prepare(
+            CharacterSwapRequest(
+                "Shifty",
+                "《BlueArchive》的调月莉音（rio）",
+                require_target_lora=True,
+            ),
+            positive_prompt="shifty_(nikke), 1girl, blue hair, buruma, solo",
+            negative_prompt="",
+            records=records,
+        )
+        self.assertIs(required.target_record, armed)
+        self.assertEqual(
+            required.deterministic_target_trigger,
+            "rio (armed) (blue archive)",
+        )
+        self.assertEqual(
+            required.target_trigger_words,
+            ("rio (armed) (blue archive)", "black bodysuit", "skin tight"),
+        )
+        repaired = planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(required.tags),
+                    source_identity_ids=[0, 2],
+                    outfit_ids=[3],
+                    style_quality_ids=[1, 4],
+                    target_identity_trigger_id=0,
+                    target_appearance_trigger_ids=[0],
+                    target_default_outfit_trigger_ids=[0, 1],
+                    confidence=0.9,
+                )
+            ),
+            tag_count=len(required.tags),
+            target_trigger_count=len(required.target_trigger_words),
+            deterministic_target_identity_id=0,
+        )
+        self.assertEqual(repaired.target_identity_trigger_id, 0)
+        self.assertEqual(repaired.target_appearance_trigger_ids, ())
+        self.assertEqual(repaired.target_default_outfit_trigger_ids, (1,))
+
+    def test_viola_compound_localized_name_uses_archived_identity_trigger(self) -> None:
+        viola = _record(
+            "characters/viola-000020.safetensors",
+            "Viola / 薇欧拉",
+            "VIOLA-SHA",
+            triggers=(),
+            source_work="梦限大Mewtype / BanG Dream!",
+        )
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(viola.name, viola.sha256),
+            canonical_name=viola.name,
+            sha256=viola.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "llm_inferred", confidence=0.96),),
+            character_names=(
+                SemanticFact("Viola", "llm_inferred", confidence=0.96),
+                SemanticFact("薇欧拉", "llm_inferred", confidence=0.96),
+            ),
+            aliases=(
+                SemanticFact("viola", "llm_inferred", confidence=0.96),
+                SemanticFact(
+                    "bang_dream!_yumemita",
+                    "llm_inferred",
+                    confidence=0.96,
+                ),
+            ),
+            source_works=(
+                SemanticFact("BanG Dream!", "llm_inferred", confidence=0.96),
+            ),
+            analysis_confidence=0.96,
+            source_fingerprint=viola.source_fingerprint,
+        )
+        planner = CharacterSwapPlanner(
+            LoraSemanticIndex(entries={entry.identity_key: entry})
+        )
+
+        preparation = planner.prepare(
+            CharacterSwapRequest(
+                "Shifty",
+                "薇欧拉-梦眠大Mewtype（Viola-bang_dream!_yumemita）",
+            ),
+            positive_prompt="shifty_(nikke), 1girl, blue hair, buruma, solo",
+            negative_prompt="",
+            records=(*self.records, viola),
+        )
+
+        self.assertIs(preparation.target_record, viola)
+        self.assertEqual(preparation.target_trigger_words, ("Viola",))
+        self.assertEqual(preparation.deterministic_target_trigger, "Viola")
+        classification = planner.parse_classification(
+            json.dumps(
+                _classification_payload(
+                    len(preparation.tags),
+                    source_identity_ids=[0, 2],
+                    outfit_ids=[3],
+                    style_quality_ids=[1, 4],
+                    confidence=0.9,
+                )
+            ),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+        plan = planner.finalize(preparation, classification)
+        self.assertIn("Viola", plan.prompt)
+        self.assertEqual(plan.target_identity_trigger, "Viola")
+        self.assertEqual(
+            [item.name for item in plan.loras],
+            ["characters/viola-000020.safetensors"],
+        )
 
     def test_uncertain_bra_does_not_collide_with_twin_braids(self) -> None:
         preparation = self.planner.prepare(

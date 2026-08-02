@@ -2,6 +2,24 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.10] - 2026-08-02
+
+### 真实 LoRA/Danbooru 短名桥接修复
+
+- 对已由可信 LoRA 归档得到的短角色名与 Copyright 作品提示，构造有限的 `character_(work)` 候选并重新通过本地 Danbooru `Character` exact 校验。`Rio + Blue Archive` 现在可直接确认 `rio_(blue_archive)`，不会因 `rio` 同时存在 Armed、Dress 等前缀结果而失败。
+- 修复多角色语义归档把显式 ASCII 角色名借用到相邻角色的问题。用户写明 `(rio)` 时只保留 Rio，不再因归档中罗马字姓名的排序方式误加入 Toki。
+- 对当前唯一可加载、已归档为角色且分析置信度足够的 LoRA，允许从可信角色名/别名中选择与用户复合中英文名称一致的单一触发词。即使本地 Danbooru 快照尚未收录新角色，`viola-000020.safetensors` 仍可使用归档中的 `Viola`，但不会放宽到其他文件或不确定身份。
+- Danbooru 四分类权限保持不变：Character 才能授权索引身份，Copyright 只构造作品限定，Artist 不参与角色命中，General 仅用于外貌/画面属性；写入 ComfyUI 的角色括号继续统一转义为 `\(` 与 `\)`。
+
+## [1.9.9] - 2026-08-02
+
+### Danbooru 四分类与多角色 LoRA 换角回归修复
+
+- 严格固定 Danbooru 的 Artist、Copyright、Character、General 边界：只有本地 `Character` exact/唯一 alias 能授权目标身份；Copyright 只约束作品，Artist 不参与角色命中，General 只补稳定外貌或其他画面属性。
+- 可信 LoRA 语义归档现在可把中文角色名桥接为有限的罗马字 discovery 候选，再交给本地 Character 索引复核。修复 `《BlueArchive》的调月莉音` 被无关 Kirino/Chise 候选阻断，以及 Viola 复合中英文名称无法命中已有 LoRA 的问题。
+- Civitai 单条 `trainedWords` 中的“角色身份, 默认服装, 细节”会先拆成独立 Tags；多角色 LoRA 必须按用户目标唯一选择对应身份，不再默认取第一个角色。用户未要求 Armed 等变体时，多角色变体包只辅助查明 canonical，默认改用普通语义身份，显式要求角色 LoRA 时才加载对应变体触发词。
+- 已由当前 LoRA 元数据唯一确定的身份 ID 会覆盖分类模型把同一 ID 重复标为外观/衣装的错误，避免无意义的两次 JSON 修复失败。索引态统一使用普通括号比较，写入 ComfyUI 时统一输出 `\(` 与 `\)`，消除正负提示词触发词一致性误报。
+
 ## [1.9.8] - 2026-08-02
 
 ### 强制角色 LoRA 与换角衣装分类热修复

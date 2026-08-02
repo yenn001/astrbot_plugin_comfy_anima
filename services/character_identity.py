@@ -114,6 +114,9 @@ def _lookup_specs(
 ) -> tuple[_LookupSpec, ...]:
     specs: list[_LookupSpec] = []
     global_works = _dedupe(work_hints)
+    safe_global_works = tuple(
+        work for raw in global_works if (work := _safe_lookup_value(raw))
+    )[:4]
 
     def add(value: str, variant: str, expected_work: str = "") -> None:
         safe = _safe_lookup_value(value)
@@ -133,14 +136,37 @@ def _lookup_specs(
         safe = _safe_lookup_value(candidate)
         if not safe:
             continue
-        expected_work = _work_qualifier(safe) or (global_works[0] if len(global_works) == 1 else "")
+        expected_work = _work_qualifier(safe) or (
+            safe_global_works[0] if len(safe_global_works) == 1 else ""
+        )
         add(safe, "provider_candidate_exact", expected_work)
         stripped, stripped_work = _strip_last_qualifier(safe)
         if stripped and stripped_work:
             add(stripped, "provider_candidate_alias_without_work", stripped_work)
+        elif "_(" not in safe:
+            # A short alias such as ``rio`` is not exact when costume variants
+            # also exist. Copyright evidence may construct bounded Character
+            # candidates, but every result is still exact-checked below.
+            for work in safe_global_works:
+                add(
+                    f"{safe}_({work})",
+                    "provider_candidate_work_qualified",
+                    work,
+                )
 
     for segment in _ascii_query_segments(target_query):
-        add(segment, "user_ascii_exact", global_works[0] if len(global_works) == 1 else "")
+        add(
+            segment,
+            "user_ascii_exact",
+            safe_global_works[0] if len(safe_global_works) == 1 else "",
+        )
+        if "_(" not in segment:
+            for work in safe_global_works:
+                add(
+                    f"{segment}_({work})",
+                    "user_ascii_work_qualified",
+                    work,
+                )
 
     deduped: list[_LookupSpec] = []
     seen: set[tuple[str, str]] = set()

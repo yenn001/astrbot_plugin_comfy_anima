@@ -153,7 +153,25 @@ class CharacterIdentityResolverTests(unittest.TestCase):
 
         self.assertTrue(result.verified)
         self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
-        self.assertEqual(result.match_variant, "local_discovery_unique_identity")
+        self.assertEqual(result.match_variant, "provider_candidate_work_qualified")
+
+    def test_short_identity_uses_only_safe_ascii_work_alias_for_exact_candidate(
+        self,
+    ) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="《BlueArchive》的调月莉音",
+            identity_candidates=("Rio",),
+            work_hints=("Blue Archive", "碧蓝档案", "蔚蓝档案"),
+            allow_discovery=False,
+        )
+
+        self.assertTrue(result.verified)
+        self.assertEqual(result.canonical_tag, "rio_(blue_archive)")
+        self.assertEqual(
+            result.match_variant,
+            "provider_candidate_work_qualified",
+        )
 
     def test_escaped_parentheses_remain_exact(self) -> None:
         result = resolve_character_identity(

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.8
+AstrBot Comfy Anima 插件 v1.9.10
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.9.8
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.8
-日期: 2026-08-01
+版本: 1.9.10
+日期: 2026-08-02
 """
 
 import asyncio
@@ -76,6 +76,7 @@ from .services.character_swap import (
     CharacterSwapPreparation,
     CharacterSwapRequest,
     SWAP_MODE_KEEP_OUTFIT,
+    character_lookup_hints_for_query,
     fit_canvas_to_aspect_ratio,
     is_explicit_lora_reference,
     is_original_character_query,
@@ -106,7 +107,7 @@ from .services.danbooru_character_profile import (
     build_character_appearance_profile,
 )
 from .services.experimental_profiles import inspect_experimental_profiles
-from .services.lora_catalog import LoraCatalogError, LoraCatalogService
+from .services.lora_catalog import LoraCatalogError, LoraCatalogService, LoraRecord
 from .services.lora_retrieval import LoraHybridSearchService
 from .services.lora_snapshot import LoraOperationSnapshot, record_identity
 from .services.lora_analysis import (
@@ -4880,6 +4881,9 @@ QQ快捷指令:
                         target_trigger_count=len(
                             preparation.target_trigger_words
                         ),
+                        deterministic_target_identity_id=(
+                            0 if preparation.deterministic_target_trigger else None
+                        ),
                     )
                 except CharacterSwapError as exc:
                     last_error = exc
@@ -5136,16 +5140,29 @@ QQ快捷指令:
         target_query: str,
         expansion_mode: str = "standard",
         appearance_override_text: str = "",
+        records: tuple[LoraRecord, ...] = (),
     ) -> tuple[tuple[str, ...], str, dict[str, Any]]:
         """Generate bounded ordinary identity tags when no target LoRA exists."""
 
         tag_index = getattr(self, "_danbooru_index", None)
         if tag_index is not None and not is_original_character_query(target_query):
+            local_identity_candidates: tuple[str, ...] = ()
+            local_work_hints: tuple[str, ...] = ()
+            if records:
+                local_identity_candidates, local_work_hints = (
+                    character_lookup_hints_for_query(
+                        records,
+                        target_query,
+                        self._runtime_semantic_index(),
+                    )
+                )
             try:
                 local_resolution = await asyncio.to_thread(
                     resolve_character_identity,
                     tag_index,
                     target_query=target_query,
+                    identity_candidates=local_identity_candidates,
+                    work_hints=local_work_hints,
                     allow_discovery=False,
                 )
             except (DanbooruIndexError, OSError, RuntimeError, ValueError):
@@ -5252,6 +5269,11 @@ QQ快捷指令:
             "romanized names, common Danbooru aliases or canonical spellings for only the "
             "same requested character; include the unqualified full name when known. "
             "work_hints must contain zero to four ASCII Danbooru copyright/work tags. "
+            "Respect Danbooru categories strictly: canonical_identity_tag and "
+            "identity_candidates are Character tags; work_hints are Copyright tags; "
+            "appearance_tags are General tags. Artist, Copyright, and General tags "
+            "must never be used as a character identity. Return ordinary parentheses "
+            "in JSON; the plugin will render every prompt parenthesis as \\( and \\). "
             "Never include a different character merely as a possibility. The local "
             "Danbooru character index will exact-check every candidate and reject conflicts. "
             "For a known character, the canonical tag is always primary. Return "
@@ -5635,6 +5657,7 @@ QQ快捷指令:
                 "ambiguous_character",
                 "semantic_target_tags_missing",
                 "missing_target_trigger",
+                "character_variant_lora_requires_semantic",
             }
         )
 
@@ -5951,6 +5974,7 @@ QQ快捷指令:
                             effective_request.target_query,
                             effective_request.prompt_expansion_mode,
                             effective_request.edit_requirement,
+                            records,
                         )
                     )
                     effective_request = replace(

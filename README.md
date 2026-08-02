@@ -1,8 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.8
+> 当前版本：v1.9.10
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
+
+v1.9.10 补齐真实库中的短角色名与作品限定桥接：`Rio + Blue Archive` 会先构造并 exact 校验 `rio_(blue_archive)`，不会被 Rio 的多个服装变体阻断；显式 `(rio)` 不再串到相邻角色 Toki；最新 Danbooru 尚未收录的 Viola 仍可由当前唯一可加载 LoRA 与高置信语义归档选出 `Viola` 触发词。Danbooru Artist、Copyright、Character、General 的权限边界与 ComfyUI 括号转义保持不变。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 

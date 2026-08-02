@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.9.8
+AstrBot Comfy Anima 插件 v1.9.10
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.9.8
+版本: 1.9.10
 日期: 2026-08-01
 """
 
@@ -150,7 +150,7 @@ RUNTIME_OVERRIDE = """
 24. 区分“生成后放大”和“放大已有图片”：前者可选择 rtx 生图管线，后者属于独立 RTX 图片工具，不能伪造成 pic。区分“新画一个穿红裙的角色”、无蒙版整图重绘和遮罩局部重绘：普通生图与整图语义重绘输出 pic；只有原图与有效遮罩齐全的局部修改才输出 edit。整图语义重绘会由插件明确标记，必须承认它是重新生成而非像素级修改。
 25. 先在内部锁定唯一操作类型，再规划提示词。不要把 base、rtx、iterative、quick、lanpaint、放大倍率、遮罩位置或“修改/替换/重绘”等操作指令写进视觉 prompt。
 26. 当用户内容明确标记“无蒙版整图语义重绘”时，未明确指定风格组合就不得自动套用默认风格001；应使用反推得到的可观察画风和色调。只有用户明确点名风格组合时才查询并应用对应预设。
-27. 本地 Danbooru 索引状态会由运行时附加。只有本次工具列表真实包含 `search_anima_danbooru_tags` 时才可调用；对不确定的角色、作品、画师、服装或姿势 canonical tag，优先合并为一次有界查询。exact canonical 或 unique alias 且 `verified=true` 才是已确认结果；prefix、keyword、fuzzy 只用于发现候选，必须再用 canonical tag 做 exact 查询后才能采用。常见且确定的 general tag 不要逐项查询，避免工具风暴。
+27. 本地 Danbooru 索引状态会由运行时附加。只有本次工具列表真实包含 `search_anima_danbooru_tags` 时才可调用；对不确定的角色、作品、画师、服装或姿势 canonical tag，优先合并为一次有界查询。严格区分 Artist、Copyright、Character、General：只有 Character exact/unique alias 可授权角色身份，Copyright 只约束作品，Artist 只表示画师，General 只表示外貌、服装、动作、构图或场景。exact canonical 或 unique alias 且 `verified=true` 才是已确认结果；prefix、keyword、fuzzy 只用于发现候选，必须再用 canonical tag 做 exact 查询后才能采用。写入最终 prompt 时，Danbooru tag 内普通括号必须转义为 `\\(` 与 `\\)`；常见且确定的 General tag 不要逐项查询，避免工具风暴。
 28. `--llm c`、`--llmcc` 与 `--lcc` 仅属于 `/画图`、`/画图no` 的专用文字换角解析器；普通分镜不得自行模拟或触发。该专用链会先删除旧角色姓名与稳定外貌，再保留未被覆盖的服装、动作、表情、视线、构图、背景和风格；目标 LoRA 缺失时可用纯语义 Tags，显式文件请求或跨身份歧义不得猜选。
 """.strip()
 
