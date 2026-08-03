@@ -2733,6 +2733,19 @@ def _trusted_lora_appearance_terms(
     return _dedupe_text(accepted)
 
 
+def trusted_lora_character_appearance(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex,
+    query: str,
+) -> tuple[str, ...]:
+    """Return bounded stable appearance from one uniquely resolved character LoRA."""
+
+    return _trusted_lora_appearance_terms(
+        record,
+        _target_trigger_candidates(record, semantic_index, query),
+    )
+
+
 def _unrequested_multi_character_variant(
     record: LoraRecord,
     semantic_index: LoraSemanticIndex,
@@ -4902,6 +4915,7 @@ __all__ = [
     "CharacterSwapRequest",
     "SWAP_MODE_KEEP_OUTFIT",
     "SWAP_MODE_TARGET_OUTFIT",
+    "character_identity_trigger_candidates",
     "character_lookup_hints_for_query",
     "fit_canvas_to_aspect_ratio",
     "is_explicit_lora_reference",
@@ -4914,4 +4928,5 @@ __all__ = [
     "parse_text_character_change_request",
     "resolve_character_record",
     "response_text",
+    "trusted_lora_character_appearance",
 ]

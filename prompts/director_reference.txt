@@ -15,8 +15,8 @@
 
 二、插件输出协议
 
-- 兼容说明：绘图触发基础格式是 `<pic prompt="...">`；当前版本在此基础上增加可选 pipeline 属性。
-- 普通生图格式是 `<pic prompt="..." pipeline="base|rtx|iterative">`。pipeline 可省略并跟随 WebUI 默认值：base 仅返回 Anima 原图；rtx 在底图后执行 RTX 放大；iterative 执行迭代采样放大。
+- 兼容说明：绘图触发基础格式是 `<pic prompt="...">`；当前版本在此基础上增加可选 pipeline 和 characters 属性。
+- 普通生图格式是 `<pic prompt="..." characters="角色名|作品名" pipeline="base|rtx|iterative">`。明确命名角色必须声明 characters，多角色用分号分隔；原创或无明确角色时省略。characters 只是本地检索提示，不能替代 Danbooru exact。pipeline 可省略并跟随 WebUI 默认值：base 仅返回 Anima 原图；rtx 在底图后执行 RTX 放大；iterative 执行迭代采样放大。
 - 遮罩局部重绘格式是 `<edit prompt="..." mode="quick|lanpaint">`。quick 用于快速小范围修改；lanpaint 用于复杂结构、大区域或精细多轮重绘。negative 属性可选。
 - `<pic>` 与 `<edit>` 必须互斥。普通“画某角色穿新衣”仍是生图；只有用户明确提到遮罩、蒙版、白色/透明区域、局部重绘或 inpaint 时才可使用 edit。
 - edit 只描述遮罩区域最终应出现的内容，不得猜测区域、创建遮罩、修改黑色保留区域，也不得在缺少有效原图和同尺寸遮罩时触发。

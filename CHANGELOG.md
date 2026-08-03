@@ -2,6 +2,17 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.19] - 2026-08-03
+
+### 全图 LLM 角色证据编译
+
+- 新增统一的提交前角色编译器。自然语言绘图、`/画图 --llm`/Ultra、普通聊天 `<pic>`、反推画图、无蒙版整图改图、底图控制和带 LLM 追加要求的 Prompt Plan 均使用同一角色校验阶段；纯 `/画图` 原始 Tags 与局部遮罩重绘不强制改写。
+- `<pic>`、JSON 与请求内 `emit_anima_plan_v1` 新增可选 `characters` 身份声明。声明仅作为查询提示，最终必须由本地 Danbooru Character exact 或唯一别名确认；Copyright 只负责作品限定，模糊、跨作品冲突和虚构 canonical 均在 ComfyUI 提交前停止。
+- 最终正面提示词中的 Character/Copyright Tags 会再次批量 exact 扫描。角色 canonical 统一转义并放回主体锚点附近，错误角色和错误作品被移除；即使 LLM 忘记声明角色，只要最终 Tags 能 exact 命中仍会进入校验。
+- 单角色外貌只接受公开安全级 Danbooru Gallery 共现档案、当前唯一角色 LoRA 的原子稳定外貌，以及用户明确指定的覆盖。未经证据支持的发型、发色、发饰、瞳色、耳型、体型和独特身体特征会删除，冲突关系句与负面角色特征同步清理。
+- 多角色仅执行逐身份 canonical 与错误 Character/Copyright 清理，不做无法安全绑定人物的全局外貌删除。当前角色 LoRA 仍只是可选增强，文件存在和触发词来自每次任务的最新 Manager/ComfyUI 快照。
+- 任务中心新增 `llm_character_validation_*` 与 `llm_character_prompt_compiled` 阶段事件，只记录来源、数量、证据类型和覆盖槽位，不保存原始提示词、Provider 原文或隐私内容。
+
 ## [1.9.18] - 2026-08-03
 
 ### 混合提示词换角与反推协议隔离

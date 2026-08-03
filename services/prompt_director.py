@@ -1,12 +1,12 @@
 """
-AstrBot Comfy Anima 插件 v1.9.18
+AstrBot Comfy Anima 插件 v1.9.19
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.9.18
+版本: 1.9.19
 日期: 2026-08-01
 """
 
@@ -49,6 +49,10 @@ _NEGATIVE_ATTR_RE = re.compile(
 )
 _PIPELINE_ATTR_RE = re.compile(
     r"\bpipeline\s*=\s*([\"'])(.*?)\1",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_CHARACTERS_ATTR_RE = re.compile(
+    r"\bcharacters\s*=\s*([\"'])(.*?)\1",
     flags=re.IGNORECASE | re.DOTALL,
 )
 _MODE_ATTR_RE = re.compile(
@@ -117,7 +121,7 @@ RUNTIME_OVERRIDE = """
 请从用户提供的剧情或描述中只选择一个最值得定格的视觉核心，优先保证镜头、动作几何、
 角色外观连续性与生成稳定性。参考规范用于指导你的导演思路，但本次调用的输出协议覆盖参考规范：
 
-1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅当用户明确指定生成管线时增加 `pipeline="base|rtx|iterative"`；仅在确有需要时增加可选的 `negative="..."` 属性，`prompt` 属性始终必需。
+1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅当用户明确指定生成管线时增加 `pipeline="base|rtx|iterative"`；仅在确有需要时增加可选的 `negative="..."` 属性。画面包含明确命名角色时必须增加 `characters="角色名|作品名"`，多人用分号分隔；原创或无明确角色时省略。`prompt` 属性始终必需。
 2. prompt 必须是单行英文混合提示词，并在内部按三层规划：hard tags → 少量 visual phrases → 英文句号后的一个 scene sentence；这句话属于 prompt 本身，不是额外回复。negative 仍是单行英文 tags。
    - hard tags 负责离散可控事实：人数、角色、作品、可见外观、服装、动作、表情、镜头、场景和光线。
    - visual phrases 只补充可见但难用单一 tag 表达的情绪后果、环境联动、材质或动势；不得与 hard tags 重复。
@@ -152,6 +156,7 @@ RUNTIME_OVERRIDE = """
 26. 当用户内容明确标记“无蒙版整图语义重绘”时，未明确指定风格组合就不得自动套用默认风格001；应使用反推得到的可观察画风和色调。只有用户明确点名风格组合时才查询并应用对应预设。
 27. 本地 Danbooru 索引状态会由运行时附加。只有本次工具列表真实包含 `search_anima_danbooru_tags` 时才可调用；对不确定的角色、作品、画师、服装或姿势 canonical tag，优先合并为一次有界查询。严格区分 Artist、Copyright、Character、General：只有 Character exact/unique alias 可授权角色身份，Copyright 只约束作品，Artist 只表示画师，General 只表示外貌、服装、动作、构图或场景。exact canonical 或 unique alias 且 `verified=true` 才是已确认结果；prefix、keyword、fuzzy 只用于发现候选，必须再用 canonical tag 做 exact 查询后才能采用。写入最终 prompt 时，Danbooru tag 内普通括号必须转义为 `\\(` 与 `\\)`；常见且确定的 General tag 不要逐项查询，避免工具风暴。
 28. `--llm c`、`--llmcc` 与 `--lcc` 仅属于 `/画图`、`/画图no` 的专用文字换角解析器；普通分镜不得自行模拟或触发。该专用链会先删除旧角色姓名与稳定外貌，再保留未被覆盖的服装、动作、表情、视线、构图、背景和风格；目标 LoRA 缺失时可用纯语义 Tags，显式文件请求或跨身份歧义不得猜选。
+29. `characters` 只是给插件的身份检索声明，不是身份授权。角色名优先写模型所知的 Danbooru canonical；不确定时写“用户角色名|作品名”，不得编造作品或外貌。插件会在提交前用本地 Danbooru Character/Copyright exact 证据重新矫正角色，并删除未经证据支持的发色、发型、瞳色、体型等猜测。
 """.strip()
 
 
@@ -178,6 +183,7 @@ class PictureResponse:
     text: str
     negative_prompts: tuple[str, ...] = ()
     pipelines: tuple[str, ...] = ()
+    character_queries: tuple[tuple[str, ...], ...] = ()
     edits: tuple["EditInstruction", ...] = ()
 
 
@@ -188,6 +194,7 @@ class PictureInstruction:
     prompt: str
     negative_prompt: str = ""
     pipeline: str = ""
+    character_queries: tuple[str, ...] = ()
     diagnostic_id: str = ""
     diagnostics: PromptDiagnostics | None = None
 
@@ -245,6 +252,7 @@ class PromptDirector:
             prompt=composed.positive_prompt,
             negative_prompt=composed.negative_prompt,
             pipeline=instruction.pipeline,
+            character_queries=instruction.character_queries,
             diagnostic_id=composed.diagnostic_id,
             diagnostics=composed.diagnostics,
         )
@@ -453,12 +461,14 @@ class PromptDirector:
                 "English hybrid Anima prompt in positive_tags: ordered Danbooru/Anima "
                 "tags, then a period, then one concise present-tense scene sentence. "
                 "The sentence belongs inside positive_tags; do not add any text outside "
-                "the function arguments."
+                "the function arguments. When the image contains explicitly named "
+                "characters, also return characters as an array of `name|work` hints; "
+                "omit it for original or unnamed subjects."
             )
         elif structured_mode == "json":
             user_prompt += (
                 "\n\nReturn exactly one JSON object with positive_tags, negative_tags "
-                "and pipeline fields."
+                "pipeline and optional characters fields."
             )
         base_system_prompt = self._system_prompt() + "\n\n" + expansion_instruction
         system_prompt = base_system_prompt
@@ -624,6 +634,7 @@ class PromptDirector:
                             payload.get("negative_prompt", payload.get("negative", "")),
                         )
                         pipeline = payload.get("pipeline", "")
+                        characters = payload.get("characters", ())
                         if not isinstance(positive, str) or not positive.strip():
                             raise PromptDirectorError(
                                 "结构化分镜缺少 positive_tags",
@@ -641,6 +652,9 @@ class PromptDirector:
                                 prompt=self._normalize_prompt(positive),
                                 negative_prompt=self._normalize_negative_prompt(negative),
                                 pipeline=self._normalize_pipeline(pipeline),
+                                character_queries=self._normalize_character_queries(
+                                    characters
+                                ),
                             ),
                             provider_id=provider_id,
                         )
@@ -953,6 +967,7 @@ class PromptDirector:
             return instructions[0]
         prompt = ""
         negative_prompt = ""
+        character_queries: tuple[str, ...] = ()
         parsed: Any = None
         try:
             parsed = json.loads(text)
@@ -966,6 +981,9 @@ class PromptDirector:
                     negative_prompt = parsed["negative_prompt"]
                 elif isinstance(parsed.get("negative_tags"), str):
                     negative_prompt = parsed["negative_tags"]
+                character_queries = PromptDirector._normalize_character_queries(
+                    parsed.get("characters")
+                )
         except json.JSONDecodeError:
             pass
         if not prompt and strict_protocol:
@@ -992,6 +1010,7 @@ class PromptDirector:
                 if isinstance(parsed, dict) and parsed.get("pipeline") is not None
                 else ""
             ),
+            character_queries=character_queries,
         )
 
     @staticmethod
@@ -1013,6 +1032,7 @@ class PromptDirector:
                 continue
             negative_match = _NEGATIVE_ATTR_RE.search(attributes)
             pipeline_match = _PIPELINE_ATTR_RE.search(attributes)
+            characters_match = _CHARACTERS_ATTR_RE.search(attributes)
             negative_prompt = (
                 PromptDirector._normalize_negative_prompt(negative_match.group(2))
                 if negative_match
@@ -1025,6 +1045,9 @@ class PromptDirector:
                     pipeline=PromptDirector._normalize_pipeline(
                         pipeline_match.group(2)
                     ) if pipeline_match else "",
+                    character_queries=PromptDirector._normalize_character_queries(
+                        characters_match.group(2) if characters_match else None
+                    ),
                 )
             )
             if max_prompts is not None and len(instructions) >= max_prompts:
@@ -1143,6 +1166,7 @@ class PromptDirector:
             text=PromptDirector.clean_response_text(model_output),
             negative_prompts=tuple(item.negative_prompt for item in instructions),
             pipelines=tuple(item.pipeline for item in instructions),
+            character_queries=tuple(item.character_queries for item in instructions),
             edits=tuple(edits),
         )
 
@@ -1165,6 +1189,35 @@ class PromptDirector:
         if normalized is None:
             raise PromptDirectorError("LLM 返回了未知生成管线")
         return normalized
+
+    @staticmethod
+    def _normalize_character_queries(value: Any) -> tuple[str, ...]:
+        """Normalize bounded character identity hints without authorizing them."""
+
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            values = re.split(r"[;；\r\n]+", value)
+        elif isinstance(value, (list, tuple)):
+            values = value
+        else:
+            raise PromptDirectorError("LLM 返回了无效的角色声明字段")
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            item = re.sub(r"\s+", " ", str(raw or "")).strip(" ,;；")
+            if not item:
+                continue
+            if len(item) > 160:
+                raise PromptDirectorError("LLM 返回的单个角色声明过长")
+            key = item.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+            if len(result) > 4:
+                raise PromptDirectorError("单张图最多声明 4 个明确角色")
+        return tuple(result)
 
     @staticmethod
     def _normalize_inpaint_mode(value: Any) -> str:

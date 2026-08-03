@@ -806,6 +806,10 @@ class GenerationOptions:
     ] = ()
     semantic_forbidden_positive_terms: tuple[str, ...] = ()
     semantic_preserved_positive_terms: tuple[str, ...] = ()
+    validate_llm_characters: bool = False
+    llm_character_queries: tuple[str, ...] = ()
+    llm_character_user_request: str = ""
+    llm_prompt_source: str = ""
 
 
 @dataclass(frozen=True)

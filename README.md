@@ -1,10 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.18
+> 当前版本：v1.9.19
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
-v1.9.18 修复混合 Tags、英文画面句与中文换角要求被参数解析压平成一行的问题，并将 Provider 作品名安全归一到本地 Danbooru Copyright canonical。像流萤这类本地已有精确角色索引的请求会直接走确定性的角色特征替换路径，不再把复合伪 Tags 交给 LLM 猜测。所有图片反推入口也在完整首次调用和修复重试期间隔离普通聊天绘图协议；换角仍有未决项时，首次错误会直接显示最多三个具体词。
+v1.9.19 将换角系统的角色证据边界扩展到所有全图 LLM 生图。自然语言、`/画图 --llm`、普通聊天 `<pic>`、反推画图、整图改图、底图控制和带 LLM 增量的 Prompt Plan 都会在提交 ComfyUI 前，用最新 LoRA 快照与本地 Danbooru Character/Copyright exact 重新确认角色；未经 Gallery 或可信 LoRA 原子证据支持的发型、发色、瞳色、体型等模型猜测会被删除。纯 `/画图` 原始 Tags 与局部遮罩重绘保持原有行为。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 
@@ -351,7 +351,7 @@ RTX 两条路径还需要满足 NVIDIA RTX 节点上游对显卡、驱动和运�
 开启 `enable_llm_pic_trigger` 后，普通角色扮演或对话模型可以用控制标签触发图片：
 
 ```xml
-<pic prompt="1girl, close-up, rain, blue eyes, wet hair, looking at viewer. She looks toward the viewer as rain runs through her wet hair beneath the cold streetlight." pipeline="rtx" negative="text, watermark">
+<pic prompt="1girl, rio \(blue_archive\), close-up, rain, looking at viewer. Rio looks toward the viewer as rain catches the cold streetlight." characters="Rio|Blue Archive" pipeline="rtx" negative="text, watermark">
 ```
 
 明确的遮罩重绘请求可使用：
@@ -360,7 +360,7 @@ RTX 两条路径还需要满足 NVIDIA RTX 节点上游对显卡、驱动和运�
 <edit prompt="red evening dress, detailed fabric" mode="quick" negative="school uniform">
 ```
 
-`<pic>` 与 `<edit>` 互斥；`<think>...</think>` 中的标签不会执行。插件还会检查真实图片、遮罩、权限、风控、管线和 LoRA 清单，模型输出并不直接获得任意工作流控制权。
+`<pic>` 与 `<edit>` 互斥；`<think>...</think>` 中的标签不会执行。明确命名角色必须增加 `characters="角色名|作品名"`，多人用分号分隔。该属性只是检索提示：插件仍会用本地 Danbooru Character/Copyright exact、Gallery 稳定外貌与最新 LoRA 快照重新校验和矫正。插件还会检查真实图片、遮罩、权限、风控、管线和 LoRA 清单，模型输出并不直接获得任意工作流控制权。
 
 通过这些入口生成的提示词会进入 Prompt Composer v2；直接 Tags 命令只有显式添加 `--llm` 时才进入 Composer。Composer 只做本地分层、去重、冲突检查和确定性负面词补充，不展示或保存模型的思维过程。
 
@@ -670,7 +670,7 @@ Manager 元数据不代表 ComfyUI 当前能加载该文件。检查 `/object_in
 
 ### 自然语言能聊天但不出图
 
-检查 `enable_natural_draw`、绘图思考模型、全局锁定、群白名单、冷却和违禁级别。普通 LLM 回复自动出图还要求 `enable_llm_pic_trigger=true`，并且最终回复包含合法的 `<pic prompt="...">`。
+检查 `enable_natural_draw`、绘图思考模型、全局锁定、群白名单、冷却和违禁级别。普通 LLM 回复自动出图还要求 `enable_llm_pic_trigger=true`，并且最终回复包含合法的 `<pic prompt="...">`；若画面有明确角色，还应包含 `characters="角色名|作品名"`。角色声明或最终 Character Tag 无法被本地 Danbooru exact 确认时会安全停止，不会把模型猜测提交给 ComfyUI。
 
 ### `/反推` 或图片换角无法读取图片
 

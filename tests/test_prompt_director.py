@@ -68,6 +68,21 @@ class PictureResponseParserTests(unittest.TestCase):
         self.assertEqual(parsed.prompts, ("first scene",))
         self.assertEqual(parsed.text, "开始生成。 完成。")
 
+    def test_pic_character_declarations_are_preserved_per_image(self) -> None:
+        parsed = PromptDirector.parse_picture_response(
+            '<pic prompt="1girl, rio, stage" characters="Rio|Blue Archive">'
+            '<pic prompt="1girl, firefly, classroom" '
+            'characters="Firefly|Honkai: Star Rail">'
+        )
+
+        self.assertEqual(
+            parsed.character_queries,
+            (
+                ("Rio|Blue Archive",),
+                ("Firefly|Honkai: Star Rail",),
+            ),
+        )
+
     def test_unclosed_think_block_is_hidden(self) -> None:
         """未闭合的 think 块也不应泄露或触发其中的标签。"""
         output = '可见正文。<think>隐藏 <pic prompt="secret draft">'
@@ -664,6 +679,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                             "positive_tags": "1girl, orange sunset",
                             "negative_tags": "lowres",
                             "pipeline": "base",
+                            "characters": ["Rio|Blue Archive"],
                         },
                     },
                 )()
@@ -681,6 +697,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(instruction.prompt, "1girl, orange sunset")
         self.assertEqual(instruction.negative_prompt, "lowres")
         self.assertEqual(instruction.pipeline, "base")
+        self.assertEqual(instruction.character_queries, ("Rio|Blue Archive",))
 
     async def test_function_call_request_requires_hybrid_prompt_inside_arguments(
         self,

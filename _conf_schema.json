@@ -170,7 +170,7 @@
   "enable_llm_pic_trigger": {
     "description": "启用 LLM 回复中的 pic 标签触发",
     "type": "bool",
-    "hint": "从普通对话回复中提取 <pic prompt=\"...\"> 并自动生成图片",
+    "hint": "从普通对话回复中提取 <pic prompt=\"...\"> 并自动生成图片；明确角色建议同时输出 characters=\"角色名|作品名\"，插件会在提交前进行 Danbooru exact 校验",
     "default": true
   },
   "enable_reverse_prompt": {
@@ -245,7 +245,7 @@
   "auto_draw_system_prompt": {
     "description": "绘图 System Prompt",
     "type": "text",
-    "hint": "留空使用插件内置分镜导演；自定义内容会叠加在插件运行时约束之后。需要出图时必须保留合法 <pic prompt=\"英文 tags\">；换装等场景可选 negative=\"英文 tags\"。不得要求普通聊天自行启用 --llm c/--llmcc/--lcc 专用文字换角模式",
+    "hint": "留空使用插件内置分镜导演；自定义内容会叠加在插件运行时约束之后。需要出图时必须保留合法 <pic prompt=\"英文 tags\">；明确角色需增加 characters=\"角色名|作品名\"，换装等场景可选 negative=\"英文 tags\"。不得要求普通聊天自行启用 --llm c/--llmcc/--lcc 专用文字换角模式",
     "default": "",
     "editor_mode": true,
     "editor_language": "markdown"

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.18
+AstrBot Comfy Anima 插件 v1.9.19
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.18
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.18
+版本: 1.9.19
 日期: 2026-08-02
 """
 
@@ -76,6 +76,7 @@ from .services.character_swap import (
     CharacterSwapPreparation,
     CharacterSwapRequest,
     SWAP_MODE_KEEP_OUTFIT,
+    character_identity_trigger_candidates,
     character_lookup_hints_for_query,
     fit_canvas_to_aspect_ratio,
     is_explicit_lora_reference,
@@ -86,12 +87,20 @@ from .services.character_swap import (
     parse_character_swap_request,
     parse_natural_character_swap,
     parse_text_character_change_request,
+    resolve_character_record,
     response_text as character_swap_response_text,
+    trusted_lora_character_appearance,
 )
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
 from .services.character_identity import (
     character_identity_lookup_candidates,
     resolve_character_identity,
+)
+from .services.character_prompt_compiler import (
+    CharacterPromptCompileError,
+    CharacterPromptEvidence,
+    compile_character_prompt,
+    split_character_validation_terms,
 )
 from .services.control_modes import (
     CONTROL_MODES,
@@ -188,7 +197,7 @@ from .services.web_ui import WebUiActionError, WebUiError, WebUiService
 AUTO_DRAW_CONTROL_PROTOCOL = """
 AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）：
 - 先把用户目标归入唯一操作：从文字新生成图片、无蒙版整图语义重绘、修改现有图片的遮罩区域、语义换角、仅放大现有图片。不要因为都与图片有关就一律输出 pic。
-- 普通生图最终使用 `<pic prompt="英文 Anima 混合提示词" pipeline="base|rtx|iterative">`；negative 属性可选。prompt 内部先规划确定的 hard tags，再放少量可见 visual phrases，最后用英文句号分隔一句简短自然语言关系描述；同一事实不要跨层重复。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
+- 普通生图最终使用 `<pic prompt="英文 Anima 混合提示词" pipeline="base|rtx|iterative">`；negative 属性可选。画面包含明确命名角色时必须增加 `characters="角色名|作品名"`，多人用分号分隔；原创或无明确角色时省略。prompt 内部先规划确定的 hard tags，再放少量可见 visual phrases，最后用英文句号分隔一句简短自然语言关系描述；同一事实不要跨层重复。base=原图不放大，rtx=Anima 后 RTX 放大，iterative=Anima 后迭代采样放大。用户未明确指定时省略 pipeline，由插件使用 WebUI 当前默认管线。
 - 输出前先消解人数、景别、机位、姿势、朝向和昼夜等明确冲突；negative 只针对本次多人接触、手持物、全身足部、极端透视或复杂衣料风险，不能加入角色身份、作品或 LoRA。
 - 只有用户明确要求修改已提供图片的遮罩区域时，才使用 `<edit prompt="遮罩区域目标英文 tags" mode="quick|lanpaint">`；negative 属性可选。quick 适合快速小范围修改，lanpaint 适合复杂结构和精细多轮重绘。
 - `<pic>` 与 `<edit>` 互斥；不要同时输出。不要在 `<think>` 内输出控制标签。
@@ -208,6 +217,7 @@ AstrBot Comfy Anima 强制控制协议（不能被其他 System Prompt 覆盖）
 - 目标明确为原创角色时，根据用户给出的发色、瞳色、耳型、物种、体型、痣等事实建立协调的稳定身份档案；不得把原角色未指定的外貌偷渡给原创角色。
 - LoRA 文件名只能来自本次工具返回；插件会在提交前强制刷新并复核 LoRA Manager 与 ComfyUI。
 - 插件可能提供 `search_anima_danbooru_tags` 只读工具和本地 Danbooru 索引。对不确定的角色、作品、画师、服装或姿势 canonical tag，优先一次批量查询；只有 exact canonical 或 unique alias 且 `verified=true` 才能当作已确认标签。prefix、keyword、fuzzy 只是候选，必须再 exact 确认。常见且确定的 general tag 不要逐个查询；工具不可用时不得声称已经查库。
+- `characters` 只是身份检索声明，不是授权。不得用模型记忆编造角色外貌；插件会在提交前用本地 Character/Copyright exact 与公开安全级 Gallery/可信 LoRA 原子证据重新矫正，删除未经证据支持的发型、发色、瞳色、体型等特征。
 - 管理员说“用方案 P-XXXXXX/某方案画图”时，先调用 `list_anima_prompt_plans`。先用 detail=false 查找真实 ID；唯一确认后再用 detail=true 读取完整正负提示词和管线。不得编造方案 ID、名称或内容。读取成功后把方案 positive_prompt 原样作为 `<pic prompt>` 基础，negative_prompt 放入 negative，除非用户明确覆盖管线，否则沿用方案 pipeline。
 - `emit_anima_plan_v1` 是插件内部绘图导演的私有输出协议，不是普通对话工具。普通对话绝对不要调用或提及它；需要生图时必须在最终可见回复中输出合法 `<pic>` 标签，等待插件接管并真正提交 ComfyUI。
 """.strip()
@@ -1648,6 +1658,12 @@ class ComfyAnimaPlugin(Star):
             pipeline = (
                 parsed.pipelines[index] if index < len(parsed.pipelines) else ""
             )
+            parsed_character_queries = getattr(parsed, "character_queries", ())
+            character_queries = (
+                parsed_character_queries[index]
+                if index < len(parsed_character_queries)
+                else ()
+            )
             compose_picture = getattr(
                 self._director,
                 "compose_picture_instruction",
@@ -1663,6 +1679,7 @@ class ComfyAnimaPlugin(Star):
                             prompt=prompt,
                             negative_prompt=negative_prompt,
                             pipeline=pipeline,
+                            character_queries=character_queries,
                         ),
                         source="conversation_pic",
                     )
@@ -1677,6 +1694,7 @@ class ComfyAnimaPlugin(Star):
                 prompt = instruction.prompt
                 negative_prompt = instruction.negative_prompt
                 pipeline = instruction.pipeline
+                character_queries = getattr(instruction, "character_queries", ())
             access_error = self._access_error(event, prompt)
             if access_error:
                 new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {access_error}"))
@@ -1699,6 +1717,10 @@ class ComfyAnimaPlugin(Star):
                         lora_preset=style_preset,
                         negative_prompt=negative_prompt,
                         pipeline=pipeline,
+                        validate_llm_characters=True,
+                        llm_character_queries=character_queries,
+                        llm_character_user_request=str(event.message_str or ""),
+                        llm_prompt_source="conversation_pic",
                     ),
                 )
             except ValueError as exc:
@@ -2128,6 +2150,12 @@ class ComfyAnimaPlugin(Star):
                         lora_preset=style_preset,
                         negative_prompt=directed_negative,
                         pipeline=selected_pipeline,
+                        validate_llm_characters=True,
+                        llm_character_queries=getattr(
+                            instruction, "character_queries", ()
+                        ),
+                        llm_character_user_request=message,
+                        llm_prompt_source="natural_language_draw",
                     ),
                 )
                 self._add_pre_generation_llm_timing(
@@ -2321,6 +2349,7 @@ class ComfyAnimaPlugin(Star):
         director_provider = ""
         director_elapsed = 0.0
         director_calls = 0
+        director_character_queries: tuple[str, ...] = ()
         requested_pipeline = ""
         width, height = overrides.width, overrides.height
         preset_name = overrides.lora_preset
@@ -2390,6 +2419,9 @@ class ComfyAnimaPlugin(Star):
                     return
                 final_prompt = instruction.prompt
                 directed_negative = instruction.negative_prompt.strip(" ,")
+                director_character_queries = getattr(
+                    instruction, "character_queries", ()
+                )
             if len(final_prompt) > self.settings.max_prompt_length:
                 yield event.plain_result(
                     f"{MessageEmoji.ERROR} 调整后的方案提示词超过当前上限 "
@@ -2449,6 +2481,12 @@ class ComfyAnimaPlugin(Star):
                         or str(plan.get("pipeline") or "base")
                     ),
                     denoise=overrides.denoise,
+                    validate_llm_characters=bool(
+                        user_delta and overrides.use_prompt_llm is not False
+                    ),
+                    llm_character_queries=director_character_queries,
+                    llm_character_user_request=user_delta,
+                    llm_prompt_source="prompt_plan_delta",
                 ),
             )
             self._add_pre_generation_llm_timing(
@@ -2874,6 +2912,12 @@ class ComfyAnimaPlugin(Star):
                         ),
                         use_prompt_llm=False,
                         suppress_default_style=(not bool(style_preset)),
+                        validate_llm_characters=True,
+                        llm_character_queries=getattr(
+                            instruction, "character_queries", ()
+                        ),
+                        llm_character_user_request=reverse_requirement,
+                        llm_prompt_source="reverse_draw",
                     ),
                     event,
                     **conditioning_kwargs,
@@ -3307,6 +3351,12 @@ class ComfyAnimaPlugin(Star):
                         semantic_preserved_positive_terms=(
                             edit_contract.preserved_source_terms
                         ),
+                        validate_llm_characters=True,
+                        llm_character_queries=getattr(
+                            instruction, "character_queries", ()
+                        ),
+                        llm_character_user_request=requirement,
+                        llm_prompt_source="semantic_redraw",
                     ),
                     event,
                     img2img_image_name=uploaded.workflow_value,
@@ -5132,6 +5182,260 @@ QQ快捷指令:
             },
         )
         return profile
+
+    @staticmethod
+    def _split_character_query_hint(value: str) -> tuple[str, str]:
+        """Split one bounded ``name|work`` declaration from the drawing director."""
+
+        raw = re.sub(r"\s+", " ", str(value or "")).strip(" ;；")
+        if not raw:
+            return "", ""
+        name, separator, work = raw.partition("|")
+        return name.strip(), work.strip() if separator else ""
+
+    async def _compile_llm_character_prompt(
+        self,
+        job: GenerationJob,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        character_queries: tuple[str, ...],
+        user_request: str,
+        records: tuple[LoraRecord, ...],
+        source: str,
+    ) -> tuple[str, str]:
+        """Verify and correct named characters before a workflow is submitted."""
+
+        index = getattr(self, "_danbooru_index", None)
+        declared_queries = tuple(
+            dict.fromkeys(
+                item
+                for raw in character_queries
+                if (item := re.sub(r"\s+", " ", str(raw or "")).strip())
+            )
+        )[:4]
+        if index is None or not self._danbooru_index_ready():
+            if declared_queries:
+                raise CharacterPromptCompileError(
+                    "本地 Danbooru 索引尚未就绪，无法安全确认 LLM 声明的角色身份",
+                    code="danbooru_index_unavailable",
+                )
+            self._record_image_task_phase(
+                job,
+                "character_validation",
+                "本地 Danbooru 索引未就绪；本次没有角色声明，跳过角色编译。",
+                "llm_character_validation_index_unavailable",
+                level="WARNING",
+                details={"source": source or "unknown"},
+            )
+            return prompt, negative_prompt
+
+        terms = split_character_validation_terms(prompt)
+        try:
+            character_lookups, copyright_lookups = await asyncio.gather(
+                asyncio.to_thread(index.lookup_many, terms, "character"),
+                asyncio.to_thread(index.lookup_many, terms, "copyright"),
+            )
+        except (DanbooruIndexError, OSError, RuntimeError, ValueError) as exc:
+            raise CharacterPromptCompileError(
+                "本地 Danbooru 角色校验失败，已停止且不会提交 ComfyUI",
+                code="danbooru_lookup_failed",
+                details={"error_type": type(exc).__name__},
+            ) from exc
+
+        prompt_character_terms: list[tuple[str, str]] = []
+        prompt_copyright_terms: list[tuple[str, str]] = []
+        prompt_character_canonicals: list[str] = []
+        for term, lookup in zip(terms, character_lookups):
+            if bool(getattr(lookup, "verified", False)):
+                canonical = normalize_tag(
+                    str(
+                        getattr(lookup, "canonical_tag", "")
+                        or getattr(lookup, "tag", "")
+                        or ""
+                    )
+                )
+                if not canonical:
+                    continue
+                prompt_character_terms.append((term, canonical))
+                prompt_character_canonicals.append(canonical)
+        for term, lookup in zip(terms, copyright_lookups):
+            if bool(getattr(lookup, "verified", False)):
+                canonical = normalize_tag(
+                    str(
+                        getattr(lookup, "canonical_tag", "")
+                        or getattr(lookup, "tag", "")
+                        or ""
+                    )
+                )
+                if not canonical:
+                    continue
+                prompt_copyright_terms.append((term, canonical))
+
+        resolution_inputs: list[tuple[str, str, str]] = []
+        for raw in declared_queries:
+            name, work = self._split_character_query_hint(raw)
+            if name:
+                resolution_inputs.append((raw, name, work))
+        if not resolution_inputs:
+            for canonical in dict.fromkeys(prompt_character_canonicals):
+                resolution_inputs.append((canonical, canonical, ""))
+        if not resolution_inputs:
+            self._record_image_task_phase(
+                job,
+                "character_validation",
+                "LLM 最终提示词未声明或 exact 命中明确角色；无需角色编译。",
+                "llm_character_validation_not_required",
+                details={"source": source or "unknown", "prompt_term_count": len(terms)},
+            )
+            return prompt, negative_prompt
+
+        semantic_index = self._runtime_semantic_index()
+        resolved_rows: list[tuple[str, str, Any, tuple[str, ...], tuple[str, ...]]] = []
+        for raw, name, explicit_work in resolution_inputs:
+            record_query = f"《{explicit_work}》的{name}" if explicit_work else name
+            identity_candidates, work_hints = character_lookup_hints_for_query(
+                records,
+                record_query,
+                semantic_index,
+            )
+            if explicit_work:
+                work_hints = tuple(dict.fromkeys((*work_hints, explicit_work)))
+            canonical_hint = ""
+            normalized_name = normalize_tag(name)
+            for term, canonical in prompt_character_terms:
+                if normalized_name in {normalize_tag(term), normalize_tag(canonical)}:
+                    canonical_hint = canonical
+                    break
+            try:
+                resolution = await asyncio.to_thread(
+                    resolve_character_identity,
+                    index,
+                    target_query=name,
+                    canonical_tag=canonical_hint,
+                    identity_candidates=identity_candidates,
+                    work_hints=work_hints,
+                    allow_discovery=False,
+                )
+            except (DanbooruIndexError, OSError, RuntimeError, ValueError) as exc:
+                raise CharacterPromptCompileError(
+                    f"角色“{name}”的本地 Danbooru 校验失败，已停止生成",
+                    code="character_resolution_failed",
+                    details={"error_type": type(exc).__name__},
+                ) from exc
+            if resolution.ambiguous:
+                raise CharacterPromptCompileError(
+                    f"角色“{name}”在本地 Danbooru 中命中多个身份，请补充准确作品名",
+                    code="character_resolution_ambiguous",
+                    details={"candidate_count": resolution.candidate_count},
+                )
+            if not resolution.verified:
+                raise CharacterPromptCompileError(
+                    f"无法在本地 Danbooru Character 索引中 exact 确认角色“{name}”",
+                    code="character_resolution_unverified",
+                    details={"query_count": resolution.query_count},
+                )
+            resolved_rows.append(
+                (raw, resolution.canonical_tag, resolution, identity_candidates, work_hints)
+            )
+
+        canonical_rows: dict[str, tuple[str, Any, tuple[str, ...], tuple[str, ...]]] = {}
+        for raw, canonical, resolution, identity_candidates, work_hints in resolved_rows:
+            canonical_rows.setdefault(
+                normalize_tag(canonical),
+                (raw, resolution, identity_candidates, work_hints),
+            )
+            declared_name, _declared_work = self._split_character_query_hint(raw)
+            normalized_declared_name = normalize_tag(declared_name)
+            for term in terms:
+                if (
+                    normalized_declared_name
+                    and normalize_tag(term) == normalized_declared_name
+                    and (term, canonical) not in prompt_character_terms
+                ):
+                    prompt_character_terms.append((term, canonical))
+        if len(canonical_rows) > 4:
+            raise CharacterPromptCompileError(
+                "单张图解析出了过多不同角色身份，已停止生成",
+                code="too_many_character_identities",
+                details={"character_count": len(canonical_rows)},
+            )
+
+        evidences: list[CharacterPromptEvidence] = []
+        single_character = len(canonical_rows) == 1
+        for canonical, (raw, resolution, _identity_candidates, _work_hints) in (
+            canonical_rows.items()
+        ):
+            appearance_terms: list[str] = []
+            appearance_sources: list[str] = []
+            if single_character:
+                profile = await self._resolve_character_appearance_profile(job, canonical)
+                if profile is not None:
+                    appearance_terms.extend(profile.appearance_tags)
+                    if profile.appearance_tags:
+                        appearance_sources.append(profile.source)
+                name, explicit_work = self._split_character_query_hint(raw)
+                record_query = (
+                    f"《{explicit_work}》的{name}" if explicit_work else name
+                )
+                try:
+                    record = resolve_character_record(
+                        records,
+                        record_query,
+                        semantic_index,
+                        allow_equivalent_variants=True,
+                    )
+                except CharacterSwapError:
+                    record = None
+                if record is not None:
+                    lora_terms = trusted_lora_character_appearance(
+                        record,
+                        semantic_index,
+                        record_query,
+                    )
+                    appearance_terms.extend(lora_terms)
+                    if lora_terms:
+                        appearance_sources.append(
+                            "civitai_trained_words"
+                            if record.from_civitai
+                            else "lora_manager_triggers"
+                        )
+            evidences.append(
+                CharacterPromptEvidence(
+                    query=raw,
+                    canonical_tag=canonical,
+                    appearance_terms=tuple(dict.fromkeys(appearance_terms)),
+                    appearance_source="+".join(dict.fromkeys(appearance_sources)),
+                    match_variant=resolution.match_variant,
+                    query_count=resolution.query_count,
+                    candidate_count=resolution.candidate_count,
+                )
+            )
+
+        compilation = compile_character_prompt(
+            prompt,
+            negative_prompt,
+            tuple(evidences),
+            prompt_character_terms=tuple(prompt_character_terms),
+            prompt_copyright_terms=tuple(prompt_copyright_terms),
+            user_request=user_request,
+        )
+        self._record_image_task_phase(
+            job,
+            "character_validation",
+            "LLM 角色身份已通过本地 Danbooru exact 校验并完成提示词矫正。",
+            "llm_character_prompt_compiled",
+            details={
+                "source": source or "unknown",
+                "character_count": len(compilation.canonical_tags),
+                "removed_term_count": len(compilation.removed_terms),
+                "added_term_count": len(compilation.added_terms),
+                "dropped_relation_count": len(compilation.dropped_relation_terms),
+                "override_categories": list(compilation.override_categories),
+                "appearance_sources": list(compilation.appearance_sources),
+            },
+        )
+        return compilation.prompt, compilation.negative_prompt
 
     async def _resolve_character_evidence_without_provider(
         self,
@@ -7605,6 +7909,16 @@ QQ快捷指令:
                         "pipeline": {
                             "type": "string",
                             "description": "Optional base, rtx or iterative pipeline.",
+                        },
+                        "characters": {
+                            "type": "array",
+                            "description": (
+                                "Optional explicitly named character identity hints. "
+                                "Use `name|work` when the work is known; omit for "
+                                "original or unnamed subjects."
+                            ),
+                            "items": {"type": "string", "minLength": 1},
+                            "maxItems": 4,
                         },
                     },
                     "required": ["positive_tags"],
@@ -13802,6 +14116,7 @@ QQ快捷指令:
         provider_id = ""
         director_negative = ""
         director_pipeline = ""
+        director_character_queries = options.llm_character_queries
         director_warning: Optional[str] = None
         provider_error_code = PromptDirector.provider_error_code(effective_prompt)
         if provider_error_code:
@@ -13856,6 +14171,9 @@ QQ快捷指令:
                         effective_prompt = instruction.prompt
                         director_negative = instruction.negative_prompt
                         director_pipeline = instruction.pipeline
+                        director_character_queries = getattr(
+                            instruction, "character_queries", ()
+                        )
                     except PromptDirectorError as exc:
                         if (
                             exc.fatal
@@ -14100,6 +14418,39 @@ QQ快捷指令:
                         suppressed_terms=options.suppressed_prompt_terms,
                     )
                     clean_prompt = trigger_plan.prompt
+                    if options.validate_llm_characters or use_llm:
+                        validation_queries = list(director_character_queries)
+                        for selection in dynamic_loras:
+                            record = resolved_record_for(selection.name)
+                            if record is None:
+                                continue
+                            role = str(record.category or "").casefold()
+                            if role != "character" and not record.character_name:
+                                continue
+                            identity_triggers = character_identity_trigger_candidates(
+                                record
+                            )
+                            if len(identity_triggers) == 1:
+                                validation_queries.append(identity_triggers[0])
+                        clean_prompt, combined_negative = (
+                            await self._compile_llm_character_prompt(
+                                job,
+                                prompt=clean_prompt,
+                                negative_prompt=combined_negative,
+                                character_queries=tuple(
+                                    dict.fromkeys(validation_queries)
+                                ),
+                                user_request=(
+                                    options.llm_character_user_request
+                                    or options.prompt
+                                ),
+                                records=snapshot_records,
+                                source=(
+                                    options.llm_prompt_source
+                                    or ("inline_director" if use_llm else "llm_prompt")
+                                ),
+                            )
+                        )
                     semantic_issues = validate_semantic_prompt(
                         clean_prompt,
                         required_groups=(
@@ -14140,9 +14491,19 @@ QQ快捷指令:
                         raise LoraWorkflowError(
                             f"最终提示词被风控拒绝：{final_access_error}"
                         )
-                except (LoraWorkflowError, LoraCatalogError, LoraPresetError) as exc:
+                except (
+                    CharacterPromptCompileError,
+                    LoraWorkflowError,
+                    LoraCatalogError,
+                    LoraPresetError,
+                ) as exc:
                     message = getattr(exc, "user_message", str(exc))
-                    raise WorkflowError(f"动态 LoRA 处理失败: {message}") from exc
+                    prefix = (
+                        "LLM 角色校验失败"
+                        if isinstance(exc, CharacterPromptCompileError)
+                        else "动态 LoRA 处理失败"
+                    )
+                    raise WorkflowError(f"{prefix}: {message}") from exc
 
                 effective_options = replace(
                     options,

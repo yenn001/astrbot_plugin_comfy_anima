@@ -16,7 +16,9 @@ from unittest.mock import AsyncMock, Mock
 from PIL import Image
 
 from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
-from ..services.danbooru_index import DanbooruTagIndex
+from ..services.character_prompt_compiler import CharacterPromptCompileError
+from ..services.danbooru_character_profile import CharacterAppearanceProfile
+from ..services.danbooru_index import DanbooruTagIndex, TagLookup, normalize_tag
 from ..services.lora_catalog import LoraRecord
 from ..services.lora_semantic import (
     LoraSemanticIndex,
@@ -116,6 +118,51 @@ def _install_astrbot_stubs() -> None:
             "astrbot.api.message_components": components,
         }
     )
+
+
+class _ExactCharacterIndex:
+    """Small exact Character/Copyright index for pre-submit validation tests."""
+
+    _rows = {
+        "rio": ("rio_(blue_archive)", "character"),
+        "rio_(blue_archive)": ("rio_(blue_archive)", "character"),
+        "blue_archive": ("blue_archive", "copyright"),
+        "honkai:_star_rail": ("honkai:_star_rail", "copyright"),
+    }
+
+    @staticmethod
+    def status() -> dict[str, object]:
+        return {"ready": True}
+
+    def lookup_many(
+        self,
+        values: object,
+        category: str = "",
+    ) -> tuple[TagLookup, ...]:
+        results = []
+        for value in values:  # type: ignore[union-attr]
+            query = str(value or "")
+            normalized = normalize_tag(query)
+            canonical, row_category = self._rows.get(normalized, ("", ""))
+            if category and row_category != category:
+                canonical = ""
+                row_category = ""
+            results.append(
+                TagLookup(
+                    query=query,
+                    normalized_query=normalized,
+                    tag=canonical,
+                    canonical_tag=canonical,
+                    category=row_category,
+                    match_type="exact" if canonical else "none",
+                    verified=bool(canonical),
+                    provenance={},
+                )
+            )
+        return tuple(results)
+
+    def lookup(self, value: str, category: str = "") -> TagLookup:
+        return self.lookup_many((value,), category)[0]
 
 
 class MainCompatibilityTests(unittest.TestCase):
@@ -1020,6 +1067,99 @@ class MainCompatibilityTests(unittest.TestCase):
 
         self.assertIsNotNone(plugin._access_error(Event(False), "cat"))
         self.assertIsNone(plugin._access_error(Event(True), "cat"))
+
+    def _llm_character_validation_plugin(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = _ExactCharacterIndex()
+        plugin._danbooru_index_ready = lambda: True
+        plugin._runtime_semantic_index = LoraSemanticIndex.empty
+        events = []
+        plugin._record_image_task_phase = (
+            lambda *args, **kwargs: events.append((*args, kwargs))
+        )
+
+        async def profile(_job, canonical):
+            if canonical != "rio_(blue_archive)":
+                return None
+            return CharacterAppearanceProfile(
+                canonical_tag=canonical,
+                appearance_tags=("black hair", "red eyes", "long hair", "halo"),
+                support=(
+                    ("black hair", 0.99),
+                    ("red eyes", 0.98),
+                    ("long hair", 0.95),
+                    ("halo", 0.9),
+                ),
+                sample_count=80,
+                fetched_at=time.time(),
+            )
+
+        plugin._resolve_character_appearance_profile = profile
+        return plugin, events
+
+    def test_llm_character_prompt_is_exact_corrected_before_submit(self) -> None:
+        plugin, events = self._llm_character_validation_plugin()
+        prompt, negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt=(
+                    "1girl, rio, honkai:_star_rail, white hair, blue eyes, "
+                    "school uniform, stage"
+                ),
+                negative_prompt="red eyes, bad hands",
+                character_queries=("Rio|Blue Archive",),
+                user_request="画碧蓝档案的调月莉音穿校服",
+                records=(),
+                source="test",
+            )
+        )
+
+        self.assertIn(r"rio_\(blue_archive\)", prompt)
+        self.assertNotIn(", rio,", f", {prompt},")
+        self.assertIn("black hair", prompt)
+        self.assertIn("red eyes", prompt)
+        self.assertNotIn("white hair", prompt)
+        self.assertNotIn("blue eyes", prompt)
+        self.assertNotIn("honkai:_star_rail", prompt)
+        self.assertNotIn("red eyes", negative)
+        self.assertIn("bad hands", negative)
+        self.assertTrue(
+            any("llm_character_prompt_compiled" in event for event in events)
+        )
+
+    def test_llm_prompt_without_character_is_left_unchanged(self) -> None:
+        plugin, _events = self._llm_character_validation_plugin()
+        prompt, negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt="1girl, original character, green hair, forest",
+                negative_prompt="bad hands",
+                character_queries=(),
+                user_request="画一个原创角色",
+                records=(),
+                source="test",
+            )
+        )
+
+        self.assertEqual(prompt, "1girl, original character, green hair, forest")
+        self.assertEqual(negative, "bad hands")
+
+    def test_unverified_llm_character_declaration_fails_closed(self) -> None:
+        plugin, _events = self._llm_character_validation_plugin()
+        with self.assertRaises(CharacterPromptCompileError) as raised:
+            asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt="1girl, invented_person, portrait",
+                    negative_prompt="",
+                    character_queries=("Invented Person|Unknown Work",),
+                    user_request="画 Invented Person",
+                    records=(),
+                    source="test",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "character_resolution_unverified")
 
 
 class HelpTextTests(unittest.IsolatedAsyncioTestCase):
