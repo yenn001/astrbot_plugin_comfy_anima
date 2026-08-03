@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.17
+AstrBot Comfy Anima 插件 v1.9.18
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.17
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.17
+版本: 1.9.18
 日期: 2026-08-02
 """
 
@@ -2555,7 +2555,7 @@ class ComfyAnimaPlugin(Star):
                     )
 
                 async with self._provider_slot():
-                    result, provider_id = await self._reverse_prompt.reverse(
+                    result, provider_id = await self._call_reverse_prompt(
                         self.context,
                         event,
                         image_path,
@@ -2750,7 +2750,7 @@ class ComfyAnimaPlugin(Star):
                 async with self._provider_slot():
                     reverse_result, reverse_provider = await self._timed_llm_call(
                         job,
-                        self._reverse_prompt.reverse(
+                        self._call_reverse_prompt(
                             self.context,
                             event,
                             image_path,
@@ -3154,7 +3154,7 @@ class ComfyAnimaPlugin(Star):
                 async with self._provider_slot():
                     reverse_result, reverse_provider = await self._timed_llm_call(
                         job,
-                        self._reverse_prompt.reverse(
+                        self._call_reverse_prompt(
                             self.context,
                             event,
                             image_path,
@@ -6106,7 +6106,7 @@ QQ快捷指令:
                         reverse_result, reverse_provider = (
                             await self._timed_llm_call(
                                 job,
-                                self._reverse_prompt.reverse(
+                                self._call_reverse_prompt(
                                     self.context,
                                     event,
                                     image_path,
@@ -6526,7 +6526,7 @@ QQ快捷指令:
                 try:
                     plan = planner.finalize(preparation, classification)
                 except CharacterSwapError as exc:
-                    if effective_request.preview and exc.code == "uncertain_tags":
+                    if exc.code == "uncertain_tags":
                         remaining_ids = tuple(
                             int(index)
                             for index in exc.details.get(
@@ -6540,14 +6540,32 @@ QQ快捷指令:
                             preparation.tags[index]
                             for index in remaining_ids
                         )
-                        preview = "、".join(unresolved[:12]) or "未知"
+                        visible_terms = tuple(
+                            str(term).strip()[:160]
+                            for term in unresolved[: (12 if effective_request.preview else 3)]
+                            if str(term).strip()
+                        )
+                        preview = "、".join(visible_terms) or "未知"
                         raise CharacterSwapError(
-                            "换角预览发现仍无法安全归类的 Tags："
-                            f"{preview}。这些内容不会提交 ComfyUI。",
-                            code="uncertain_tags_preview",
+                            (
+                                "换角预览发现仍无法安全归类的 Tags："
+                                if effective_request.preview
+                                else "换角已停止；仍无法安全归类的 Tags："
+                            )
+                            + f"{preview}。"
+                            + (
+                                "这些内容不会提交 ComfyUI。"
+                                if effective_request.preview
+                                else "请将复合句拆成逗号分隔的原子 Tags，或使用 --preview 查看完整边界。"
+                            ),
+                            code=(
+                                "uncertain_tags_preview"
+                                if effective_request.preview
+                                else "uncertain_tags"
+                            ),
                             details={
                                 **dict(exc.details),
-                                "preview_term_count": len(unresolved),
+                                "visible_term_count": len(visible_terms),
                             },
                         ) from exc
                     raise
@@ -7212,6 +7230,49 @@ QQ快捷指令:
             )
         yield self._make_image_result(event, image_paths, seed, forward=forward)
         self._schedule_cleanup(image_paths)
+
+    @asynccontextmanager
+    async def _internal_llm_request_scope(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[None, None]:
+        """Prevent ordinary-chat prompt injection during internal LLM work."""
+
+        internal_events = getattr(self, "_internal_llm_events", None)
+        if internal_events is None:
+            internal_events = set()
+            self._internal_llm_events = internal_events
+        event_key = id(event)
+        already_guarded = event_key in internal_events
+        internal_events.add(event_key)
+        try:
+            yield
+        finally:
+            if not already_guarded:
+                internal_events.discard(event_key)
+
+    async def _call_reverse_prompt(
+        self,
+        context: Any,
+        event: AstrMessageEvent,
+        image_path: Path,
+        supplement: str = "",
+        progress: Any = None,
+        profile: str = "full",
+    ) -> tuple[Any, str]:
+        """Run the complete reverse call and repair window as internal LLM work."""
+
+        if self._reverse_prompt is None:
+            raise ReversePromptError("在线反推功能未启用", code="reverse_disabled")
+        async with self._internal_llm_request_scope(event):
+            return await self._reverse_prompt.reverse(
+                context,
+                event,
+                image_path,
+                supplement,
+                progress,
+                profile=profile,
+            )
 
     async def _generate_directed_prompt(
         self,
@@ -13331,7 +13392,7 @@ QQ快捷指令:
                 async with self._provider_slot():
                     reverse_result, reverse_provider = await self._timed_llm_call(
                         job,
-                        self._reverse_prompt.reverse(
+                        self._call_reverse_prompt(
                             self.context,
                             event,
                             source,

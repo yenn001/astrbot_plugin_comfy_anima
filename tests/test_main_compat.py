@@ -2439,7 +2439,7 @@ class GenerationTimingAccountingTests(unittest.IsolatedAsyncioTestCase):
         job = self.main.GenerationJob("u", "preview", 1.0)
         result = await self.main.ComfyAnimaPlugin._timed_llm_call(
             job,
-            asyncio.sleep(0.01, result="ok"),
+            asyncio.sleep(0.03, result="ok"),
         )
         self.assertEqual(result, "ok")
         self.assertEqual(job.llm_call_count, 1)
@@ -3713,6 +3713,7 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             lookups,
             [
+                ("wuthering_waves", "copyright"),
                 ("jinhsi_(wuthering_waves)", "character"),
                 ("jinhsi", "character"),
             ],
@@ -4294,6 +4295,50 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(seen, [True])
+        self.assertNotIn(id(event), plugin._internal_llm_events)
+
+    async def test_reverse_call_keeps_both_attempts_out_of_auto_draw_injection(
+        self,
+    ) -> None:
+        seen = []
+        system_prompts = []
+
+        class ReverseService:
+            async def reverse(
+                inner_self,
+                _context,
+                current_event,
+                _image_path,
+                _supplement,
+                _progress,
+                *,
+                profile,
+            ):
+                for _attempt in (1, 2):
+                    seen.append(id(current_event) in plugin._internal_llm_events)
+                    request = types.SimpleNamespace(system_prompt="reverse-json-only")
+                    await plugin.inject_auto_draw_prompt(current_event, request)
+                    system_prompts.append(request.system_prompt)
+                return object(), f"vision-{profile}"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._reverse_prompt = ReverseService()
+        plugin._internal_llm_events = set()
+        plugin.settings = types.SimpleNamespace(enable_llm_pic_trigger=True)
+        event = object()
+
+        _result, provider_id = await plugin._call_reverse_prompt(
+            object(),
+            event,
+            Path("input.png"),
+            "focus",
+            None,
+            profile="swap",
+        )
+
+        self.assertEqual(provider_id, "vision-swap")
+        self.assertEqual(seen, [True, True])
+        self.assertEqual(system_prompts, ["reverse-json-only", "reverse-json-only"])
         self.assertNotIn(id(event), plugin._internal_llm_events)
 
     async def test_invalid_json_confidence_and_control_tags_fail_closed(self) -> None:

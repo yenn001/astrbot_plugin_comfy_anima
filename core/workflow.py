@@ -1,19 +1,19 @@
 """
-AstrBot Comfy Anima 插件 v1.9.17
+AstrBot Comfy Anima 插件 v1.9.18
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.9.17
+版本: 1.9.18
 日期: 2026-08-01
 """
 
 import copy
 import json
 import secrets
-import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,27 +38,259 @@ class WorkflowError(ValueError):
     """工作流格式或节点映射无效。"""
 
 
-def _split_generation_command_tokens(command_text: str) -> list[str]:
+@dataclass(frozen=True, slots=True)
+class _GenerationCommandToken:
+    """One parsed command token and its exact location in the source text."""
+
+    value: str
+    start: int
+    end: int
+
+
+def _tokenize_generation_command(command_text: str) -> list[_GenerationCommandToken]:
     """Split command options without treating prompt apostrophes as shell quotes.
 
     Danbooru/Anima tags commonly contain English possessives such as
-    ``worm's eye view``. POSIX shlex treats the apostrophe in that bare token as
-    an opening quote and raises ``No closing quotation``. Non-POSIX mode keeps
-    apostrophes and backslashes literal while still grouping values wrapped in
-    matching single or double quotes.
+    ``worm's eye view``. A quote starts a grouped token only when it is the
+    token's first character, so apostrophes and Danbooru backslashes remain
+    literal. Source spans are retained because option removal must not flatten
+    a hybrid prompt's original Tag and visual-sentence layers.
     """
 
-    try:
-        raw_tokens = shlex.split(command_text, posix=False)
-    except ValueError as exc:
-        raise ValueError(f"参数引号不完整: {exc}") from exc
-    tokens: list[str] = []
-    for token in raw_tokens:
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
-            tokens.append(token[1:-1])
+    tokens: list[_GenerationCommandToken] = []
+    length = len(command_text)
+    index = 0
+    while index < length:
+        while index < length and command_text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+
+        start = index
+        quote = command_text[index] if command_text[index] in {'"', "'"} else ""
+        if quote:
+            index += 1
+            value_start = index
+            while index < length and command_text[index] != quote:
+                index += 1
+            if index >= length:
+                raise ValueError("参数引号不完整: No closing quotation")
+            value = command_text[value_start:index]
+            index += 1
+            end = index
         else:
-            tokens.append(token)
+            while index < length and not command_text[index].isspace():
+                index += 1
+            end = index
+            value = command_text[start:end]
+        tokens.append(_GenerationCommandToken(value=value, start=start, end=end))
     return tokens
+
+
+def _split_generation_command_tokens(command_text: str) -> list[str]:
+    """Return command token values while preserving legacy parser semantics."""
+
+    return [token.value for token in _tokenize_generation_command(command_text)]
+
+
+_SOURCE_VALUE_OPTIONS = frozenset(
+    {
+        "--negative",
+        "--n",
+        "--seed",
+        "--sd",
+        "--size",
+        "--sz",
+        "--steps",
+        "--st",
+        "--cfg",
+        "--c",
+        "--pipeline",
+        "--p",
+        "--denoise",
+        "--d",
+        "--preset",
+        "--lora-preset",
+        "--pr",
+    }
+)
+_SOURCE_FLAG_OPTIONS = frozenset(
+    {
+        "--upscale",
+        "--u",
+        "--no-upscale",
+        "--nu",
+        "--raw",
+        "--no-llm",
+        "--r",
+    }
+)
+_SOURCE_LLM_OPTIONS = frozenset(
+    {"--llm", "--l", "--llmcc", "--lcc", "--llm-character-change"}
+)
+_SOURCE_LLM_EXPANSION_VALUES = frozenset(
+    {
+        "s",
+        "standard",
+        "normal",
+        "普通",
+        "简洁",
+        "u",
+        "ultra",
+        "complex",
+        "ornate",
+        "复杂",
+        "华丽",
+        "高质量",
+    }
+)
+_SOURCE_CHARACTER_CHANGE_VALUES = frozenset(
+    {
+        "c",
+        "cc",
+        "char-change",
+        "char_change",
+        "character-change",
+        "character_change",
+    }
+)
+_SOURCE_CONTROL_OPTIONS = frozenset({"--m", "--control", "--control-mode"})
+_SOURCE_CHARACTER_SWAP_MODE_VALUES = frozenset(
+    {"k", "keep-outfit", "t", "target-outfit"}
+)
+
+
+def _is_generation_control_value(value: str) -> bool:
+    """Ask the canonical alias normalizer whether one value is a control mode."""
+
+    try:
+        normalized = normalize_command_aliases(
+            ("--control-mode", value),
+            context=CONTEXT_GENERATION,
+        )
+    except ValueError:
+        return False
+    return bool(normalized and normalized[0] == "--control-mode")
+
+
+def _source_prompt_token_indexes(
+    tokens: list[_GenerationCommandToken],
+    *,
+    mode_context: str,
+    character_change_requested: bool,
+) -> list[int]:
+    """Return source-token indexes that belong to the prompt, not options."""
+
+    prompt_indexes: list[int] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index].value.casefold()
+        if not token.startswith("--"):
+            prompt_indexes.append(index)
+            index += 1
+            continue
+
+        if token in _SOURCE_VALUE_OPTIONS:
+            index += 2
+            continue
+        if token in _SOURCE_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in _SOURCE_LLM_OPTIONS:
+            index += 1
+            while index < len(tokens) and not tokens[index].value.startswith("--"):
+                value = tokens[index].value.strip().casefold()
+                if value in _SOURCE_LLM_EXPANSION_VALUES:
+                    index += 1
+                    continue
+                if mode_context == "generation" and value in _SOURCE_CHARACTER_CHANGE_VALUES:
+                    index += 1
+                    continue
+                if (
+                    mode_context == "generation"
+                    and value == "char"
+                    and index + 1 < len(tokens)
+                    and tokens[index + 1].value.strip().casefold() == "change"
+                ):
+                    index += 2
+                    continue
+                break
+            continue
+
+        if mode_context == "generation" and token in _SOURCE_CONTROL_OPTIONS:
+            if (
+                token == "--m"
+                and character_change_requested
+                and index + 1 < len(tokens)
+                and tokens[index + 1].value.strip().casefold()
+                in _SOURCE_CHARACTER_SWAP_MODE_VALUES
+            ):
+                index += 2
+                continue
+            index += 1
+            while index < len(tokens) and _is_generation_control_value(
+                tokens[index].value
+            ):
+                index += 1
+            continue
+
+        if token in {"--mode", "--m"} and mode_context != "generation":
+            index += 2
+            continue
+        if character_change_requested and token in {
+            "--mode",
+            "--swap-mode",
+            "--weight",
+            "--swap-weight",
+            "--w",
+        }:
+            index += 2
+            continue
+        if character_change_requested and token in {
+            "--preview",
+            "--swap-preview",
+            "--v",
+            "--no-character-lora",
+            "--no-lora",
+            "--nl",
+            "--swap-no-character-lora",
+        }:
+            index += 1
+            continue
+
+        # The owning parser reports unknown options before reconstruction.
+        index += 1
+    return prompt_indexes
+
+
+def _removed_option_separator(source: str) -> str:
+    """Collapse only whitespace surrounding removed options, preserving layers."""
+
+    if "\n" in source or "\r" in source:
+        return "\n"
+    return " " if any(character.isspace() for character in source) else ""
+
+
+def _rebuild_generation_prompt(
+    command_text: str,
+    tokens: list[_GenerationCommandToken],
+    prompt_indexes: list[int],
+) -> str:
+    """Rebuild prompt tokens with their original inter-token layout intact."""
+
+    if not prompt_indexes:
+        return ""
+    parts = [tokens[prompt_indexes[0]].value]
+    previous_index = prompt_indexes[0]
+    for token_index in prompt_indexes[1:]:
+        previous = tokens[previous_index]
+        current = tokens[token_index]
+        separator = command_text[previous.end : current.start]
+        if token_index != previous_index + 1:
+            separator = _removed_option_separator(separator)
+        parts.extend((separator, current.value))
+        previous_index = token_index
+    return "".join(parts).strip()
 
 
 class WorkflowBuilder:
@@ -884,7 +1116,8 @@ def parse_generation_options(
     ``semantic_redraw`` 时，`--mode` 改为解析 preserve/balanced/free。
     含空格的负面词需要使用引号。
     """
-    tokens = _split_generation_command_tokens(command_text)
+    source_tokens = _tokenize_generation_command(command_text)
+    tokens = [token.value for token in source_tokens]
     alias_context = {
         "generation": CONTEXT_GENERATION,
         "inpaint": CONTEXT_INPAINT,
@@ -1126,7 +1359,17 @@ def parse_generation_options(
             prompt_parts.append(token)
         index += 1
 
-    prompt = " ".join(prompt_parts).strip()
+    prompt_indexes = _source_prompt_token_indexes(
+        source_tokens,
+        mode_context=mode_context,
+        character_change_requested=character_change_requested,
+    )
+    source_prompt_parts = [source_tokens[index].value for index in prompt_indexes]
+    if source_prompt_parts != prompt_parts:
+        # This is an internal parser invariant: alias handling may rewrite
+        # options and their values, but it must never rewrite prompt tokens.
+        raise ValueError("绘图参数解析内部状态不一致")
+    prompt = _rebuild_generation_prompt(command_text, source_tokens, prompt_indexes)
     if not prompt:
         raise ValueError("请输入绘图提示词")
     swap_specific_requested = bool(

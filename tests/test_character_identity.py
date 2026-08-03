@@ -46,6 +46,24 @@ class CharacterIdentityResolverTests(unittest.TestCase):
                     "count": 8300,
                 },
                 {
+                    "tag": "firefly_(honkai:_star_rail)",
+                    "category": "character",
+                    "aliases": [],
+                    "count": 28000,
+                },
+                {
+                    "tag": "honkai:_star_rail",
+                    "category": "copyright",
+                    "aliases": [],
+                    "count": 250000,
+                },
+                {
+                    "tag": "genshin_impact",
+                    "category": "copyright",
+                    "aliases": [],
+                    "count": 500000,
+                },
+                {
                     "tag": "toki_style",
                     "category": "artist",
                     "aliases": ["wrong_category_toki"],
@@ -158,6 +176,17 @@ class CharacterIdentityResolverTests(unittest.TestCase):
         self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
         self.assertEqual(result.match_variant, "provider_candidate_work_qualified")
 
+    def test_punctuation_discovery_must_be_unique_and_exact_confirmed(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="崩坏星穹铁道流萤",
+            canonical_tag="firefly_(honkai_star_rail)",
+            allow_discovery=False,
+        )
+
+        self.assertTrue(result.verified)
+        self.assertEqual(result.canonical_tag, "firefly_(honkai:_star_rail)")
+
     def test_short_identity_uses_only_safe_ascii_work_alias_for_exact_candidate(
         self,
     ) -> None:
@@ -194,6 +223,81 @@ class CharacterIdentityResolverTests(unittest.TestCase):
         )
 
         self.assertIn("viola_(bang_dream!)", candidates)
+
+    def test_provider_candidate_uses_exact_normalized_work_hint(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="崩坏星穹铁道流萤",
+            identity_candidates=("firefly",),
+            work_hints=("honkai_star_rail",),
+            allow_discovery=False,
+        )
+
+        self.assertTrue(result.verified)
+        self.assertEqual(result.canonical_tag, "firefly_(honkai:_star_rail)")
+        self.assertEqual(result.match_variant, "provider_candidate_work_qualified")
+
+    def test_conflicting_exact_copyright_evidence_fails_closed(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="流萤",
+            canonical_tag="firefly_(honkai_star_rail)",
+            identity_candidates=("firefly",),
+            work_hints=("genshin_impact",),
+            allow_discovery=False,
+        )
+
+        self.assertFalse(result.verified)
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(result.match_variant, "copyright_exact_conflict")
+        self.assertEqual(
+            set(result.conflicting_works),
+            {"honkai:_star_rail", "genshin_impact"},
+        )
+        self.assertEqual(result.candidates, ())
+
+    def test_fuzzy_copyright_spelling_does_not_authorize_rewrite(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="流萤",
+            canonical_tag="firefly_(honkai_star)",
+            work_hints=("honkai_star",),
+            allow_discovery=False,
+        )
+
+        self.assertFalse(result.verified)
+        self.assertFalse(result.ambiguous)
+
+    def test_punctuation_collapsed_copyright_collision_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            payload = {
+                "tags": [
+                    {
+                        "tag": "firefly_(honkai:_star_rail)",
+                        "category": "character",
+                    },
+                    {
+                        "tag": "honkai:_star_rail",
+                        "category": "copyright",
+                    },
+                    {
+                        "tag": "honkai-star-rail",
+                        "category": "copyright",
+                    },
+                ]
+            }
+            index.import_bytes(json.dumps(payload).encode(), content_type="json")
+
+            result = resolve_character_identity(
+                index,
+                target_query="流萤",
+                canonical_tag="firefly_(honkai_star_rail)",
+                allow_discovery=False,
+            )
+
+        self.assertFalse(result.verified)
+        self.assertFalse(result.ambiguous)
 
 
 if __name__ == "__main__":

@@ -757,6 +757,63 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
         self.assertIn(r"kei \(blue archive\)", result.prompt)
         self.assertIn("worm's eye view", result.prompt)
 
+    def test_generation_parser_preserves_hybrid_prompt_line_boundaries(
+        self,
+    ) -> None:
+        prompt = (
+            "1girl, solo, speech bubble.\n"
+            "Medium shot, slightly high angle. A high school girl stands at "
+            "a sliding classroom door.\n"
+            "把角色换成目标角色：《崩坏星穹铁道》流萤"
+        )
+
+        result = parse_generation_options(
+            f"{prompt} --llm cc",
+            mode_context="generation",
+        )
+
+        self.assertEqual(result.prompt, prompt)
+        self.assertEqual(result.prompt.splitlines()[0], "1girl, solo, speech bubble.")
+        self.assertTrue(result.character_swap_preview is False)
+        self.assertEqual(result.prompt_edit_mode, "character_change")
+
+    def test_generation_parser_removes_midstream_options_without_merging_layers(
+        self,
+    ) -> None:
+        result = parse_generation_options(
+            "1girl, worm's eye view --size 512x512\n"
+            "Medium shot. The girl's hand rests on the door. --l u",
+            mode_context="generation",
+        )
+
+        self.assertEqual(
+            result.prompt,
+            "1girl, worm's eye view\n"
+            "Medium shot. The girl's hand rests on the door.",
+        )
+        self.assertEqual((result.width, result.height), (512, 512))
+        self.assertTrue(result.use_prompt_llm)
+        self.assertEqual(result.prompt_expansion_mode, "ultra")
+
+    def test_generation_parser_preserves_layers_with_canonical_swap_options(
+        self,
+    ) -> None:
+        result = parse_generation_options(
+            "1girl, school uniform\nAt the classroom door. "
+            "--llm-character-change --swap-mode keep-outfit "
+            "--swap-weight 0.65 --swap-preview --swap-no-character-lora",
+            mode_context="generation",
+        )
+
+        self.assertEqual(
+            result.prompt,
+            "1girl, school uniform\nAt the classroom door.",
+        )
+        self.assertTrue(result.character_swap_preview)
+        self.assertFalse(result.character_swap_use_target_lora)
+        self.assertEqual(result.character_swap_mode, "keep-outfit")
+        self.assertEqual(result.character_swap_target_lora_strength, 0.65)
+
     def test_generation_parser_allows_apostrophe_inside_quoted_option_value(
         self,
     ) -> None:

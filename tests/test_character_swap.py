@@ -1948,6 +1948,68 @@ class CharacterSwapPlanningTests(unittest.TestCase):
             request.feature_swap_categories,
         )
 
+    def test_firefly_hybrid_prompt_uses_local_feature_swap_without_uncertain_tags(
+        self,
+    ) -> None:
+        planner = CharacterSwapPlanner(LoraSemanticIndex.empty())
+        request = CharacterSwapRequest(
+            "",
+            "Firefly",
+            use_target_lora=False,
+            semantic_identity_index_verified=True,
+            semantic_identity_confidence=1.0,
+            feature_swap_enabled=True,
+            feature_swap_categories=(
+                "hair_style",
+                "hair_color",
+                "hair_ornament",
+                "eye_color",
+                "unique_body_parts",
+                "body_shape",
+                "ear_shape",
+            ),
+        )
+        prompt = (
+            "1girl, solo, school uniform, brown blazer, open blazer, white shirt, "
+            "tight shirt, large breasts, brown bow tie, brown plaid skirt, "
+            "pleated skirt, long grey hair, blue eyes, blushing, open mouth, "
+            "looking at viewer, hand near mouth, holding door, sliding door, "
+            "classroom entrance, high angle, medium shot, speech bubble.\n"
+            "Medium shot, slightly high angle. A high school girl stands at a "
+            "sliding classroom door, leaning forward with one hand on the door "
+            "frame and the other near her face."
+        )
+        preparation = planner.prepare(
+            request,
+            positive_prompt=prompt,
+            negative_prompt="",
+            records=(self.style,),
+            fallback_target_tags=(r"firefly_\(honkai:_star_rail\)",),
+        )
+
+        classification = planner.deterministic_classification(preparation)
+
+        self.assertIsNotNone(classification)
+        assert classification is not None
+        self.assertEqual(classification.uncertain_ids, ())
+        plan = planner.finalize(preparation, classification)
+        for removed in ("long grey hair", "blue eyes", "large breasts"):
+            self.assertNotIn(f", {removed},", f", {plan.prompt},")
+        for preserved in (
+            "school uniform",
+            "brown blazer",
+            "holding door",
+            "sliding door",
+            "high angle",
+            "medium shot",
+            "speech bubble.",
+            "slightly high angle. A high school girl stands at a sliding classroom door",
+            "leaning forward with one hand on the door frame and the other near her face.",
+        ):
+            self.assertIn(preserved, plan.prompt)
+        self.assertIn(r"firefly_\(honkai:_star_rail\)", plan.prompt)
+        self.assertGreaterEqual(plan.feature_swap_removed_count, 3)
+
     def test_feature_scoped_swap_replaces_hair_ornament_but_not_ear_accessories(
         self,
     ) -> None:

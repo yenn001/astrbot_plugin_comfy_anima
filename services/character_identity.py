@@ -33,6 +33,7 @@ class CharacterIdentityResolution:
     query_count: int = 0
     candidate_count: int = 0
     candidates: tuple[str, ...] = ()
+    conflicting_works: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,15 @@ def _strip_last_qualifier(value: str) -> tuple[str, str]:
         return normalized, ""
     stripped = normalized[: match.start()].rstrip("_")
     return stripped, normalize_tag(match.group(1))
+
+
+def _replace_last_qualifier(value: str, work: str) -> str:
+    normalized = normalize_tag(value)
+    safe_work = _safe_lookup_value(work)
+    match = _TRAILING_QUALIFIER_RE.search(normalized)
+    if match is None or not safe_work:
+        return normalized
+    return f"{normalized[: match.start()]}_({safe_work})"
 
 
 def _identity_root(value: str) -> str:
@@ -228,12 +238,135 @@ def _verified_hit(lookup: TagLookup, expected_work: str) -> bool:
 def _lookup_many(
     index: DanbooruTagIndex,
     values: Sequence[str],
+    category: str = "character",
 ) -> tuple[TagLookup, ...]:
     batch = getattr(index, "lookup_many", None)
     if callable(batch):
-        return tuple(batch(values, "character"))
+        return tuple(batch(values, category))
     lookup = getattr(index, "lookup")
-    return tuple(lookup(value, "character") for value in values)
+    return tuple(lookup(value, category) for value in values)
+
+
+def _verified_copyright_hit(lookup: TagLookup) -> bool:
+    return bool(
+        lookup.found
+        and lookup.verified
+        and str(lookup.category or "").casefold() == "copyright"
+    )
+
+
+def _copyright_punctuation_key(value: str) -> str:
+    """Compare ASCII Copyright spellings while ignoring punctuation only."""
+
+    return "".join(re.findall(r"[a-z0-9]+", normalize_tag(value)))
+
+
+def _discover_unique_copyright(
+    index: DanbooruTagIndex,
+    value: str,
+) -> str:
+    """Discover one punctuation-only Copyright variant, then exact-confirm it."""
+
+    target_key = _copyright_punctuation_key(value)
+    tokens = re.findall(r"[a-z0-9]+", normalize_tag(value))
+    search = getattr(index, "search", None)
+    if not target_key or not tokens or len(tokens[0]) < 3 or not callable(search):
+        return ""
+
+    discovered: dict[str, TagCandidate] = {}
+    for mode in ("prefix", "keyword"):
+        for candidate in search(
+            tokens[0],
+            mode=mode,
+            category="copyright",
+            limit=50,
+        ):
+            canonical = _candidate_canonical(candidate)
+            if (
+                canonical
+                and str(candidate.category or "").casefold() == "copyright"
+                and _copyright_punctuation_key(canonical) == target_key
+            ):
+                discovered.setdefault(canonical, candidate)
+        if discovered:
+            break
+    if len(discovered) != 1:
+        return ""
+
+    canonical = next(iter(discovered))
+    exact = _lookup_many(index, (canonical,), "copyright")
+    if len(exact) != 1 or not _verified_copyright_hit(exact[0]):
+        return ""
+    return _safe_lookup_value(exact[0].canonical_tag or exact[0].tag)
+
+
+def _normalize_provider_work_evidence(
+    index: DanbooruTagIndex,
+    *,
+    canonical_tag: str,
+    identity_candidates: Sequence[str],
+    work_hints: Sequence[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Normalize only Copyright exact/unique-alias evidence.
+
+    Provider punctuation is advisory.  A work spelling is rewritten only after
+    the local Copyright category exact-confirms it, and multiple different
+    confirmed works are returned as a conflict instead of being guessed away.
+    """
+
+    bounded_candidates = tuple(identity_candidates[:8])
+    bounded_hints = tuple(work_hints[:4])
+    raw_works = _dedupe(
+        (
+            _work_qualifier(canonical_tag),
+            *(_work_qualifier(value) for value in bounded_candidates),
+            *bounded_hints,
+        )
+    )
+    safe_works = tuple(
+        work for raw in raw_works if (work := _safe_lookup_value(raw))
+    )[:13]
+    if not safe_works:
+        return canonical_tag, bounded_candidates, bounded_hints, ()
+
+    lookups = _lookup_many(index, safe_works, "copyright")
+    resolved: dict[str, str] = {}
+    for raw, lookup in zip(safe_works, lookups):
+        if not _verified_copyright_hit(lookup):
+            continue
+        canonical = _safe_lookup_value(lookup.canonical_tag or lookup.tag)
+        if canonical:
+            resolved[raw] = canonical
+    for raw in safe_works:
+        if raw in resolved:
+            continue
+        canonical = _discover_unique_copyright(index, raw)
+        if canonical:
+            resolved[raw] = canonical
+
+    confirmed_works = tuple(dict.fromkeys(resolved.values()))
+    if len(confirmed_works) > 1:
+        return canonical_tag, bounded_candidates, bounded_hints, confirmed_works
+
+    def normalize_qualified(value: str) -> str:
+        safe = _safe_lookup_value(value)
+        if not safe:
+            return str(value or "")
+        raw_work = _work_qualifier(safe)
+        canonical_work = resolved.get(raw_work, "")
+        return _replace_last_qualifier(safe, canonical_work) if canonical_work else safe
+
+    normalized_hints = tuple(
+        dict.fromkeys(resolved.get(_safe_lookup_value(value), _safe_lookup_value(value))
+                      for value in bounded_hints
+                      if _safe_lookup_value(value))
+    )
+    return (
+        normalize_qualified(canonical_tag),
+        tuple(normalize_qualified(value) for value in bounded_candidates),
+        normalized_hints,
+        (),
+    )
 
 
 def _candidate_canonical(candidate: TagCandidate) -> str:
@@ -250,6 +383,25 @@ def resolve_character_identity(
     allow_discovery: bool = True,
 ) -> CharacterIdentityResolution:
     """Resolve one character using local verified evidence only."""
+
+    (
+        canonical_tag,
+        identity_candidates,
+        work_hints,
+        conflicting_works,
+    ) = _normalize_provider_work_evidence(
+        index,
+        canonical_tag=canonical_tag,
+        identity_candidates=identity_candidates,
+        work_hints=work_hints,
+    )
+    if conflicting_works:
+        return CharacterIdentityResolution(
+            ambiguous=True,
+            match_variant="copyright_exact_conflict",
+            candidate_count=len(conflicting_works),
+            conflicting_works=conflicting_works[:8],
+        )
 
     specs = _lookup_specs(
         target_query,
