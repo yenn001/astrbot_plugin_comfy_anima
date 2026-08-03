@@ -125,7 +125,9 @@ from .services.danbooru_character_profile import (
 from .services.localized_character_aliases import (
     LocalizedAliasCandidate,
     LocalizedCharacterAliasIndex,
+    canonical_work_for_character,
     contains_localized_text,
+    split_localized_character_query,
 )
 from .services.experimental_profiles import inspect_experimental_profiles
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService, LoraRecord
@@ -163,6 +165,7 @@ from .services.lora_presets import (
 from .services.lora_prompting import (
     atomic_lora_trigger_terms,
     build_lora_trigger_plan,
+    choose_character_identity_trigger,
     merge_runtime_lora_selections,
 )
 from .services.lora_visuals import LoraVisualError, LoraVisualService
@@ -1087,7 +1090,10 @@ class ComfyAnimaPlugin(Star):
         if (
             normalized_mode != "batch"
             and localized_index is not None
-            and contains_localized_text(raw_query)
+            and (
+                contains_localized_text(raw_query)
+                or bool(split_localized_character_query(raw_query)[1])
+            )
             and normalized_category in {"", "character", "copyright"}
         ):
             try:
@@ -6766,6 +6772,31 @@ QQ快捷指令:
                 accepted_character_keys.add(key)
                 overrides[key] = selected_trigger
                 continue
+            metadata_canonicals = await self._verified_record_character_canonicals(
+                record
+            )
+            metadata_matches = tuple(
+                canonical for canonical in metadata_canonicals if canonical in expected
+            )
+            if len(metadata_canonicals) == 1 and len(metadata_matches) == 1:
+                selected_trigger = choose_character_identity_trigger(
+                    record,
+                    (metadata_matches[0], record.character_name),
+                )
+                if selected_trigger:
+                    accepted_character_keys.add(key)
+                    overrides[key] = selected_trigger
+                    self._record_image_task_phase(
+                        job,
+                        "lora",
+                        "角色 LoRA 已通过当前语义身份与作品信息绑定到最终 Danbooru exact 角色。",
+                        "llm_character_lora_metadata_bound",
+                        details={
+                            "binding_count": 1,
+                            "trigger_exact_character": False,
+                        },
+                    )
+                    continue
             if key in strict_keys:
                 raise LoraWorkflowError(
                     f"已明确选择的角色 LoRA 无法与最终 exact 身份唯一绑定：{record.name}"
@@ -6791,6 +6822,111 @@ QQ快捷指令:
             )
         )
         return kept, overrides, tuple(filtered)
+
+    async def _verified_record_character_canonicals(
+        self,
+        record: LoraRecord,
+    ) -> tuple[str, ...]:
+        """Map one fresh enriched character record to exact Danbooru identities.
+
+        Character LoRA trigger syntax is not required to be a Danbooru canonical.
+        The binding authority is the record's current character/work metadata,
+        followed by an exact Character and Copyright lookup.  Multi-character or
+        ambiguous records deliberately return several canonicals and remain blocked.
+        """
+
+        index = getattr(self, "_danbooru_index", None)
+        if index is None or not self._danbooru_index_ready():
+            return ()
+
+        def split_values(value: str) -> tuple[str, ...]:
+            return tuple(
+                dict.fromkeys(
+                    item.strip()
+                    for item in re.split(r"\s*(?:/|\||;|；|,|，)\s*", str(value or ""))
+                    if item.strip()
+                )
+            )
+
+        names = tuple(
+            value
+            for value in split_values(record.character_name)
+            if value.isascii()
+            and re.search(r"[A-Za-z]", value)
+            and len(value) <= 80
+        )
+        works = tuple(
+            value
+            for value in split_values(record.source_work)
+            if value.isascii()
+            and re.search(r"[A-Za-z]", value)
+            and len(value) <= 120
+        )
+        if not names:
+            return ()
+        try:
+            work_lookups = await asyncio.to_thread(
+                index.lookup_many,
+                works,
+                "copyright",
+            ) if works else ()
+        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+            return ()
+        canonical_works = tuple(
+            dict.fromkeys(
+                canonical
+                for lookup in work_lookups
+                if bool(getattr(lookup, "verified", False))
+                and (
+                    canonical := normalize_tag(
+                        str(
+                            getattr(lookup, "canonical_tag", "")
+                            or getattr(lookup, "tag", "")
+                            or ""
+                        )
+                    )
+                )
+            )
+        )
+        candidates: list[str] = []
+        for name in names:
+            normalized_name = normalize_tag(name)
+            if not normalized_name:
+                continue
+            candidates.append(normalized_name)
+            candidates.extend(
+                f"{normalized_name}_({work})" for work in canonical_works
+            )
+        if not candidates:
+            return ()
+        try:
+            lookups = await asyncio.to_thread(
+                index.lookup_many,
+                tuple(dict.fromkeys(candidates)),
+                "character",
+            )
+        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+            return ()
+        return tuple(
+            dict.fromkeys(
+                canonical
+                for lookup in lookups
+                if bool(getattr(lookup, "verified", False))
+                and (
+                    canonical := normalize_tag(
+                        str(
+                            getattr(lookup, "canonical_tag", "")
+                            or getattr(lookup, "tag", "")
+                            or ""
+                        )
+                    )
+                )
+                and (
+                    not canonical_works
+                    or canonical_work_for_character(canonical) in canonical_works
+                )
+            )
+        )
 
     async def _resolve_character_evidence_without_provider(
         self,
@@ -9214,6 +9350,9 @@ QQ快捷指令:
             return False
         source = str(scene_text or "")
         folded = source.casefold()
+        declared_name, declared_work = split_localized_character_query(source)
+        if declared_name and declared_work:
+            return True
         if re.search(
             r"\b(?:danbooru|booru|canonical\s*tags?|artist\s*tags?|"
             r"character\s*tags?|copyright\s*tags?)\b|"

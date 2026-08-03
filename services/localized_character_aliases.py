@@ -323,6 +323,10 @@ class LocalizedCharacterAliasIndex:
         normalized = normalize_tag(source)
         if normalized and not contains_localized_text(source):
             candidates.append(normalized)
+            camel_spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", source)
+            camel_normalized = normalize_tag(camel_spaced)
+            if camel_normalized:
+                candidates.append(camel_normalized)
         verified: list[str] = []
         for candidate in dict.fromkeys(candidates):
             canonical = self._verified_copyright(index, candidate)
@@ -338,6 +342,41 @@ class LocalizedCharacterAliasIndex:
     ) -> LocalizedCharacterResolution:
         entries = self._exact_entries(name, "character")
         if not entries:
+            confirmed_works = self.resolve_work(work, index) if work else ()
+            normalized_name = normalize_tag(name)
+            if (
+                len(confirmed_works) == 1
+                and normalized_name
+                and normalized_name.isascii()
+                and re.search(r"[a-z]", normalized_name)
+            ):
+                confirmed_work = confirmed_works[0]
+                candidate_tag = (
+                    normalized_name
+                    if canonical_work_for_character(normalized_name)
+                    else f"{normalized_name}_({confirmed_work})"
+                )
+                lookup = index.lookup(candidate_tag, "character")
+                if bool(getattr(lookup, "verified", False)):
+                    canonical = normalize_tag(lookup.canonical_tag or lookup.tag)
+                    if canonical_work_for_character(canonical) == confirmed_work:
+                        candidate = LocalizedAliasCandidate(
+                            canonical_tag=canonical,
+                            category="character",
+                            matched_alias=str(name).strip(),
+                            work=confirmed_work,
+                            verified=True,
+                            match_type="localized_work_ascii_character_exact",
+                            source="derived-localized-work",
+                        )
+                        return LocalizedCharacterResolution(
+                            canonical_tag=canonical,
+                            verified=True,
+                            match_type=candidate.match_type,
+                            candidate_count=1,
+                            candidates=(candidate,),
+                            confirmed_work=confirmed_work,
+                        )
             return LocalizedCharacterResolution()
         confirmed_works = self.resolve_work(work, index) if work else ()
         if work and not confirmed_works:

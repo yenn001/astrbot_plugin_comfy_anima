@@ -2000,6 +2000,62 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overrides, {key: "toki (blue archive)"})
         self.assertEqual(filtered, ())
 
+    def test_variant_trigger_binds_through_exact_character_and_work_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "kei_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda *args, **kwargs: phases.append((*args, kwargs))
+            )
+            record = LoraRecord(
+                "kei_student_blue_archive.safetensors",
+                category="character",
+                character_name="Kei / ケイ / 凯伊",
+                source_work="Blue Archive；碧蓝档案",
+                trigger_words=(r"kei \(student\) \(blue archive\)",),
+            )
+            selection = LoraSelection(record.name, 0.65)
+            key = self.main.canonical_lora_name(record.name).casefold()
+
+            kept, overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, kei_\(blue_archive\), maid, selfie",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                )
+            )
+
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(
+            overrides,
+            {key: "kei (student) (blue archive)"},
+        )
+        self.assertEqual(filtered, ())
+        self.assertTrue(
+            any("llm_character_lora_metadata_bound" in row for row in phases)
+        )
+
     def test_adjacent_alias_lookup_error_uses_character_compile_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")

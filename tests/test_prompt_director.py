@@ -345,7 +345,7 @@ class PictureResponseParserTests(unittest.TestCase):
         director = PromptDirector(reference, PluginSettings.from_mapping({}))
         system_prompt = director._system_prompt(capabilities=())
 
-        self.assertIn("Prompt contract version: 2.1", system_prompt)
+        self.assertIn("Prompt contract version: 2.2", system_prompt)
         self.assertIn('Return exactly one `<pic prompt="...">`', system_prompt)
         self.assertIn("not authoritative for Danbooru identity", system_prompt)
         self.assertIn("飞鸟马时 (toki)", system_prompt)
@@ -787,6 +787,46 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["tool_call_timeout"], 195)
         self.assertEqual(captured["max_steps"], 4)
         self.assertEqual(wait_timeouts, [900])
+
+    async def test_invalid_lookup_terminal_repairs_without_lookup_tools(self) -> None:
+        director = self._director()
+        lookup_calls: list[dict[str, object]] = []
+        repair_calls: list[dict[str, object]] = []
+
+        class Context:
+            async def tool_loop_agent(self, **kwargs: object) -> object:
+                lookup_calls.append(dict(kwargs))
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": "I found the assets but forgot the terminal."},
+                )()
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                repair_calls.append(dict(kwargs))
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": (
+                            '<pic prompt="kei_\\(blue_archive\\), maid, selfie. '
+                            'Kei takes a maid selfie.">'
+                        )
+                    },
+                )()
+
+        instruction, _provider_id = await director.generate_instruction(
+            Context(),
+            object(),
+            "《BlueArchive》Kei，女仆装，自拍",
+            tools=object(),
+        )
+
+        self.assertEqual(len(lookup_calls), 1)
+        self.assertEqual(len(repair_calls), 1)
+        self.assertNotIn("tools", repair_calls[0])
+        self.assertIn("Return exactly one", str(repair_calls[0]["prompt"]))
+        self.assertIn("kei_\\(blue_archive\\)", instruction.prompt)
 
     async def test_tool_failure_never_retries_without_tools(self) -> None:
         director = self._director()

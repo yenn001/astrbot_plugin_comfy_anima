@@ -2,6 +2,15 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.22] - 2026-08-03
+
+### 角色 LoRA 元数据绑定与无工具终端修复
+
+- 修复本地资产工具首轮已经找到角色、作品、风格和 LoRA 后，第二轮协议修复仍继续携带同一批查询工具的问题。修复轮现在是独立的无工具 `<pic>` 终端调用，避免重复查询耗尽步骤后落入 `invalid_picture_protocol`。
+- 将“角色 LoRA 属于谁”和“LoRA 用什么训练触发词激活”拆成两个证据域。角色归属由当前可加载记录中的角色名与作品元数据经过 Danbooru Character/Copyright exact 证明；`kei (student) (blue archive)` 之类非 canonical 训练触发词只在唯一身份绑定后用于激活。
+- 新增混合名称桥接：`《BlueArchive》Kei`、本地化作品名加 ASCII 角色名会先 exact 作品，再构造并 exact 验证 `kei_(blue_archive)`。CamelCase 作品名会安全归一化，不进行模糊授权。
+- 保持原有 fail-closed 边界：多角色 LoRA、作品冲突、不能唯一绑定的角色资产和额外 Character 身份仍会被过滤或停止。本版不增加依赖、ComfyUI 节点、模型或工作流文件。
+
 ## [1.9.21] - 2026-08-03
 
 ### 多语言角色名转译与作品消歧

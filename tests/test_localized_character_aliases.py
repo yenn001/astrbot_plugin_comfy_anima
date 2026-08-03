@@ -48,6 +48,18 @@ class LocalizedCharacterAliasTests(unittest.TestCase):
                     "aliases": [],
                     "count": 900000,
                 },
+                {
+                    "tag": "kei_(blue_archive)",
+                    "category": "character",
+                    "aliases": [],
+                    "count": 2148,
+                },
+                {
+                    "tag": "blue_archive",
+                    "category": "copyright",
+                    "aliases": [],
+                    "count": 371555,
+                },
             ],
         }
         self.index.import_bytes(json.dumps(payload).encode(), content_type="json")
@@ -151,6 +163,23 @@ class LocalizedCharacterAliasTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].verified)
         self.assertEqual(results[0].canonical_tag, "phoebe_(wuthering_waves)")
+
+    def test_ascii_character_with_camelcase_work_resolves_exact(self) -> None:
+        aliases = LocalizedCharacterAliasIndex()
+
+        results = aliases.search(
+            "《BlueArchive》Kei",
+            index=self.index,
+            category="character",
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].verified)
+        self.assertEqual(results[0].canonical_tag, "kei_(blue_archive)")
+        self.assertEqual(
+            results[0].match_type,
+            "localized_work_ascii_character_exact",
+        )
 
 
 if __name__ == "__main__":

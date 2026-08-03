@@ -12,7 +12,7 @@ import re
 from collections.abc import Iterable
 
 
-PROMPT_CONTRACT_VERSION = "2.1"
+PROMPT_CONTRACT_VERSION = "2.2"
 
 TASK_DRAW = "draw"
 TASK_PROMPT_PLAN = "prompt_plan"
@@ -172,8 +172,10 @@ Runtime LoRA capability:
   uniquely matched current asset; if no unique result exists, continue with
   verified semantic identity rather than guessing a file.
 - A character LoRA must bind to the same exact-confirmed Character canonical.
-  Armed, Bunny, Dress or other variant identities never substitute for the base
-  identity unless that exact variant was explicitly requested and confirmed.
+  Its activation trigger may use a training variant syntax that is not itself a
+  Danbooru Character tag; current character-name plus work metadata remains the
+  binding authority. Armed, Bunny, Dress or other distinct indexed identities
+  never substitute for the base identity unless explicitly requested and exact.
 - Do not claim a lookup or save succeeded unless the corresponding tool returned
   success. Tool metadata aids retrieval but never overrides user-visible facts.
 """.strip()
@@ -195,6 +197,10 @@ Runtime Danbooru capability:
 - Once a Character query returns verified exact, use that returned canonical in
   both positive tags and the character lookup hint. Do not query the same
   identity again by a localized name or replace the exact canonical with prose.
+- After one exact Character, its exact Copyright and at most one unique current
+  character LoRA are known, stop asset lookup and emit the terminal. Do not spend
+  tool steps rechecking common General tags unless the user explicitly asks for
+  tag validation.
 """.strip()
 
 PROMPT_PLAN_CAPABILITY_CONTRACT = """

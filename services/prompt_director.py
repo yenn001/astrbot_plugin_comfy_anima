@@ -564,6 +564,12 @@ class PromptDirector:
             capabilities=normalized_capabilities,
             transport="pic",
         )
+        terminal_repair_system_prompt = self._system_prompt(
+            task_kind=normalized_task_kind,
+            expansion_mode=normalized_expansion_mode,
+            capabilities=(),
+            transport="pic",
+        )
         kwargs = {
             "prompt": user_prompt,
             "system_prompt": system_prompt,
@@ -589,9 +595,11 @@ class PromptDirector:
             active_prompt: str,
             *,
             include_output_tools: bool = True,
+            include_lookup_tools: bool = True,
         ) -> Any:
             use_output_tools = include_output_tools and output_tools is not None
-            if uses_lookup_tools:
+            use_lookup_tools = include_lookup_tools and uses_lookup_tools
+            if use_lookup_tools:
                 if not hasattr(context, "tool_loop_agent"):
                     raise PromptDirectorError(
                         "当前 AstrBot 不支持本地资产查询工具，已停止本次绘图",
@@ -614,6 +622,9 @@ class PromptDirector:
                     **kwargs,
                     "prompt": active_prompt,
                     "system_prompt": (
+                        terminal_repair_system_prompt
+                        if uses_lookup_tools and not include_lookup_tools
+                        else
                         system_prompt
                         if use_output_tools
                         else pic_system_prompt
@@ -822,6 +833,12 @@ class PromptDirector:
                         fatal=True,
                     ) from exc
                 first_error = exc
+                if uses_lookup_tools and not hasattr(context, "llm_generate"):
+                    raise PromptDirectorError(
+                        "本地资产工具分镜结果无效，且当前 AstrBot 不支持无工具终端修复",
+                        exc.detail or exc.user_message,
+                        fatal=True,
+                    ) from exc
                 auto_protocol_fallback = (
                     transport == "function"
                     and output_tools is not None
@@ -857,6 +874,7 @@ class PromptDirector:
                     response = await invoke(
                         repair_prompt,
                         include_output_tools=not auto_protocol_fallback,
+                        include_lookup_tools=not uses_lookup_tools,
                     )
                 except asyncio.TimeoutError as retry_exc:
                     raise PromptDirectorError(
