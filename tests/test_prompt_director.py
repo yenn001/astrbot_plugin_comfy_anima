@@ -1,5 +1,6 @@
 """提示词导演的 LLM 控制标签解析测试。"""
 
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -827,6 +828,85 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", repair_calls[0])
         self.assertIn("Return exactly one", str(repair_calls[0]["prompt"]))
         self.assertIn("kei_\\(blue_archive\\)", instruction.prompt)
+
+    async def test_invalid_lookup_terminal_accepts_strict_json_repair(self) -> None:
+        director = self._director()
+
+        class Context:
+            lookup_calls = 0
+            repair_calls = 0
+
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                self.lookup_calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": "Asset lookup complete without a terminal."},
+                )()
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.repair_calls += 1
+                self.repair_kwargs = dict(kwargs)
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": json.dumps(
+                            {
+                                "positive_tags": (
+                                    r"viola_\(bang_dream!\), maid, selfie. "
+                                    "Viola takes a maid selfie."
+                                ),
+                                "negative_tags": "bad hands",
+                                "pipeline": "base",
+                                "characters": ["Viola|BanG Dream!"],
+                            }
+                        )
+                    },
+                )()
+
+        context = Context()
+        instruction, _provider_id = await director.generate_instruction(
+            context,
+            object(),
+            "《Bang！Dream！》薇欧拉，女仆装，自拍",
+            tools=object(),
+        )
+
+        self.assertEqual(context.lookup_calls, 1)
+        self.assertEqual(context.repair_calls, 1)
+        self.assertNotIn("tools", context.repair_kwargs)
+        self.assertIn("Do not call any tool again", context.repair_kwargs["prompt"])
+        self.assertIn(r"viola_\(bang_dream!\)", instruction.prompt)
+        self.assertEqual(instruction.character_queries, ("Viola|BanG Dream!",))
+
+    async def test_invalid_lookup_terminal_rejects_prose_repair_with_shape_only_detail(
+        self,
+    ) -> None:
+        director = self._director()
+
+        class Context:
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                return type("Response", (), {"completion_text": "lookup done"})()
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": "private prose must never become a prompt"},
+                )()
+
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_instruction(
+                Context(),
+                object(),
+                "draw",
+                tools=object(),
+            )
+
+        self.assertIn("invalid_terminal_repair:", raised.exception.detail)
+        self.assertIn("chars=40", raised.exception.detail)
+        self.assertNotIn("private prose", raised.exception.detail)
 
     async def test_tool_failure_never_retries_without_tools(self) -> None:
         director = self._director()

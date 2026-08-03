@@ -1756,6 +1756,243 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "character_resolution_unverified")
 
+    def test_gallery_exact_authorizes_locally_missing_unique_current_character_lora(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "bang_dream!", "category": "copyright"},
+                            {
+                                "tag": "viola_(pokemon)",
+                                "category": "character",
+                                "aliases": ["viola"],
+                            },
+                        ],
+                        "aliases": [
+                            {"alias": "bang!dream!", "tag": "bang_dream!"}
+                        ],
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            class Client:
+                autocomplete_calls = 0
+
+                @staticmethod
+                async def danbooru_gallery_health():
+                    return {"connected": True, "source": "danbooru"}
+
+                @classmethod
+                async def danbooru_character_autocomplete(cls, query, *, limit=20):
+                    del limit
+                    cls.autocomplete_calls += 1
+                    if cls.autocomplete_calls == 1:
+                        return []
+                    if query == "viola_(bang_dream!)":
+                        return [
+                            {
+                                "name": "viola_(bang_dream!)",
+                                "category": 4,
+                                "is_deprecated": False,
+                                "post_count": 167,
+                            }
+                        ]
+                    return []
+
+            plugin, events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            plugin._client = Client()
+            record = LoraRecord(
+                "viola-000020.safetensors",
+                sha256="viola-sha",
+                category="character",
+                character_name="Viola / 薇欧拉",
+                source_work="BanG Dream! / 梦限大Mewtype",
+                trigger_words=(),
+                aliases=("viola",),
+                from_civitai=True,
+            )
+            job = self.main.GenerationJob("user", "draw", 0.0)
+            prompt, negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    job,
+                    prompt="1girl, viola, maid, selfie",
+                    negative_prompt="bad hands",
+                    character_queries=("薇欧拉|Bang！Dream！",),
+                    user_request="画《Bang！Dream！》薇欧拉穿女仆装自拍",
+                    records=(record,),
+                    source="test",
+                )
+            )
+            key = self.main.canonical_lora_name(record.name).casefold()
+            selection = LoraSelection(record.name, 0.65)
+            kept, overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    job,
+                    prompt=prompt + ", viola",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                    strict_keys=frozenset({key}),
+                )
+            )
+            english_job = self.main.GenerationJob("user", "draw", 0.0)
+            english_prompt, _ = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    english_job,
+                    prompt="1girl, viola, maid, selfie",
+                    negative_prompt="",
+                    character_queries=("Viola",),
+                    user_request="draw Viola in a maid outfit",
+                    records=(record,),
+                    source="test",
+                )
+            )
+            wrong_llm_job = self.main.GenerationJob("user", "draw", 0.0)
+            corrected_prompt, _ = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    wrong_llm_job,
+                    prompt=r"1girl, viola_\(pokemon\), maid, selfie",
+                    negative_prompt="",
+                    character_queries=("Viola",),
+                    user_request="draw Viola in a maid outfit",
+                    records=(record,),
+                    source="test",
+                )
+            )
+            pokemon_job = self.main.GenerationJob("user", "draw", 0.0)
+            pokemon_prompt, _ = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    pokemon_job,
+                    prompt=r"1girl, viola_\(pokemon\), portrait",
+                    negative_prompt="",
+                    character_queries=("Viola|Pokemon",),
+                    user_request="draw Pokemon Viola",
+                    records=(record,),
+                    source="test",
+                )
+            )
+
+        self.assertIn(r"viola_\(bang_dream!\)", prompt)
+        self.assertEqual(negative, "bad hands")
+        self.assertEqual(
+            job.llm_external_character_authorities,
+            {"viola_(bang_dream!)": key},
+        )
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(overrides, {key: "viola"})
+        self.assertEqual(filtered, ())
+        self.assertIn(r"viola_\(bang_dream!\)", english_prompt)
+        self.assertEqual(
+            english_job.llm_external_character_authorities,
+            {"viola_(bang_dream!)": key},
+        )
+        self.assertIn(r"viola_\(bang_dream!\)", corrected_prompt)
+        self.assertNotIn(r"viola_\(pokemon\)", corrected_prompt)
+        self.assertIn(r"viola_\(pokemon\)", pokemon_prompt)
+        self.assertEqual(pokemon_job.llm_external_character_authorities, {})
+        self.assertTrue(
+            any("llm_character_external_exact_authorized" in row for row in events)
+        )
+        self.assertTrue(
+            any("llm_character_gallery_retry_recovered" in row for row in events)
+        )
+        self.assertTrue(
+            any(
+                "llm_character_bare_alias_collision_overridden" in row
+                for row in events
+            )
+        )
+        self.assertTrue(any("llm_character_lora_metadata_bound" in row for row in events))
+        self.assertTrue(
+            any("llm_character_lora_identity_anchor_used" in row for row in events)
+        )
+
+    def test_gallery_fallback_rejects_offline_wrong_category_and_ambiguous_loras(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {"tags": [{"tag": "bang_dream!", "category": "copyright"}]}
+                ).encode(),
+                content_type="json",
+            )
+            base_record = LoraRecord(
+                "viola-a.safetensors",
+                category="character",
+                character_name="Viola / 薇欧拉",
+                source_work="BanG Dream!",
+                trigger_words=("viola",),
+            )
+
+            async def run_case(client, records):
+                plugin, _events = self._llm_character_validation_plugin()
+                plugin._danbooru_index = index
+                plugin._client = client
+                with self.assertRaises(CharacterPromptCompileError) as raised:
+                    await plugin._compile_llm_character_prompt(
+                        self.main.GenerationJob("user", "draw", 0.0),
+                        prompt="1girl, viola, maid, selfie",
+                        negative_prompt="",
+                        character_queries=("Viola|BanG Dream!",),
+                        user_request="draw Viola",
+                        records=records,
+                        source="test",
+                    )
+                self.assertEqual(raised.exception.code, "character_resolution_unverified")
+
+            class OfflineClient:
+                @staticmethod
+                async def danbooru_gallery_health():
+                    return {"connected": False, "source": "danbooru"}
+
+            class WrongCategoryClient:
+                @staticmethod
+                async def danbooru_gallery_health():
+                    return {"connected": True, "source": "danbooru"}
+
+                @staticmethod
+                async def danbooru_character_autocomplete(_query, *, limit=20):
+                    del limit
+                    return [
+                        {
+                            "name": "viola_(bang_dream!)",
+                            "category": 3,
+                            "is_deprecated": False,
+                        }
+                    ]
+
+            class DeprecatedClient(WrongCategoryClient):
+                @staticmethod
+                async def danbooru_character_autocomplete(_query, *, limit=20):
+                    del limit
+                    return [
+                        {
+                            "name": "viola_(bang_dream!)",
+                            "category": 4,
+                            "is_deprecated": True,
+                        }
+                    ]
+
+            asyncio.run(run_case(OfflineClient(), (base_record,)))
+            asyncio.run(run_case(WrongCategoryClient(), (base_record,)))
+            asyncio.run(run_case(DeprecatedClient(), (base_record,)))
+            asyncio.run(
+                run_case(
+                    WrongCategoryClient(),
+                    (
+                        base_record,
+                        replace(base_record, name="viola-b.safetensors", sha256="other"),
+                    ),
+                )
+            )
+
     def test_llm_character_adjacent_toki_alias_needs_no_character_lora(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")

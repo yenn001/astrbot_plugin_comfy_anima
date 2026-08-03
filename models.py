@@ -876,3 +876,4 @@ class GenerationJob:
     prefetched_gpu_name: str = ""
     llm_elapsed_seconds: float = 0.0
     llm_call_count: int = 0
+    llm_external_character_authorities: dict[str, str] = field(default_factory=dict)

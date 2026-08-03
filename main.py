@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.21
+AstrBot Comfy Anima 插件 v1.9.23
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v1.9.21
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.21
-日期: 2026-08-03
+版本: 1.9.23
+日期: 2026-08-04
 """
 
 import asyncio
@@ -95,6 +95,7 @@ from .services.character_swap import (
 )
 from .services.config_profiles import ConfigProfileError, ConfigProfileService
 from .services.character_identity import (
+    CharacterIdentityResolution,
     character_identity_lookup_candidates,
     resolve_character_identity,
     resolve_user_adjacent_character_alias,
@@ -6154,6 +6155,274 @@ QQ快捷指令:
                 return True
         return False
 
+    @staticmethod
+    def _split_bounded_character_metadata(
+        value: str,
+        *,
+        maximum_length: int,
+    ) -> tuple[str, ...]:
+        """Split current LoRA metadata without treating free-form prose as identity."""
+
+        return tuple(
+            dict.fromkeys(
+                item.strip()
+                for item in re.split(r"\s*(?:/|\||;|；|,|，)\s*", str(value or ""))
+                if item.strip() and len(item.strip()) <= maximum_length
+            )
+        )
+
+    @staticmethod
+    def _identity_anchor_activation_trigger(
+        record: LoraRecord,
+        canonical: str,
+    ) -> str:
+        """Use the proven canonical base when a character LoRA has no trigger list."""
+
+        normalized_canonical = normalize_tag(canonical)
+        base = re.sub(r"_\([^()]+\)$", "", normalized_canonical)
+        if not re.fullmatch(r"[a-z0-9_.'!&+:/\-]{2,80}", base):
+            return ""
+        identity_values = (
+            *ComfyAnimaPlugin._split_bounded_character_metadata(
+                record.character_name,
+                maximum_length=80,
+            ),
+            *record.aliases[:32],
+        )
+        if any(normalize_tag(value) == base for value in identity_values):
+            return base
+        return ""
+
+    async def _resolve_current_lora_gallery_identity(
+        self,
+        job: GenerationJob,
+        *,
+        target_query: str,
+        records: tuple[LoraRecord, ...],
+    ) -> tuple[CharacterIdentityResolution, LoraRecord | None]:
+        """Authorize one locally missing Character through fresh unique LoRA evidence.
+
+        The current loadable LoRA record is only a bounded discovery bridge.  Its
+        role and work metadata must be unambiguous, the work must exact-confirm in
+        the local Copyright index, and Gallery autocomplete must return the exact
+        same non-deprecated category-4 canonical.  Nothing is written into the
+        local Danbooru snapshot.
+        """
+
+        index = getattr(self, "_danbooru_index", None)
+        client = getattr(self, "_client", None)
+        if (
+            index is None
+            or not self._danbooru_index_ready()
+            or client is None
+            or not hasattr(client, "danbooru_character_autocomplete")
+        ):
+            return CharacterIdentityResolution(), None
+        try:
+            record = resolve_character_record(
+                records,
+                target_query,
+                self._runtime_semantic_index(),
+                allow_equivalent_variants=False,
+            )
+        except CharacterSwapError:
+            return CharacterIdentityResolution(), None
+        if str(record.category or "").strip().casefold() != "character":
+            return CharacterIdentityResolution(), None
+
+        names = tuple(
+            value
+            for value in self._split_bounded_character_metadata(
+                record.character_name,
+                maximum_length=80,
+            )
+            if value.isascii() and re.search(r"[A-Za-z]", value)
+        )
+        works = tuple(
+            value
+            for value in self._split_bounded_character_metadata(
+                record.source_work,
+                maximum_length=120,
+            )
+            if value.isascii() and re.search(r"[A-Za-z]", value)
+        )
+        if not names or not works:
+            return CharacterIdentityResolution(), None
+        try:
+            work_lookups = await asyncio.to_thread(
+                index.lookup_many,
+                works,
+                "copyright",
+            )
+        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+            return CharacterIdentityResolution(), None
+        canonical_works = tuple(
+            dict.fromkeys(
+                canonical
+                for lookup in work_lookups
+                if bool(getattr(lookup, "verified", False))
+                and (
+                    canonical := normalize_tag(
+                        str(
+                            getattr(lookup, "canonical_tag", "")
+                            or getattr(lookup, "tag", "")
+                            or ""
+                        )
+                    )
+                )
+            )
+        )
+        if len(canonical_works) != 1:
+            return CharacterIdentityResolution(), None
+        candidates = tuple(
+            dict.fromkeys(
+                f"{normalized_name}_({canonical_works[0]})"
+                for name in names
+                if (normalized_name := normalize_tag(name))
+                and re.fullmatch(r"[a-z0-9_().!'&+:/\-]{1,160}", normalized_name)
+            )
+        )
+        if not candidates:
+            return CharacterIdentityResolution(), None
+        health: dict[str, Any] | None = None
+        health_error: Exception | None = None
+        for health_attempt in range(2):
+            try:
+                health = await client.danbooru_gallery_health()
+                if bool(health.get("connected")):
+                    break
+            except (
+                ComfyClientError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                health_error = exc
+            if health_attempt == 0:
+                await asyncio.sleep(0.2)
+        if health is None:
+            self._record_image_task_phase(
+                job,
+                "character_validation",
+                "Danbooru Gallery 不可用；不会用当前 LoRA 元信息替代角色 exact 身份。",
+                "llm_character_gallery_unavailable",
+                level="WARNING",
+                details={
+                    "error_type": type(health_error).__name__
+                    if health_error is not None
+                    else "UnknownError",
+                    "attempts": 2,
+                },
+            )
+            return CharacterIdentityResolution(), None
+        if not bool(health.get("connected")):
+            self._record_image_task_phase(
+                job,
+                "character_validation",
+                "Danbooru Gallery 当前离线；外部 exact 角色授权已跳过。",
+                "llm_character_gallery_offline",
+                level="WARNING",
+                details={"source": str(health.get("source") or "")[:32]},
+            )
+            return CharacterIdentityResolution(), None
+
+        exact_hits: list[str] = []
+        retry_recovered = False
+        for candidate in candidates[:8]:
+            for autocomplete_attempt in range(3):
+                try:
+                    rows = await client.danbooru_character_autocomplete(candidate)
+                except (
+                    ComfyClientError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    rows = []
+                matched = False
+                for row in rows:
+                    category = str(row.get("category") or "").strip().casefold()
+                    deprecated_value = row.get("is_deprecated", False)
+                    deprecated = deprecated_value is True or str(
+                        deprecated_value
+                    ).casefold() in {
+                        "1",
+                        "true",
+                        "yes",
+                    }
+                    row_tag = normalize_tag(
+                        str(
+                            row.get("value")
+                            or row.get("name")
+                            or row.get("tag")
+                            or row.get("label")
+                            or ""
+                        )
+                    )
+                    if (
+                        category in {"4", "character"}
+                        and not deprecated
+                        and row_tag == candidate
+                    ):
+                        matched = True
+                        break
+                if matched:
+                    exact_hits.append(candidate)
+                    retry_recovered = retry_recovered or autocomplete_attempt > 0
+                    break
+                if autocomplete_attempt < 2:
+                    await asyncio.sleep(0.2 * (autocomplete_attempt + 1))
+        if retry_recovered:
+            self._record_image_task_phase(
+                job,
+                "character_validation",
+                "Gallery exact 首次查询暂未返回目标；有界重试后已恢复。",
+                "llm_character_gallery_retry_recovered",
+                details={"maximum_attempts": 3},
+            )
+        unique_hits = tuple(dict.fromkeys(exact_hits))
+        if len(unique_hits) != 1:
+            return (
+                CharacterIdentityResolution(
+                    ambiguous=len(unique_hits) > 1,
+                    match_variant=(
+                        "current_lora_gallery_exact_conflict"
+                        if len(unique_hits) > 1
+                        else "none"
+                    ),
+                    query_count=len(candidates),
+                    candidate_count=len(unique_hits),
+                    candidates=unique_hits[:8],
+                ),
+                None,
+            )
+        canonical = unique_hits[0]
+        self._record_image_task_phase(
+            job,
+            "character_validation",
+            "本地角色快照缺项；已由当前唯一角色 LoRA、Copyright exact 与 Gallery Character exact 联合确认身份。",
+            "llm_character_external_exact_authorized",
+            details={
+                "candidate_count": len(candidates),
+                "work_verified": True,
+                "record_bound": True,
+            },
+        )
+        return (
+            CharacterIdentityResolution(
+                canonical_tag=canonical,
+                verified=True,
+                match_variant="current_lora_gallery_exact",
+                match_type="gallery_exact",
+                query_count=len(candidates),
+                candidate_count=1,
+                candidates=(canonical,),
+            ),
+            record,
+        )
+
     async def _compile_llm_character_prompt(
         self,
         job: GenerationJob,
@@ -6166,6 +6435,8 @@ QQ快捷指令:
         source: str,
     ) -> tuple[str, str]:
         """Verify and correct named characters before a workflow is submitted."""
+
+        job.llm_external_character_authorities.clear()
 
         index = getattr(self, "_danbooru_index", None)
         declared_queries = tuple(
@@ -6330,10 +6601,15 @@ QQ快捷指令:
                 )
             )[:8]
             canonical_hint = ""
+            canonical_hint_from_bare_alias = False
             normalized_name = normalize_tag(name)
             for term, canonical in prompt_character_terms:
                 if normalized_name in {normalize_tag(term), normalize_tag(canonical)}:
                     canonical_hint = canonical
+                    normalized_term = normalize_tag(term)
+                    canonical_hint_from_bare_alias = (
+                        normalized_term == normalized_name and "_(" not in normalized_term
+                    )
                     break
             try:
                 resolution = await asyncio.to_thread(
@@ -6479,6 +6755,75 @@ QQ快捷指令:
                     )
                 if len(unique_alias_canonicals) == 1:
                     resolution = alias_resolutions[0]
+            resolved_local_work = canonical_work_for_character(
+                normalize_tag(resolution.canonical_tag)
+            )
+            normalized_work_hints = frozenset(
+                normalize_tag(value) for value in work_hints if normalize_tag(value)
+            )
+            local_work_conflicts_with_hints = bool(
+                resolution.verified
+                and resolved_local_work
+                and normalized_work_hints
+                and resolved_local_work not in normalized_work_hints
+            )
+            if (
+                not resolution.verified
+                or canonical_hint_from_bare_alias
+                or local_work_conflicts_with_hints
+            ):
+                external_resolution, authority_record = (
+                    await self._resolve_current_lora_gallery_identity(
+                        job,
+                        target_query=record_query,
+                        records=records,
+                    )
+                )
+                if external_resolution.ambiguous and not resolution.ambiguous:
+                    resolution = external_resolution
+                elif external_resolution.verified and authority_record is not None:
+                    canonical = normalize_tag(external_resolution.canonical_tag)
+                    local_canonical = normalize_tag(resolution.canonical_tag)
+                    local_work = canonical_work_for_character(local_canonical)
+                    external_work = canonical_work_for_character(canonical)
+                    may_override_bare_alias_collision = bool(
+                        resolution.verified
+                        and canonical_hint_from_bare_alias
+                        and local_canonical != canonical
+                        and local_work
+                        and external_work
+                        and local_work != external_work
+                    )
+                    if (
+                        not resolution.verified
+                        or local_canonical == canonical
+                        or may_override_bare_alias_collision
+                        or local_work_conflicts_with_hints
+                    ):
+                        previous_canonical = local_canonical
+                        resolution = external_resolution
+                        record_key = canonical_lora_name(authority_record.name).casefold()
+                        job.llm_external_character_authorities[canonical] = record_key
+                        identity_candidates = tuple(
+                            dict.fromkeys((canonical, *identity_candidates))
+                        )[:12]
+                        canonical_work = canonical_work_for_character(canonical)
+                        work_hints = tuple(
+                            dict.fromkeys(
+                                (
+                                    *((canonical_work,) if canonical_work else ()),
+                                    *work_hints,
+                                )
+                            )
+                        )[:8]
+                        if previous_canonical and previous_canonical != canonical:
+                            self._record_image_task_phase(
+                                job,
+                                "character_validation",
+                                "裸角色别名在旧快照中指向同名异作品角色；已由当前唯一 LoRA 与 Gallery exact 覆盖该别名碰撞。",
+                                "llm_character_bare_alias_collision_overridden",
+                                details={"work_conflict": True},
+                            )
             if resolution.ambiguous:
                 raise CharacterPromptCompileError(
                     f"角色“{name}”在本地 Danbooru 中命中多个身份，请补充准确作品名",
@@ -6487,7 +6832,7 @@ QQ快捷指令:
                 )
             if not resolution.verified:
                 raise CharacterPromptCompileError(
-                    f"无法在本地 Danbooru Character 索引中 exact 确认角色“{name}”",
+                    f"无法通过本地 Danbooru 或当前唯一角色 LoRA + Gallery exact 确认角色“{name}”",
                     code="character_resolution_unverified",
                     details={"query_count": resolution.query_count},
                 )
@@ -6619,7 +6964,7 @@ QQ快捷指令:
         self._record_image_task_phase(
             job,
             "character_validation",
-            "LLM 角色身份已通过本地 Danbooru exact 校验并完成提示词矫正。",
+            "LLM 角色身份已通过本地或请求级外部 exact 授权并完成提示词矫正。",
             "llm_character_prompt_compiled",
             details={
                 "source": source or "unknown",
@@ -6636,8 +6981,10 @@ QQ快捷指令:
     async def _verified_prompt_character_canonicals(
         self,
         prompt: str,
+        *,
+        authorized_canonicals: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
-        """Return only Character canonicals exact-confirmed in the final prompt."""
+        """Return locally exact or request-locally authorized final identities."""
 
         index = getattr(self, "_danbooru_index", None)
         if index is None or not self._danbooru_index_ready():
@@ -6655,10 +7002,20 @@ QQ快捷指令:
             raise LoraWorkflowError(
                 "角色 LoRA 绑定前无法复核最终 Danbooru Character 身份"
             ) from exc
-        return tuple(
+        normalized_terms = frozenset(normalize_tag(term) for term in terms)
+        external_canonicals = tuple(
+            canonical
+            for value in authorized_canonicals
+            if (canonical := normalize_tag(value)) in normalized_terms
+        )
+        external_by_base = {
+            re.sub(r"_\([^()]+\)$", "", canonical): canonical
+            for canonical in external_canonicals
+        }
+        local_canonicals = tuple(
             dict.fromkeys(
                 canonical
-                for lookup in lookups
+                for term, lookup in zip(terms, lookups)
                 if bool(getattr(lookup, "verified", False))
                 and (
                     canonical := normalize_tag(
@@ -6669,8 +7026,15 @@ QQ快捷指令:
                         )
                     )
                 )
+                and not (
+                    (base := re.sub(r"_\([^()]+\)$", "", canonical))
+                    in external_by_base
+                    and external_by_base[base] != canonical
+                    and normalize_tag(term) == base
+                )
             )
         )
+        return tuple(dict.fromkeys((*local_canonicals, *external_canonicals)))
 
     async def _bind_llm_character_loras(
         self,
@@ -6683,7 +7047,13 @@ QQ快捷指令:
     ) -> tuple[tuple[LoraSelection, ...], dict[str, str], tuple[str, ...]]:
         """Keep only character LoRAs that exact-bind to the compiled identity."""
 
-        expected = frozenset(await self._verified_prompt_character_canonicals(prompt))
+        external_authorities = dict(job.llm_external_character_authorities)
+        expected = frozenset(
+            await self._verified_prompt_character_canonicals(
+                prompt,
+                authorized_canonicals=tuple(external_authorities),
+            )
+        )
         index = getattr(self, "_danbooru_index", None)
         if index is None or not self._danbooru_index_ready():
             return selections, {}, ()
@@ -6778,24 +7148,51 @@ QQ快捷指令:
             metadata_matches = tuple(
                 canonical for canonical in metadata_canonicals if canonical in expected
             )
+            external_matches = tuple(
+                canonical
+                for canonical, authorized_record_key in external_authorities.items()
+                if canonical in expected and authorized_record_key == key
+            )
+            if not metadata_matches and len(external_matches) == 1:
+                metadata_canonicals = external_matches
+                metadata_matches = external_matches
             if len(metadata_canonicals) == 1 and len(metadata_matches) == 1:
                 selected_trigger = choose_character_identity_trigger(
                     record,
                     (metadata_matches[0], record.character_name),
                 )
+                used_identity_anchor = bool(
+                    selected_trigger and not atomic_lora_trigger_terms(record)
+                )
+                if not selected_trigger:
+                    selected_trigger = self._identity_anchor_activation_trigger(
+                        record,
+                        metadata_matches[0],
+                    )
+                    used_identity_anchor = bool(selected_trigger)
                 if selected_trigger:
                     accepted_character_keys.add(key)
                     overrides[key] = selected_trigger
                     self._record_image_task_phase(
                         job,
                         "lora",
-                        "角色 LoRA 已通过当前语义身份与作品信息绑定到最终 Danbooru exact 角色。",
+                        "角色 LoRA 已通过当前语义身份、作品信息与 exact 角色授权绑定。",
                         "llm_character_lora_metadata_bound",
                         details={
                             "binding_count": 1,
                             "trigger_exact_character": False,
+                            "external_exact": bool(external_matches),
+                            "identity_anchor_trigger": used_identity_anchor,
                         },
                     )
+                    if used_identity_anchor:
+                        self._record_image_task_phase(
+                            job,
+                            "lora",
+                            "角色 LoRA 没有可用训练触发词；已使用唯一 exact 身份的 canonical 基词作为激活锚点。",
+                            "llm_character_lora_identity_anchor_used",
+                            details={"binding_count": 1},
+                        )
                     continue
             if key in strict_keys:
                 raise LoraWorkflowError(
@@ -16036,7 +16433,10 @@ QQ快捷指令:
                         )
                         expected_character_canonicals = (
                             await self._verified_prompt_character_canonicals(
-                                clean_prompt
+                                clean_prompt,
+                                authorized_canonicals=tuple(
+                                    job.llm_external_character_authorities
+                                ),
                             )
                         )
                         _, explicit_user_loras = extract_lora_selections(
@@ -16090,7 +16490,10 @@ QQ快捷指令:
                     if options.validate_llm_characters or use_llm:
                         final_character_canonicals = frozenset(
                             await self._verified_prompt_character_canonicals(
-                                clean_prompt
+                                clean_prompt,
+                                authorized_canonicals=tuple(
+                                    job.llm_external_character_authorities
+                                ),
                             )
                         )
                         unexpected_character_canonicals = (

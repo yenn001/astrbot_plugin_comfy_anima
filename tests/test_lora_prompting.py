@@ -81,6 +81,34 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             "kallen_kaslana",
         )
 
+    def test_single_character_without_trained_words_uses_identity_anchor(self) -> None:
+        record = LoraRecord(
+            "characters/viola.safetensors",
+            category="character",
+            character_name="Viola / 薇欧拉 / 薇欧拉-梦限大Mewtype",
+            trigger_words=(),
+        )
+
+        self.assertEqual(choose_character_identity_trigger(record), "")
+        plan = build_lora_trigger_plan(
+            prompt=r"1girl, viola_\(bang_dream!\), maid, selfie",
+            negative_prompt="",
+            selections=(LoraSelection(record.name, 0.65),),
+            records_by_name={"characters/viola": record},
+            verified_character_triggers={record.name: "viola"},
+        )
+        self.assertIn(r"viola_\(bang_dream!\)", plan.prompt)
+
+    def test_multi_character_without_trained_words_has_no_identity_anchor(self) -> None:
+        record = LoraRecord(
+            "characters/multi.safetensors",
+            category="character",
+            character_name="Viola / Rio",
+            trigger_words=(),
+        )
+
+        self.assertEqual(choose_character_identity_trigger(record), "")
+
     def test_multi_character_trained_words_require_query_specific_identity(self) -> None:
         record = LoraRecord(
             "characters/baarmed_4in1_v1.safetensors",

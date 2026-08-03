@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.9.21
+AstrBot Comfy Anima 插件 v1.9.23
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.9.21
-日期: 2026-08-03
+版本: 1.9.23
+日期: 2026-08-04
 """
 
 import asyncio
@@ -568,7 +568,7 @@ class PromptDirector:
             task_kind=normalized_task_kind,
             expansion_mode=normalized_expansion_mode,
             capabilities=(),
-            transport="pic",
+            transport="json",
         )
         kwargs = {
             "prompt": user_prompt,
@@ -700,6 +700,7 @@ class PromptDirector:
             ) from exc
 
         first_error: PromptDirectorError | None = None
+        terminal_repair_response = False
         for attempt in range(2):
             try:
                 provider_error = response_error_code(response)
@@ -709,6 +710,14 @@ class PromptDirector:
                         provider_error,
                         fatal=True,
                     )
+                if terminal_repair_response:
+                    instruction = self._extract_terminal_repair_instruction(response)
+                    if compose_result:
+                        instruction = self.compose_picture_instruction(
+                            instruction,
+                            provider_id=provider_id,
+                        )
+                    return instruction, provider_id
                 if transport in {"function", "json"}:
                     payload: Any = None
                     if transport == "function":
@@ -743,50 +752,7 @@ class PromptDirector:
                                 fatal=True,
                             ) from json_exc
                     if payload is not None:
-                        if not isinstance(payload, dict):
-                            raise PromptDirectorError(
-                                "结构化分镜必须是 JSON 对象",
-                                "invalid_structured_root",
-                                fatal=True,
-                            )
-                        allowed_fields = {
-                            "positive_tags",
-                            "prompt",
-                            "negative_tags",
-                            "negative_prompt",
-                            "negative",
-                            "pipeline",
-                            "characters",
-                        }
-                        if any(key not in allowed_fields for key in payload):
-                            raise PromptDirectorError(
-                                "结构化分镜包含不受支持的字段",
-                                "unexpected_structured_fields",
-                                fatal=True,
-                            )
-                        positive, negative = self._structured_prompt_values(payload)
-                        pipeline = payload.get("pipeline", "")
-                        characters = payload.get("characters", ())
-                        if not isinstance(positive, str) or not positive.strip():
-                            raise PromptDirectorError(
-                                "结构化分镜缺少 positive_tags",
-                                "missing_positive_tags",
-                                fatal=True,
-                            )
-                        if not isinstance(negative, str) or not isinstance(pipeline, str):
-                            raise PromptDirectorError(
-                                "结构化分镜字段类型无效",
-                                "invalid_structured_fields",
-                                fatal=True,
-                            )
-                        instruction = PictureInstruction(
-                            prompt=self._normalize_prompt(positive),
-                            negative_prompt=self._normalize_negative_prompt(negative),
-                            pipeline=self._normalize_pipeline(pipeline),
-                            character_queries=self._normalize_character_queries(
-                                characters
-                            ),
-                        )
+                        instruction = self._picture_instruction_from_payload(payload)
                         if compose_result:
                             instruction = self.compose_picture_instruction(
                                 instruction,
@@ -845,7 +811,13 @@ class PromptDirector:
                     and structured_mode == "auto"
                 )
                 repair_prompt = (
-                    (pic_user_prompt if auto_protocol_fallback else user_prompt)
+                    user_prompt
+                    + "\n\nThe local asset lookup is complete. Return exactly one JSON "
+                    "object with positive_tags, negative_tags, pipeline and optional "
+                    "characters fields. Do not call any tool again. Do not return "
+                    "explanation, Markdown, XML, an error message or plain text."
+                    if uses_lookup_tools
+                    else (pic_user_prompt if auto_protocol_fallback else user_prompt)
                     + (
                         "\n\nYour previous response was invalid. Return exactly one "
                         '<pic prompt="English Anima tags. One concise scene sentence." '
@@ -876,6 +848,7 @@ class PromptDirector:
                         include_output_tools=not auto_protocol_fallback,
                         include_lookup_tools=not uses_lookup_tools,
                     )
+                    terminal_repair_response = uses_lookup_tools
                 except asyncio.TimeoutError as retry_exc:
                     raise PromptDirectorError(
                         "绘图模型修复重试超时，已停止且不会提交 ComfyUI",
@@ -1164,6 +1137,111 @@ class PromptDirector:
             ),
             character_queries=character_queries,
         )
+
+    @staticmethod
+    def _picture_instruction_from_payload(payload: Any) -> PictureInstruction:
+        """Validate one sealed JSON/function picture plan."""
+
+        if not isinstance(payload, dict):
+            raise PromptDirectorError(
+                "结构化分镜必须是 JSON 对象",
+                "invalid_structured_root",
+                fatal=True,
+            )
+        allowed_fields = {
+            "positive_tags",
+            "prompt",
+            "negative_tags",
+            "negative_prompt",
+            "negative",
+            "pipeline",
+            "characters",
+        }
+        if any(key not in allowed_fields for key in payload):
+            raise PromptDirectorError(
+                "结构化分镜包含不受支持的字段",
+                "unexpected_structured_fields",
+                fatal=True,
+            )
+        positive, negative = PromptDirector._structured_prompt_values(payload)
+        pipeline = payload.get("pipeline", "")
+        characters = payload.get("characters", ())
+        if not isinstance(positive, str) or not positive.strip():
+            raise PromptDirectorError(
+                "结构化分镜缺少 positive_tags",
+                "missing_positive_tags",
+                fatal=True,
+            )
+        if not isinstance(negative, str) or not isinstance(pipeline, str):
+            raise PromptDirectorError(
+                "结构化分镜字段类型无效",
+                "invalid_structured_fields",
+                fatal=True,
+            )
+        return PictureInstruction(
+            prompt=PromptDirector._normalize_prompt(positive),
+            negative_prompt=PromptDirector._normalize_negative_prompt(negative),
+            pipeline=PromptDirector._normalize_pipeline(pipeline),
+            character_queries=PromptDirector._normalize_character_queries(characters),
+        )
+
+    @staticmethod
+    def _terminal_repair_diagnostics(response: Any) -> str:
+        """Return bounded shape diagnostics without leaking Provider content."""
+
+        visible = response_text(response)
+        text = str(visible or "")
+        stripped = text.strip()
+        return (
+            f"chars={len(text)};visible={bool(stripped)};"
+            f"pic_count={len(_PIC_TAG_RE.findall(text))};"
+            f"json_shape={stripped.startswith('{') and stripped.endswith('}')};"
+            f"structured={_has_structured_call_surface(response)}"
+        )
+
+    @staticmethod
+    def _extract_terminal_repair_instruction(response: Any) -> PictureInstruction:
+        """Accept one strict repair envelope without reopening lookup authority."""
+
+        diagnostics = PromptDirector._terminal_repair_diagnostics(response)
+        if _has_structured_call_surface(response):
+            try:
+                structured = extract_structured_payload(
+                    response,
+                    expected_tool_name="emit_anima_plan_v1",
+                    allow_json_fallback=False,
+                )
+                return PromptDirector._picture_instruction_from_payload(
+                    structured.arguments
+                )
+            except (PromptDirectorError, StructuredProviderError) as exc:
+                raise PromptDirectorError(
+                    "绘图模型终端修复返回了无效结构化结果",
+                    f"invalid_terminal_repair_structured:{diagnostics}",
+                    fatal=True,
+                ) from exc
+
+        visible = str(response_text(response) or "")
+        PromptDirector.reject_provider_error_output(visible)
+        try:
+            match = PromptDirector._strict_control_match(
+                visible,
+                pattern=_PIC_TAG_RE,
+                control_name="pic",
+                detail="invalid_picture_protocol",
+            )
+            return PromptDirector._picture_instruction_from_match(match)
+        except PromptDirectorError:
+            pass
+        try:
+            payload = _strict_json_object(visible)
+            return PromptDirector._picture_instruction_from_payload(payload)
+        except (PromptDirectorError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PromptDirectorError(
+                "绘图模型终端修复没有返回唯一合法的 JSON 或 <pic> 分镜",
+                f"invalid_terminal_repair:{diagnostics}",
+                fatal=True,
+            ) from exc
 
     @staticmethod
     def _structured_prompt_values(payload: Mapping[str, Any]) -> tuple[Any, Any]:

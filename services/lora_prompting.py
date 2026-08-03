@@ -431,6 +431,23 @@ def build_lora_trigger_plan(
             for candidate in override_candidates
             if override_key and _term_key(candidate) == override_key
         )
+        if not matches and (
+            record_category == "character" or str(record.character_name or "").strip()
+        ):
+            identity_anchor_matches = tuple(
+                part.strip()
+                for part in re.split(
+                    r"\s*(?:/|\||；|;|,|，)\s*",
+                    str(record.character_name or ""),
+                )
+                if part.strip()
+                and part.strip().isascii()
+                and re.fullmatch(r"[A-Za-z0-9_ .@'!&+:/\-]{2,80}", part.strip())
+                and _term_key(part) == override_key
+                and is_character_identity_trigger_candidate(part)
+            )
+            if len(identity_anchor_matches) == 1:
+                matches = identity_anchor_matches
         if len(matches) != 1:
             raise LoraWorkflowError(
                 f"verified character trigger does not match LoRA metadata: {selection.name}"

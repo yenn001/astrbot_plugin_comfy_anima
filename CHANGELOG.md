@@ -2,6 +2,15 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.23] - 2026-08-04
+
+### 本地快照缺项角色授权与终端修复兼容
+
+- 修复薇欧拉一类“当前 LoRA Manager 元信息唯一且在线 Danbooru Gallery 能 exact 确认，但插件内置 Danbooru 快照尚无该 Character”的错误拒绝。授权链固定为：当前唯一可加载角色 LoRA → 本地 Copyright exact → 构造有界 canonical → Gallery category-4、非弃用、同名 exact。
+- 外部 exact 只在单个当前角色 LoRA 文件上建立请求级授权，不写回本地 SQLite，也不会成为全局别名。该授权贯穿提示词编译、角色 LoRA 绑定、触发词注入后复核和额外身份拦截；多 LoRA、跨作品、错分类、已弃用或 Gallery 离线继续 fail closed。
+- 资产工具完成查询后的第二次调用改为无工具严格 JSON 修复，同时兼容合法 `<pic>` 与 `emit_anima_plan_v1` 结构化响应。错误散文、未知字段、混合控制标签、重复/畸形 JSON 和错误工具调用仍被拒绝。
+- 新增中文名加本地化作品标点、英文名无作品但当前 LoRA 唯一、Gallery 离线/错分类/已弃用、多个角色 LoRA 歧义、严格 JSON 修复和错误散文等回归。本版不增加依赖、ComfyUI 节点、模型或工作流文件。
+
 ## [1.9.22] - 2026-08-03
 
 ### 角色 LoRA 元数据绑定与无工具终端修复
