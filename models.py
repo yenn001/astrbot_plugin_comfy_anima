@@ -156,6 +156,7 @@ class PluginSettings:
     director_extra_instruction: str = ""
     enable_natural_draw: bool = True
     enable_llm_pic_trigger: bool = True
+    enable_chat_draw_terminal_guard: bool = True
     auto_draw_system_prompt: str = ""
     max_auto_images_per_reply: int = 1
     enable_reverse_prompt: bool = True
@@ -379,6 +380,10 @@ class PluginSettings:
             ).strip(),
             enable_natural_draw=_as_bool(data.get("enable_natural_draw"), True),
             enable_llm_pic_trigger=_as_bool(data.get("enable_llm_pic_trigger"), True),
+            enable_chat_draw_terminal_guard=_as_bool(
+                data.get("enable_chat_draw_terminal_guard"),
+                True,
+            ),
             auto_draw_system_prompt=str(
                 data.get("auto_draw_system_prompt", "")
             ).strip(),

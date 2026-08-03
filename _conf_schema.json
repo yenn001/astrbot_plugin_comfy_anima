@@ -173,6 +173,12 @@
     "hint": "从普通对话回复中提取 <pic prompt=\"...\"> 并自动生成图片；明确角色建议同时输出 characters=\"角色名|作品名\"，插件会在提交前进行 Danbooru exact 校验",
     "default": true
   },
+  "enable_chat_draw_terminal_guard": {
+    "description": "普通聊天绘图终止协议守卫",
+    "type": "bool",
+    "hint": "推荐开启。普通聊天回复会先完整缓冲；本轮 LoRA、Danbooru 与 Prompt Plan 工具必须全部成功，明确绘图最终只能包含一个合法 <pic>。裸 Tags 会携带有界资产证据修复一次，仍无效则停止且不会提交 ComfyUI；纯资产查询误出的 <pic> 会被移除。",
+    "default": true
+  },
   "enable_reverse_prompt": {
     "description": "启用在线图片反推",
     "type": "bool",

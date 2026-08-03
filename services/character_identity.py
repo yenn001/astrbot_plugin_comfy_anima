@@ -300,6 +300,32 @@ def _discover_unique_copyright(
     return _safe_lookup_value(exact[0].canonical_tag or exact[0].tag)
 
 
+def _confirmed_copyright_work_hints(
+    index: DanbooruTagIndex,
+    work_hints: Sequence[str],
+) -> tuple[str, ...]:
+    """Return only locally exact-confirmed Copyright identities."""
+
+    safe_hints = tuple(
+        work
+        for raw in _dedupe(work_hints[:4])
+        if (work := _safe_lookup_value(raw))
+    )
+    if not safe_hints:
+        return ()
+    lookups = _lookup_many(index, safe_hints, "copyright")
+    confirmed: list[str] = []
+    for raw, lookup in zip(safe_hints, lookups):
+        canonical = ""
+        if _verified_copyright_hit(lookup):
+            canonical = _safe_lookup_value(lookup.canonical_tag or lookup.tag)
+        if not canonical:
+            canonical = _discover_unique_copyright(index, raw)
+        if canonical and canonical not in confirmed:
+            confirmed.append(canonical)
+    return tuple(confirmed)
+
+
 def _normalize_provider_work_evidence(
     index: DanbooruTagIndex,
     *,
@@ -507,8 +533,169 @@ def resolve_character_identity(
     )
 
 
+def resolve_user_adjacent_character_alias(
+    index: DanbooruTagIndex,
+    *,
+    alias: str,
+    canonical_candidates: Sequence[str] = (),
+    work_hints: Sequence[str] = (),
+) -> CharacterIdentityResolution:
+    """Resolve one user-authored adjacent ASCII alias without LoRA authority.
+
+    The alias is trusted only as a lookup seed.  Prefix/keyword discovery may
+    locate candidates, but the selected Character canonical and its base
+    identity root must both exact-confirm.  This deliberately prefers the base
+    identity over costume variants such as ``toki_(bunny)_(blue_archive)``.
+    """
+
+    safe_alias = _safe_lookup_value(alias)
+    if not safe_alias:
+        return CharacterIdentityResolution()
+
+    confirmed_works = _confirmed_copyright_work_hints(index, work_hints)
+    if len(confirmed_works) > 1:
+        return CharacterIdentityResolution(
+            ambiguous=True,
+            match_variant="user_adjacent_alias_work_conflict",
+            candidate_count=len(confirmed_works),
+            conflicting_works=confirmed_works[:8],
+        )
+
+    direct_lookup = index.lookup(safe_alias, "character")
+    direct_root = (
+        _identity_root(direct_lookup.canonical_tag or direct_lookup.tag)
+        if _verified_hit(direct_lookup, "")
+        else ""
+    )
+
+    def alias_matches_root(root: str) -> bool:
+        base, _work = _strip_last_qualifier(root)
+        return bool(
+            base == safe_alias
+            or (direct_root and normalize_tag(direct_root) == normalize_tag(root))
+        )
+
+    exact_candidates = _lookup_many(
+        index,
+        tuple(
+            dict.fromkeys(
+                safe
+                for value in canonical_candidates[:12]
+                if (safe := _safe_lookup_value(value))
+            )
+        ),
+        "character",
+    )
+    prompt_roots = tuple(
+        dict.fromkeys(
+            root
+            for lookup in exact_candidates
+            if _verified_hit(lookup, "")
+            and (
+                root := _identity_root(lookup.canonical_tag or lookup.tag)
+            )
+        )
+    )
+    eligible_prompt_roots = (
+        tuple(
+            root
+            for root in prompt_roots
+            if _work_qualifier(root) in confirmed_works
+        )
+        if confirmed_works
+        else prompt_roots
+    )
+    exact_roots = tuple(
+        root for root in eligible_prompt_roots if alias_matches_root(root)
+    )
+
+    def prompt_conflict(resolved_root: str) -> CharacterIdentityResolution | None:
+        mismatched = tuple(
+            root
+            for root in eligible_prompt_roots
+            if normalize_tag(root) != normalize_tag(resolved_root)
+        )
+        if not mismatched:
+            return None
+        candidates = tuple(
+            dict.fromkeys((normalize_tag(resolved_root), *mismatched))
+        )
+        return CharacterIdentityResolution(
+            ambiguous=True,
+            match_variant="user_adjacent_alias_prompt_conflict",
+            candidate_count=len(candidates),
+            candidates=candidates[:8],
+        )
+
+    if len(exact_roots) > 1:
+        return CharacterIdentityResolution(
+            ambiguous=True,
+            match_variant="user_adjacent_alias_prompt_conflict",
+            candidate_count=len(exact_roots),
+            candidates=exact_roots[:8],
+        )
+    if len(exact_roots) == 1:
+        resolved = resolve_character_identity(
+            index,
+            target_query=safe_alias,
+            canonical_tag=exact_roots[0],
+            work_hints=work_hints,
+            allow_discovery=False,
+        )
+        if resolved.verified:
+            if conflict := prompt_conflict(_identity_root(resolved.canonical_tag)):
+                return conflict
+            return CharacterIdentityResolution(
+                canonical_tag=resolved.canonical_tag,
+                verified=True,
+                match_variant="user_adjacent_alias_prompt_exact",
+                match_type=resolved.match_type,
+                query_count=resolved.query_count,
+                candidate_count=max(1, len(exact_candidates)),
+                candidates=exact_roots,
+            )
+        if resolved.ambiguous:
+            return resolved
+
+    discovered = resolve_character_identity(
+        index,
+        target_query=safe_alias,
+        identity_candidates=(safe_alias,),
+        work_hints=work_hints,
+        allow_discovery=True,
+    )
+    if not discovered.verified or discovered.ambiguous:
+        return discovered
+    root = _identity_root(discovered.canonical_tag)
+    if not alias_matches_root(root):
+        return CharacterIdentityResolution(
+            query_count=discovered.query_count,
+            candidate_count=discovered.candidate_count,
+            candidates=discovered.candidates,
+        )
+    if conflict := prompt_conflict(root):
+        return conflict
+    root_lookup = index.lookup(root, "character")
+    if not _verified_hit(root_lookup, _work_qualifier(root)):
+        return CharacterIdentityResolution(
+            query_count=discovered.query_count,
+            candidate_count=discovered.candidate_count,
+            candidates=discovered.candidates,
+        )
+    return CharacterIdentityResolution(
+        canonical_tag=normalize_tag(root_lookup.canonical_tag or root_lookup.tag),
+        verified=True,
+        match_variant="user_adjacent_alias_unique_base",
+        match_type=str(getattr(root_lookup, "match_type", "") or "canonical"),
+        query_count=discovered.query_count,
+        candidate_count=discovered.candidate_count,
+        candidates=discovered.candidates,
+    )
+
+
 __all__ = [
     "CharacterIdentityResolution",
     "character_identity_lookup_candidates",
     "resolve_character_identity",
+    "resolve_user_adjacent_character_alias",
 ]

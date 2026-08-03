@@ -207,6 +207,7 @@ const booleanFields = new Set([
   "enable_prompt_llm",
   "enable_natural_draw",
   "enable_llm_pic_trigger",
+  "enable_chat_draw_terminal_guard",
   "enable_prompt_composer_v2",
   "enable_prompt_diagnostics",
   "prompt_diagnostics_include_content",

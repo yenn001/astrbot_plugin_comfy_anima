@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from ..core.lora import canonical_lora_name
+from ..core.lora import LoraWorkflowError, canonical_lora_name
 from ..models import LoraSelection
 from .lora_catalog import FUNCTIONAL_LORA_CATEGORIES, LoraRecord
 from .lora_presets import (
@@ -230,6 +230,17 @@ def _metadata_trigger_terms(record: LoraRecord) -> tuple[str, ...]:
     return tuple(terms)
 
 
+def atomic_lora_trigger_terms(record: LoraRecord) -> tuple[str, ...]:
+    """Expose bounded atomic Manager/Civitai trigger terms for identity validation.
+
+    Metadata category labels are advisory.  Callers that enforce character
+    identity must inspect these terms even when a record is mislabeled as a
+    style LoRA or has no ``character_name`` field.
+    """
+
+    return _metadata_trigger_terms(record)
+
+
 def character_identity_trigger_candidates(record: LoraRecord) -> tuple[str, ...]:
     """Return every metadata term that is proven to name this record's character."""
 
@@ -307,6 +318,7 @@ def build_lora_trigger_plan(
     records_by_name: Mapping[str, LoraRecord],
     presets: tuple[LoraPreset, ...] = (),
     suppressed_terms: Iterable[str] = (),
+    verified_character_triggers: Mapping[str, str] | None = None,
 ) -> LoraTriggerPlan:
     """Append only explicit, role-appropriate trigger words.
 
@@ -314,7 +326,9 @@ def build_lora_trigger_plan(
     LoRAs receive one reliable identity trigger only, so default clothes and
     appearance tags cannot defeat an explicit outfit change.  A preset's
     manually saved trigger string supplements the latest role-appropriate
-    Manager metadata for its members.
+    Manager metadata for its members.  ``verified_character_triggers`` may
+    select one exact metadata identity from a multi-character LoRA; mismatched
+    evidence fails closed instead of silently loading an unbound variant.
     """
 
     prompt_text = str(prompt or "").strip(" ,")
@@ -327,6 +341,11 @@ def build_lora_trigger_plan(
     skipped: list[str] = []
     preset_roles: dict[str, str] = {}
     manual_triggers: list[tuple[str, str]] = []
+    verified_overrides = {
+        _canonical_key(name): str(trigger or "").strip()
+        for name, trigger in (verified_character_triggers or {}).items()
+        if _canonical_key(name)
+    }
 
     def append_trigger(trigger: str, source: str) -> None:
         value = trigger.strip(" ,")
@@ -363,19 +382,73 @@ def build_lora_trigger_plan(
         for trigger in manual:
             manual_triggers.append((trigger, f"preset {preset.name}"))
 
+    effective_roles: dict[str, str] = {}
+    resolved_character_triggers: dict[str, str] = {}
+    for selection in selections:
+        key = _canonical_key(selection.name)
+        record = records_by_name.get(key)
+        if record is None:
+            if key in verified_overrides:
+                raise LoraWorkflowError(
+                    f"verified character trigger has no fresh LoRA metadata: {selection.name}"
+                )
+            continue
+        record_category = str(record.category or "").strip().casefold()
+        # Catalog character evidence is authoritative.  A saved style preset
+        # must never turn a character LoRA into a style LoRA and thereby inject
+        # every trained word, including default clothes and appearance.
+        if (
+            record_category == "character"
+            or str(record.character_name or "").strip()
+            or key in verified_overrides
+        ):
+            role = PRESET_CATEGORY_CHARACTER
+        else:
+            role = preset_roles.get(key) or record_category
+        effective_roles[key] = role
+
+        has_override = key in verified_overrides
+        if role != PRESET_CATEGORY_CHARACTER:
+            if has_override:
+                raise LoraWorkflowError(
+                    f"verified character trigger targets non-character LoRA: {selection.name}"
+                )
+            continue
+
+        if not has_override:
+            resolved_character_triggers[key] = choose_character_identity_trigger(record)
+            continue
+
+        override_key = _term_key(verified_overrides[key])
+        override_candidates = (
+            character_identity_trigger_candidates(record)
+            if record_category == "character"
+            or str(record.character_name or "").strip()
+            else atomic_lora_trigger_terms(record)
+        )
+        matches = tuple(
+            candidate
+            for candidate in override_candidates
+            if override_key and _term_key(candidate) == override_key
+        )
+        if len(matches) != 1:
+            raise LoraWorkflowError(
+                f"verified character trigger does not match LoRA metadata: {selection.name}"
+            )
+        # Preserve the exact atomic term supplied by current Manager metadata;
+        # the verified mapping is selection evidence, not prompt authority.
+        resolved_character_triggers[key] = matches[0]
+
     conflicting_character_terms: set[str] = set()
     for selection in selections:
         key = _canonical_key(selection.name)
         record = records_by_name.get(key)
         if record is None:
             continue
-        role = preset_roles.get(key) or record.category
-        is_character_role = role in {PRESET_CATEGORY_CHARACTER, "character"} or (
-            role in {PRESET_CATEGORY_MIXED, "mixed"} and bool(record.character_name)
-        )
-        if not is_character_role:
+        role = effective_roles.get(key) or str(record.category or "").casefold()
+        if role != PRESET_CATEGORY_CHARACTER:
             continue
-        identity_trigger_key = _term_key(choose_character_identity_trigger(record))
+        identity_trigger_key = _term_key(resolved_character_triggers.get(key, ""))
         for trigger in _metadata_trigger_terms(record):
             trigger_key = _term_key(trigger)
             if (
@@ -415,13 +488,13 @@ def build_lora_trigger_plan(
             skipped.append(f"{selection.name}: no metadata trigger words")
             continue
 
-        role = preset_roles.get(key) or record.category
+        role = effective_roles.get(key) or str(record.category or "").casefold()
         if role == PRESET_CATEGORY_ARTIST_STYLE or role in FUNCTIONAL_LORA_CATEGORIES:
             for trigger in triggers:
                 append_trigger(trigger, selection.name)
             continue
         if role == PRESET_CATEGORY_CHARACTER or role == "character":
-            trigger = choose_character_identity_trigger(record)
+            trigger = resolved_character_triggers.get(key, "")
             if trigger:
                 append_trigger(trigger, selection.name)
             else:
@@ -431,7 +504,7 @@ def build_lora_trigger_plan(
             continue
         if role == PRESET_CATEGORY_MIXED or role == "mixed":
             if record.character_name:
-                trigger = choose_character_identity_trigger(record)
+                trigger = resolved_character_triggers.get(key, "")
                 if trigger:
                     append_trigger(trigger, selection.name)
                 else:

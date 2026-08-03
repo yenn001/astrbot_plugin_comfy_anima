@@ -2,6 +2,7 @@
 
 import unittest
 
+from ..core.lora import LoraWorkflowError
 from ..models import LoraSelection
 from ..services.lora_catalog import LoraRecord
 from ..services.lora_presets import LoraPreset
@@ -48,6 +49,25 @@ class RuntimeLoraMergeTests(unittest.TestCase):
 
 
 class RuntimeLoraTriggerTests(unittest.TestCase):
+    def test_verified_character_override_reclassifies_mislabeled_style_record(self) -> None:
+        record = LoraRecord(
+            "style/disguised.safetensors",
+            category="artist_style",
+            trigger_words=(r"toki \(blue archive\)", "masterpiece", "white bodysuit"),
+        )
+
+        plan = build_lora_trigger_plan(
+            prompt="1girl, selfie",
+            negative_prompt="",
+            selections=(LoraSelection(record.name, 0.8),),
+            records_by_name={"style/disguised": record},
+            verified_character_triggers={record.name: r"toki \(blue archive\)"},
+        )
+
+        self.assertEqual(plan.added, ("toki (blue archive)",))
+        self.assertNotIn("masterpiece", plan.prompt)
+        self.assertNotIn("white bodysuit", plan.prompt)
+
     def test_identity_trigger_matches_spaced_name_to_underscore_tag(self) -> None:
         record = LoraRecord(
             "characters/kallen.safetensors",
@@ -79,6 +99,89 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             choose_character_identity_trigger(record, ("rio",)),
             "rio (armed) (blue archive)",
         )
+
+    def test_verified_override_selects_one_identity_from_multi_character_lora(self) -> None:
+        record = LoraRecord(
+            "characters/baarmed_4in1_v1.safetensors",
+            category="character",
+            character_name="Himari / Eimi / Rio / Toki",
+            trigger_words=(
+                r"himari \(armed\) \(blue archive\), white bodysuit",
+                r"eimi \(armed\) \(blue archive\), black sports bra",
+                r"rio \(armed\) \(blue archive\), black bodysuit",
+                r"toki \(armed\) \(blue archive\), hooded jacket",
+            ),
+        )
+
+        plan = build_lora_trigger_plan(
+            prompt="1girl, solo",
+            negative_prompt="",
+            selections=(LoraSelection("characters/baarmed_4in1_v1", 0.8),),
+            records_by_name={"characters/baarmed_4in1_v1": record},
+            verified_character_triggers={
+                "characters/baarmed_4in1_v1": "toki (armed) (blue archive)"
+            },
+        )
+
+        self.assertEqual(plan.added, ("toki (armed) (blue archive)",))
+        self.assertIn("toki (armed) (blue archive)", plan.prompt)
+        self.assertNotIn("himari", plan.prompt)
+        self.assertNotIn("eimi", plan.prompt)
+        self.assertNotIn("rio", plan.prompt)
+        self.assertFalse(any("no reliable" in item for item in plan.skipped))
+
+    def test_invalid_verified_character_override_fails_closed(self) -> None:
+        record = LoraRecord(
+            "characters/rio.safetensors",
+            category="character",
+            character_name="Rio",
+            trigger_words=(r"rio \(blue archive\)", "black bodysuit"),
+        )
+
+        with self.assertRaises(LoraWorkflowError):
+            build_lora_trigger_plan(
+                prompt="1girl, solo",
+                negative_prompt="",
+                selections=(LoraSelection("characters/rio", 0.8),),
+                records_by_name={"characters/rio": record},
+                verified_character_triggers={
+                    "characters/rio": "black bodysuit"
+                },
+            )
+
+    def test_character_record_in_style_preset_stays_identity_only(self) -> None:
+        preset = LoraPreset(
+            name="misclassified style",
+            category="artist_style",
+            selections=(LoraSelection("characters/rio", 0.8),),
+        )
+        for category, character_name in (
+            ("character", ""),
+            ("artist_style", "Rio"),
+        ):
+            with self.subTest(category=category, character_name=character_name):
+                record = LoraRecord(
+                    "characters/rio.safetensors",
+                    category=category,
+                    character_name=character_name,
+                    trigger_words=(
+                        r"rio \(blue archive\)",
+                        "black dress",
+                        "red eyes",
+                    ),
+                )
+
+                plan = build_lora_trigger_plan(
+                    prompt="1girl, solo",
+                    negative_prompt="",
+                    selections=preset.selections,
+                    records_by_name={"characters/rio": record},
+                    presets=(preset,),
+                )
+
+                self.assertEqual(plan.added, ("rio (blue archive)",))
+                self.assertNotIn("black dress", plan.prompt)
+                self.assertNotIn("red eyes", plan.prompt)
 
     def test_character_trigger_plan_splits_compound_civitai_trained_word(self) -> None:
         record = LoraRecord(

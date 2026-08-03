@@ -8,6 +8,7 @@ import unittest
 from ..services.character_identity import (
     character_identity_lookup_candidates,
     resolve_character_identity,
+    resolve_user_adjacent_character_alias,
 )
 from ..services.danbooru_index import DanbooruTagIndex
 
@@ -163,6 +164,134 @@ class CharacterIdentityResolverTests(unittest.TestCase):
 
         self.assertTrue(result.verified)
         self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
+
+    def test_user_adjacent_alias_selects_base_identity_without_lora(self) -> None:
+        result = resolve_user_adjacent_character_alias(
+            self.index,
+            alias="toki",
+            canonical_candidates=(),
+            work_hints=("blue_archive",),
+        )
+
+        self.assertTrue(result.verified)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
+        self.assertEqual(result.match_variant, "user_adjacent_alias_unique_base")
+
+    def test_user_adjacent_alias_binds_prompt_exact_to_same_base(self) -> None:
+        result = resolve_user_adjacent_character_alias(
+            self.index,
+            alias="toki",
+            canonical_candidates=("toki_(blue_archive)",),
+            work_hints=("blue_archive",),
+        )
+
+        self.assertTrue(result.verified)
+        self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
+        self.assertEqual(result.match_variant, "user_adjacent_alias_prompt_exact")
+
+    def test_user_adjacent_alias_rejects_variant_when_base_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            payload = {
+                "tags": [
+                    {
+                        "tag": "toki_(bunny)_(blue_archive)",
+                        "category": "character",
+                        "count": 5000,
+                    },
+                    {
+                        "tag": "blue_archive",
+                        "category": "copyright",
+                    },
+                ]
+            }
+            index.import_bytes(json.dumps(payload).encode(), content_type="json")
+            result = resolve_user_adjacent_character_alias(
+                index,
+                alias="toki",
+                work_hints=("blue_archive",),
+            )
+
+        self.assertFalse(result.verified)
+        self.assertFalse(result.ambiguous)
+
+    def test_user_adjacent_alias_filters_prompt_roots_by_confirmed_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(work_a)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "toki_(work_b)",
+                                "category": "character",
+                            },
+                            {"tag": "work_a", "category": "copyright"},
+                            {"tag": "work_b", "category": "copyright"},
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            result = resolve_user_adjacent_character_alias(
+                index,
+                alias="toki",
+                canonical_candidates=("toki_(work_a)", "toki_(work_b)"),
+                work_hints=("work_a",),
+            )
+
+        self.assertTrue(result.verified)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(result.canonical_tag, "toki_(work_a)")
+        self.assertEqual(result.match_variant, "user_adjacent_alias_prompt_exact")
+
+    def test_user_adjacent_alias_rejects_different_prompt_exact_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "toki_(bunny)_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "hatsune_miku_(vocaloid)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            result = resolve_user_adjacent_character_alias(
+                index,
+                alias="toki",
+                canonical_candidates=("hatsune_miku_(vocaloid)",),
+            )
+
+        self.assertFalse(result.verified)
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(
+            result.match_variant,
+            "user_adjacent_alias_prompt_conflict",
+        )
+        self.assertEqual(
+            set(result.candidates),
+            {"toki_(blue_archive)", "hatsune_miku_(vocaloid)"},
+        )
 
     def test_prefix_discovery_collapses_one_identity_not_first_fuzzy_variant(self) -> None:
         result = resolve_character_identity(

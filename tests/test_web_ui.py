@@ -507,6 +507,7 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
 
     def test_prompt_workshop_exposes_config_status_and_local_diagnostics(self) -> None:
         fields = (
+            "enable_chat_draw_terminal_guard",
             "enable_prompt_composer_v2",
             "adaptive_negative_mode",
             "enable_prompt_diagnostics",
@@ -520,6 +521,10 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
         for field in fields:
             with self.subTest(field=field):
                 self.assertIn(f'name="{field}"', self.html)
+        self.assertIn(
+            "Danbooru guarded 只约束 LLM 声明的角色、作品与画师硬锚点",
+            self.html,
+        )
         self.assertIn('data-panel="prompt"', self.html)
         self.assertIn('id="panel-prompt"', self.html)
         self.assertIn('id="prompt-diagnostic-form"', self.html)

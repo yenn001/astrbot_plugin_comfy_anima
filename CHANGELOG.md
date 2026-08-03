@@ -2,6 +2,19 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.20] - 2026-08-03
+
+### Prompt Contract v2、普通聊天终止守卫与跨语言角色别名
+
+- 将绘图导演拆分为版本化、按任务加载的最小合同：普通生图、Prompt Plan 增量、反推画图、整图语义改图、底图控制、遮罩重绘和换角中间编辑分别声明职责；`<pic>`、`<edit>`、Function Call 与严格 JSON 传输互斥，不再用“忽略前文规则”覆盖输出协议。Auto Function 响应一旦出现畸形、冲突或错误工具调用，不会再接受同一响应夹带的 `<pic>`，只能通过下一次独立修复或安全停止。
+- 重写内置 `director_reference.txt` 为纯创作参考。动态 System Prompt 只注入本次实际可用的 LoRA、Danbooru 或 Prompt Plan 能力；遮罩重绘、换角中间编辑与 Prompt Plan 不再承载整图场景扩写手册。结构化 JSON 拒绝重复键、NaN/Infinity、非对象根、未知字段和非字符串角色声明。
+- 新增普通聊天资产查询终止状态机，覆盖 LoRA、风格组合、Danbooru 与 Prompt Plan 工具。启用守卫时普通 Agent 回复强制完整缓冲；所有工具调用必须完成且零失败，最终只允许一个合法 `<pic>`，多 `<pic>`、`pic+edit`、裸 Tags、假完成文案和纯查询误出图均被修复一次或失败关闭。
+- 终止修复只携带本轮插件生成的有界资产证据，不信任模型泄露的裸 Tags；精确 LoRA 文件名、保存组合控制和 verified canonical 可继续进入修复结果。失败分支同步清理 reasoning、会话最后一条 assistant 文本、事件状态与 LoRA 快照；AstrBot 真实取消标志会在任何修复调用前终止并完成同样清理。
+- 内部 LLM 事件隔离改为引用计数，避免同一 QQ 事件中的重叠反推、分镜或修复调用提前解除普通聊天协议隔离。
+- 修复 `飞鸟马时（toki）`：用户紧邻角色名写出的 ASCII 别名可独立发现候选，但最终 Character canonical 与基础 identity root 仍须 exact；没有角色 LoRA 时也能确认 `toki_(blue_archive)`。未声明 `characters` 且提示词同时含基础身份与 Bunny/Armed 变体时，只保留 exact 基础 canonical；只有多个变体而不存在基础 canonical 时继续停止。
+- 用户显式作品名现在优先进入有限 work hints，外貌证据阶段复用包含作品与别名的查询上下文。角色 LoRA 继续只是可选增强；工作流注入前会把每个已选择 LoRA 的原子触发词重新通过本地 Character exact，并要求命中的身份与最终 canonical 完全一致，即使该 LoRA 被误归档为画师/风格也不能绕过角色闸门。Armed/Bunny 等变体不会替代基础身份，无法绑定的自动候选会被真正移出 `dynamic_loras` 后回退语义 Tags，而不是只跳过触发词却继续加载模型。
+- 独立端口 WebUI 与 AstrBot 原生插件页同步新增“普通聊天绘图终止守卫”开关和完整缓冲说明。本版不增加 Python 依赖、ComfyUI 自定义节点、模型或工作流文件。
+
 ## [1.9.19] - 2026-08-03
 
 ### 全图 LLM 角色证据编译

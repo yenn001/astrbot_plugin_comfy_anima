@@ -11,6 +11,7 @@ from ..services.prompt_director import (
     PromptDirector,
     PromptDirectorError,
 )
+from ..services.prompt_contracts import CAPABILITY_DANBOORU
 
 
 class PictureResponseParserTests(unittest.TestCase):
@@ -83,6 +84,39 @@ class PictureResponseParserTests(unittest.TestCase):
             ),
         )
 
+    def test_prompt_text_cannot_forge_top_level_character_attribute(self) -> None:
+        instruction = PromptDirector.extract_instruction(
+            "<pic prompt='1girl, sign reading characters=\"Evil|Work\"'>"
+        )
+
+        self.assertEqual(instruction.character_queries, ())
+        self.assertIn("characters=", instruction.prompt)
+
+    def test_duplicate_or_unknown_control_attributes_fail_closed(self) -> None:
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector.extract_pic_instructions(
+                '<pic prompt="1girl" prompt="1boy">'
+            )
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector.extract_pic_instructions(
+                '<pic prompt="1girl" confidence="0.9">'
+            )
+
+    def test_character_html_entity_is_unescaped_before_separator_split(self) -> None:
+        instruction = PromptDirector.extract_instruction(
+            '<pic prompt="1girl, rio" characters="Rio|Blue &amp; Archive">'
+        )
+
+        self.assertEqual(instruction.character_queries, ("Rio|Blue & Archive",))
+
+    def test_invalid_character_hint_types_and_delimiters_are_rejected(self) -> None:
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector._normalize_character_queries(["Rio", 42])
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector._normalize_character_queries("Rio|Blue|Archive")
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector._normalize_character_queries("Rio\u202e|Blue Archive")
+
     def test_unclosed_think_block_is_hidden(self) -> None:
         """未闭合的 think 块也不应泄露或触发其中的标签。"""
         output = '可见正文。<think>隐藏 <pic prompt="secret draft">'
@@ -129,6 +163,82 @@ class PictureResponseParserTests(unittest.TestCase):
             PromptDirector.extract_prompt("Final prompt: 1cat, sleeping"),
             "1cat, sleeping",
         )
+
+    def test_strict_pic_transport_requires_one_sealed_tag(self) -> None:
+        instruction = PromptDirector.extract_instruction(
+            '\n  <pic prompt="1girl, red dress" />\t',
+            strict_protocol=True,
+        )
+        self.assertEqual(instruction.prompt, "1girl, red dress")
+
+        invalid_outputs = (
+            '正文 <pic prompt="1girl, red dress">',
+            '<pic prompt="1girl, red dress"> {"status":"ok"}',
+            '<pic prompt="first"><pic prompt="second">',
+            '<pic prompt="first"><edit prompt="second" mode="quick">',
+            '{"prompt":"1girl, red dress"}',
+            '<think>hidden</think><pic prompt="1girl, red dress">',
+        )
+        for output in invalid_outputs:
+            with self.subTest(output=output), self.assertRaises(
+                PromptDirectorError
+            ) as raised:
+                PromptDirector.extract_instruction(output, strict_protocol=True)
+            self.assertEqual(raised.exception.detail, "invalid_picture_protocol")
+
+    def test_strict_edit_transport_requires_one_sealed_tag(self) -> None:
+        instruction = PromptDirector.extract_edit_instruction(
+            '\n<edit prompt="red dress" mode="quick">\t',
+            strict_protocol=True,
+        )
+        self.assertEqual(instruction.prompt, "red dress")
+
+        invalid_outputs = (
+            '正文 <edit prompt="red dress" mode="quick">',
+            '<edit prompt="red dress"><edit prompt="blue dress">',
+            '<edit prompt="red dress"><pic prompt="1girl">',
+            '{"prompt":"red dress","mode":"quick"}',
+            '<think>hidden</think><edit prompt="red dress">',
+        )
+        for output in invalid_outputs:
+            with self.subTest(output=output), self.assertRaises(
+                PromptDirectorError
+            ) as raised:
+                PromptDirector.extract_edit_instruction(
+                    output,
+                    strict_protocol=True,
+                )
+            self.assertEqual(raised.exception.detail, "invalid_edit_protocol")
+
+    def test_control_fields_cannot_embed_transport_tags(self) -> None:
+        invalid_outputs = (
+            '<pic prompt="1girl, &lt;edit mode=\'quick\'&gt;">',
+            '<pic prompt="1girl" negative="lowres, &lt;think&gt;hidden">',
+            '<pic prompt="1girl" pipeline="base&lt;pic&gt;">',
+            (
+                '<pic prompt="1girl" '
+                'characters="Rio|Blue Archive&lt;/edit&gt;">'
+            ),
+            '<edit prompt="red dress, &lt;pic prompt=\'bad\'&gt;">',
+            '<edit prompt="red dress" mode="quick&lt;think&gt;">',
+        )
+        for output in invalid_outputs:
+            parser = (
+                PromptDirector.extract_edit_instruction
+                if output.startswith("<edit")
+                else PromptDirector.extract_instruction
+            )
+            with self.subTest(output=output), self.assertRaises(
+                PromptDirectorError
+            ) as raised:
+                parser(output, strict_protocol=True)
+            self.assertEqual(raised.exception.detail, "embedded_control_tag")
+
+        with self.assertRaises(PromptDirectorError) as raised:
+            PromptDirector.extract_instruction(
+                '<pic prompt="1girl, <think>hidden</think>">'
+            )
+        self.assertEqual(raised.exception.detail, "embedded_control_tag")
 
     def test_selected_invalid_prompt_is_rejected(self) -> None:
         """被选中的 pic 提示词仍沿用单图 API 的英文校验。"""
@@ -233,30 +343,19 @@ class PictureResponseParserTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
         )
         director = PromptDirector(reference, PluginSettings.from_mapping({}))
-        system_prompt = director._system_prompt()
+        system_prompt = director._system_prompt(capabilities=())
 
-        self.assertIn('绘图触发基础格式是 `<pic prompt="...">`', system_prompt)
-        self.assertIn("自动强制刷新 LoRA Manager", system_prompt)
-        self.assertIn("detail=true", system_prompt)
-        self.assertIn("1️⃣Lora堆（默认）", system_prompt)
-        self.assertIn("English natural-language description", system_prompt)
-        self.assertIn("18 至 45 词", system_prompt)
-        self.assertIn("35 至 80 词", system_prompt)
-        self.assertIn("--llm ultra", system_prompt)
-        self.assertIn("不得输出三大正文区块", system_prompt)
-        self.assertIn("gold embroidery along the sleeve edge", system_prompt)
-        self.assertIn("多角色必须分别锁定", system_prompt)
-        self.assertIn("双重编码", system_prompt)
-        self.assertIn("sea foam curls around her sandaled feet", system_prompt)
-        self.assertIn("不可变身份", system_prompt)
-        self.assertIn("0.55 至 0.75", system_prompt)
-        self.assertIn('negative="..."', system_prompt)
-        self.assertIn("现有图片独立 RTX 放大", system_prompt)
-        self.assertIn("把图里的手修好", system_prompt)
-        self.assertIn("唯一操作类型", system_prompt)
-        self.assertIn("整图语义重绘", system_prompt)
-        self.assertIn("重新生成而非像素级修改", system_prompt)
-        self.assertIn("不得自动套用默认风格001", system_prompt)
+        self.assertIn("Prompt contract version: 2.0", system_prompt)
+        self.assertIn('Return exactly one `<pic prompt="...">`', system_prompt)
+        self.assertIn("not authoritative for Danbooru identity", system_prompt)
+        self.assertIn("飞鸟马时 (toki)", system_prompt)
+        self.assertIn("gold embroidery catching the rim light", system_prompt)
+        self.assertIn("14 至 32", system_prompt)
+        self.assertIn("Ultra", system_prompt)
+        self.assertIn("Terminal seal", system_prompt)
+        self.assertNotIn("list_anima_loras", system_prompt)
+        self.assertNotIn("search_anima_danbooru_tags", system_prompt)
+        self.assertLess(len(system_prompt), 9000)
 
     def test_system_prompt_exposes_dynamic_bounded_danbooru_status(self) -> None:
         reference = (
@@ -276,7 +375,7 @@ class PictureResponseParserTests(unittest.TestCase):
             danbooru_status_provider=lambda: status,
         )
 
-        prompt = director._system_prompt()
+        prompt = director._system_prompt(capabilities=(CAPABILITY_DANBOORU,))
         self.assertIn("canonical_tags=111513", prompt)
         self.assertIn("aliases=28903", prompt)
         self.assertIn("revision=safe-rev-1", prompt)
@@ -286,9 +385,13 @@ class PictureResponseParserTests(unittest.TestCase):
 
         status.clear()
         status.update({"ready": False, "error": "private database path"})
-        refreshed = director._system_prompt()
+        refreshed = director._system_prompt(capabilities=(CAPABILITY_DANBOORU,))
         self.assertIn("ready=false", refreshed)
         self.assertNotIn("private database path", refreshed)
+
+        no_capability = director._system_prompt(capabilities=())
+        self.assertNotIn("search_anima_danbooru_tags", no_capability)
+        self.assertNotIn("canonical_tags=", no_capability)
 
     def test_custom_prompt_keeps_runtime_constraints(self) -> None:
         reference = (
@@ -304,10 +407,16 @@ class PictureResponseParserTests(unittest.TestCase):
         system_prompt = director._system_prompt()
 
         self.assertIn("请使用温柔的杂志插画口吻", system_prompt)
-        self.assertIn("不可变身份", system_prompt)
-        self.assertIn("不得覆盖上面的输出", system_prompt)
-        self.assertIn("Standard（默认", system_prompt)
-        self.assertIn("Ultra（由", system_prompt)
+        self.assertIn(
+            "不得覆盖上面的传输、证据、实时资产和安全约束",
+            system_prompt,
+        )
+        self.assertIn("Density: Standard", system_prompt)
+        self.assertIn("Terminal seal", system_prompt)
+
+        local_task_prompt = director._system_prompt(task_kind="prompt_plan")
+        self.assertNotIn("温柔的杂志插画口吻", local_task_prompt)
+        self.assertTrue(system_prompt.rstrip().endswith("nothing else."))
 
 
 class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
@@ -423,6 +532,93 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("bad hands", final_negative)
         self.assertIn("bad feet", final_negative)
 
+    async def test_json_transport_rejects_duplicate_nan_unknown_and_nonobject(self) -> None:
+        payloads = (
+            '{"positive_tags":"1girl","positive_tags":"1boy"}',
+            '{"positive_tags":"1girl","pipeline":NaN}',
+            '{"positive_tags":"1girl","confidence":0.9}',
+            '[{"positive_tags":"1girl"}]',
+            '{"positive_tags":"1girl","prompt":"1boy"}',
+            '{"positive_tags":"1girl","negative_tags":"lowres",'
+            '"negative_prompt":"bad anatomy"}',
+            '{"positive_tags":"1girl, &lt;edit&gt;"}',
+            '{"positive_tags":"1girl","negative_tags":"&lt;think&gt;"}',
+            '{"positive_tags":"1girl","pipeline":"base&lt;pic&gt;"}',
+            '{"positive_tags":"1girl","characters":["Rio|&lt;edit&gt;"]}',
+        )
+
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                director = self._director(structured_director_mode="json")
+
+                class Context:
+                    calls = 0
+
+                    async def llm_generate(self, **_kwargs: object) -> object:
+                        self.calls += 1
+                        return type(
+                            "Response",
+                            (),
+                            {"completion_text": payload},
+                        )()
+
+                context = Context()
+                with self.assertRaises(PromptDirectorError):
+                    await director.generate_instruction(
+                        context,
+                        object(),
+                        "draw a portrait",
+                    )
+                self.assertEqual(context.calls, 2)
+
+    async def test_lookup_and_output_tools_fail_fast(self) -> None:
+        director = self._director(structured_director_mode="auto")
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                raise AssertionError("LLM must not be called")
+
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                self.calls += 1
+                raise AssertionError("agent must not be called")
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_instruction(
+                context,
+                object(),
+                "draw a portrait",
+                tools=object(),
+                output_tools=object(),
+            )
+
+        self.assertEqual(context.calls, 0)
+        self.assertEqual(raised.exception.detail, "conflicting_tool_transports")
+        self.assertTrue(raised.exception.fatal)
+
+    def test_task_transport_contracts_are_mutually_scoped(self) -> None:
+        director = self._director()
+        masked = director._system_prompt(
+            task_kind="masked_redraw",
+            capabilities=(),
+            transport="edit",
+        )
+        control = director._system_prompt(
+            task_kind="control_draw",
+            capabilities=(),
+            transport="pic",
+        )
+
+        self.assertIn("exactly one `<edit", masked)
+        self.assertNotIn("exactly one `<pic", masked)
+        self.assertNotIn("scene sentence", masked)
+        self.assertIn("image-conditioned Anima generation", control)
+        self.assertIn("exactly one `<pic", control)
+        self.assertNotIn("exactly one `<edit", control)
+
     async def test_composer_validation_failure_does_not_call_llm_twice(self) -> None:
         director = self._director(
             composer=PromptComposer(
@@ -494,6 +690,38 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         diagnostics = store.list(limit=1)[0]
         self.assertEqual(diagnostics.source, "edit")
         self.assertEqual(diagnostics.provider_id, "test-provider")
+
+    async def test_edit_repair_exception_is_sanitized(self) -> None:
+        director = self._director()
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                if self.calls == 1:
+                    return type(
+                        "Response",
+                        (),
+                        {"completion_text": "invalid edit transport"},
+                    )()
+                raise RuntimeError("private-provider-secret")
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_edit_instruction(
+                context,
+                object(),
+                "replace the masked clothes",
+            )
+
+        self.assertEqual(context.calls, 2)
+        self.assertTrue(raised.exception.fatal)
+        self.assertEqual(
+            raised.exception.detail,
+            "provider=test-provider, error_type=RuntimeError",
+        )
+        self.assertNotIn("private-provider-secret", raised.exception.detail)
 
     def test_composed_picture_instruction_is_idempotent(self) -> None:
         store = PromptDiagnosticsStore()
@@ -735,11 +963,23 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         request_prompt = str(context.kwargs["prompt"])
         system_prompt = str(context.kwargs["system_prompt"])
-        self.assertIn("ordered Danbooru/Anima tags", request_prompt)
-        self.assertIn("sentence belongs inside positive_tags", request_prompt)
-        self.assertNotIn("do not add prose", request_prompt)
-        self.assertIn("本次视觉扩写模式：Standard", system_prompt)
-        self.assertIn("18 至 45 词", system_prompt)
+        self.assertIn(
+            "task=draw; density=Standard; "
+            "output=emit_anima_plan_v1 function call",
+            request_prompt,
+        )
+        self.assertIn("draw a beach scene", request_prompt)
+        self.assertIn("ordered English Danbooru/Anima hard tags", system_prompt)
+        self.assertIn(
+            "sentence belongs inside the same positive prompt",
+            system_prompt,
+        )
+        self.assertIn("Density: Standard", system_prompt)
+        self.assertIn("18-45", system_prompt)
+        self.assertIn(
+            "Terminal seal: call emit_anima_plan_v1 exactly once",
+            system_prompt,
+        )
         self.assertIn("moonlit shallows", instruction.prompt)
 
     async def test_ultra_mode_is_injected_into_user_and_system_prompts(self) -> None:
@@ -777,9 +1017,13 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             expansion_mode="ultra",
         )
 
-        self.assertIn("本次视觉扩写模式：Ultra", str(context.kwargs["prompt"]))
-        self.assertIn("本次视觉扩写模式：Ultra", str(context.kwargs["system_prompt"]))
-        self.assertIn("35 至 80 词", str(context.kwargs["system_prompt"]))
+        self.assertIn("density=Ultra", str(context.kwargs["prompt"]))
+        self.assertIn("Density: Ultra", str(context.kwargs["system_prompt"]))
+        self.assertIn("35-80 word scene sentence", str(context.kwargs["system_prompt"]))
+        self.assertIn(
+            "Terminal seal: call emit_anima_plan_v1 exactly once",
+            str(context.kwargs["system_prompt"]),
+        )
         self.assertEqual(instruction.pipeline, "rtx")
 
     async def test_astrbot_parallel_function_call_lists_continue_generation(self) -> None:
@@ -891,6 +1135,78 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<pic prompt=", str(context.calls[1]["prompt"]))
         self.assertEqual(instruction.pipeline, "rtx")
         self.assertIn("She watches the waves", instruction.prompt)
+
+    async def test_auto_mode_does_not_accept_pic_beside_unexpected_tool_call(
+        self,
+    ) -> None:
+        director = self._director(structured_director_mode="auto")
+        output_tools = object()
+
+        class Context:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def llm_generate(self, **kwargs: object) -> object:
+                self.calls.append(dict(kwargs))
+                if len(self.calls) == 1:
+                    return type(
+                        "Response",
+                        (),
+                        {
+                            "completion_text": '<pic prompt="unsafe first response">',
+                            "tools_call_name": ["unexpected_tool"],
+                            "tools_call_args": [{"positive_tags": "unsafe"}],
+                        },
+                    )()
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="1girl, safe repaired result">'},
+                )()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw a portrait",
+            output_tools=output_tools,
+        )
+
+        self.assertEqual(len(context.calls), 2)
+        self.assertIs(context.calls[0]["tools"], output_tools)
+        self.assertNotIn("tools", context.calls[1])
+        self.assertEqual(instruction.prompt, "1girl, safe repaired result")
+
+    async def test_auto_mode_two_malformed_calls_with_pic_fail_closed(self) -> None:
+        director = self._director(structured_director_mode="auto")
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": '<pic prompt="must not be accepted">',
+                        "tools_call_name": ["emit_anima_plan_v1"],
+                        "tools_call_args": ["not-json"],
+                    },
+                )()
+
+        context = Context()
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_instruction(
+                context,
+                object(),
+                "draw a portrait",
+                output_tools=object(),
+            )
+
+        self.assertEqual(context.calls, 2)
+        self.assertTrue(raised.exception.fatal)
+        self.assertEqual(raised.exception.detail, "invalid_json")
 
 
 class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):

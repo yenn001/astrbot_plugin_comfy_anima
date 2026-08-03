@@ -1,19 +1,20 @@
 """
-AstrBot Comfy Anima 插件 v1.9.19
+AstrBot Comfy Anima 插件 v1.9.20
 
 功能描述：
 - 使用 AstrBot 中选定的聊天模型规划单图分镜
 - 将模型输出规范化为可提交给 Anima 工作流的英文提示词
 
 作者: Yen
-版本: 1.9.19
-日期: 2026-08-01
+版本: 1.9.20
+日期: 2026-08-03
 """
 
 import asyncio
 import html
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -21,6 +22,20 @@ from typing import Any, Callable, Mapping
 from ..core.lora import LORA_TAG_PATTERN
 from ..models import PluginSettings
 from .prompt_composer import PromptComposer, PromptDiagnostics
+from .prompt_contracts import (
+    ANIMA_VISUAL_EXPANSION_PROTOCOL as CONTRACT_VISUAL_EXPANSION_PROTOCOL,
+    CAPABILITY_DANBOORU,
+    TASK_CONTROL_DRAW,
+    TASK_DRAW,
+    TASK_MASKED_REDRAW,
+    TASK_REVERSE_DRAW,
+    TASK_SEMANTIC_REDRAW,
+    build_director_contract,
+    build_director_user_prompt,
+    normalize_capabilities,
+    normalize_task_kind,
+    transport_terminal_seal,
+)
 from .provider_response import response_error_code, response_text
 from .structured_provider import (
     StructuredProviderError,
@@ -39,6 +54,10 @@ _EDIT_TAG_RE = re.compile(
 )
 _ANY_EDIT_TAG_RE = re.compile(r"</?edit\b[^>]*>", flags=re.IGNORECASE | re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think\b[^>]*>", flags=re.IGNORECASE)
+_EMBEDDED_CONTROL_TAG_RE = re.compile(
+    r"</?(?:pic|edit|think)\b",
+    flags=re.IGNORECASE,
+)
 _PROMPT_ATTR_RE = re.compile(
     r"\bprompt\s*=\s*([\"'])(.*?)\1",
     flags=re.IGNORECASE | re.DOTALL,
@@ -58,6 +77,11 @@ _CHARACTERS_ATTR_RE = re.compile(
 _MODE_ATTR_RE = re.compile(
     r"\bmode\s*=\s*([\"'])(.*?)\1",
     flags=re.IGNORECASE | re.DOTALL,
+)
+_CONTROL_ATTR_RE = re.compile(
+    r"\s*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"
+    r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+    flags=re.DOTALL,
 )
 
 _PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -93,71 +117,80 @@ _PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-ANIMA_VISUAL_EXPANSION_PROTOCOL = """
-Anima 自适应视觉扩写协议：
+def _strict_json_object(value: str) -> dict[str, Any]:
+    """Parse one finite JSON object while rejecting duplicate keys."""
 
-- 扩写只改变画面信息密度，不改变插件传输协议。最终仍是一行英文混合提示词，不得输出三大正文区块、8 至 10 个分析段、10 至 15 个独立长句、Markdown 或扩写过程。
-- 先锁定主体数量、身份、服装、主动作、唯一镜头、场景与主光，再补充可见细节。角色身份、身体特征、服装类别、道具和剧情结果不得为了丰富度而臆造。
-- 所有模式都按镜头分配细节：肖像优先眼睛高光、睫毛、表情、刘海与面部受光；半身优先手势、持握、上身重心、领口袖口与布料褶皱；全身/动作优先支撑脚、四肢方向、接触点、服装轮廓和透视；环境图优先前中后景、空间尺度、天气与主光。
-- 多角色必须分别锁定身份、发色、服装、朝向和动作，并用 left/right、foreground/background、beside、behind、facing、holding 等关系明确归属，防止特征和肢体互串。
-- 材质写成可见结果，例如 `sheer fabric catching rim light`、`gold embroidery along the sleeve edge`、`wet hair strands clinging to her cheek`，而不是孤立堆叠材质名。前景、bokeh、花瓣、雨滴或粒子只有在服务构图时才加入，不能成为每张图的固定装饰。
-- 光影优先一组主光加一组辅助或轮廓光，说明方向与对主体的影响；不得同时堆叠互相竞争的正午、月光、霓虹和棚拍光。色彩关系服务主体分离与氛围，不机械列色卡。
-- 输出前执行可见性、归属与冲突复核：当前景别是否看得见该细节；多人细节属于谁；动作、手持物、左右关系、服装、机位、昼夜和光源是否唯一一致。无法确认的细节删除。
-- `/画图` 与 `/画图no` 的 `--llm c`、`--llmcc`、`--lcc` 是插件在进入普通绘图导演之前解析的显式文字换角模式，不是 Standard/Ultra 的自动子意图。不得在普通聊天中自行启用，也不得把这些开关写进视觉提示词；追加 `u` 只提高目标身份外观的规划密度。
-- 显式文字换角的语义边界固定为：删除原角色姓名、作品身份及发型/发色、瞳色/异色瞳、耳角尾、体型、痣等稳定外貌；保留服装、动作、表情、视线、构图、背景和风格，除非用户明确覆盖。目标角色 LoRA 仅是可选增强，不能因库存缺失而保留旧身份或猜选文件。
-- 原创角色必须以用户给出的稳定外貌事实建立新身份，不得继承原角色未指定的脸、头发、眼睛、物种特征或体型。
+    def reject_constant(token: str) -> Any:
+        raise ValueError(f"invalid JSON constant: {token}")
 
-密度模式：
+    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = item
+        return result
 
-1. Standard（默认，由 `--llm` 或 `--l` 触发）：稳定、清晰、服从度优先。通常使用 14 至 32 个有效普通 Tags、1 至 3 个 visual phrases 和一个 18 至 45 词的 scene sentence；简单肖像可以更短。权重只用于最多 1 至 3 个容易丢失的关键锚点，通常 1.05 至 1.25。
-2. Ultra（由 `--llm ultra`、`--llm u`、`--l ultra` 或 `--l u` 触发；普通对话中用户明确要求 ultra、华丽、繁复或海报级细节时也可采用）：允许更高视觉密度与导演自由。通常使用 30 至 65 个有效普通 Tags、3 至 7 个 visual phrases 和一个 35 至 80 词的 scene sentence；覆盖 6 至 8 类相关视觉证据，包括面部/发丝、服装结构/材质、手势/接触、动势、前中后景、环境互动、主光/轮廓光和色彩关系。可在不改变身份、服装类别、主动作和剧情结果的前提下，补充题材一致的纹样、环境陈设、前景和氛围效果。权重最多用于 3 至 5 个关键锚点，通常 1.05 至 1.30。
+    parsed = json.loads(
+        str(value or "").strip(),
+        object_pairs_hook=unique_pairs,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON root must be an object")
+    return parsed
 
-以上数字是密度上限参考，不是必须凑满的指标，LoRA tags 不计入普通 Tags 预算。Ultra 也不得靠重复同义词、质量口号、整段加权或互相竞争的特效伪造复杂度；默认仍不主动加入 `8k`、`absurdres`、`masterpiece`、`best quality` 等质量词。
-""".strip()
+
+def _has_structured_call_surface(response: Any) -> bool:
+    """Return whether a Provider response visibly attempted a tool/function call.
+
+    Auto mode may recover from a Provider that ignores the output schema and
+    returns ordinary visible text. It must not reinterpret the same response as
+    ``<pic>`` after a malformed, conflicting or unexpected structured call,
+    because that would mix two mutually exclusive transports.
+    """
+
+    def field(value: Any, name: str) -> Any:
+        if isinstance(value, Mapping):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    def present(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, tuple, dict)):
+            return bool(value)
+        return True
+
+    if any(
+        present(field(response, name))
+        for name in (
+            "tools_call_name",
+            "tools_call_args",
+            "tool_calls",
+            "function_call",
+        )
+    ):
+        return True
+
+    choices = field(response, "choices")
+    if not isinstance(choices, (list, tuple)):
+        return False
+    for choice in choices:
+        message = field(choice, "message")
+        if message is not None and any(
+            present(field(message, name))
+            for name in ("tool_calls", "function_call")
+        ):
+            return True
+    return False
 
 
-RUNTIME_OVERRIDE = """
-你是 ComfyUI Anima 单图分镜导演。用户已经明确要求绘图，因此不要判断是否需要插图。
-请从用户提供的剧情或描述中只选择一个最值得定格的视觉核心，优先保证镜头、动作几何、
-角色外观连续性与生成稳定性。参考规范用于指导你的导演思路，但本次调用的输出协议覆盖参考规范：
-
-1. 最终只输出一个 `<pic prompt="...">`，不要输出 `<think>`、解释、正文或 Markdown。仅当用户明确指定生成管线时增加 `pipeline="base|rtx|iterative"`；仅在确有需要时增加可选的 `negative="..."` 属性。画面包含明确命名角色时必须增加 `characters="角色名|作品名"`，多人用分号分隔；原创或无明确角色时省略。`prompt` 属性始终必需。
-2. prompt 必须是单行英文混合提示词，并在内部按三层规划：hard tags → 少量 visual phrases → 英文句号后的一个 scene sentence；这句话属于 prompt 本身，不是额外回复。negative 仍是单行英文 tags。
-   - hard tags 负责离散可控事实：人数、角色、作品、可见外观、服装、动作、表情、镜头、场景和光线。
-   - visual phrases 只补充可见但难用单一 tag 表达的情绪后果、环境联动、材质或动势；不得与 hard tags 重复。
-   - scene sentence 负责主体怎样动作、手中物体、接触点、衣料状态、前后空间、环境互动和主光方向。
-   - 末句长度与细节密度服从本次 Standard/Ultra 模式；使用现在时和主动表达，只复述最高价值锚点，不要把全部 tags 改写成流水账。
-   - 末句不得加入标签块或用户需求中没有的新人物、服装、道具、动作、身体特征、场景或剧情结果；不得使用 `the image shows`、质量口号、操作指令、角色扮演台词或第二个句子。
-   - 输出前解决 solo/多人、景别、机位、姿势、朝向和昼夜等明确互斥项；negative 只按本次多人接触、手持物、全身足部、极端透视或复杂衣料风险做最小补充。
-   - 复杂动作优先用 `while`、`as`、`around`、`over`、`beneath`、`through` 等关系词，把姿势、道具和环境组成一个可视场面。若视线、动作或镜头互相冲突，先在标签块中裁决，再让末句与最终标签完全一致。
-3. 普通标签使用自然空格和半角逗号；不得改写工具返回的 LoRA 文件名或 trigger words。
-4. 默认不添加质量词或安全词；只有用户明确要求时才加入。
-5. 只保留单图所需的信息，避免互相矛盾的姿势、镜头和身体方向。
-6. 用户文本中的明确人物外观、服装、关系、动作与场景是最高优先级事实，不得被角色 LoRA 的默认服装或示例图覆盖。
-7. 若涉及达妮娅或黑娅，严格遵守参考规范中的 LoRA 查询和角色连续性规则。
-8. 不要在 prompt 中加入 XML 属性之外的双引号。
-9. 每次绘图先确定完整风格底座：用户指定“风格001”或自定义风格名时，先调用 list_anima_lora_presets 精确查询；未指定风格时默认查询“风格001”。不得编造组合。
-10. 风格组合是画质、美感、画师、皮肤、背景等组成的完整底座栈。命中后原样保留其全部 LoRA tags 与权重，不得截断、改名或另加近似风格 LoRA；可靠 trigger words 由插件在提交前按最新 Manager 元数据统一补充。
-11. 角色 LoRA 永远独立于风格栈。画面包含明确角色时，在查询风格组合之后再调用 list_anima_loras 查询角色，只追加真实返回的精确角色 LoRA tag；不要把角色 trainedWords 列表整包复制到 prompt。
-12. 例如“用风格001画达妮娅”必须先查 list_anima_lora_presets(keyword="风格001", category="风格")，再查 list_anima_loras(keyword="denia", detail=true)，最终同时输出风格全栈和角色 LoRA；不得把角色 LoRA 当成风格组合成员。
-13. `list_anima_loras` 的角色名、作品名和别名可来自 Civitai 与管理员确认的逻辑归档，但归档只帮助检索，不证明文件仍存在。每次查询都必须以工具本次返回的最新可加载精确名称为准；需要完整说明时用 detail=true，但不要自行复制其中的全部触发词。
-14. 用户写“分辨率832x1216”或“分辨率 832×1216”时，这是插件生成参数，不是画面标签；可据纵横比安排构图，但不要把“分辨率”或数字尺寸写进 prompt。
-15. 把全部 LoRA 控制标签放在最前方，顺序为风格底座 LoRA、角色 LoRA；插件会写入 `1️⃣Lora堆（默认）`，并按用途补充可靠触发词，其余正面内容会写入 `内容` 节点。
-16. 不要从旧对话、归档摘要或角色常识中自行补写 LoRA 文件名与 trigger words。工具无结果、返回多候选或提示记录已失效时，改用可靠的普通英文角色标签，不得猜选。
-17. 先把需求拆成不可变身份、可变服装/饰品、动作几何、镜头、场景与光线。用户要求换装时，只保留角色名、脸、发型、发色、瞳色及非服装标志等身份词；不要机械复制角色 LoRA 的全部 trigger words。
-18. 明确换装且角色 LoRA 强绑定默认服装时，角色 LoRA 通常降到 0.55 至 0.75，并把目标服装放在正面提示词较前位置，关键服装可用 1.10 至 1.25 的轻权重。没有服装冲突时不要无故降低角色权重。
-19. 只有元数据明确指出旧服装词时，才把少量互斥旧服装词写入 negative；不得把角色名、作品名、脸、发色、瞳色、体型等身份词放入 negative。无法可靠区分时宁可省略 negative，不得猜测。
-20. 按“明确用户要求 > 当前剧情连续性 > 本次工具元数据 > 一般推断”解决冲突；去掉同义重复，只保留一个镜头、一个主要动作方向和一套服装。
-21. pipeline 只按用户明确意图选择：原图/不放大/base 使用 base；RTX/高清放大使用 rtx；迭代放大/细节重构/二次采样使用 iterative。用户未指定时省略 pipeline 属性，由插件采用 WebUI 当前默认值。不得把 pipeline 词写进 prompt。
-22. 若请求来自底图控制生成，pose/depth/lineart/reference 已由插件锁定。你只描述最终画面，不得把控制模式名、ControlNet、LLLite、预处理器、节点名或模型文件名写进 prompt。Pose 约束姿态，Depth 约束空间结构，Lineart 描述上色后的成图，Reference 只作柔和外观与画风参考。
-23. 本调用是生图或已明确标记的整图语义重绘分镜，不得输出 edit 标签。局部重绘由插件的独立遮罩重绘协议处理。
-24. 区分“生成后放大”和“放大已有图片”：前者可选择 rtx 生图管线，后者属于独立 RTX 图片工具，不能伪造成 pic。区分“新画一个穿红裙的角色”、无蒙版整图重绘和遮罩局部重绘：普通生图与整图语义重绘输出 pic；只有原图与有效遮罩齐全的局部修改才输出 edit。整图语义重绘会由插件明确标记，必须承认它是重新生成而非像素级修改。
-25. 先在内部锁定唯一操作类型，再规划提示词。不要把 base、rtx、iterative、quick、lanpaint、放大倍率、遮罩位置或“修改/替换/重绘”等操作指令写进视觉 prompt。
-26. 当用户内容明确标记“无蒙版整图语义重绘”时，未明确指定风格组合就不得自动套用默认风格001；应使用反推得到的可观察画风和色调。只有用户明确点名风格组合时才查询并应用对应预设。
-27. 本地 Danbooru 索引状态会由运行时附加。只有本次工具列表真实包含 `search_anima_danbooru_tags` 时才可调用；对不确定的角色、作品、画师、服装或姿势 canonical tag，优先合并为一次有界查询。严格区分 Artist、Copyright、Character、General：只有 Character exact/unique alias 可授权角色身份，Copyright 只约束作品，Artist 只表示画师，General 只表示外貌、服装、动作、构图或场景。exact canonical 或 unique alias 且 `verified=true` 才是已确认结果；prefix、keyword、fuzzy 只用于发现候选，必须再用 canonical tag 做 exact 查询后才能采用。写入最终 prompt 时，Danbooru tag 内普通括号必须转义为 `\\(` 与 `\\)`；常见且确定的 General tag 不要逐项查询，避免工具风暴。
-28. `--llm c`、`--llmcc` 与 `--lcc` 仅属于 `/画图`、`/画图no` 的专用文字换角解析器；普通分镜不得自行模拟或触发。该专用链会先删除旧角色姓名与稳定外貌，再保留未被覆盖的服装、动作、表情、视线、构图、背景和风格；目标 LoRA 缺失时可用纯语义 Tags，显式文件请求或跨身份歧义不得猜选。
-29. `characters` 只是给插件的身份检索声明，不是身份授权。角色名优先写模型所知的 Danbooru canonical；不确定时写“用户角色名|作品名”，不得编造作品或外貌。插件会在提交前用本地 Danbooru Character/Copyright exact 证据重新矫正角色，并删除未经证据支持的发色、发型、瞳色、体型等猜测。
-""".strip()
+# Public compatibility name. Runtime prompt construction is task-scoped below;
+# keep the historical import while sourcing it from the compact v2 contract.
+ANIMA_VISUAL_EXPANSION_PROTOCOL = CONTRACT_VISUAL_EXPANSION_PROTOCOL
 
 
 class PromptDirectorError(RuntimeError):
@@ -301,30 +334,63 @@ class PromptDirector:
                 "无法读取分镜参考文件", f"读取 {path} 失败: {exc}"
             ) from exc
 
-    def _system_prompt(self) -> str:
-        """组合运行时协议、用户附带参考及额外指令。"""
-        parts = [RUNTIME_OVERRIDE, ANIMA_VISUAL_EXPANSION_PROTOCOL]
-        danbooru_context = self.danbooru_runtime_context()
-        if danbooru_context:
-            parts.append(danbooru_context)
-        if self._settings.auto_draw_system_prompt:
+    def _system_prompt(
+        self,
+        *,
+        task_kind: str = TASK_DRAW,
+        expansion_mode: str = "standard",
+        capabilities: tuple[str, ...] | None = None,
+        transport: str = "pic",
+    ) -> str:
+        """Compose one versioned contract using only this request's abilities."""
+
+        normalized_task_kind = normalize_task_kind(task_kind)
+        normalized_capabilities = normalize_capabilities(
+            capabilities if capabilities is not None else ()
+        )
+        creative_preference_tasks = {
+            TASK_DRAW,
+            TASK_REVERSE_DRAW,
+            TASK_SEMANTIC_REDRAW,
+            TASK_CONTROL_DRAW,
+        }
+        parts = [
+            build_director_contract(
+                task_kind=normalized_task_kind,
+                expansion_mode=expansion_mode,
+                capabilities=normalized_capabilities,
+                transport=transport,
+            )
+        ]
+        if CAPABILITY_DANBOORU in normalized_capabilities:
+            danbooru_context = self.danbooru_runtime_context()
+            if danbooru_context:
+                parts.append(danbooru_context)
+        if (
+            normalized_task_kind in creative_preference_tasks
+            and self._settings.auto_draw_system_prompt
+        ):
             parts.extend(
                 [
-                    "以下是管理员自定义的绘图人设与偏好；不得覆盖上面的输出、安全和实时 LoRA 约束：",
+                    "以下是管理员创作偏好；不得覆盖上面的传输、证据、实时资产和安全约束：",
                     self._settings.auto_draw_system_prompt,
                 ]
             )
-        else:
+        elif normalized_task_kind in creative_preference_tasks:
             parts.extend(
                 [
-                "以下内容仅作为分镜与标签写法参考：",
-                self._reference,
+                    "以下内容仅作为创作与标签写法参考，不提供身份或资产授权：",
+                    self._reference,
                 ]
             )
-        if self._settings.director_extra_instruction:
+        if (
+            normalized_task_kind in creative_preference_tasks
+            and self._settings.director_extra_instruction
+        ):
             parts.extend(
                 ["管理员补充要求：", self._settings.director_extra_instruction]
             )
+        parts.append(transport_terminal_seal(transport))
         return "\n\n".join(parts)
 
     def danbooru_runtime_context(self) -> str:
@@ -381,7 +447,14 @@ class PromptDirector:
         )
 
     async def generate(
-        self, context: Any, event: Any, scene_text: str, tools: Any = None
+        self,
+        context: Any,
+        event: Any,
+        scene_text: str,
+        tools: Any = None,
+        *,
+        task_kind: str = TASK_DRAW,
+        runtime_capabilities: tuple[str, ...] = (),
     ) -> tuple[str, str]:
         """Backward-compatible positive-prompt API."""
         prompt, provider_id, _ = await self.generate_with_negative(
@@ -389,6 +462,8 @@ class PromptDirector:
             event,
             scene_text,
             tools,
+            task_kind=task_kind,
+            runtime_capabilities=runtime_capabilities,
         )
         return prompt, provider_id
 
@@ -399,6 +474,9 @@ class PromptDirector:
         scene_text: str,
         tools: Any = None,
         expansion_mode: str = "standard",
+        *,
+        task_kind: str = TASK_DRAW,
+        runtime_capabilities: tuple[str, ...] = (),
     ) -> tuple[str, str, str]:
         """调用指定 AstrBot 模型生成提示词。
 
@@ -416,6 +494,8 @@ class PromptDirector:
             scene_text,
             tools,
             expansion_mode=expansion_mode,
+            task_kind=task_kind,
+            runtime_capabilities=runtime_capabilities,
         )
         return instruction.prompt, provider_id, instruction.negative_prompt
 
@@ -428,57 +508,62 @@ class PromptDirector:
         output_tools: Any = None,
         lookup_tool_call_timeout: int | None = None,
         expansion_mode: str = "standard",
+        task_kind: str = TASK_DRAW,
+        runtime_capabilities: tuple[str, ...] = (),
+        compose_result: bool = True,
     ) -> tuple[PictureInstruction, str]:
         """Generate one validated picture instruction including its pipeline."""
 
+        if tools is not None and output_tools is not None:
+            raise PromptDirectorError(
+                "本地资产查询工具与结构化输出工具不能同时启用",
+                "conflicting_tool_transports",
+                fatal=True,
+            )
         provider_id = await self._resolve_provider_id(context, event)
         normalized_expansion_mode = str(
             expansion_mode or "standard"
         ).strip().casefold()
         if normalized_expansion_mode not in {"standard", "ultra"}:
             normalized_expansion_mode = "standard"
-        expansion_instruction = (
-            "本次视觉扩写模式：Ultra。执行高密度华丽分镜，充分使用相关的"
-            "材质、微观外观、手势接触、前中后景、环境互动、光源方向与色彩关系；"
-            "允许题材一致且不改变硬事实的装饰性补充，但不得用重复同义词或质量口号凑长度。"
-            if normalized_expansion_mode == "ultra"
-            else
-            "本次视觉扩写模式：Standard。保持清晰、稳定和高服从度，只补足当前镜头"
-            "真正可见且有控制价值的细节，不追求无意义的华丽堆叠。"
-        )
+        normalized_task_kind = normalize_task_kind(task_kind)
+        normalized_capabilities = normalize_capabilities(runtime_capabilities)
         structured_mode = str(
             getattr(self._settings, "structured_director_mode", "auto") or "auto"
         ).casefold()
-        base_user_prompt = (
-            "请把下面的剧情或画面需求导演成一张图。只返回规定的 pic 标签。\n\n"
-            f"{expansion_instruction}\n\n"
-            f"用户内容：\n{scene_text.strip()}"
+        transport = (
+            "function"
+            if output_tools is not None
+            else "json"
+            if structured_mode in {"json", "function_call"}
+            else "pic"
+        )
+        base_user_prompt = build_director_user_prompt(
+            scene_text,
+            task_kind=normalized_task_kind,
+            expansion_mode=normalized_expansion_mode,
+            transport=transport,
         )
         user_prompt = base_user_prompt
-        if output_tools is not None:
-            user_prompt += (
-                "\n\nUse the emit_anima_plan_v1 function exactly once. Put the final "
-                "English hybrid Anima prompt in positive_tags: ordered Danbooru/Anima "
-                "tags, then a period, then one concise present-tense scene sentence. "
-                "The sentence belongs inside positive_tags; do not add any text outside "
-                "the function arguments. When the image contains explicitly named "
-                "characters, also return characters as an array of `name|work` hints; "
-                "omit it for original or unnamed subjects."
-            )
-        elif structured_mode == "json":
-            user_prompt += (
-                "\n\nReturn exactly one JSON object with positive_tags, negative_tags "
-                "pipeline and optional characters fields."
-            )
-        base_system_prompt = self._system_prompt() + "\n\n" + expansion_instruction
+        base_system_prompt = self._system_prompt(
+            task_kind=normalized_task_kind,
+            expansion_mode=normalized_expansion_mode,
+            capabilities=normalized_capabilities,
+            transport=transport,
+        )
         system_prompt = base_system_prompt
-        if output_tools is not None:
-            system_prompt += (
-                "\n\nRuntime structured-output override: for this request only, call "
-                "emit_anima_plan_v1 exactly once instead of printing a <pic> tag. "
-                "This changes only the transport format; all Anima prompt, safety, "
-                "LoRA and pipeline rules above remain mandatory."
-            )
+        pic_user_prompt = build_director_user_prompt(
+            scene_text,
+            task_kind=normalized_task_kind,
+            expansion_mode=normalized_expansion_mode,
+            transport="pic",
+        )
+        pic_system_prompt = self._system_prompt(
+            task_kind=normalized_task_kind,
+            expansion_mode=normalized_expansion_mode,
+            capabilities=normalized_capabilities,
+            transport="pic",
+        )
         kwargs = {
             "prompt": user_prompt,
             "system_prompt": system_prompt,
@@ -529,7 +614,11 @@ class PromptDirector:
                     **kwargs,
                     "prompt": active_prompt,
                     "system_prompt": (
-                        system_prompt if use_output_tools else base_system_prompt
+                        system_prompt
+                        if use_output_tools
+                        else pic_system_prompt
+                        if output_tools is not None
+                        else base_system_prompt
                     ),
                 }
                 if use_output_tools:
@@ -547,13 +636,13 @@ class PromptDirector:
                         raise
                     llm_kwargs.pop("tools", None)
                     llm_kwargs["prompt"] = (
-                        base_user_prompt
+                        pic_user_prompt
                         + "\n\nReturn exactly one "
                         '<pic prompt="English Anima tags. One concise scene sentence."> '
                         "tag and nothing else. Do not return Markdown, explanation or "
                         "plain conversational text."
                     )
-                    llm_kwargs["system_prompt"] = base_system_prompt
+                    llm_kwargs["system_prompt"] = pic_system_prompt
                     response = await asyncio.wait_for(
                         context.llm_generate(
                             chat_provider_id=provider_id,
@@ -609,30 +698,62 @@ class PromptDirector:
                         provider_error,
                         fatal=True,
                     )
-                if output_tools is not None or structured_mode in {
-                    "function_call",
-                    "json",
-                }:
-                    try:
-                        structured = extract_structured_payload(
-                            response,
-                            expected_tool_name="emit_anima_plan_v1",
-                            allow_json_fallback=(structured_mode != "function_call"),
-                        )
-                    except StructuredProviderError as structured_exc:
-                        if structured_mode == "function_call":
-                            raise PromptDirectorError(
-                                "绘图模型没有返回合法的结构化 Function Call",
-                                structured_exc.code,
-                                fatal=True,
-                            ) from structured_exc
+                if transport in {"function", "json"}:
+                    payload: Any = None
+                    if transport == "function":
+                        try:
+                            structured = extract_structured_payload(
+                                response,
+                                expected_tool_name="emit_anima_plan_v1",
+                                allow_json_fallback=(
+                                    structured_mode != "function_call"
+                                ),
+                            )
+                        except StructuredProviderError as structured_exc:
+                            if (
+                                structured_mode == "function_call"
+                                or _has_structured_call_surface(response)
+                            ):
+                                raise PromptDirectorError(
+                                    "绘图模型没有返回合法的结构化 Function Call",
+                                    structured_exc.code,
+                                    fatal=True,
+                                ) from structured_exc
+                        else:
+                            payload = structured.arguments
                     else:
-                        payload = structured.arguments
-                        positive = payload.get("positive_tags", payload.get("prompt", ""))
-                        negative = payload.get(
+                        visible = response_text(response)
+                        try:
+                            payload = _strict_json_object(str(visible or ""))
+                        except (TypeError, ValueError, json.JSONDecodeError) as json_exc:
+                            raise PromptDirectorError(
+                                "绘图模型没有返回合法的结构化 JSON",
+                                "invalid_director_json",
+                                fatal=True,
+                            ) from json_exc
+                    if payload is not None:
+                        if not isinstance(payload, dict):
+                            raise PromptDirectorError(
+                                "结构化分镜必须是 JSON 对象",
+                                "invalid_structured_root",
+                                fatal=True,
+                            )
+                        allowed_fields = {
+                            "positive_tags",
+                            "prompt",
                             "negative_tags",
-                            payload.get("negative_prompt", payload.get("negative", "")),
-                        )
+                            "negative_prompt",
+                            "negative",
+                            "pipeline",
+                            "characters",
+                        }
+                        if any(key not in allowed_fields for key in payload):
+                            raise PromptDirectorError(
+                                "结构化分镜包含不受支持的字段",
+                                "unexpected_structured_fields",
+                                fatal=True,
+                            )
+                        positive, negative = self._structured_prompt_values(payload)
                         pipeline = payload.get("pipeline", "")
                         characters = payload.get("characters", ())
                         if not isinstance(positive, str) or not positive.strip():
@@ -647,17 +768,19 @@ class PromptDirector:
                                 "invalid_structured_fields",
                                 fatal=True,
                             )
-                        instruction = self.compose_picture_instruction(
-                            PictureInstruction(
-                                prompt=self._normalize_prompt(positive),
-                                negative_prompt=self._normalize_negative_prompt(negative),
-                                pipeline=self._normalize_pipeline(pipeline),
-                                character_queries=self._normalize_character_queries(
-                                    characters
-                                ),
+                        instruction = PictureInstruction(
+                            prompt=self._normalize_prompt(positive),
+                            negative_prompt=self._normalize_negative_prompt(negative),
+                            pipeline=self._normalize_pipeline(pipeline),
+                            character_queries=self._normalize_character_queries(
+                                characters
                             ),
-                            provider_id=provider_id,
                         )
+                        if compose_result:
+                            instruction = self.compose_picture_instruction(
+                                instruction,
+                                provider_id=provider_id,
+                            )
                         return instruction, provider_id
                 completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
@@ -670,10 +793,11 @@ class PromptDirector:
                     completion,
                     strict_protocol=True,
                 )
-                instruction = self.compose_picture_instruction(
-                    instruction,
-                    provider_id=provider_id,
-                )
+                if compose_result:
+                    instruction = self.compose_picture_instruction(
+                        instruction,
+                        provider_id=provider_id,
+                    )
                 return instruction, provider_id
             except PromptDirectorError as exc:
                 if exc.detail in {
@@ -699,10 +823,12 @@ class PromptDirector:
                     ) from exc
                 first_error = exc
                 auto_protocol_fallback = (
-                    output_tools is not None and structured_mode == "auto"
+                    transport == "function"
+                    and output_tools is not None
+                    and structured_mode == "auto"
                 )
                 repair_prompt = (
-                    (base_user_prompt if auto_protocol_fallback else user_prompt)
+                    (pic_user_prompt if auto_protocol_fallback else user_prompt)
                     + (
                         "\n\nYour previous response was invalid. Return exactly one "
                         '<pic prompt="English Anima tags. One concise scene sentence." '
@@ -715,7 +841,12 @@ class PromptDirector:
                         "emit_anima_plan_v1 exactly once with valid JSON arguments. "
                         "positive_tags must contain ordered English tags followed by a "
                         "period and one concise natural-language scene sentence."
-                        if output_tools is not None
+                        if transport == "function"
+                        else "\n\nYour previous response was invalid. Return exactly one "
+                        "JSON object with positive_tags, negative_tags, pipeline and "
+                        "optional characters fields. Do not return explanation, "
+                        "Markdown or plain text."
+                        if transport == "json"
                         else "\n\nYour previous response was invalid. Return exactly one "
                         '<pic prompt="English Anima tags. One concise scene sentence."> '
                         "tag and nothing else. "
@@ -751,25 +882,23 @@ class PromptDirector:
         scene_text: str,
         tools: Any = None,
         lookup_tool_call_timeout: int | None = None,
+        runtime_capabilities: tuple[str, ...] = (),
     ) -> tuple[EditInstruction, str]:
         """Plan a masked redraw without allowing the model to invent a mask."""
 
         provider_id = await self._resolve_provider_id(context, event)
-        user_prompt = (
-            "用户已提供原图与明确遮罩。请只规划白色或透明遮罩区域的局部重绘。"
-            "只返回规定的 edit 标签。\n\n"
-            f"用户内容：\n{scene_text.strip()}"
+        normalized_capabilities = normalize_capabilities(runtime_capabilities)
+        user_prompt = build_director_user_prompt(
+            scene_text,
+            task_kind=TASK_MASKED_REDRAW,
+            expansion_mode="standard",
+            transport="edit",
         )
-        system_prompt = self._system_prompt() + "\n\n" + (
-            "这是局部重绘调用。忽略上文要求输出 pic 的第1条，最终只输出一个 "
-            "`<edit prompt=\"英文 tags\" mode=\"quick|lanpaint\">`；可选 "
-            "`negative=\"英文 tags\"`。quick 用于小范围、快速、边界清晰的修改；"
-            "lanpaint 用于大区域、复杂结构、手脚、服装重构或用户明确要求精细多轮重绘。"
-            "不得输出 pic，不得假设或描述遮罩以外的修改，不得声称已创建遮罩。"
-            "先从口语命令中提取遮罩区域的最终目标状态：例如‘把这里的衣服换成红裙’"
-            "只写 red dress 等结果标签；‘修好图里的手’应描述结构正确的手部结果，并优先"
-            "选择 lanpaint。prompt 中不得出现 change、replace、edit、mask、here、there 等"
-            "操作或位置指代词，也不得重复描述黑色保留区域。"
+        system_prompt = self._system_prompt(
+            task_kind=TASK_MASKED_REDRAW,
+            expansion_mode="standard",
+            capabilities=normalized_capabilities,
+            transport="edit",
         )
         tool_call_timeout = (
             max(
@@ -862,15 +991,12 @@ class PromptDirector:
                         fatal=True,
                     )
                 self.reject_provider_error_output(completion)
-                instructions = self.extract_edit_instructions(completion, max_edits=1)
-                if not instructions:
-                    raise PromptDirectorError(
-                        "LLM 没有返回合法 edit 标签",
-                        "invalid_edit_protocol",
-                        fatal=True,
-                    )
+                instruction = self.extract_edit_instruction(
+                    completion,
+                    strict_protocol=True,
+                )
                 instruction = self.compose_edit_instruction(
-                    instructions[0],
+                    instruction,
                     provider_id=provider_id,
                     source="edit",
                 )
@@ -903,6 +1029,15 @@ class PromptDirector:
                     raise PromptDirectorError(
                         "重绘模型修复重试超时，已停止且不会提交 ComfyUI",
                         "edit_repair_timeout",
+                        fatal=True,
+                    ) from retry_exc
+                except Exception as retry_exc:
+                    raise PromptDirectorError(
+                        "重绘模型修复重试失败，已停止且不会提交 ComfyUI",
+                        (
+                            f"provider={provider_id}, "
+                            f"error_type={type(retry_exc).__name__}"
+                        ),
                         fatal=True,
                     ) from retry_exc
 
@@ -960,6 +1095,15 @@ class PromptDirector:
         strict_protocol: bool = False,
     ) -> PictureInstruction:
         """Extract one positive prompt and an optional negative prompt."""
+        if strict_protocol:
+            match = PromptDirector._strict_control_match(
+                model_output,
+                pattern=_PIC_TAG_RE,
+                control_name="pic",
+                detail="invalid_picture_protocol",
+            )
+            return PromptDirector._picture_instruction_from_match(match)
+
         text = PromptDirector._remove_think_content(model_output).strip()
         PromptDirector.reject_provider_error_output(text)
         instructions = PromptDirector.extract_pic_instructions(text, max_prompts=1)
@@ -971,27 +1115,17 @@ class PromptDirector:
         parsed: Any = None
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict) and isinstance(
-                parsed.get("prompt", parsed.get("positive_tags")), str
-            ):
-                prompt = parsed.get("prompt", parsed.get("positive_tags", ""))
-                if isinstance(parsed.get("negative"), str):
-                    negative_prompt = parsed["negative"]
-                elif isinstance(parsed.get("negative_prompt"), str):
-                    negative_prompt = parsed["negative_prompt"]
-                elif isinstance(parsed.get("negative_tags"), str):
-                    negative_prompt = parsed["negative_tags"]
+            if isinstance(parsed, dict):
+                prompt, negative_prompt = PromptDirector._structured_prompt_values(parsed)
+                if not isinstance(prompt, str):
+                    prompt = ""
+                if not isinstance(negative_prompt, str):
+                    negative_prompt = ""
                 character_queries = PromptDirector._normalize_character_queries(
                     parsed.get("characters")
                 )
         except json.JSONDecodeError:
             pass
-        if not prompt and strict_protocol:
-            raise PromptDirectorError(
-                "绘图模型没有返回合法的 <pic> 标签或结构化 JSON",
-                "invalid_picture_protocol",
-                fatal=True,
-            )
         if not prompt:
             cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text)
             cleaned = re.sub(
@@ -1014,6 +1148,134 @@ class PromptDirector:
         )
 
     @staticmethod
+    def _structured_prompt_values(payload: Mapping[str, Any]) -> tuple[Any, Any]:
+        """Select structured prompt aliases only when they are unambiguous."""
+
+        positive_aliases = tuple(
+            key for key in ("positive_tags", "prompt") if key in payload
+        )
+        if len(positive_aliases) > 1:
+            raise PromptDirectorError(
+                "结构化分镜重复声明了正向提示词字段",
+                "conflicting_positive_aliases",
+                fatal=True,
+            )
+        negative_aliases = tuple(
+            key
+            for key in ("negative_tags", "negative_prompt", "negative")
+            if key in payload
+        )
+        if len(negative_aliases) > 1:
+            raise PromptDirectorError(
+                "结构化分镜重复声明了负向提示词字段",
+                "conflicting_negative_aliases",
+                fatal=True,
+            )
+        positive = payload.get(positive_aliases[0], "") if positive_aliases else ""
+        negative = payload.get(negative_aliases[0], "") if negative_aliases else ""
+        return positive, negative
+
+    @staticmethod
+    def _strict_control_match(
+        model_output: str,
+        *,
+        pattern: re.Pattern[str],
+        control_name: str,
+        detail: str,
+    ) -> re.Match[str]:
+        """Require one control tag as the entire visible transport envelope."""
+
+        source = str(model_output or "")
+        PromptDirector.reject_provider_error_output(source)
+        matches = list(pattern.finditer(source))
+        if len(matches) != 1:
+            raise PromptDirectorError(
+                f"LLM 没有返回唯一合法的 <{control_name}> 标签",
+                detail,
+                fatal=True,
+            )
+        match = matches[0]
+        if source[: match.start()].strip() or source[match.end() :].strip():
+            raise PromptDirectorError(
+                f"LLM 在 <{control_name}> 标签之外返回了额外内容",
+                detail,
+                fatal=True,
+            )
+        return match
+
+    @staticmethod
+    def _reject_embedded_control_tags(value: Any, *, field: str) -> None:
+        decoded = html.unescape(str(value or ""))
+        if _EMBEDDED_CONTROL_TAG_RE.search(decoded):
+            raise PromptDirectorError(
+                f"LLM 在 {field} 字段中嵌入了控制标签",
+                "embedded_control_tag",
+                fatal=True,
+            )
+
+    @staticmethod
+    def _parse_control_attributes(
+        attributes: str,
+        *,
+        allowed: frozenset[str],
+    ) -> dict[str, str]:
+        """Parse top-level quoted attributes and reject ambiguity."""
+
+        source = str(attributes or "")
+        cursor = 0
+        parsed: dict[str, str] = {}
+        while cursor < len(source):
+            if source[cursor:].strip() in {"", "/"}:
+                break
+            match = _CONTROL_ATTR_RE.match(source, cursor)
+            if match is None:
+                raise PromptDirectorError(
+                    "LLM 返回了无法解析的绘图标签属性",
+                    "invalid_control_attributes",
+                    fatal=True,
+                )
+            key = match.group("name").casefold()
+            if key not in allowed:
+                raise PromptDirectorError(
+                    f"LLM 返回了未知绘图标签属性: {key}",
+                    "unknown_control_attribute",
+                    fatal=True,
+                )
+            if key in parsed:
+                raise PromptDirectorError(
+                    f"LLM 重复返回了绘图标签属性: {key}",
+                    "duplicate_control_attribute",
+                    fatal=True,
+                )
+            value = html.unescape(match.group("value"))
+            PromptDirector._reject_embedded_control_tags(value, field=key)
+            parsed[key] = value
+            cursor = match.end()
+        return parsed
+
+    @staticmethod
+    def render_picture_instruction(instruction: PictureInstruction) -> str:
+        """Serialize one validated instruction without attribute injection."""
+
+        attributes = [
+            f'prompt="{html.escape(instruction.prompt, quote=True)}"'
+        ]
+        if instruction.negative_prompt:
+            attributes.append(
+                f'negative="{html.escape(instruction.negative_prompt, quote=True)}"'
+            )
+        if instruction.pipeline:
+            attributes.append(
+                f'pipeline="{html.escape(instruction.pipeline, quote=True)}"'
+            )
+        if instruction.character_queries:
+            characters = ";".join(instruction.character_queries)
+            attributes.append(
+                f'characters="{html.escape(characters, quote=True)}"'
+            )
+        return "<pic " + " ".join(attributes) + ">"
+
+    @staticmethod
     def extract_pic_instructions(
         model_output: str, *, max_prompts: int | None = None
     ) -> list[PictureInstruction]:
@@ -1026,33 +1288,96 @@ class PromptDirector:
         visible_text = PromptDirector._remove_think_content(model_output)
         instructions: list[PictureInstruction] = []
         for match in _PIC_TAG_RE.finditer(visible_text):
-            attributes = match.group("attrs")
-            prompt_match = _PROMPT_ATTR_RE.search(attributes)
-            if prompt_match is None:
-                continue
-            negative_match = _NEGATIVE_ATTR_RE.search(attributes)
-            pipeline_match = _PIPELINE_ATTR_RE.search(attributes)
-            characters_match = _CHARACTERS_ATTR_RE.search(attributes)
-            negative_prompt = (
-                PromptDirector._normalize_negative_prompt(negative_match.group(2))
-                if negative_match
-                else ""
-            )
-            instructions.append(
-                PictureInstruction(
-                    prompt=PromptDirector._normalize_prompt(prompt_match.group(2)),
-                    negative_prompt=negative_prompt,
-                    pipeline=PromptDirector._normalize_pipeline(
-                        pipeline_match.group(2)
-                    ) if pipeline_match else "",
-                    character_queries=PromptDirector._normalize_character_queries(
-                        characters_match.group(2) if characters_match else None
-                    ),
-                )
-            )
+            try:
+                instruction = PromptDirector._picture_instruction_from_match(match)
+            except PromptDirectorError as exc:
+                if exc.detail == "missing_picture_prompt":
+                    continue
+                raise
+            instructions.append(instruction)
             if max_prompts is not None and len(instructions) >= max_prompts:
                 break
         return instructions
+
+    @staticmethod
+    def _picture_instruction_from_match(match: re.Match[str]) -> PictureInstruction:
+        attributes = PromptDirector._parse_control_attributes(
+            match.group("attrs"),
+            allowed=frozenset({"prompt", "negative", "pipeline", "characters"}),
+        )
+        prompt = attributes.get("prompt", "")
+        if not prompt:
+            raise PromptDirectorError(
+                "LLM 返回的 pic 标签缺少 prompt 属性",
+                "missing_picture_prompt",
+                fatal=True,
+            )
+        negative_prompt = (
+            PromptDirector._normalize_negative_prompt(attributes["negative"])
+            if "negative" in attributes
+            else ""
+        )
+        return PictureInstruction(
+            prompt=PromptDirector._normalize_prompt(prompt),
+            negative_prompt=negative_prompt,
+            pipeline=PromptDirector._normalize_pipeline(
+                attributes.get("pipeline", "")
+            ),
+            character_queries=PromptDirector._normalize_character_queries(
+                attributes.get("characters")
+            ),
+        )
+
+    @staticmethod
+    def extract_edit_instruction(
+        model_output: str,
+        *,
+        strict_protocol: bool = False,
+    ) -> EditInstruction:
+        """Extract one edit instruction, optionally enforcing a sealed envelope."""
+
+        if strict_protocol:
+            match = PromptDirector._strict_control_match(
+                model_output,
+                pattern=_EDIT_TAG_RE,
+                control_name="edit",
+                detail="invalid_edit_protocol",
+            )
+            return PromptDirector._edit_instruction_from_match(match)
+        instructions = PromptDirector.extract_edit_instructions(
+            model_output,
+            max_edits=1,
+        )
+        if not instructions:
+            raise PromptDirectorError(
+                "LLM 没有返回合法 edit 标签",
+                "invalid_edit_protocol",
+                fatal=True,
+            )
+        return instructions[0]
+
+    @staticmethod
+    def _edit_instruction_from_match(match: re.Match[str]) -> EditInstruction:
+        attributes = PromptDirector._parse_control_attributes(
+            match.group("attrs"),
+            allowed=frozenset({"prompt", "negative", "mode"}),
+        )
+        prompt = attributes.get("prompt", "")
+        if not prompt:
+            raise PromptDirectorError(
+                "LLM 返回的 edit 标签缺少 prompt 属性",
+                "missing_edit_prompt",
+                fatal=True,
+            )
+        return EditInstruction(
+            prompt=PromptDirector._normalize_prompt(prompt),
+            negative_prompt=PromptDirector._normalize_negative_prompt(
+                attributes.get("negative", "")
+            ),
+            mode=PromptDirector._normalize_inpaint_mode(
+                attributes.get("mode", "quick")
+            ),
+        )
 
     @staticmethod
     def extract_edit_instructions(
@@ -1067,23 +1392,13 @@ class PromptDirector:
         visible_text = PromptDirector._remove_think_content(model_output)
         instructions: list[EditInstruction] = []
         for match in _EDIT_TAG_RE.finditer(visible_text):
-            attributes = match.group("attrs")
-            prompt_match = _PROMPT_ATTR_RE.search(attributes)
-            if prompt_match is None:
-                continue
-            negative_match = _NEGATIVE_ATTR_RE.search(attributes)
-            mode_match = _MODE_ATTR_RE.search(attributes)
-            instructions.append(
-                EditInstruction(
-                    prompt=PromptDirector._normalize_prompt(prompt_match.group(2)),
-                    negative_prompt=PromptDirector._normalize_negative_prompt(
-                        negative_match.group(2) if negative_match else ""
-                    ),
-                    mode=PromptDirector._normalize_inpaint_mode(
-                        mode_match.group(2) if mode_match else "quick"
-                    ),
-                )
-            )
+            try:
+                instruction = PromptDirector._edit_instruction_from_match(match)
+            except PromptDirectorError as exc:
+                if exc.detail == "missing_edit_prompt":
+                    continue
+                raise
+            instructions.append(instruction)
             if max_edits is not None and len(instructions) >= max_edits:
                 break
         return instructions
@@ -1172,6 +1487,7 @@ class PromptDirector:
 
     @staticmethod
     def _normalize_pipeline(value: Any) -> str:
+        PromptDirector._reject_embedded_control_tags(value, field="pipeline")
         raw = str(value or "").strip()
         if not raw:
             return ""
@@ -1197,19 +1513,37 @@ class PromptDirector:
         if value is None:
             return ()
         if isinstance(value, str):
-            values = re.split(r"[;；\r\n]+", value)
+            values: list[str] | tuple[str, ...] = re.split(
+                r"[;；\r\n]+",
+                html.unescape(value),
+            )
         elif isinstance(value, (list, tuple)):
+            if any(not isinstance(item, str) for item in value):
+                raise PromptDirectorError("LLM 返回了非字符串角色声明")
             values = value
         else:
             raise PromptDirectorError("LLM 返回了无效的角色声明字段")
         result: list[str] = []
         seen: set[str] = set()
         for raw in values:
-            item = re.sub(r"\s+", " ", str(raw or "")).strip(" ,;；")
+            item = re.sub(r"\s+", " ", html.unescape(raw)).strip(" ,;；")
             if not item:
                 continue
+            PromptDirector._reject_embedded_control_tags(item, field="characters")
+            if re.search(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]", item):
+                raise PromptDirectorError("LLM 返回的角色声明含有控制字符")
             if len(item) > 160:
                 raise PromptDirectorError("LLM 返回的单个角色声明过长")
+            if item.count("|") > 1:
+                raise PromptDirectorError("角色声明只能包含一个 name|work 分隔符")
+            name, separator, work = item.partition("|")
+            name = name.strip()
+            work = work.strip() if separator else ""
+            if not name:
+                raise PromptDirectorError("角色声明缺少角色名")
+            item = f"{name}|{work}" if work else name
+            if any(unicodedata.category(char) in {"Cf", "Cc"} for char in item):
+                raise PromptDirectorError("LLM 返回的角色声明含有不可见控制字符")
             key = item.casefold()
             if key in seen:
                 continue
@@ -1221,6 +1555,7 @@ class PromptDirector:
 
     @staticmethod
     def _normalize_inpaint_mode(value: Any) -> str:
+        PromptDirector._reject_embedded_control_tags(value, field="mode")
         aliases = {
             "quick": "quick",
             "快速": "quick",
@@ -1240,7 +1575,19 @@ class PromptDirector:
         visible_parts: list[str] = []
         cursor = 0
         depth = 0
+        control_spans = tuple(
+            sorted(
+                (
+                    (match.start(), match.end())
+                    for pattern in (_PIC_TAG_RE, _EDIT_TAG_RE)
+                    for match in pattern.finditer(model_output)
+                ),
+                key=lambda item: item[0],
+            )
+        )
         for match in _THINK_TAG_RE.finditer(model_output):
+            if any(start <= match.start() < end for start, end in control_spans):
+                continue
             if depth == 0:
                 visible_parts.append(model_output[cursor : match.start()])
 
@@ -1264,6 +1611,7 @@ class PromptDirector:
     def _normalize_prompt(prompt: str) -> str:
         """规范化并校验一条英文绘图提示词。"""
         prompt = html.unescape(prompt)
+        PromptDirector._reject_embedded_control_tags(prompt, field="prompt")
         PromptDirector.reject_provider_error_output(prompt)
         prompt = re.sub(r"\s*[\r\n]+\s*", ", ", prompt)
         prompt = re.sub(r"(?:,\s*){2,}", ", ", prompt)
@@ -1275,8 +1623,6 @@ class PromptDirector:
         prompt_without_loras = LORA_TAG_PATTERN.sub("", prompt)
         if re.search(r"[\u3400-\u9fff]", prompt_without_loras):
             raise PromptDirectorError("LLM 返回了中文提示词，请更换模型或调整附加要求")
-        if "<pic" in prompt.lower() or "</pic" in prompt.lower():
-            raise PromptDirectorError("LLM 返回了嵌套或损坏的 pic 标签")
         return prompt
 
     @staticmethod
@@ -1306,6 +1652,7 @@ class PromptDirector:
     def _normalize_negative_prompt(prompt: str) -> str:
         """Normalize an optional negative prompt without allowing control tags."""
         prompt = html.unescape(str(prompt or ""))
+        PromptDirector._reject_embedded_control_tags(prompt, field="negative")
         prompt = re.sub(r"\s*[\r\n]+\s*", ", ", prompt)
         prompt = re.sub(r"(?:,\s*){2,}", ", ", prompt)
         prompt = re.sub(r"\s{2,}", " ", prompt).strip(" ,")
@@ -1317,6 +1664,4 @@ class PromptDirector:
             raise PromptDirectorError("负面提示词不能包含 LoRA 标签")
         if re.search(r"[\u3400-\u9fff]", prompt):
             raise PromptDirectorError("LLM 返回了中文负面提示词")
-        if "<pic" in prompt.lower() or "</pic" in prompt.lower():
-            raise PromptDirectorError("LLM 返回了损坏的 negative 属性")
         return prompt

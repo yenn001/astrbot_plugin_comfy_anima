@@ -176,6 +176,25 @@ def _appearance_map(values: Iterable[str]) -> dict[str, tuple[str, ...]]:
     }
 
 
+def _explicit_costume_accessory(term: str, user_request: str) -> bool:
+    """Protect deterministic costume props that merely resemble body features."""
+
+    request = _normalized_words(user_request)
+    if not re.search(
+        r"\b(?:playboy bunny|bunny girl|rabbit girl)\b|兔女郎|兔娘",
+        request,
+    ):
+        return False
+    value = _normalized_words(term)
+    return bool(
+        re.fullmatch(
+            r"(?:rabbit|bunny|animal) ear (?:hairband|headband)|"
+            r"fake (?:rabbit|bunny|animal) ears",
+            value,
+        )
+    )
+
+
 def split_character_validation_terms(value: str) -> tuple[str, ...]:
     """Expose the prompt splitter used by character validation and correction."""
 
@@ -258,6 +277,9 @@ def compile_character_prompt(
 
         categories = _character_feature_categories_for_term(term)
         if len(verified) == 1 and categories:
+            if _explicit_costume_accessory(term, user_request):
+                kept.append(term)
+                continue
             if any(category in override_set for category in categories):
                 kept.append(term)
                 continue

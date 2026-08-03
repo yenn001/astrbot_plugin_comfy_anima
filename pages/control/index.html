@@ -253,6 +253,7 @@
                 <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
                 <label class="toggle"><input name="enable_natural_draw" type="checkbox"><span>启用自然语言绘图</span></label>
                 <label class="toggle"><input name="enable_llm_pic_trigger" type="checkbox"><span>解析 &lt;pic prompt&gt;</span></label>
+                <label class="toggle"><input name="enable_chat_draw_terminal_guard" type="checkbox"><span>普通聊天绘图终止守卫</span></label>
                 <div class="span-4 section-divider"><span>Prompt Composer v2</span></div>
                 <label class="toggle"><input name="enable_prompt_composer_v2" type="checkbox"><span>启用三层提示词整理</span></label>
                 <label><span>动态负面词策略</span><select name="adaptive_negative_mode"><option value="off">关闭</option><option value="conservative">保守</option><option value="standard">标准</option></select></label>
@@ -263,7 +264,7 @@
                 <label class="span-2"><span>Danbooru 索引 URL</span><input name="danbooru_index_url" type="url" placeholder="HTTPS 或可信私网 HTTP JSON / CSV 地址"></label>
                 <label><span>索引超时（秒）</span><input name="danbooru_index_timeout" type="number" min="5" max="300" step="1"></label>
                 <label><span>索引上限（MB）</span><input name="danbooru_index_max_size_mb" type="number" min="1" max="512" step="1"></label>
-                <p class="span-4 muted">Composer 只做本地分层、去重、冲突检查与确定性负面词补充，不展示模型思维过程。Danbooru guarded 只约束 LLM 声明的角色、作品与画师硬锚点，不拦截用户原始 Tags 或 LoRA 触发词。</p>
+                <p class="span-4 muted">终止守卫会完整缓冲普通聊天回复，并检查本轮 LoRA、Danbooru 与 Prompt Plan 查询是否全部成功；明确绘图最终必须只有一个合法 pic，纯资产查询误出的 pic 会被移除。Composer 只做本地分层、去重、冲突检查与确定性负面词补充，不展示模型思维过程。Danbooru guarded 只约束 LLM 声明的角色、作品与画师硬锚点，不拦截用户原始 Tags 或 LoRA 触发词。</p>
                 <label class="span-4"><span>System Prompt</span><textarea name="auto_draw_system_prompt" rows="9" placeholder="留空使用插件内置导演提示词"></textarea></label>
                 <div class="span-4 section-divider"><span>在线图片反推</span></div>
                 <label class="toggle"><input name="enable_reverse_prompt" type="checkbox"><span>启用 /反推 与 /反推画图</span></label>

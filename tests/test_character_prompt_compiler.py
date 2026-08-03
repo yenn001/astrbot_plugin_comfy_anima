@@ -92,6 +92,22 @@ class CharacterPromptCompilerTests(unittest.TestCase):
             {FEATURE_HAIR_STYLE, FEATURE_HAIR_COLOR, FEATURE_EYE_COLOR},
         )
 
+    def test_bunny_costume_hairband_is_not_deleted_as_character_appearance(self) -> None:
+        result = compile_character_prompt(
+            (
+                "1girl, toki, playboy bunny, rabbit ear hairband, "
+                "fake rabbit ears, rabbit ears, selfie"
+            ),
+            "",
+            (CharacterPromptEvidence("toki", "toki_(blue_archive)"),),
+            prompt_character_terms=(("toki", "toki_(blue_archive)"),),
+            user_request="画兔女郎飞鸟马时（toki）自拍",
+        )
+
+        self.assertIn("rabbit ear hairband", result.prompt)
+        self.assertIn("fake rabbit ears", result.prompt)
+        self.assertNotIn(", rabbit ears,", f", {result.prompt},")
+
     def test_removes_wrong_copyright_and_keeps_verified_work(self) -> None:
         result = compile_character_prompt(
             "1girl, rio, nikke, blue archive, city",
