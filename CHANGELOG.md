@@ -2,6 +2,16 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.21] - 2026-08-03
+
+### 多语言角色名转译与作品消歧
+
+- 新增独立 `LocalizedCharacterAliasIndex`，允许一个中文、日文或韩文 alias 对应多个 Danbooru Character canonical；本地化数据只发现候选，不能直接授权角色身份。
+- `search_anima_danbooru_tags` 现在可识别 `《作品》的角色` 形式。`《鸣潮》的菲比` 会先把“鸣潮” exact 到 Copyright `wuthering_waves`，再唯一选择并 exact 复核 Character `phoebe_(wuthering_waves)`；裸“菲比”因同名风险要求作品，不按热度猜选。
+- 所有 LLM 生图入口的提交前角色编译器复用同一解析层，并在命中后再次走原有 Character identity resolver。任务时间线新增脱敏事件 `localized_alias_exact_used`，不保存完整用户提示词。
+- 支持管理员自行放置 Autocomplete-Plus 兼容的 `tag,category,count,alias` CSV 到插件数据目录。外部数据集不随源码或发布包再分发，来源、许可证和更新责任由管理员管理；损坏 CSV 不会禁用内置事实修正。
+- Prompt Contract 升级为 v2.1，明确要求本地化角色查询携带作品限定，并禁止候选按热度授权。本版不增加 Python 依赖、ComfyUI 节点、模型或工作流文件。
+
 ## [1.9.20] - 2026-08-03
 
 ### Prompt Contract v2、普通聊天终止守卫与跨语言角色别名

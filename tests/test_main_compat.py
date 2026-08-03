@@ -912,6 +912,126 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "DANBOORU_INDEX_UNAVAILABLE")
 
+    def test_danbooru_llm_tool_translates_localized_character_with_work(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "localized.sqlite3"
+        )
+        plugin._danbooru_index.import_bytes(
+            json.dumps(
+                {
+                    "source": "fixture",
+                    "license": "fixture-only",
+                    "revision": "localized-tool-r1",
+                    "tags": [
+                        {
+                            "tag": "phoebe_(wuthering_waves)",
+                            "category": "character",
+                            "aliases": [],
+                            "count": 3100,
+                        },
+                        {
+                            "tag": "wuthering_waves",
+                            "category": "copyright",
+                            "aliases": [],
+                            "count": 12000,
+                        },
+                    ],
+                }
+            ).encode(),
+            content_type="json",
+        )
+        plugin._localized_character_aliases = self.main.LocalizedCharacterAliasIndex()
+
+        result = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="《鸣潮》的菲比",
+                    mode="exact",
+                    category="character",
+                )
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["localized_alias_lookup"])
+        self.assertTrue(result["queries"][0]["verified"])
+        candidate = result["queries"][0]["results"][0]
+        self.assertEqual(candidate["canonical_tag"], "phoebe_(wuthering_waves)")
+        self.assertEqual(candidate["prompt_tag"], r"phoebe_\(wuthering_waves\)")
+        self.assertEqual(candidate["match_type"], "localized_alias_exact")
+
+    def test_localized_work_character_phrase_routes_danbooru_tool(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = types.SimpleNamespace(
+            status=lambda: {"ready": True},
+        )
+
+        self.assertTrue(plugin._scene_needs_danbooru_tools("《鸣潮》的菲比，女仆装"))
+
+    def test_llm_character_compiler_uses_localized_alias_exact(self) -> None:
+        async def run_case() -> None:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = self.main.DanbooruTagIndex(
+                Path(tempfile.mkdtemp()) / "localized-compile.sqlite3"
+            )
+            plugin._danbooru_index.import_bytes(
+                json.dumps(
+                    {
+                        "source": "fixture",
+                        "license": "fixture-only",
+                        "revision": "localized-compile-r1",
+                        "tags": [
+                            {
+                                "tag": "phoebe_(wuthering_waves)",
+                                "category": "character",
+                                "aliases": [],
+                                "count": 3100,
+                            },
+                            {
+                                "tag": "wuthering_waves",
+                                "category": "copyright",
+                                "aliases": [],
+                                "count": 12000,
+                            },
+                        ],
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._localized_character_aliases = (
+                self.main.LocalizedCharacterAliasIndex()
+            )
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda _job, _phase, _message, code, **_kwargs: phases.append(code)
+            )
+
+            async def no_profile(_job, _canonical):
+                return None
+
+            plugin._resolve_character_appearance_profile = no_profile
+            prompt, negative = await plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("tester", "draw", 0.0),
+                prompt=(
+                    "phoebe \\(wuthering waves\\), 1girl, maid, selfie. "
+                    "Phoebe takes a selfie in a maid outfit."
+                ),
+                negative_prompt="",
+                character_queries=("菲比|鸣潮",),
+                user_request="《鸣潮》的菲比，女仆装，自拍",
+                records=(),
+                source="unit",
+            )
+
+            self.assertIn(r"phoebe_\(wuthering_waves\)", prompt)
+            self.assertEqual(negative, "")
+            self.assertIn("localized_alias_exact_used", phases)
+            self.assertIn("llm_character_prompt_compiled", phases)
+
+        asyncio.run(run_case())
+
     def test_danbooru_background_failure_keeps_existing_status(self) -> None:
         async def run_case() -> None:
             class Index:

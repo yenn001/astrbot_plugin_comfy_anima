@@ -1,10 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.20
+> 当前版本：v1.9.21
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
-v1.9.20 将绘图导演重构为按任务和传输格式组装的 Prompt Contract v2：普通生图、Prompt Plan、反推画图、整图改图、底图控制、遮罩重绘和换角中间编辑不再共享一份互相覆盖的超长协议。普通聊天的 LoRA、Danbooru 与 Prompt Plan 查询现在有代码级终止守卫：回复先完整缓冲，工具必须全部成功，最终只能有一个合法 `<pic>`；裸 Tags 会携带本轮已验证资产证据修复一次，失败则不会提交 ComfyUI。用户明确写出的紧邻罗马字别名也可在没有角色 LoRA 时通过本地 Character exact，例如 `飞鸟马时（toki）` 会选择基础 `toki_(blue_archive)`；自动选择的角色 LoRA 还必须与该 exact canonical 完全绑定，否则会在工作流注入前移除，因此不会误加载 Bunny 或 Armed 服装变体。
+v1.9.21 新增独立的多语言角色别名层：中文、日文或韩文名称只负责发现 Danbooru 候选，最终仍必须通过 Character 与 Copyright 双重 exact。带作品的 `《鸣潮》的菲比` 可安全转成 `phoebe_(wuthering_waves)`；裸写同名角色时不会按热度猜选，而会要求补充作品。管理员还可在插件数据目录放置自己有权使用的 Autocomplete-Plus 格式 `localized_danbooru_aliases.csv` 扩充别名，第三方词库不会进入公开安装包。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 
@@ -87,6 +87,8 @@ Ultra 仍只输出“一行有序 Tags + 一句英文关系句”，不会把三
 插件可使用管理员自行提供的离线 Danbooru Tag 索引做硬锚点检查，但**安装包不附带任何第三方标签库或索引数据**。在全局设置填写 `danbooru_index_url` 后，可从“提示词工坊”手动更新 JSON / CSV 数据：HTTPS 可访问可信远端；明文 HTTP 仅允许回环或私有局域网地址。更新采用临时库校验与原子替换，下载、解析或校验失败时保留上一份可用索引。
 
 导入器同时兼容带表头的 JSON/CSV，以及 Anima 常见的无表头 `tag,category,count,aliases` 导出；无表头数据中的超长或无法唯一确认的别名会被丢弃，但 canonical tag 会保留。
+
+角色本地化别名与主索引分开保存，因为同一个中文名可能对应多个作品中的不同 Character。插件内置的少量事实修正只解决已确认案例；管理员可把有权使用的 `tag,category,count,alias` 多语言 CSV 放到 `plugin_data/astrbot_plugin_comfy_anima/localized_danbooru_aliases.csv`，重载插件后生效。该覆盖层允许一对多，只负责候选发现；缺少作品、作品冲突、主 Character canonical 不存在或 Copyright 不匹配都会停止，不会绕过主索引 exact。
 
 - `off`：关闭索引检查。
 - `report`：默认且完整可用，只在诊断中报告未知或冲突锚点，不阻止绘图；索引缺失也不会阻止任务。

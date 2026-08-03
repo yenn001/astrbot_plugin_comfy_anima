@@ -345,7 +345,7 @@ class PictureResponseParserTests(unittest.TestCase):
         director = PromptDirector(reference, PluginSettings.from_mapping({}))
         system_prompt = director._system_prompt(capabilities=())
 
-        self.assertIn("Prompt contract version: 2.0", system_prompt)
+        self.assertIn("Prompt contract version: 2.1", system_prompt)
         self.assertIn('Return exactly one `<pic prompt="...">`', system_prompt)
         self.assertIn("not authoritative for Danbooru identity", system_prompt)
         self.assertIn("飞鸟马时 (toki)", system_prompt)

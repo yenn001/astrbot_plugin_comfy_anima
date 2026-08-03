@@ -12,7 +12,7 @@ import re
 from collections.abc import Iterable
 
 
-PROMPT_CONTRACT_VERSION = "2.0"
+PROMPT_CONTRACT_VERSION = "2.1"
 
 TASK_DRAW = "draw"
 TASK_PROMPT_PLAN = "prompt_plan"
@@ -188,6 +188,10 @@ Runtime Danbooru capability:
   appearance, clothing, action, composition or scene.
 - Prefix, keyword, fuzzy, embedding and rerank results are candidates only.
   Exact-confirm the selected canonical in its proper category before using it.
+- For a localized character name, query the name together with its explicit work,
+  for example `《鸣潮》的菲比`. The localized layer may return several same-name
+  candidates and must never choose by popularity. Continue only when the tool
+  returns one verified Character canonical with an exact Copyright qualifier.
 - Once a Character query returns verified exact, use that returned canonical in
   both positive tags and the character lookup hint. Do not query the same
   identity again by a localized name or replace the exact canonical with prose.

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.20
+AstrBot Comfy Anima 插件 v1.9.21
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.20
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.20
+版本: 1.9.21
 日期: 2026-08-03
 """
 
@@ -121,6 +121,11 @@ from .services.danbooru_character_profile import (
     CharacterAppearanceProfile,
     CharacterAppearanceProfileStore,
     build_character_appearance_profile,
+)
+from .services.localized_character_aliases import (
+    LocalizedAliasCandidate,
+    LocalizedCharacterAliasIndex,
+    contains_localized_text,
 )
 from .services.experimental_profiles import inspect_experimental_profiles
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService, LoraRecord
@@ -500,6 +505,11 @@ class ComfyAnimaPlugin(Star):
         self.settings = PluginSettings.from_mapping(config)
         self._danbooru_index = DanbooruTagIndex(
             self._persistent_data_dir / "danbooru_tags_v1.sqlite3"
+        )
+        self._localized_character_aliases = LocalizedCharacterAliasIndex(
+            csv_path=(
+                self._persistent_data_dir / "localized_danbooru_aliases.csv"
+            )
         )
         self._character_appearance_profiles = CharacterAppearanceProfileStore(
             self._persistent_data_dir / "danbooru_character_profiles_v2.json"
@@ -973,6 +983,25 @@ class ComfyAnimaPlugin(Star):
             "aliases": [item for item in aliases if item][:6],
         }
 
+    @staticmethod
+    def _localized_danbooru_tool_candidate_payload(
+        candidate: LocalizedAliasCandidate,
+    ) -> dict[str, Any]:
+        canonical = str(candidate.canonical_tag or "").strip()
+        return {
+            "canonical_tag": canonical,
+            "prompt_tag": escape_prompt_tag(canonical) if canonical else "",
+            "category": str(candidate.category or ""),
+            "post_count": 0,
+            "match_type": str(candidate.match_type or "localized_alias_candidate"),
+            "matched_value": str(candidate.matched_alias or "")[:256],
+            "verified": bool(candidate.verified),
+            "aliases": [str(candidate.matched_alias or "")[:128]],
+            "localized_alias": True,
+            "work": str(candidate.work or "")[:128],
+            "requires_work": bool(candidate.requires_work),
+        }
+
     @filter.llm_tool(name="search_anima_danbooru_tags")
     async def search_anima_danbooru_tags(
         self,
@@ -987,7 +1016,9 @@ class ComfyAnimaPlugin(Star):
         这是只读工具，只用于真实绘图或标签校验。exact 会同时匹配 canonical
         与唯一 alias；prefix/keyword 只返回候选，必须再用候选 canonical_tag
         做 exact 查询并确认 verified=true。batch 使用竖线或换行分隔多个待验证
-        Tag，一次最多 12 项。不要用它逐个查询常见 general Tags。
+        Tag，一次最多 12 项。中文角色查询应尽量保留作品限定，例如
+        `《鸣潮》的菲比`；本地化别名只负责发现候选，返回 verified=true 前仍会
+        经过 Character 与 Copyright 双重 exact。不要用它逐个查询常见 general Tags。
 
         Args:
             query(string): 一个查询；batch 模式用 `tag1 | tag2` 或换行分隔。
@@ -1051,7 +1082,40 @@ class ComfyAnimaPlugin(Star):
                 separators=(",", ":"),
             )
 
-        if normalized_mode == "batch":
+        localized_candidates: tuple[LocalizedAliasCandidate, ...] = ()
+        localized_index = getattr(self, "_localized_character_aliases", None)
+        if (
+            normalized_mode != "batch"
+            and localized_index is not None
+            and contains_localized_text(raw_query)
+            and normalized_category in {"", "character", "copyright"}
+        ):
+            try:
+                localized_candidates = await asyncio.to_thread(
+                    localized_index.search,
+                    raw_query,
+                    index=self._danbooru_index,
+                    category=normalized_category,
+                    limit=effective_limit,
+                )
+            except (DanbooruIndexError, OSError, RuntimeError, TypeError, ValueError):
+                localized_candidates = ()
+
+        if localized_candidates:
+            query_results = [
+                {
+                    "query": raw_query,
+                    "verified": bool(
+                        len(localized_candidates) == 1
+                        and localized_candidates[0].verified
+                    ),
+                    "results": [
+                        self._localized_danbooru_tool_candidate_payload(candidate)
+                        for candidate in localized_candidates
+                    ],
+                }
+            ]
+        elif normalized_mode == "batch":
             queries = tuple(
                 dict.fromkeys(
                     item.strip()
@@ -1131,7 +1195,28 @@ class ComfyAnimaPlugin(Star):
             final_status.get("revision") or ""
         )
         if index_changed:
-            if normalized_mode == "batch":
+            if localized_candidates:
+                localized_candidates = await asyncio.to_thread(
+                    localized_index.search,
+                    raw_query,
+                    index=self._danbooru_index,
+                    category=normalized_category,
+                    limit=effective_limit,
+                )
+                query_results = [
+                    {
+                        "query": raw_query,
+                        "verified": bool(
+                            len(localized_candidates) == 1
+                            and localized_candidates[0].verified
+                        ),
+                        "results": [
+                            self._localized_danbooru_tool_candidate_payload(candidate)
+                            for candidate in localized_candidates
+                        ],
+                    }
+                ]
+            elif normalized_mode == "batch":
                 lookups = await asyncio.to_thread(
                     self._danbooru_index.lookup_many,
                     queries,
@@ -1190,6 +1275,8 @@ class ComfyAnimaPlugin(Star):
             "category": normalized_category,
             "queries": query_results,
         }
+        if localized_candidates:
+            payload["localized_alias_lookup"] = True
         encoded = json.dumps(
             payload,
             ensure_ascii=False,
@@ -6258,6 +6345,88 @@ QQ快捷指令:
                     code="character_resolution_failed",
                     details={"error_type": type(exc).__name__},
                 ) from exc
+            localized_resolution = None
+            localized_index = getattr(self, "_localized_character_aliases", None)
+            if (
+                not resolution.verified
+                and not resolution.ambiguous
+                and localized_index is not None
+                and contains_localized_text(name)
+            ):
+                try:
+                    localized_resolution = await asyncio.to_thread(
+                        localized_index.resolve_character,
+                        name,
+                        explicit_work,
+                        index,
+                    )
+                except (
+                    DanbooruIndexError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    raise CharacterPromptCompileError(
+                        f"角色“{name}”的本地化别名校验失败，已停止生成",
+                        code="localized_character_resolution_failed",
+                        details={"error_type": type(exc).__name__},
+                    ) from exc
+                if localized_resolution.work_required:
+                    raise CharacterPromptCompileError(
+                        f"角色“{name}”存在多个作品中的同名身份，请补充准确作品名",
+                        code="localized_character_work_required",
+                        details={
+                            "candidate_count": localized_resolution.candidate_count
+                        },
+                    )
+                if localized_resolution.ambiguous:
+                    raise CharacterPromptCompileError(
+                        f"角色“{name}”的本地化别名命中多个身份，请补充准确作品名",
+                        code="character_resolution_ambiguous",
+                        details={
+                            "candidate_count": localized_resolution.candidate_count
+                        },
+                    )
+                if localized_resolution.verified:
+                    resolution = await asyncio.to_thread(
+                        resolve_character_identity,
+                        index,
+                        target_query=localized_resolution.canonical_tag,
+                        canonical_tag=localized_resolution.canonical_tag,
+                        identity_candidates=(localized_resolution.canonical_tag,),
+                        work_hints=(localized_resolution.confirmed_work,),
+                        allow_discovery=False,
+                    )
+                    if resolution.verified:
+                        identity_candidates = tuple(
+                            dict.fromkeys(
+                                (
+                                    localized_resolution.canonical_tag,
+                                    *identity_candidates,
+                                )
+                            )
+                        )[:12]
+                        work_hints = tuple(
+                            dict.fromkeys(
+                                (
+                                    localized_resolution.confirmed_work,
+                                    *work_hints,
+                                )
+                            )
+                        )[:8]
+                        self._record_image_task_phase(
+                            job,
+                            "character_validation",
+                            "已用本地化角色名和作品名定位 Danbooru canonical，并完成 Character/Copyright 双重 exact 校验。",
+                            "localized_alias_exact_used",
+                            details={
+                                "candidate_count": localized_resolution.candidate_count,
+                                "work_verified": bool(
+                                    localized_resolution.confirmed_work
+                                ),
+                            },
+                        )
             if not resolution.verified and adjacent_aliases:
                 alias_resolutions = []
                 for alias in adjacent_aliases:
@@ -9051,6 +9220,12 @@ QQ快捷指令:
             r"标签|tag名|角色名|作品名|画师名|画师标签|角色标签|作品标签",
             folded,
             flags=re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            r"《[^》\r\n]{1,80}》\s*(?:的|里(?:的)?|中(?:的)?)?\s*"
+            r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]{1,32}",
+            source,
         ):
             return True
         if re.search(r"[A-Za-z][^\r\n]{0,80}\\?\([^\r\n)]{2,80}\\?\)", source):
