@@ -23,22 +23,25 @@ import tempfile
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence, TextIO
 import unicodedata
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
 
-DEFAULT_MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
-MAX_INDEX_RECORDS = 500_000
+DEFAULT_MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_INDEX_RECORDS = 3_000_000
+MAX_ALIAS_EDGES = 12_000_000
 MAX_TAG_LENGTH = 256
 MAX_ALIASES_PER_TAG = 64
 MAX_PROVENANCE_JSON_LENGTH = 8192
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
+_SUPPORTED_SCHEMA_VERSIONS = {"1", _SCHEMA_VERSION}
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
 _SPACE_OR_UNDERSCORE = re.compile(r"[\s_]+", re.UNICODE)
+_PROMPT_PAREN_ESCAPE = re.compile(r"\\+([()])")
 _ALIAS_SEPARATOR = re.compile(r"[|;,]")
 _DANBOORU_CATEGORIES = {
     "0": "general",
@@ -142,6 +145,13 @@ class _ImportRecord:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _ExactResolution:
+    row: sqlite3.Row | None = None
+    ambiguous_rows: tuple[sqlite3.Row, ...] = ()
+    blocked_by_canonical: bool = False
+
+
 def normalize_tag(value: str) -> str:
     """Return a stable lookup key for user-facing Danbooru prompt syntax.
 
@@ -152,7 +162,10 @@ def normalize_tag(value: str) -> str:
 
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
     text = text.replace("’", "'").replace("‘", "'").replace("`", "'")
-    text = text.replace(r"\(", "(").replace(r"\)", ")")
+    # Input may have crossed JSON, Markdown and prompt serializers more than
+    # once. Parenthesis escaping is not part of Danbooru identity, so collapse
+    # every adjacent escape layer while leaving unrelated backslashes intact.
+    text = _PROMPT_PAREN_ESCAPE.sub(r"\1", text)
     text = _SPACE_OR_UNDERSCORE.sub("_", text)
     return text.strip("_").casefold()
 
@@ -338,20 +351,19 @@ def _records_from_json(
     return records, metadata
 
 
-def _records_from_csv(
-    data: bytes,
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise DanbooruIndexError("tag index build cancelled")
+
+
+def _iter_records_from_csv_stream(
+    stream: TextIO,
     provenance: Mapping[str, Any],
-) -> tuple[list[_ImportRecord], dict[str, Any]]:
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise DanbooruIndexError("tag index CSV must be UTF-8") from exc
-    # Prefer the documented headered format, but also accept the common
-    # Danbooru export shape used by Anima tag indexes:
-    # ``tag,category,count,aliases`` without a header row.  The latter is
-    # intentionally detected conservatively so an arbitrary malformed CSV is
-    # still rejected instead of being silently interpreted as tags.
-    stream = io.StringIO(text, newline="")
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Iterator[_ImportRecord]:
+    """Yield validated CSV records without materializing the source catalogue."""
+
     probe = csv.reader(stream)
     try:
         first_row = next(probe)
@@ -359,31 +371,30 @@ def _records_from_csv(
         raise DanbooruIndexError("tag index CSV is missing a header") from exc
     lowered = {str(name).strip().casefold() for name in first_row}
     has_header = any(name in lowered for name in ("tag", "name", "canonical_tag"))
-    records: list[_ImportRecord] = []
+    emitted = 0
 
     if has_header:
-        stream.seek(0)
-        reader = csv.DictReader(stream)
-        if not reader.fieldnames:
-            raise DanbooruIndexError("tag index CSV is missing a header")
+        reader = csv.DictReader(stream, fieldnames=first_row)
         for row_number, raw in enumerate(reader, start=2):
-            if len(records) >= MAX_INDEX_RECORDS:
-                raise DanbooruIndexError("tag index contains too many records")
+            _check_cancel(cancel_event)
             normalized_row = {
                 str(key).strip().casefold(): value for key, value in raw.items() if key
             }
             if not any(str(value or "").strip() for value in normalized_row.values()):
                 continue
+            if emitted >= MAX_INDEX_RECORDS:
+                raise DanbooruIndexError("tag index contains too many records")
             try:
-                records.append(_record_from_mapping(normalized_row, provenance))
+                record = _record_from_mapping(normalized_row, provenance)
             except DanbooruIndexError as exc:
                 raise DanbooruIndexError(
                     f"invalid CSV record on line {row_number}: {exc}"
                 ) from exc
-        return records, {}
+            emitted += 1
+            yield record
+        return
 
     # Headerless Anima/Danbooru exports have at least tag, category and count.
-    # Validate those two numeric/semantic columns before accepting the format.
     if len(first_row) < 3:
         raise DanbooruIndexError("tag index CSV requires tag or name column")
     try:
@@ -398,10 +409,11 @@ def _records_from_csv(
             yield row_number, raw
 
     for row_number, raw in rows():
-        if len(records) >= MAX_INDEX_RECORDS:
-            raise DanbooruIndexError("tag index contains too many records")
+        _check_cancel(cancel_event)
         if not any(str(value or "").strip() for value in raw):
             continue
+        if emitted >= MAX_INDEX_RECORDS:
+            raise DanbooruIndexError("tag index contains too many records")
         normalized_row = {
             "tag": raw[0] if len(raw) > 0 else "",
             "category": raw[1] if len(raw) > 1 else "",
@@ -409,56 +421,32 @@ def _records_from_csv(
             "aliases": raw[3] if len(raw) > 3 else "",
         }
         try:
-            records.append(
-                _record_from_mapping(
-                    normalized_row,
-                    provenance,
-                    skip_overlong_aliases=True,
-                )
+            record = _record_from_mapping(
+                normalized_row,
+                provenance,
+                skip_overlong_aliases=True,
             )
         except DanbooruIndexError as exc:
             raise DanbooruIndexError(
                 f"invalid CSV record on line {row_number}: {exc}"
             ) from exc
+        emitted += 1
+        yield record
 
-    # Some headerless Danbooru exports intentionally include broad aliases
-    # which either name another canonical tag or point to several canonical
-    # tags.  Such aliases cannot be verified uniquely.  Drop only those
-    # ambiguous aliases while retaining every canonical tag and every unique,
-    # bounded alias; JSON and headered CSV imports keep their strict conflict
-    # behavior unchanged.
-    canonical_tags = {record.normalized_tag for record in records}
-    owners: dict[str, set[str]] = {}
-    for record in records:
-        for alias in record.normalized_aliases:
-            owners.setdefault(alias, set()).add(record.normalized_tag)
-    ambiguous = {
-        alias
-        for alias, tag_owners in owners.items()
-        if alias in canonical_tags or len(tag_owners) > 1
-    }
-    if ambiguous:
-        records = [
-            _ImportRecord(
-                tag=record.tag,
-                normalized_tag=record.normalized_tag,
-                category=record.category,
-                aliases=tuple(
-                    alias
-                    for alias in record.aliases
-                    if alias not in ambiguous
-                ),
-                normalized_aliases=tuple(
-                    alias
-                    for alias in record.normalized_aliases
-                    if alias not in ambiguous
-                ),
-                count=record.count,
-                provenance=record.provenance,
-            )
-            for record in records
-        ]
-    return records, {}
+
+def _records_from_csv(
+    data: bytes,
+    provenance: Mapping[str, Any],
+) -> tuple[list[_ImportRecord], dict[str, Any]]:
+    """Compatibility wrapper for callers that already own an in-memory payload."""
+
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise DanbooruIndexError("tag index CSV must be UTF-8") from exc
+    return list(
+        _iter_records_from_csv_stream(io.StringIO(text, newline=""), provenance)
+    ), {}
 
 
 class DanbooruTagIndex:
@@ -494,19 +482,63 @@ class DanbooruTagIndex:
         source: str = "",
         content_type: str = "",
         provenance: Mapping[str, Any] | None = None,
+        _expected_generation: int | None = None,
+        _known_sha256: str = "",
+        _cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         file_path = Path(path)
         try:
-            data = file_path.read_bytes()
+            with file_path.open("rb") as handle:
+                prefix = handle.read(4096)
         except OSError as exc:
             self._last_error = str(exc)
             raise DanbooruIndexError(f"cannot read tag index: {file_path}") from exc
-        return self.import_bytes(
-            data,
-            source=source or str(file_path),
-            content_type=content_type or file_path.suffix,
-            provenance=provenance,
-        )
+        if not prefix:
+            raise DanbooruIndexError("tag index is empty")
+        source_label = source or str(file_path)
+        content_hint = content_type or file_path.suffix
+        kind = self._content_kind(content_hint, prefix)
+        if kind == "json":
+            try:
+                payload = file_path.read_bytes()
+            except OSError as exc:
+                self._last_error = str(exc)
+                raise DanbooruIndexError(f"cannot read tag index: {file_path}") from exc
+            return self.import_bytes(
+                payload,
+                source=source_label,
+                content_type=content_hint,
+                provenance=provenance,
+                _expected_generation=_expected_generation,
+                _known_sha256=_known_sha256,
+                _cancel_event=_cancel_event,
+            )
+
+        base_provenance = _json_mapping(provenance)
+        if source_label:
+            base_provenance["source"] = source_label
+        digest = _known_sha256 or self._sha256_file(file_path, _cancel_event)
+        metadata = dict(base_provenance)
+        metadata.setdefault("revision", digest[:12])
+        metadata["sha256"] = digest
+        metadata["imported_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            with file_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                records = _iter_records_from_csv_stream(
+                    stream,
+                    base_provenance,
+                    cancel_event=_cancel_event,
+                )
+                return self._commit_records(
+                    records,
+                    metadata,
+                    expected_generation=_expected_generation,
+                    cancel_event=_cancel_event,
+                )
+        except UnicodeDecodeError as exc:
+            if self._generation_is_current(_expected_generation):
+                self._last_error = "tag index CSV must be UTF-8"
+            raise DanbooruIndexError("tag index CSV must be UTF-8") from exc
 
     def import_bytes(
         self,
@@ -515,6 +547,8 @@ class DanbooruTagIndex:
         content_type: str = "",
         provenance: Mapping[str, Any] | None = None,
         _expected_generation: int | None = None,
+        _known_sha256: str = "",
+        _cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data must be bytes")
@@ -531,22 +565,34 @@ class DanbooruTagIndex:
                     payload, base_provenance
                 )
             else:
-                records, embedded_metadata = _records_from_csv(payload, base_provenance)
-            if not records:
-                raise DanbooruIndexError("tag index contains no records")
+                try:
+                    text_stream = io.TextIOWrapper(
+                        io.BytesIO(payload),
+                        encoding="utf-8-sig",
+                        newline="",
+                    )
+                    records = _iter_records_from_csv_stream(
+                        text_stream,
+                        base_provenance,
+                        cancel_event=_cancel_event,
+                    )
+                    embedded_metadata = {}
+                except UnicodeDecodeError as exc:
+                    raise DanbooruIndexError("tag index CSV must be UTF-8") from exc
             metadata = dict(base_provenance)
             for key, value in embedded_metadata.items():
                 metadata.setdefault(key, value)
             if source:
                 metadata["source"] = source
-            digest = hashlib.sha256(payload).hexdigest()
+            digest = _known_sha256 or hashlib.sha256(payload).hexdigest()
             metadata.setdefault("revision", digest[:12])
             metadata["sha256"] = digest
             metadata["imported_at"] = datetime.now(timezone.utc).isoformat()
-            self._replace_snapshot(
+            return self._commit_records(
                 records,
                 metadata,
                 expected_generation=_expected_generation,
+                cancel_event=_cancel_event,
             )
         except Exception as exc:
             if self._generation_is_current(_expected_generation):
@@ -554,7 +600,117 @@ class DanbooruTagIndex:
             if isinstance(exc, DanbooruIndexError):
                 raise
             raise DanbooruIndexError(f"tag index import failed: {exc}") from exc
-        if self._generation_is_current(_expected_generation):
+
+    def build_from_records(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        source: str = "",
+        provenance: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        revision: str = "",
+        sha256: str = "",
+        _expected_generation: int | None = None,
+        _cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Build one immutable snapshot directly from a lazy record iterable.
+
+        This is the stable integration point for local index generators.  The
+        caller supplies record mappings; schema creation, ambiguity accounting,
+        validation and atomic replacement remain owned by this service.
+        """
+
+        base_provenance = _json_mapping(provenance)
+        supplied_metadata = _json_mapping(metadata)
+        for key in ("source", "license", "revision"):
+            value = supplied_metadata.get(key)
+            if value not in (None, ""):
+                base_provenance.setdefault(key, value)
+        if source:
+            base_provenance["source"] = source
+
+        def parsed_records() -> Iterator[_ImportRecord]:
+            for record_number, raw in enumerate(records, start=1):
+                _check_cancel(_cancel_event)
+                if not isinstance(raw, Mapping):
+                    raise DanbooruIndexError(
+                        f"generated record {record_number} is not an object"
+                    )
+                try:
+                    yield _record_from_mapping(raw, base_provenance)
+                except DanbooruIndexError as exc:
+                    raise DanbooruIndexError(
+                        f"invalid generated record {record_number}: {exc}"
+                    ) from exc
+
+        snapshot_metadata = dict(base_provenance)
+        snapshot_metadata.update(supplied_metadata)
+        if source:
+            snapshot_metadata["source"] = source
+        if revision:
+            snapshot_metadata["revision"] = revision
+        if sha256:
+            snapshot_metadata["sha256"] = sha256
+            snapshot_metadata.setdefault("revision", sha256[:12])
+        snapshot_metadata.setdefault(
+            "revision", datetime.now(timezone.utc).strftime("generated-%Y%m%d%H%M%S")
+        )
+        snapshot_metadata["imported_at"] = datetime.now(timezone.utc).isoformat()
+        return self._commit_records(
+            parsed_records(),
+            snapshot_metadata,
+            expected_generation=_expected_generation,
+            cancel_event=_cancel_event,
+        )
+
+    @staticmethod
+    def _sha256_file(
+        path: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        digest = hashlib.sha256()
+        try:
+            with Path(path).open("rb") as handle:
+                while True:
+                    _check_cancel(cancel_event)
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as exc:
+            raise DanbooruIndexError(f"cannot read tag index: {path}") from exc
+        return digest.hexdigest()
+
+    def _commit_records(
+        self,
+        records: Iterable[_ImportRecord],
+        metadata: Mapping[str, Any],
+        *,
+        expected_generation: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        try:
+            _check_cancel(cancel_event)
+            if not self._generation_is_current(expected_generation):
+                raise DanbooruIndexError("stale tag index update was discarded")
+            self._replace_snapshot(
+                records,
+                metadata,
+                expected_generation=expected_generation,
+                cancel_event=cancel_event,
+            )
+        except UnicodeDecodeError as exc:
+            error = DanbooruIndexError("tag index CSV must be UTF-8")
+            if self._generation_is_current(expected_generation):
+                self._last_error = str(error)
+            raise error from exc
+        except Exception as exc:
+            if self._generation_is_current(expected_generation):
+                self._last_error = str(exc)
+            if isinstance(exc, DanbooruIndexError):
+                raise
+            raise DanbooruIndexError(f"tag index import failed: {exc}") from exc
+        if self._generation_is_current(expected_generation):
             self._last_error = ""
         return self.status()
 
@@ -572,10 +728,11 @@ class DanbooruTagIndex:
 
     def _replace_snapshot(
         self,
-        records: Sequence[_ImportRecord],
+        records: Iterable[_ImportRecord],
         metadata: Mapping[str, Any],
         *,
         expected_generation: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
@@ -586,7 +743,13 @@ class DanbooruTagIndex:
         try:
             # Build and fsync outside the reader lock. Existing lookups continue
             # using the immutable old snapshot until the short replace window.
-            self._build_database(temporary, records, metadata)
+            self._build_database(
+                temporary,
+                records,
+                metadata,
+                cancel_event=cancel_event,
+            )
+            _check_cancel(cancel_event)
             # Windows rejects fsync on a read-only CRT descriptor.
             with temporary.open("r+b") as handle:
                 os.fsync(handle.fileno())
@@ -600,6 +763,7 @@ class DanbooruTagIndex:
                                 "stale tag index update was discarded"
                             )
                         os.replace(temporary, self.path)
+            self._fsync_parent_directory(self.path.parent)
         except Exception:
             try:
                 temporary.unlink(missing_ok=True)
@@ -608,18 +772,35 @@ class DanbooruTagIndex:
             raise
 
     @staticmethod
+    def _fsync_parent_directory(path: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+            os.fsync(descriptor)
+        except OSError:
+            return
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
     def _build_database(
         path: Path,
-        records: Sequence[_ImportRecord],
+        records: Iterable[_ImportRecord],
         metadata: Mapping[str, Any],
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         connection = sqlite3.connect(path, timeout=30)
         try:
             connection.executescript(
                 """
-                PRAGMA journal_mode=DELETE;
-                PRAGMA synchronous=FULL;
+                PRAGMA journal_mode=OFF;
+                PRAGMA synchronous=OFF;
                 PRAGMA foreign_keys=ON;
+                PRAGMA temp_store=FILE;
                 CREATE TABLE metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -634,53 +815,57 @@ class DanbooruTagIndex:
                     provenance TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE TABLE aliases (
-                    id INTEGER PRIMARY KEY,
                     tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                     alias TEXT NOT NULL,
-                    normalized_alias TEXT NOT NULL UNIQUE,
-                    alias_length INTEGER NOT NULL
-                );
-                CREATE INDEX idx_tags_category ON tags(category);
-                CREATE INDEX idx_tags_prefix ON tags(normalized_tag);
-                CREATE INDEX idx_tags_length ON tags(tag_length);
-                CREATE INDEX idx_alias_prefix ON aliases(normalized_alias);
-                CREATE INDEX idx_alias_length ON aliases(alias_length);
+                    normalized_alias TEXT NOT NULL,
+                    alias_length INTEGER NOT NULL,
+                    PRIMARY KEY (normalized_alias, tag_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE alias_keys (
+                    normalized_alias TEXT PRIMARY KEY,
+                    alias_length INTEGER NOT NULL,
+                    owner_count INTEGER NOT NULL CHECK (owner_count > 0),
+                    canonical_conflict INTEGER NOT NULL
+                        CHECK (canonical_conflict IN (0, 1))
+                ) WITHOUT ROWID;
                 """
             )
-            canonical_keys = {record.normalized_tag for record in records}
-            if len(canonical_keys) != len(records):
-                raise DanbooruIndexError("duplicate canonical tag in import")
-            alias_owner: dict[str, str] = {}
+            record_count = 0
+            alias_edge_count = 0
+            category_counts: dict[str, int] = {}
+            provenance_counts: dict[str, int] = {}
             for record in records:
-                for alias in record.normalized_aliases:
-                    if alias in canonical_keys and alias != record.normalized_tag:
-                        raise DanbooruIndexError(
-                            f"alias conflicts with canonical tag: {alias}"
-                        )
-                    owner = alias_owner.setdefault(alias, record.normalized_tag)
-                    if owner != record.normalized_tag:
-                        raise DanbooruIndexError(f"duplicate alias in import: {alias}")
-
-            for record in records:
-                cursor = connection.execute(
-                    """INSERT INTO tags
-                       (tag, normalized_tag, tag_length, category, count, provenance)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        record.tag,
-                        record.normalized_tag,
-                        len(record.normalized_tag),
-                        record.category,
-                        record.count,
-                        json.dumps(
-                            record.provenance,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
+                _check_cancel(cancel_event)
+                record_count += 1
+                if record_count > MAX_INDEX_RECORDS:
+                    raise DanbooruIndexError("tag index contains too many records")
+                try:
+                    cursor = connection.execute(
+                        """INSERT INTO tags
+                           (tag, normalized_tag, tag_length, category, count, provenance)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            record.tag,
+                            record.normalized_tag,
+                            len(record.normalized_tag),
+                            record.category,
+                            record.count,
+                            json.dumps(
+                                record.provenance,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
                         ),
-                    ),
-                )
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise DanbooruIndexError(
+                        f"duplicate canonical tag in import at record {record_count}"
+                    ) from exc
                 tag_id = int(cursor.lastrowid)
+                alias_edge_count += len(record.normalized_aliases)
+                if alias_edge_count > MAX_ALIAS_EDGES:
+                    raise DanbooruIndexError("tag index contains too many alias edges")
                 connection.executemany(
                     """INSERT INTO aliases
                        (tag_id, alias, normalized_alias, alias_length)
@@ -692,15 +877,92 @@ class DanbooruTagIndex:
                         )
                     ],
                 )
+                category_counts[record.category] = (
+                    category_counts.get(record.category, 0) + 1
+                )
+                label = str(
+                    record.provenance.get("source")
+                    or record.provenance.get("value")
+                    or "unspecified"
+                )
+                provenance_counts[label] = provenance_counts.get(label, 0) + 1
+            if record_count == 0:
+                raise DanbooruIndexError("tag index contains no records")
+
+            _check_cancel(cancel_event)
+            connection.execute(
+                """INSERT INTO alias_keys
+                   (normalized_alias, alias_length, owner_count, canonical_conflict)
+                   SELECT a.normalized_alias,
+                          MIN(a.alias_length),
+                          COUNT(*),
+                          CASE WHEN MAX(t.id IS NOT NULL) THEN 1 ELSE 0 END
+                   FROM aliases a
+                   LEFT JOIN tags t ON t.normalized_tag = a.normalized_alias
+                   GROUP BY a.normalized_alias"""
+            )
+            alias_key_count = int(
+                connection.execute("SELECT COUNT(*) FROM alias_keys").fetchone()[0]
+            )
+            unique_alias_count = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM alias_keys
+                       WHERE owner_count = 1 AND canonical_conflict = 0"""
+                ).fetchone()[0]
+            )
+            ambiguous_alias_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM alias_keys WHERE owner_count > 1"
+                ).fetchone()[0]
+            )
+            canonical_conflict_alias_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM alias_keys WHERE canonical_conflict = 1"
+                ).fetchone()[0]
+            )
+            _check_cancel(cancel_event)
+            connection.executescript(
+                """
+                CREATE INDEX idx_tags_category ON tags(category);
+                CREATE INDEX idx_tags_length_count ON tags(tag_length, count DESC);
+                CREATE INDEX idx_alias_tag_id ON aliases(tag_id);
+                CREATE INDEX idx_alias_length ON aliases(alias_length);
+                ANALYZE;
+                """
+            )
             complete_metadata = {
-                "schema_version": _SCHEMA_VERSION,
                 **{str(key): str(value) for key, value in metadata.items()},
+                "schema_version": _SCHEMA_VERSION,
+                "tag_count": str(record_count),
+                "alias_count": str(alias_edge_count),
+                "alias_key_count": str(alias_key_count),
+                "unique_alias_count": str(unique_alias_count),
+                "ambiguous_alias_count": str(ambiguous_alias_count),
+                "canonical_conflict_alias_count": str(canonical_conflict_alias_count),
+                "category_counts": json.dumps(
+                    category_counts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "provenance_counts": json.dumps(
+                    provenance_counts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             }
             connection.executemany(
                 "INSERT INTO metadata(key, value) VALUES (?, ?)",
                 complete_metadata.items(),
             )
-            check = connection.execute("PRAGMA integrity_check").fetchone()
+            _check_cancel(cancel_event)
+            foreign_key_error = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchone()
+            if foreign_key_error is not None:
+                raise DanbooruIndexError("SQLite foreign-key check failed")
+            check = connection.execute("PRAGMA quick_check").fetchone()
             if not check or check[0] != "ok":
                 raise DanbooruIndexError("SQLite integrity check failed")
             connection.commit()
@@ -724,17 +986,37 @@ class DanbooruTagIndex:
             try:
                 connection = self._connect()
                 try:
-                    exact = self._exact(connection, normalized, category_filter)
-                    if exact is not None:
+                    exact = self._resolve_exact(connection, normalized, category_filter)
+                    if exact.row is not None:
                         return self._lookup_from_row(
-                            connection, query, normalized, exact, verified=True
+                            connection, query, normalized, exact.row, verified=True
+                        )
+                    if exact.ambiguous_rows:
+                        return TagLookup(
+                            query=query,
+                            normalized_query=normalized,
+                            provenance={},
+                            match_type="alias_ambiguous",
+                            matched_value=normalized,
+                            verified=False,
+                            candidates=tuple(
+                                self._candidate_from_row(connection, row)
+                                for row in exact.ambiguous_rows
+                            ),
+                        )
+                    if exact.blocked_by_canonical:
+                        return TagLookup(
+                            query=query,
+                            normalized_query=normalized,
+                            provenance={},
+                            match_type="canonical_category_mismatch",
                         )
                     candidates = self._candidates(
                         connection, normalized, category_filter, limit=8
                     )
                 finally:
                     connection.close()
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, DanbooruIndexError) as exc:
                 self._last_error = str(exc)
                 return TagLookup(
                     query=query, normalized_query=normalized, provenance={}
@@ -798,13 +1080,31 @@ class DanbooruTagIndex:
                                 )
                             )
                             continue
-                        row = self._exact(connection, normalized, category_filter)
-                        if row is None:
+                        exact = self._resolve_exact(
+                            connection, normalized, category_filter
+                        )
+                        if exact.row is None:
                             results.append(
                                 TagLookup(
                                     query=query,
                                     normalized_query=normalized,
                                     provenance={},
+                                    match_type=(
+                                        "alias_ambiguous"
+                                        if exact.ambiguous_rows
+                                        else (
+                                            "canonical_category_mismatch"
+                                            if exact.blocked_by_canonical
+                                            else "none"
+                                        )
+                                    ),
+                                    matched_value=(
+                                        normalized if exact.ambiguous_rows else ""
+                                    ),
+                                    candidates=tuple(
+                                        self._candidate_from_row(connection, row)
+                                        for row in exact.ambiguous_rows
+                                    ),
                                 )
                             )
                             continue
@@ -813,13 +1113,13 @@ class DanbooruTagIndex:
                                 connection,
                                 query,
                                 normalized,
-                                row,
+                                exact.row,
                                 verified=True,
                             )
                         )
                 finally:
                     connection.close()
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, DanbooruIndexError) as exc:
                 self._last_error = str(exc)
                 return tuple(
                     TagLookup(
@@ -866,15 +1166,20 @@ class DanbooruTagIndex:
                 connection = self._connect()
                 try:
                     if normalized_mode == "exact":
-                        row = self._exact(connection, normalized, category_filter)
-                        if row is None:
-                            return ()
-                        return (
-                            self._candidate_from_row(
-                                connection,
-                                row,
-                                verified=True,
-                            ),
+                        exact = self._resolve_exact(
+                            connection, normalized, category_filter
+                        )
+                        if exact.row is not None:
+                            return (
+                                self._candidate_from_row(
+                                    connection,
+                                    exact.row,
+                                    verified=True,
+                                ),
+                            )
+                        return tuple(
+                            self._candidate_from_row(connection, row)
+                            for row in exact.ambiguous_rows[:effective_limit]
                         )
                     if normalized_mode == "prefix":
                         return tuple(
@@ -895,7 +1200,7 @@ class DanbooruTagIndex:
                     )
                 finally:
                     connection.close()
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, DanbooruIndexError) as exc:
                 self._last_error = str(exc)
                 return ()
 
@@ -916,27 +1221,95 @@ class DanbooruTagIndex:
             return "", []
         return f" AND {prefix}.category = ? COLLATE NOCASE", [category]
 
+    @staticmethod
+    def _schema_version(connection: sqlite3.Connection) -> str:
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise DanbooruIndexError("unsupported tag index schema") from exc
+        version = str(row[0] if row else "")
+        if version not in _SUPPORTED_SCHEMA_VERSIONS:
+            raise DanbooruIndexError("unsupported tag index schema")
+        return version
+
+    def _resolve_exact(
+        self,
+        connection: sqlite3.Connection,
+        normalized: str,
+        category: str,
+        *,
+        ambiguity_limit: int = 50,
+    ) -> _ExactResolution:
+        # Canonical spellings are globally authoritative.  A category filter
+        # cannot reinterpret a canonical from another category as an alias.
+        canonical = connection.execute(
+            """SELECT t.*, 'canonical' AS match_type,
+                      t.tag AS matched_value, 1.0 AS score
+               FROM tags t WHERE t.normalized_tag = ?""",
+            (normalized,),
+        ).fetchone()
+        if canonical is not None:
+            if (
+                category
+                and str(canonical["category"]).casefold() != category.casefold()
+            ):
+                return _ExactResolution(blocked_by_canonical=True)
+            return _ExactResolution(row=canonical)
+
+        category_sql, params = self._category_sql(category)
+        if self._schema_version(connection) == "1":
+            row = connection.execute(
+                """SELECT t.*, 'alias' AS match_type,
+                          a.alias AS matched_value, 1.0 AS score
+                   FROM aliases a JOIN tags t ON t.id = a.tag_id
+                   WHERE a.normalized_alias = ?"""
+                + category_sql,
+                [normalized, *params],
+            ).fetchone()
+            return _ExactResolution(row=row)
+
+        alias_key = connection.execute(
+            """SELECT owner_count, canonical_conflict
+               FROM alias_keys WHERE normalized_alias = ?""",
+            (normalized,),
+        ).fetchone()
+        if alias_key is None:
+            return _ExactResolution()
+        rows = tuple(
+            connection.execute(
+                """SELECT t.*, 'alias_ambiguous' AS match_type,
+                          a.alias AS matched_value, 1.0 AS score
+                   FROM aliases a JOIN tags t ON t.id = a.tag_id
+                   WHERE a.normalized_alias = ?"""
+                + category_sql
+                + " ORDER BY t.count DESC, t.tag LIMIT ?",
+                [normalized, *params, max(1, min(int(ambiguity_limit), 50))],
+            ).fetchall()
+        )
+        globally_unique = (
+            int(alias_key["owner_count"]) == 1
+            and int(alias_key["canonical_conflict"]) == 0
+        )
+        if globally_unique and len(rows) == 1:
+            row = connection.execute(
+                """SELECT t.*, 'alias' AS match_type,
+                          a.alias AS matched_value, 1.0 AS score
+                   FROM aliases a JOIN tags t ON t.id = a.tag_id
+                   WHERE a.normalized_alias = ?"""
+                + category_sql,
+                [normalized, *params],
+            ).fetchone()
+            return _ExactResolution(row=row)
+        return _ExactResolution(ambiguous_rows=rows)
+
     def _exact(
         self, connection: sqlite3.Connection, normalized: str, category: str
     ) -> sqlite3.Row | None:
-        category_sql, params = self._category_sql(category)
-        row = connection.execute(
-            """SELECT t.*, 'canonical' AS match_type,
-                      t.tag AS matched_value, 1.0 AS score
-               FROM tags t WHERE t.normalized_tag = ?"""
-            + category_sql,
-            [normalized, *params],
-        ).fetchone()
-        if row is not None:
-            return row
-        return connection.execute(
-            """SELECT t.*, 'alias' AS match_type,
-                      a.alias AS matched_value, 1.0 AS score
-               FROM aliases a JOIN tags t ON t.id = a.tag_id
-               WHERE a.normalized_alias = ?"""
-            + category_sql,
-            [normalized, *params],
-        ).fetchone()
+        """Compatibility helper returning only a verified exact row."""
+
+        return self._resolve_exact(connection, normalized, category).row
 
     def _lookup_from_row(
         self,
@@ -1149,12 +1522,19 @@ class DanbooruTagIndex:
     def status(self) -> dict[str, Any]:
         base: dict[str, Any] = {
             "ready": False,
+            "schema_version": "",
             "tag_count": 0,
             "alias_count": 0,
+            "alias_key_count": 0,
+            "unique_alias_count": 0,
+            "ambiguous_alias_count": 0,
+            "canonical_conflict_alias_count": 0,
             "revision": "",
             "source": "",
             "license": "",
             "sha256": "",
+            "identity_complete": False,
+            "source_cutoff_at": "",
             "error": self._last_error,
             "category_counts": {},
             "provenance_counts": {},
@@ -1171,54 +1551,105 @@ class DanbooruTagIndex:
                             "SELECT key, value FROM metadata"
                         ).fetchall()
                     }
-                    if metadata.get("schema_version") != _SCHEMA_VERSION:
-                        raise DanbooruIndexError("unsupported tag index schema")
-                    base["tag_count"] = int(
-                        connection.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
-                    )
-                    base["alias_count"] = int(
-                        connection.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
-                    )
-                    base["category_counts"] = {
-                        str(row[0]): int(row[1])
-                        for row in connection.execute(
-                            "SELECT category, COUNT(*) FROM tags GROUP BY category"
-                        ).fetchall()
-                    }
-                    provenance_counts: dict[str, int] = {}
-                    for raw, amount in connection.execute(
-                        "SELECT provenance, COUNT(*) FROM tags GROUP BY provenance"
-                    ).fetchall():
-                        try:
-                            decoded = json.loads(raw or "{}")
-                        except (TypeError, json.JSONDecodeError):
-                            decoded = {}
-                        if isinstance(decoded, dict):
-                            label = str(
-                                decoded.get("source")
-                                or decoded.get("value")
-                                or "unspecified"
+                    schema_version = self._schema_version(connection)
+                    base["schema_version"] = schema_version
+                    if schema_version == _SCHEMA_VERSION:
+                        base["tag_count"] = int(metadata.get("tag_count") or 0)
+                        base["alias_count"] = int(metadata.get("alias_count") or 0)
+                        base["alias_key_count"] = int(
+                            metadata.get("alias_key_count") or 0
+                        )
+                        base["unique_alias_count"] = int(
+                            metadata.get("unique_alias_count") or 0
+                        )
+                        base["ambiguous_alias_count"] = int(
+                            metadata.get("ambiguous_alias_count") or 0
+                        )
+                        base["canonical_conflict_alias_count"] = int(
+                            metadata.get("canonical_conflict_alias_count") or 0
+                        )
+                        for field in ("category_counts", "provenance_counts"):
+                            try:
+                                decoded = json.loads(metadata.get(field) or "{}")
+                            except (TypeError, json.JSONDecodeError):
+                                decoded = {}
+                            base[field] = (
+                                {str(key): int(value) for key, value in decoded.items()}
+                                if isinstance(decoded, Mapping)
+                                else {}
                             )
-                        else:
-                            label = "unspecified"
-                        provenance_counts[label] = provenance_counts.get(
-                            label, 0
-                        ) + int(amount)
-                    base["provenance_counts"] = provenance_counts
+                    else:
+                        base["tag_count"] = int(
+                            connection.execute("SELECT COUNT(*) FROM tags").fetchone()[
+                                0
+                            ]
+                        )
+                        base["alias_count"] = int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM aliases"
+                            ).fetchone()[0]
+                        )
+                        base["alias_key_count"] = base["alias_count"]
+                        base["unique_alias_count"] = base["alias_count"]
+                        base["category_counts"] = {
+                            str(row[0]): int(row[1])
+                            for row in connection.execute(
+                                "SELECT category, COUNT(*) FROM tags GROUP BY category"
+                            ).fetchall()
+                        }
+                        provenance_counts: dict[str, int] = {}
+                        for raw, amount in connection.execute(
+                            "SELECT provenance, COUNT(*) FROM tags GROUP BY provenance"
+                        ).fetchall():
+                            try:
+                                decoded = json.loads(raw or "{}")
+                            except (TypeError, json.JSONDecodeError):
+                                decoded = {}
+                            if isinstance(decoded, dict):
+                                label = str(
+                                    decoded.get("source")
+                                    or decoded.get("value")
+                                    or "unspecified"
+                                )
+                            else:
+                                label = "unspecified"
+                            provenance_counts[label] = provenance_counts.get(
+                                label, 0
+                            ) + int(amount)
+                        base["provenance_counts"] = provenance_counts
                     for key in (
                         "revision",
                         "source",
                         "license",
                         "sha256",
                         "imported_at",
+                        "transport",
+                        "dataset",
+                        "source_updated_at",
+                        "source_cutoff_at",
+                        "source_max_tag_id",
+                        "source_max_alias_id",
+                        "build_mode",
+                        "general_min_posts",
+                        "meta_min_posts",
+                        "generator",
                     ):
                         base[key] = metadata.get(key, "")
+                    base["identity_complete"] = str(
+                        metadata.get("identity_complete") or ""
+                    ).strip().casefold() in {"1", "true", "yes", "on"}
                     base["ready"] = True
                 finally:
                     connection.close()
             except (sqlite3.Error, DanbooruIndexError) as exc:
                 base["error"] = str(exc)
         return base
+
+    @staticmethod
+    async def _wait_for_build(
+        build_task: asyncio.Task[dict[str, Any]], timeout: float
+    ) -> dict[str, Any]:
+        return await asyncio.wait_for(asyncio.shield(build_task), timeout=timeout)
 
     async def update_from_url(
         self,
@@ -1232,6 +1663,9 @@ class DanbooruTagIndex:
             raise DanbooruIndexError("max_bytes must be positive")
         parsed = urlparse(str(url or "").strip())
         generation = self._begin_update()
+        download_path: Path | None = None
+        content_type = ""
+        digest = hashlib.sha256()
         try:
             addresses = await self._validate_update_url(parsed)
             client_timeout = aiohttp.ClientTimeout(total=float(timeout))
@@ -1239,84 +1673,128 @@ class DanbooruTagIndex:
                 resolver=_PinnedResolver(parsed.hostname, addresses),
                 use_dns_cache=True,
             )
-            async with aiohttp.ClientSession(
-                timeout=client_timeout,
-                connector=connector,
-            ) as session:
-                async with session.get(
-                    parsed.geturl(), allow_redirects=False
-                ) as response:
-                    if 300 <= response.status < 400:
-                        raise DanbooruIndexError(
-                            "tag index URL redirects are not allowed"
-                        )
-                    if response.status >= 400:
-                        raise DanbooruIndexError(
-                            f"tag index URL returned HTTP {response.status}"
-                        )
-                    content_length = response.headers.get("Content-Length", "")
-                    if content_length:
-                        try:
-                            declared = int(content_length)
-                        except ValueError:
-                            declared = 0
-                        if declared > max_bytes:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.download.",
+                suffix=".tmp",
+                dir=self.path.parent,
+            )
+            download_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as output:
+                async with aiohttp.ClientSession(
+                    timeout=client_timeout,
+                    connector=connector,
+                ) as session:
+                    async with session.get(
+                        parsed.geturl(), allow_redirects=False
+                    ) as response:
+                        if 300 <= response.status < 400:
                             raise DanbooruIndexError(
-                                "tag index download exceeds size limit"
+                                "tag index URL redirects are not allowed"
                             )
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        total += len(chunk)
-                        if total > max_bytes:
+                        if response.status >= 400:
                             raise DanbooruIndexError(
-                                "tag index download exceeds size limit"
+                                f"tag index URL returned HTTP {response.status}"
                             )
-                        chunks.append(chunk)
-                    content_type = response.headers.get("Content-Type", "")
+                        content_length = response.headers.get("Content-Length", "")
+                        if content_length:
+                            try:
+                                declared = int(content_length)
+                            except ValueError:
+                                declared = 0
+                            if declared > max_bytes:
+                                raise DanbooruIndexError(
+                                    "tag index download exceeds size limit"
+                                )
+                        total = 0
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise DanbooruIndexError(
+                                    "tag index download exceeds size limit"
+                                )
+                            output.write(chunk)
+                            digest.update(chunk)
+                        content_type = response.headers.get("Content-Type", "")
+                output.flush()
+                os.fsync(output.fileno())
         except DanbooruIndexError as exc:
             self._invalidate_update(generation)
             self._last_error = str(exc)
+            if download_path is not None:
+                download_path.unlink(missing_ok=True)
             raise
         except asyncio.CancelledError:
             self._invalidate_update(generation)
+            if download_path is not None:
+                download_path.unlink(missing_ok=True)
             raise
         except asyncio.TimeoutError as exc:
             self._invalidate_update(generation)
             self._last_error = "tag index download timed out"
+            if download_path is not None:
+                download_path.unlink(missing_ok=True)
             raise DanbooruIndexError(self._last_error) from exc
         except aiohttp.ClientError as exc:
             self._invalidate_update(generation)
             self._last_error = f"tag index request failed: {type(exc).__name__}"
+            if download_path is not None:
+                download_path.unlink(missing_ok=True)
+            raise DanbooruIndexError(self._last_error) from exc
+        except OSError as exc:
+            self._invalidate_update(generation)
+            self._last_error = "tag index temporary download failed"
+            if download_path is not None:
+                download_path.unlink(missing_ok=True)
             raise DanbooruIndexError(self._last_error) from exc
         source_label = urlunparse(
             (parsed.scheme, parsed.netloc, parsed.path, "", "", "")
         )
-        try:
-            # Parsing and SQLite construction can be significant for a 64 MiB
-            # catalogue, so keep the AstrBot event loop responsive.
-            build_timeout = max(30.0, min(300.0, float(timeout) * 2.0))
-            return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.import_bytes,
-                    b"".join(chunks),
-                    source=source_label,
-                    content_type=content_type,
-                    provenance={"transport": parsed.scheme},
-                    _expected_generation=generation,
-                ),
-                timeout=build_timeout,
+        cancel_event = threading.Event()
+        build_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.import_file,
+                download_path,
+                source=source_label,
+                content_type=content_type,
+                provenance={"transport": parsed.scheme},
+                _expected_generation=generation,
+                _known_sha256=digest.hexdigest(),
+                _cancel_event=cancel_event,
             )
+        )
+        try:
+            # Million-scale parsing is cooperative: timeout/cancellation sets a
+            # thread-safe stop flag and waits for the temporary builder to clean up.
+            build_timeout = max(300.0, min(3600.0, float(timeout) * 10.0))
+            return await self._wait_for_build(build_task, build_timeout)
         except asyncio.CancelledError:
             self._invalidate_update(generation)
+            cancel_event.set()
+            try:
+                await asyncio.shield(build_task)
+            except (DanbooruIndexError, asyncio.CancelledError):
+                pass
+            except Exception:
+                pass
             raise
         except asyncio.TimeoutError as exc:
             self._invalidate_update(generation)
+            cancel_event.set()
+            try:
+                await asyncio.shield(build_task)
+            except (DanbooruIndexError, asyncio.CancelledError):
+                pass
+            except Exception:
+                pass
             self._last_error = "tag index build timed out"
             raise DanbooruIndexError(self._last_error) from exc
         except DanbooruIndexError:
-            # import_bytes records the error and atomic replacement keeps old data.
+            # import_file records the error and atomic replacement keeps old data.
             raise
+        finally:
+            if download_path is not None:
+                download_path.unlink(missing_ok=True)
 
     @staticmethod
     async def _validate_update_url(
@@ -1368,6 +1846,7 @@ class DanbooruTagIndex:
 
 __all__ = [
     "DEFAULT_MAX_DOWNLOAD_BYTES",
+    "MAX_ALIAS_EDGES",
     "MAX_ALIASES_PER_TAG",
     "MAX_INDEX_RECORDS",
     "MAX_PROVENANCE_JSON_LENGTH",

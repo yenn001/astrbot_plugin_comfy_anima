@@ -513,6 +513,146 @@ class CivitaiIdentityTests(unittest.IsolatedAsyncioTestCase):
                 (record,),
             )
 
+    def test_four_character_lora_keeps_every_deduplicated_identity(self) -> None:
+        record = LoraCatalogService._record_from_manager_item(
+            {
+                "model_name": "Character > Eimi / Himari / Rio / Toki (Blue Archive)",
+                "file_name": "baarmed_4in1_v1",
+                "sub_type": "lora",
+                "tags": ["character", "blue archive"],
+                "civitai": {
+                    "trainedWords": [
+                        r"eimi \(armed\) \(blue archive\)",
+                        r"himari \(armed\) \(blue archive\)",
+                        r"rio \(armed\) \(blue archive\)",
+                        r"toki \(armed\) \(blue archive\)",
+                        r"rio \(armed\) \(blue archive\)",
+                    ]
+                },
+            }
+        )
+
+        identities = tuple(
+            part.strip().casefold()
+            for part in record.character_name.split("/")
+            if part.strip()
+        )
+        self.assertEqual(set(identities), {"eimi", "himari", "rio", "toki"})
+        self.assertEqual(len(identities), len(set(identities)))
+
+    def test_character_identity_extraction_is_bounded_above_legacy_limit(self) -> None:
+        record = LoraCatalogService._record_from_manager_item(
+            {
+                "model_name": (
+                    "Character > "
+                    + " / ".join(f"Student_{index}" for index in range(40))
+                    + " (Blue Archive)"
+                ),
+                "file_name": "blue_archive_character_collection",
+                "sub_type": "lora",
+                "tags": ["character", "blue archive"],
+                "civitai": {
+                    "trainedWords": [
+                        f"student_{index} (blue archive)"
+                        for index in range(40)
+                    ]
+                },
+            }
+        )
+
+        identities = tuple(
+            part.strip().casefold()
+            for part in record.character_name.split("/")
+            if part.strip()
+        )
+        self.assertGreaterEqual(len(identities), 16)
+        self.assertLessEqual(len(identities), 24)
+        self.assertEqual(len(identities), len(set(identities)))
+
+    def test_work_qualified_clothing_trigger_is_not_character_identity(self) -> None:
+        record = LoraCatalogService._record_from_manager_item(
+            {
+                "model_name": "Character > Rio (Blue Archive)",
+                "file_name": "rio_blue_archive",
+                "sub_type": "lora",
+                "tags": ["character", "blue archive"],
+                "civitai": {
+                    "trainedWords": [
+                        r"rio \(blue archive\)",
+                        r"black bodysuit \(blue archive\)",
+                    ]
+                },
+            }
+        )
+
+        identities = {
+            part.strip().casefold()
+            for part in record.character_name.split("/")
+            if part.strip()
+        }
+        self.assertEqual(identities, {"rio"})
+
+    def test_multi_franchise_lora_keeps_more_than_three_works(self) -> None:
+        record = LoraCatalogService._record_from_manager_item(
+            {
+                "model_name": "Character > Crossover Hero",
+                "file_name": "crossover_hero",
+                "sub_type": "lora",
+                "tags": [
+                    "character",
+                    "blue archive",
+                    "wuthering waves",
+                    "genshin impact",
+                    "arknights",
+                ],
+            }
+        )
+
+        for work in (
+            "Blue Archive",
+            "Wuthering Waves",
+            "Genshin Impact",
+            "Arknights",
+        ):
+            self.assertIn(work, record.source_work)
+
+    async def test_each_four_in_one_character_identity_selects_same_lora(self) -> None:
+        record = LoraRecord(
+            "characters/baarmed_4in1_v1.safetensors",
+            category="character",
+            aliases=("Eimi", "Himari", "Rio", "Toki", "Blue Archive"),
+            character_name="Eimi / Himari / Rio / Toki",
+            source_work="Blue Archive",
+            trigger_words=(
+                r"eimi \(armed\) \(blue archive\)",
+                r"himari \(armed\) \(blue archive\)",
+                r"rio \(armed\) \(blue archive\)",
+                r"toki \(armed\) \(blue archive\)",
+            ),
+        )
+
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (record,)
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        for query in ("Eimi", "Himari", "Rio", "Toki"):
+            with self.subTest(query=query):
+                resolved = await service.resolve_selections(
+                    (LoraSelection(query, 0.8),),
+                    strict=True,
+                )
+                self.assertEqual(
+                    resolved[0].name,
+                    "characters/baarmed_4in1_v1",
+                )
+
+        with self.assertRaises(LoraCatalogError):
+            await service.resolve_selections(
+                (LoraSelection("Arisu", 0.8),),
+                strict=True,
+            )
+
     def test_character_title_can_infer_category_without_manual_tag(self) -> None:
         record = LoraCatalogService._record_from_manager_item(
             {
@@ -571,6 +711,175 @@ class CivitaiIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved[0].name, "black deniav1-2")
         self.assertEqual(resolved[0].strength, 0.9)
+
+    async def test_strict_work_only_query_does_not_select_character_lora(self) -> None:
+        record = LoraRecord(
+            "characters/rio.safetensors",
+            category="character",
+            aliases=("Rio", "Blue Archive", "莉音"),
+            character_name="Rio",
+            source_work="Blue Archive",
+            trigger_words=(r"rio \(blue archive\)", "black bodysuit"),
+            tags=("blue archive", "student council"),
+            description="Millennium student council officer from Blue Archive",
+        )
+
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (record,)
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        for query in ("Blue Archive", "student council", "Millennium officer"):
+            with self.subTest(query=query):
+                with self.assertRaises(LoraCatalogError):
+                    await service.resolve_selections(
+                        (LoraSelection(query, 0.8),),
+                        strict=True,
+                    )
+
+        slash_work_record = replace(
+            record,
+            name="characters/scathach.safetensors",
+            aliases=("Scathach", "Fate/Grand Order"),
+            character_name="Scathach",
+            source_work="Fate/Grand Order",
+            trigger_words=(r"scathach \(fate/grand order\)",),
+            tags=("fate/grand order",),
+        )
+
+        class SlashWorkCatalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (slash_work_record,)
+
+        with self.assertRaises(LoraCatalogError):
+            await SlashWorkCatalog(PluginSettings.from_mapping({})).resolve_selections(
+                (LoraSelection("Fate/Grand Order", 0.8),),
+                strict=True,
+            )
+
+    async def test_strict_trigger_context_does_not_select_character_lora(self) -> None:
+        record = LoraCatalogService._record_from_manager_item(
+            {
+                "model_name": "Character > Rio (Blue Archive)",
+                "file_name": "rio_blue_archive",
+                "sub_type": "lora",
+                "tags": ["character", "blue archive"],
+                "civitai": {
+                    "trainedWords": [
+                        r"rio \(blue archive\)",
+                        "black bodysuit",
+                        r"school swimsuit \(blue archive\)",
+                    ]
+                },
+            }
+        )
+
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (record,)
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        for query in ("black bodysuit", r"school swimsuit \(blue archive\)"):
+            with self.subTest(query=query):
+                with self.assertRaises(LoraCatalogError):
+                    await service.resolve_selections(
+                        (LoraSelection(query, 0.8),),
+                        strict=True,
+                    )
+
+    async def test_descriptive_title_segment_is_not_character_identity(self) -> None:
+        record = LoraCatalogService._record_from_manager_item(
+            {
+                "model_name": "Character > Rio / Millennium student council officer",
+                "file_name": "rio_v1",
+                "sub_type": "lora",
+                "tags": ["character", "blue archive"],
+                "civitai": {"trainedWords": [r"rio \(blue archive\)"]},
+            }
+        )
+
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (record,)
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        with self.assertRaises(LoraCatalogError):
+            await service.resolve_selections(
+                (LoraSelection("Millennium student council officer", 0.8),),
+                strict=True,
+            )
+        resolved = await service.resolve_selections(
+            (LoraSelection("Rio", 0.8),),
+            strict=True,
+        )
+        self.assertEqual(resolved[0].name, "rio_v1")
+
+    async def test_character_bearing_categories_all_reject_broad_queries(self) -> None:
+        for category in ("mixed", "Character", "unknown"):
+            with self.subTest(category=category):
+                record = LoraRecord(
+                    f"characters/rio-{category}.safetensors",
+                    category=category,
+                    aliases=("Rio", "Blue Archive"),
+                    character_name="Rio",
+                    source_work="Blue Archive",
+                    tags=("student council",),
+                    description="Millennium student council officer",
+                )
+
+                class Catalog(LoraCatalogService):
+                    async def _get_records(self, *_args, **_kwargs):
+                        return (record,)
+
+                service = Catalog(PluginSettings.from_mapping({}))
+                for query in ("Blue Archive", "student council", "Millennium"):
+                    with self.assertRaises(LoraCatalogError):
+                        await service.resolve_selections(
+                            (LoraSelection(query, 0.8),),
+                            strict=True,
+                        )
+
+    async def test_strict_character_identity_alias_and_trigger_still_resolve(self) -> None:
+        record = LoraRecord(
+            "characters/rio.safetensors",
+            category="character",
+            aliases=("Rio", "Blue Archive", "莉音"),
+            character_name="Rio",
+            source_work="Blue Archive",
+            trigger_words=(r"rio \(blue archive\)", "black bodysuit"),
+            tags=("blue archive", "student council"),
+        )
+
+        class Catalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (record,)
+
+        service = Catalog(PluginSettings.from_mapping({}))
+        for query in ("Rio", "莉音", r"rio \(blue archive\)"):
+            with self.subTest(query=query):
+                resolved = await service.resolve_selections(
+                    (LoraSelection(query, 0.8),),
+                    strict=True,
+                )
+                self.assertEqual(resolved[0].name, "characters/rio")
+
+        localized_title_record = replace(
+            record,
+            model_name="莉音",
+            aliases=("莉音",),
+        )
+
+        class LocalizedTitleCatalog(LoraCatalogService):
+            async def _get_records(self, *_args, **_kwargs):
+                return (localized_title_record,)
+
+        resolved = await LocalizedTitleCatalog(
+            PluginSettings.from_mapping({})
+        ).resolve_selections(
+            (LoraSelection("莉音", 0.8),),
+            strict=True,
+        )
+        self.assertEqual(resolved[0].name, "characters/rio")
 
     async def test_multiple_character_variants_refuse_fuzzy_guess(self) -> None:
         records = (

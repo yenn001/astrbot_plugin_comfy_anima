@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.23
+AstrBot Comfy Anima 插件 v1.9.24
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.23
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.23
+版本: 1.9.24
 日期: 2026-08-04
 """
 
@@ -19,6 +19,7 @@ import json
 import re
 import shlex
 import tempfile
+import threading
 import time
 import unicodedata
 from collections import OrderedDict
@@ -118,6 +119,11 @@ from .services.danbooru_index import (
     escape_prompt_tag,
     normalize_tag,
 )
+from .services.danbooru_builder import (
+    DanbooruApiBuilder,
+    DanbooruBuildError,
+    DanbooruBuildOptions,
+)
 from .services.danbooru_character_profile import (
     CharacterAppearanceProfile,
     CharacterAppearanceProfileStore,
@@ -132,6 +138,10 @@ from .services.localized_character_aliases import (
 )
 from .services.experimental_profiles import inspect_experimental_profiles
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService, LoraRecord
+from .services.lora_identity_evidence import (
+    build_lora_identity_discovery,
+    resolve_lora_character_canonicals,
+)
 from .services.lora_retrieval import LoraHybridSearchService
 from .services.lora_snapshot import LoraOperationSnapshot, record_identity
 from .services.lora_analysis import (
@@ -234,6 +244,10 @@ _DANBOORU_TOOL_CATEGORIES = {
     "meta": "meta",
 }
 _DANBOORU_BATCH_SPLIT_RE = re.compile(r"[|\r\n]+")
+_QUALIFIED_IDENTITY_TAG_RE = re.compile(
+    r"^([a-z0-9][a-z0-9_.'!?:-]{0,191})_\(([^()]{1,128})\)$",
+    re.IGNORECASE,
+)
 _DANBOORU_IDENTITY_CATEGORIES = frozenset({"artist", "copyright", "character"})
 _DANBOORU_ROUTER_STOPWORDS = frozenset(
     {
@@ -303,6 +317,18 @@ WEB_UI_EDITABLE_FIELDS = (
     "danbooru_index_url",
     "danbooru_index_timeout",
     "danbooru_index_max_size_mb",
+    "danbooru_api_base_url",
+    "danbooru_api_proxy_url",
+    "danbooru_api_mode",
+    "danbooru_api_general_min_posts",
+    "danbooru_api_meta_min_posts",
+    "danbooru_api_page_size",
+    "danbooru_api_request_interval_ms",
+    "danbooru_api_timeout",
+    "danbooru_api_max_records",
+    "danbooru_api_include_aliases",
+    "danbooru_auto_update_enabled",
+    "danbooru_auto_update_interval_hours",
     "enable_prompt_asset_library",
     "prompt_asset_remote_import_enabled",
     "prompt_asset_max_download_mb",
@@ -510,6 +536,10 @@ class ComfyAnimaPlugin(Star):
         self._danbooru_index = DanbooruTagIndex(
             self._persistent_data_dir / "danbooru_tags_v1.sqlite3"
         )
+        self._danbooru_builder = DanbooruApiBuilder(
+            self._danbooru_index,
+            self._persistent_data_dir / "danbooru_api_checkpoint_v1.sqlite3",
+        )
         self._localized_character_aliases = LocalizedCharacterAliasIndex(
             csv_path=(
                 self._persistent_data_dir / "localized_danbooru_aliases.csv"
@@ -574,6 +604,8 @@ class ComfyAnimaPlugin(Star):
         self._prompt_lab_batches: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._prompt_lab_lock = asyncio.Lock()
         self._danbooru_update_task: Optional[asyncio.Task[Any]] = None
+        self._danbooru_scheduler_task: Optional[asyncio.Task[Any]] = None
+        self._danbooru_cancel_events: dict[str, threading.Event] = {}
         self._danbooru_update_state: dict[str, Any] = {
             "id": "",
             "status": "idle",
@@ -930,6 +962,18 @@ class ComfyAnimaPlugin(Star):
                 )
             else:
                 self._web_ui_start_task = loop.create_task(self._start_web_ui())
+        if self.settings.danbooru_auto_update_enabled:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] Danbooru 自动更新未启动: AstrBot event loop is not ready"
+                )
+            else:
+                self._danbooru_scheduler_task = loop.create_task(
+                    self._run_danbooru_auto_update_scheduler(),
+                    name=f"{PLUGIN_NAME}:danbooru-auto-update",
+                )
         if self._log_console_attached:
             logger.info(
                 f"[{PLUGIN_NAME}] 专属 WebUI 日志控制台已启用，"
@@ -960,6 +1004,85 @@ class ComfyAnimaPlugin(Star):
                 exc_info=True,
             )
 
+    def _danbooru_auto_update_status(self) -> dict[str, Any]:
+        enabled = bool(self.settings.danbooru_auto_update_enabled)
+        interval_seconds = max(
+            24 * 3600,
+            min(
+                2160 * 3600,
+                int(self.settings.danbooru_auto_update_interval_hours) * 3600,
+            ),
+        )
+        latest: dict[str, Any] = {}
+        store = getattr(self, "_task_store", None)
+        if store is not None:
+            for task in store.recent_tasks(
+                limit=50,
+                task_type="danbooru_index_update",
+            ):
+                if str(task.get("mode") or "").casefold() == "official_api":
+                    latest = dict(task)
+                    break
+        now = time.time()
+        reference = float(
+            latest.get("ended_at")
+            or latest.get("created_at")
+            or 0.0
+        )
+        latest_status = str(latest.get("status") or "").casefold()
+        retry_seconds = (
+            interval_seconds
+            if latest_status in {"succeeded", "queued", "running"}
+            else min(interval_seconds, 6 * 3600)
+        )
+        next_run_at = reference + retry_seconds if reference else now
+        running = getattr(self, "_danbooru_update_task", None)
+        return {
+            "enabled": enabled,
+            "interval_hours": interval_seconds // 3600,
+            "last_run_at": reference,
+            "last_status": latest_status,
+            "last_run_id": str(latest.get("run_id") or ""),
+            "next_run_at": next_run_at if enabled else 0.0,
+            "due": bool(enabled and next_run_at <= now),
+            "running": bool(running is not None and not running.done()),
+        }
+
+    async def _run_danbooru_auto_update_scheduler(self) -> None:
+        """Periodically start the same persistent, atomic official API task."""
+
+        try:
+            await asyncio.sleep(120)
+            while self.settings.danbooru_auto_update_enabled:
+                status = self._danbooru_auto_update_status()
+                if status["due"] and not status["running"]:
+                    try:
+                        result = await self.web_ui_update_danbooru_index(
+                            {
+                                "mode": "official_api",
+                                "_requested_by": "scheduler",
+                            }
+                        )
+                        logger.info(
+                            f"[{PLUGIN_NAME}] Danbooru 定期更新任务已创建: "
+                            f"run_id={result.get('run_id', '')}"
+                        )
+                    except (TaskStoreError, WebUiActionError) as exc:
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] Danbooru 定期更新暂未启动: {exc}"
+                        )
+                status = self._danbooru_auto_update_status()
+                next_run_at = float(status.get("next_run_at") or 0.0)
+                delay = max(60.0, min(900.0, next_run_at - time.time()))
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[{PLUGIN_NAME}] Danbooru 自动更新调度器异常停止: {exc}",
+                exc_info=True,
+            )
+
     @staticmethod
     def _danbooru_tool_index_payload(status: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -968,6 +1091,23 @@ class ComfyAnimaPlugin(Star):
             "tag_count": max(0, int(status.get("tag_count") or 0)),
             "alias_count": max(0, int(status.get("alias_count") or 0)),
         }
+
+    @staticmethod
+    def _danbooru_revision_signature(status: Mapping[str, Any]) -> str:
+        return "|".join(
+            (
+                str(status.get("schema_version") or ""),
+                str(status.get("revision") or ""),
+                str(status.get("sha256") or ""),
+            )
+        )
+
+    @staticmethod
+    def _qualified_identity_parts(value: str) -> tuple[str, str]:
+        matched = _QUALIFIED_IDENTITY_TAG_RE.fullmatch(normalize_tag(value))
+        if matched is None:
+            return "", ""
+        return matched.group(1), matched.group(2)
 
     @staticmethod
     def _danbooru_tool_candidate_payload(candidate: Any) -> dict[str, Any]:
@@ -1005,6 +1145,35 @@ class ComfyAnimaPlugin(Star):
             "work": str(candidate.work or "")[:128],
             "requires_work": bool(candidate.requires_work),
         }
+
+    def _danbooru_tool_lookup_payloads(
+        self,
+        lookup: Any,
+        category: str,
+    ) -> list[dict[str, Any]]:
+        if bool(getattr(lookup, "found", False)):
+            candidates: tuple[Any, ...] = (lookup,)
+        else:
+            candidates = tuple(getattr(lookup, "candidates", ()) or ())
+            if (
+                str(getattr(lookup, "match_type", "") or "")
+                == "alias_ambiguous"
+                and category
+            ):
+                global_lookup = self._danbooru_index.lookup(
+                    str(getattr(lookup, "query", "") or ""),
+                    "",
+                )
+                if (
+                    str(getattr(global_lookup, "match_type", "") or "")
+                    == "alias_ambiguous"
+                    and getattr(global_lookup, "candidates", ())
+                ):
+                    candidates = tuple(global_lookup.candidates)
+        return [
+            self._danbooru_tool_candidate_payload(candidate)
+            for candidate in candidates[:8]
+        ]
 
     @filter.llm_tool(name="search_anima_danbooru_tags")
     async def search_anima_danbooru_tags(
@@ -1150,10 +1319,9 @@ class ComfyAnimaPlugin(Star):
                 {
                     "query": lookup.query,
                     "verified": bool(lookup.verified),
-                    "results": (
-                        [self._danbooru_tool_candidate_payload(lookup)]
-                        if lookup.found
-                        else []
+                    "results": self._danbooru_tool_lookup_payloads(
+                        lookup,
+                        normalized_category,
                     ),
                 }
                 for lookup in lookups
@@ -1233,10 +1401,9 @@ class ComfyAnimaPlugin(Star):
                     {
                         "query": lookup.query,
                         "verified": bool(lookup.verified),
-                        "results": (
-                            [self._danbooru_tool_candidate_payload(lookup)]
-                            if lookup.found
-                            else []
+                        "results": self._danbooru_tool_lookup_payloads(
+                            lookup,
+                            normalized_category,
                         ),
                     }
                     for lookup in lookups
@@ -5344,7 +5511,7 @@ class ComfyAnimaPlugin(Star):
 --raw / --no-llm 明确保持原样，不调用绘图导演。
 示例: /画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx
 华丽示例: /画图 双人奇幻宫殿海报，薄纱与金属材质，宏大逆光 --l u --pipeline rtx
-文字换角（仅显式指令）: --llm c、--llmcc、--lcc；Ultra 可写 --llm c u 或 --lcc u
+文字换角（仅显式指令）: --llm c、--llm cc、--llmcc、--lcc；Ultra 可写 --llm cc u、--llmcc u 或 --lcc u
 格式: /画图 <完整原 Tags>，把角色换成<目标角色>[，额外覆盖要求] --lcc
 示例: /画图 1girl, roxy migurdia, blue hair, twin braids, school uniform, standing，把角色换成甘雨，穿JK制服 --lcc u
 该模式会清除旧角色姓名与稳定外貌；保留服装、动作、表情、构图和背景，除非后半句明确修改。
@@ -5517,7 +5684,7 @@ QQ快捷指令:
 --pipeline base|rtx|iterative
 --upscale / --no-upscale
 --llm / --l = Standard；--llm u / --l u = Ultra 华丽扩写；--raw = 原始 Tags
---llm c / --llmcc / --lcc = 文字换角；追加 u 启用 Ultra 身份外观规划
+--llm c / --llm cc / --llmcc / --lcc = 文字换角；追加 u 启用 Ultra 可信外貌规划
 --preset "风格001或自定义名称"
 短写: --p b|r|i、--sz、--st、--sd、--c、--n、--pr、--l、--r
 底图控制: --m p|d|l|r；支持 --m p d、--m p --m d；省略时按命令正文推断
@@ -6172,26 +6339,98 @@ QQ快捷指令:
         )
 
     @staticmethod
+    def _split_bounded_work_metadata(
+        value: str,
+        *,
+        maximum_length: int = 120,
+    ) -> tuple[str, ...]:
+        """Preserve complete work titles before adding slash-delimited hints."""
+
+        source = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if not source:
+            return ()
+        primary = tuple(
+            item.strip()
+            for item in re.split(r"\s*(?:\||;|；|,|，)\s*", source)
+            if item.strip() and len(item.strip()) <= maximum_length
+        )
+        fallback = tuple(
+            part.strip()
+            for item in primary
+            for part in re.split(r"\s*[/／]\s*", item)
+            if part.strip()
+            and part.strip() != item
+            and len(part.strip()) <= maximum_length
+        )
+        return tuple(dict.fromkeys((*primary, *fallback)))
+
+    async def _verified_work_canonicals(
+        self,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        index = getattr(self, "_danbooru_index", None)
+        if index is None or not values:
+            return ()
+        candidates: list[str] = []
+        localized_index = getattr(self, "_localized_character_aliases", None)
+        for value in values[:16]:
+            if localized_index is not None:
+                try:
+                    candidates.extend(
+                        await asyncio.to_thread(
+                            localized_index.resolve_work,
+                            value,
+                            index,
+                        )
+                    )
+                except (
+                    DanbooruIndexError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+            normalized = normalize_tag(value)
+            if normalized:
+                candidates.append(normalized)
+        unique = tuple(dict.fromkeys(candidates))[:24]
+        if not unique:
+            return ()
+        try:
+            lookups = await asyncio.to_thread(index.lookup_many, unique, "copyright")
+        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+            return ()
+        return tuple(
+            dict.fromkeys(
+                canonical
+                for lookup in lookups
+                if bool(getattr(lookup, "verified", False))
+                and (
+                    canonical := normalize_tag(
+                        str(
+                            getattr(lookup, "canonical_tag", "")
+                            or getattr(lookup, "tag", "")
+                            or ""
+                        )
+                    )
+                )
+            )
+        )
+
+    @staticmethod
     def _identity_anchor_activation_trigger(
         record: LoraRecord,
         canonical: str,
     ) -> str:
-        """Use the proven canonical base when a character LoRA has no trigger list."""
+        """Use the already-bound exact canonical base when no trigger list exists."""
 
+        del record
         normalized_canonical = normalize_tag(canonical)
         base = re.sub(r"_\([^()]+\)$", "", normalized_canonical)
         if not re.fullmatch(r"[a-z0-9_.'!&+:/\-]{2,80}", base):
             return ""
-        identity_values = (
-            *ComfyAnimaPlugin._split_bounded_character_metadata(
-                record.character_name,
-                maximum_length=80,
-            ),
-            *record.aliases[:32],
-        )
-        if any(normalize_tag(value) == base for value in identity_values):
-            return base
-        return ""
+        return base
 
     async def _resolve_current_lora_gallery_identity(
         self,
@@ -6227,61 +6466,43 @@ QQ快捷指令:
             )
         except CharacterSwapError:
             return CharacterIdentityResolution(), None
-        if str(record.category or "").strip().casefold() != "character":
-            return CharacterIdentityResolution(), None
-
-        names = tuple(
-            value
-            for value in self._split_bounded_character_metadata(
-                record.character_name,
-                maximum_length=80,
-            )
-            if value.isascii() and re.search(r"[A-Za-z]", value)
-        )
-        works = tuple(
-            value
-            for value in self._split_bounded_character_metadata(
-                record.source_work,
-                maximum_length=120,
-            )
-            if value.isascii() and re.search(r"[A-Za-z]", value)
-        )
-        if not names or not works:
-            return CharacterIdentityResolution(), None
+        semantic_index = self._runtime_semantic_index()
         try:
-            work_lookups = await asyncio.to_thread(
-                index.lookup_many,
-                works,
-                "copyright",
+            discovery = await asyncio.to_thread(
+                build_lora_identity_discovery,
+                record,
+                semantic_index=semantic_index,
+                tag_index=index,
+                localized_index=getattr(
+                    self,
+                    "_localized_character_aliases",
+                    None,
+                ),
+                query=target_query,
             )
-        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+        except (DanbooruIndexError, OSError, RuntimeError, TypeError, ValueError):
             return CharacterIdentityResolution(), None
-        canonical_works = tuple(
-            dict.fromkeys(
-                canonical
-                for lookup in work_lookups
-                if bool(getattr(lookup, "verified", False))
-                and (
-                    canonical := normalize_tag(
-                        str(
-                            getattr(lookup, "canonical_tag", "")
-                            or getattr(lookup, "tag", "")
-                            or ""
-                        )
-                    )
-                )
-            )
-        )
+        canonical_works = discovery.canonical_works
         if len(canonical_works) != 1:
             return CharacterIdentityResolution(), None
+        qualified_values: list[str] = []
+        unqualified_values: list[str] = []
+        for value in discovery.character_candidates:
+            normalized_name = normalize_tag(value)
+            if not re.fullmatch(r"[a-z0-9_().!'&+:/\-]{1,192}", normalized_name):
+                continue
+            _base, existing_work = self._qualified_identity_parts(normalized_name)
+            if existing_work:
+                if existing_work in canonical_works:
+                    qualified_values.append(normalized_name)
+            else:
+                qualified_values.extend(
+                    f"{normalized_name}_({work})" for work in canonical_works
+                )
+                unqualified_values.append(normalized_name)
         candidates = tuple(
-            dict.fromkeys(
-                f"{normalized_name}_({canonical_works[0]})"
-                for name in names
-                if (normalized_name := normalize_tag(name))
-                and re.fullmatch(r"[a-z0-9_().!'&+:/\-]{1,160}", normalized_name)
-            )
-        )
+            dict.fromkeys((*qualified_values, *unqualified_values))
+        )[:32]
         if not candidates:
             return CharacterIdentityResolution(), None
         health: dict[str, Any] | None = None
@@ -6433,10 +6654,12 @@ QQ快捷指令:
         user_request: str,
         records: tuple[LoraRecord, ...],
         source: str,
+        _revision_retry: bool = False,
     ) -> tuple[str, str]:
         """Verify and correct named characters before a workflow is submitted."""
 
         job.llm_external_character_authorities.clear()
+        job.danbooru_revision_signature = ""
 
         index = getattr(self, "_danbooru_index", None)
         declared_queries = tuple(
@@ -6462,11 +6685,50 @@ QQ快捷指令:
             )
             return prompt, negative_prompt
 
+        initial_index_status = await asyncio.to_thread(index.status)
+        validation_signature = self._danbooru_revision_signature(
+            initial_index_status
+        )
+
+        async def finish_with_revision_guard(
+            compiled_prompt: str,
+            compiled_negative: str,
+        ) -> tuple[str, str]:
+            final_index_status = await asyncio.to_thread(index.status)
+            final_signature = self._danbooru_revision_signature(final_index_status)
+            if final_signature != validation_signature:
+                if _revision_retry:
+                    raise CharacterPromptCompileError(
+                        "Danbooru 索引在角色校验期间连续变化，已停止生成；请稍后重试",
+                        code="danbooru_index_changed",
+                    )
+                self._record_image_task_phase(
+                    job,
+                    "character_validation",
+                    "角色校验期间 Danbooru 索引已切换；正在基于新快照完整重做一次。",
+                    "llm_character_validation_revision_retry",
+                    level="WARNING",
+                    details={"source": source or "unknown"},
+                )
+                return await self._compile_llm_character_prompt(
+                    job,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    character_queries=character_queries,
+                    user_request=user_request,
+                    records=records,
+                    source=source,
+                    _revision_retry=True,
+                )
+            job.danbooru_revision_signature = validation_signature
+            return compiled_prompt, compiled_negative
+
         terms = split_character_validation_terms(prompt)
         try:
-            character_lookups, copyright_lookups = await asyncio.gather(
+            character_lookups, copyright_lookups, untyped_lookups = await asyncio.gather(
                 asyncio.to_thread(index.lookup_many, terms, "character"),
                 asyncio.to_thread(index.lookup_many, terms, "copyright"),
+                asyncio.to_thread(index.lookup_many, terms, ""),
             )
         except (DanbooruIndexError, OSError, RuntimeError, ValueError) as exc:
             raise CharacterPromptCompileError(
@@ -6510,6 +6772,25 @@ QQ快捷指令:
             name, declared_aliases = self._split_declared_character_aliases(name)
             if name:
                 resolution_inputs.append((raw, name, work, declared_aliases))
+        declared_keys = {
+            (normalize_tag(name), normalize_tag(work))
+            for _raw, name, work, _aliases in resolution_inputs
+        }
+        for term, character_lookup, untyped_lookup in zip(
+            terms,
+            character_lookups,
+            untyped_lookups,
+        ):
+            if bool(getattr(character_lookup, "verified", False)) or bool(
+                getattr(untyped_lookup, "verified", False)
+            ):
+                continue
+            name, work = self._qualified_identity_parts(term)
+            key = (normalize_tag(name), normalize_tag(work))
+            if not name or not work or key in declared_keys:
+                continue
+            resolution_inputs.append((term, name, work, ()))
+            declared_keys.add(key)
         if not resolution_inputs:
             inferred_canonicals = list(dict.fromkeys(prompt_character_canonicals))
             grouped: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
@@ -6557,7 +6838,7 @@ QQ快捷指令:
                 "llm_character_validation_not_required",
                 details={"source": source or "unknown", "prompt_term_count": len(terms)},
             )
-            return prompt, negative_prompt
+            return await finish_with_revision_guard(prompt, negative_prompt)
 
         semantic_index = self._runtime_semantic_index()
         resolved_rows: list[
@@ -6950,6 +7231,7 @@ QQ快捷指令:
                     match_variant=resolution.match_variant,
                     query_count=resolution.query_count,
                     candidate_count=resolution.candidate_count,
+                    confirmed_work=resolution.confirmed_work,
                 )
             )
 
@@ -6976,27 +7258,39 @@ QQ快捷指令:
                 "appearance_sources": list(compilation.appearance_sources),
             },
         )
-        return compilation.prompt, compilation.negative_prompt
+        return await finish_with_revision_guard(
+            compilation.prompt,
+            compilation.negative_prompt,
+        )
 
     async def _verified_prompt_character_canonicals(
         self,
         prompt: str,
         *,
         authorized_canonicals: tuple[str, ...] = (),
+        expected_revision_signature: str = "",
     ) -> tuple[str, ...]:
         """Return locally exact or request-locally authorized final identities."""
 
         index = getattr(self, "_danbooru_index", None)
         if index is None or not self._danbooru_index_ready():
             return ()
+        starting_status = await asyncio.to_thread(index.status)
+        starting_signature = self._danbooru_revision_signature(starting_status)
+        if (
+            expected_revision_signature
+            and starting_signature != expected_revision_signature
+        ):
+            raise LoraWorkflowError(
+                "Danbooru 索引在角色规划后发生变化，已停止提交；请重试本次绘图"
+            )
         terms = split_character_validation_terms(prompt)
         if not terms:
             return ()
         try:
-            lookups = await asyncio.to_thread(
-                index.lookup_many,
-                terms,
-                "character",
+            lookups, untyped_lookups = await asyncio.gather(
+                asyncio.to_thread(index.lookup_many, terms, "character"),
+                asyncio.to_thread(index.lookup_many, terms, ""),
             )
         except (DanbooruIndexError, OSError, RuntimeError, ValueError) as exc:
             raise LoraWorkflowError(
@@ -7008,6 +7302,27 @@ QQ快捷指令:
             for value in authorized_canonicals
             if (canonical := normalize_tag(value)) in normalized_terms
         )
+        authorized_set = frozenset(
+            normalize_tag(value)
+            for value in authorized_canonicals
+            if normalize_tag(value)
+        )
+        unknown_qualified = tuple(
+            term
+            for term, character_lookup, untyped_lookup in zip(
+                terms,
+                lookups,
+                untyped_lookups,
+            )
+            if self._qualified_identity_parts(term)[0]
+            and not bool(getattr(character_lookup, "verified", False))
+            and not bool(getattr(untyped_lookup, "verified", False))
+            and normalize_tag(term) not in authorized_set
+        )
+        if unknown_qualified:
+            raise LoraWorkflowError(
+                "最终提示词包含无法通过当前 Danbooru 或请求级外部 exact 授权的限定角色 Tag"
+            )
         external_by_base = {
             re.sub(r"_\([^()]+\)$", "", canonical): canonical
             for canonical in external_canonicals
@@ -7034,6 +7349,12 @@ QQ快捷指令:
                 )
             )
         )
+        ending_status = await asyncio.to_thread(index.status)
+        ending_signature = self._danbooru_revision_signature(ending_status)
+        if ending_signature != starting_signature:
+            raise LoraWorkflowError(
+                "Danbooru 索引在最终角色复核期间发生变化，已停止提交；请重试本次绘图"
+            )
         return tuple(dict.fromkeys((*local_canonicals, *external_canonicals)))
 
     async def _bind_llm_character_loras(
@@ -7052,6 +7373,7 @@ QQ快捷指令:
             await self._verified_prompt_character_canonicals(
                 prompt,
                 authorized_canonicals=tuple(external_authorities),
+                expected_revision_signature=job.danbooru_revision_signature,
             )
         )
         index = getattr(self, "_danbooru_index", None)
@@ -7236,94 +7558,20 @@ QQ快捷指令:
         if index is None or not self._danbooru_index_ready():
             return ()
 
-        def split_values(value: str) -> tuple[str, ...]:
-            return tuple(
-                dict.fromkeys(
-                    item.strip()
-                    for item in re.split(r"\s*(?:/|\||;|；|,|，)\s*", str(value or ""))
-                    if item.strip()
-                )
-            )
-
-        names = tuple(
-            value
-            for value in split_values(record.character_name)
-            if value.isascii()
-            and re.search(r"[A-Za-z]", value)
-            and len(value) <= 80
-        )
-        works = tuple(
-            value
-            for value in split_values(record.source_work)
-            if value.isascii()
-            and re.search(r"[A-Za-z]", value)
-            and len(value) <= 120
-        )
-        if not names:
-            return ()
         try:
-            work_lookups = await asyncio.to_thread(
-                index.lookup_many,
-                works,
-                "copyright",
-            ) if works else ()
-        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+            return await asyncio.to_thread(
+                resolve_lora_character_canonicals,
+                record,
+                semantic_index=self._runtime_semantic_index(),
+                tag_index=index,
+                localized_index=getattr(
+                    self,
+                    "_localized_character_aliases",
+                    None,
+                ),
+            )
+        except (DanbooruIndexError, OSError, RuntimeError, TypeError, ValueError):
             return ()
-        canonical_works = tuple(
-            dict.fromkeys(
-                canonical
-                for lookup in work_lookups
-                if bool(getattr(lookup, "verified", False))
-                and (
-                    canonical := normalize_tag(
-                        str(
-                            getattr(lookup, "canonical_tag", "")
-                            or getattr(lookup, "tag", "")
-                            or ""
-                        )
-                    )
-                )
-            )
-        )
-        candidates: list[str] = []
-        for name in names:
-            normalized_name = normalize_tag(name)
-            if not normalized_name:
-                continue
-            candidates.append(normalized_name)
-            candidates.extend(
-                f"{normalized_name}_({work})" for work in canonical_works
-            )
-        if not candidates:
-            return ()
-        try:
-            lookups = await asyncio.to_thread(
-                index.lookup_many,
-                tuple(dict.fromkeys(candidates)),
-                "character",
-            )
-        except (DanbooruIndexError, OSError, RuntimeError, ValueError):
-            return ()
-        return tuple(
-            dict.fromkeys(
-                canonical
-                for lookup in lookups
-                if bool(getattr(lookup, "verified", False))
-                and (
-                    canonical := normalize_tag(
-                        str(
-                            getattr(lookup, "canonical_tag", "")
-                            or getattr(lookup, "tag", "")
-                            or ""
-                        )
-                    )
-                )
-                and (
-                    not canonical_works
-                    or canonical_work_for_character(canonical) in canonical_works
-                )
-            )
-        )
 
     async def _resolve_character_evidence_without_provider(
         self,
@@ -7331,6 +7579,7 @@ QQ快捷指令:
         target_query: str,
         records: tuple[LoraRecord, ...],
         appearance_override_text: str = "",
+        expansion_mode: str = "standard",
     ) -> tuple[tuple[str, ...], dict[str, Any]]:
         """Resolve exact identity plus stable appearance before any LLM fallback.
 
@@ -7547,10 +7796,11 @@ QQ快捷指令:
                     await asyncio.to_thread(store.put, profile)
                 except (OSError, TypeError, ValueError):
                     pass
+        appearance_limit = 10 if str(expansion_mode).casefold() == "ultra" else 6
         appearance_tags = self._filter_character_appearance_overrides(
             profile.appearance_tags if profile is not None else (),
             appearance_override_text,
-        )
+        )[:appearance_limit]
         return (
             (canonical, *appearance_tags),
             {
@@ -7707,10 +7957,11 @@ QQ快捷指令:
                 appearance_tags = (
                     profile.appearance_tags if profile is not None else ()
                 )
+                appearance_limit = 10 if expansion_mode == "ultra" else 6
                 appearance_tags = self._filter_character_appearance_overrides(
                     appearance_tags,
                     appearance_override_text,
-                )
+                )[:appearance_limit]
                 self._record_image_task_phase(
                     job,
                     "resolver",
@@ -7756,7 +8007,12 @@ QQ快捷指令:
             )
         provider_id = await self._director.resolve_provider_id(self.context, event)
         original_target = is_original_character_query(target_query)
-        appearance_budget = "6 to 12" if expansion_mode == "ultra" else "3 to 8"
+        original_appearance_budget = (
+            "6 to 12" if expansion_mode == "ultra" else "3 to 8"
+        )
+        known_appearance_budget = (
+            "zero to ten" if expansion_mode == "ultra" else "zero to six"
+        )
         system_prompt = (
             "You convert one target character request into conservative Anima/Danbooru "
             "identity tags. Return one JSON object with exactly these fields: "
@@ -7780,14 +8036,14 @@ QQ快捷指令:
             "Never include a different character merely as a possibility. The local "
             "Danbooru character index will exact-check every candidate and reject conflicts. "
             "For a known character, the canonical tag is always primary. Return "
-            "zero to four appearance_tags only when they are iconic, stable and highly "
+            f"{known_appearance_budget} appearance_tags only when they are iconic, stable and highly "
             "certain for that exact character, such as an unmistakable hair color/style, "
             "eye color, ears or permanent facial mark. Omit every vague, disputed or "
             "partially remembered trait instead of guessing. Do not reconstruct a full face "
             "or body checklist merely to fill the array. "
             "If and only if target_character explicitly requests an original/OC character, "
             'set canonical_identity_tag to exactly "original character" and create '
-            f"{appearance_budget} mutually consistent stable physical traits, preserving "
+            f"{original_appearance_budget} mutually consistent stable physical traits, preserving "
             "every user-specified hair, eye, skin, face, ear, species and body-build fact. "
             "Never copy unspecified physical traits from the source character. "
             "confidence must be a JSON number from 0 to 1. "
@@ -8459,6 +8715,7 @@ QQ快捷指令:
                         effective_request.target_query,
                         records,
                         effective_request.edit_requirement,
+                        effective_request.prompt_expansion_mode,
                     )
                 )
                 effective_request = replace(
@@ -8935,9 +9192,12 @@ QQ快捷指令:
                 if image_path is not None:
                     image_path.unlink(missing_ok=True)
 
-        yield event.plain_result(
-            f"{MessageEmoji.DRAW} 正在刷新 LoRA、解析角色身份并执行语义换角……"
+        swap_notice = (
+            "正在以 Ultra 华丽模式刷新 LoRA、扩展可信角色外貌并执行语义换角……"
+            if request.prompt_expansion_mode == "ultra"
+            else "正在刷新 LoRA、解析角色身份并执行语义换角……"
         )
+        yield event.plain_result(f"{MessageEmoji.DRAW} {swap_notice}")
         try:
             plan, generated, classifier_provider, reverse_provider, effective_request = (
                 await self._run_auxiliary_job(
@@ -9117,6 +9377,11 @@ QQ快捷指令:
                 else f"换角分类模型: {classifier_provider}"
             ),
         ]
+        if effective_request.prompt_expansion_mode == "ultra":
+            info_lines.append(
+                "换角 Ultra：已使用更高的可信外貌证据预算；"
+                "身份、作品、衣装和场景仍受原安全门约束。"
+            )
         if plan.feature_swap_categories:
             feature_labels = {
                 "hair_style": "发型",
@@ -9713,7 +9978,11 @@ QQ快捷指令:
                 continue
             if token in folded:
                 return True
-        return False
+        # New Character LoRAs may not have a semantic archive entry yet.  A
+        # locally recognized character/work request should therefore expose
+        # both Danbooru and LoRA tools; the tool itself still force-refreshes
+        # Manager/ComfyUI before returning any file.
+        return self._scene_needs_danbooru_tools(source)
 
     @staticmethod
     def _scene_needs_prompt_plan_tools(scene_text: str) -> bool:
@@ -10905,6 +11174,28 @@ QQ快捷指令:
                 "danbooru_index_url": settings.danbooru_index_url,
                 "danbooru_index_timeout": settings.danbooru_index_timeout,
                 "danbooru_index_max_size_mb": settings.danbooru_index_max_size_mb,
+                "danbooru_api_base_url": settings.danbooru_api_base_url,
+                "danbooru_api_proxy_url": settings.danbooru_api_proxy_url,
+                "danbooru_api_mode": settings.danbooru_api_mode,
+                "danbooru_api_general_min_posts": (
+                    settings.danbooru_api_general_min_posts
+                ),
+                "danbooru_api_meta_min_posts": settings.danbooru_api_meta_min_posts,
+                "danbooru_api_page_size": settings.danbooru_api_page_size,
+                "danbooru_api_request_interval_ms": (
+                    settings.danbooru_api_request_interval_ms
+                ),
+                "danbooru_api_timeout": settings.danbooru_api_timeout,
+                "danbooru_api_max_records": settings.danbooru_api_max_records,
+                "danbooru_api_include_aliases": (
+                    settings.danbooru_api_include_aliases
+                ),
+                "danbooru_auto_update_enabled": (
+                    settings.danbooru_auto_update_enabled
+                ),
+                "danbooru_auto_update_interval_hours": (
+                    settings.danbooru_auto_update_interval_hours
+                ),
                 "enable_prompt_asset_library": (
                     settings.enable_prompt_asset_library
                 ),
@@ -10986,6 +11277,11 @@ QQ快捷指令:
         """Validate, persist and reload configuration changed in the Web UI."""
         if self.config is None:
             raise WebUiActionError("当前 AstrBot 配置对象不支持持久化")
+        running_danbooru = getattr(self, "_danbooru_update_task", None)
+        if running_danbooru is not None and not running_danbooru.done():
+            raise WebUiActionError(
+                "Danbooru 索引更新仍在运行；请等待任务结束或先在任务中心取消，避免插件重载中断快照"
+            )
         candidate = dict(self.config)
         supplied: set[str] = set()
         for key in WEB_UI_EDITABLE_FIELDS:
@@ -11002,6 +11298,10 @@ QQ快捷指令:
             payload["default_generation_pipeline"]
         ).strip().lower() not in {"base", "rtx", "iterative"}:
             raise WebUiActionError("默认生成管线仅支持 base、rtx 或 iterative")
+        if "danbooru_api_mode" in supplied and str(
+            payload["danbooru_api_mode"]
+        ).strip().casefold() not in {"identity", "full"}:
+            raise WebUiActionError("Danbooru API 生成模式仅支持 identity 或 full")
         if "default_generation_pipeline" in supplied:
             normalized_pipeline = str(
                 payload["default_generation_pipeline"]
@@ -11020,7 +11320,14 @@ QQ快捷指令:
             "character_swap_timeout": (30, 600),
             "prompt_diagnostics_capacity": (10, 500),
             "danbooru_index_timeout": (5, 300),
-            "danbooru_index_max_size_mb": (1, 128),
+            "danbooru_index_max_size_mb": (1, 512),
+            "danbooru_api_general_min_posts": (0, 1_000_000),
+            "danbooru_api_meta_min_posts": (0, 1_000_000),
+            "danbooru_api_page_size": (1, 1000),
+            "danbooru_api_request_interval_ms": (250, 10_000),
+            "danbooru_api_timeout": (10, 300),
+            "danbooru_api_max_records": (1000, 3_000_000),
+            "danbooru_auto_update_interval_hours": (24, 2160),
             "prompt_asset_max_download_mb": (1, 16),
             "prompt_lab_batch_capacity": (4, 128),
             "prompt_lab_ttl_seconds": (60, 86400),
@@ -11044,6 +11351,13 @@ QQ快捷指令:
                 "prompt_diagnostics_capacity",
                 "danbooru_index_timeout",
                 "danbooru_index_max_size_mb",
+                "danbooru_api_general_min_posts",
+                "danbooru_api_meta_min_posts",
+                "danbooru_api_page_size",
+                "danbooru_api_request_interval_ms",
+                "danbooru_api_timeout",
+                "danbooru_api_max_records",
+                "danbooru_auto_update_interval_hours",
                 "prompt_asset_max_download_mb",
                 "prompt_lab_batch_capacity",
                 "prompt_lab_ttl_seconds",
@@ -11282,7 +11596,33 @@ QQ快捷指令:
             for item in store.list(self.settings.prompt_diagnostics_capacity)
         ]
         index_status = self._danbooru_index.status()
-        index_status["update_task"] = dict(self._danbooru_update_state)
+        update_task: dict[str, Any] = {}
+        task_store = getattr(self, "_task_store", None)
+        if task_store is not None:
+            recent = task_store.recent_tasks(
+                limit=1,
+                task_type="danbooru_index_update",
+            )
+            if recent:
+                update_task = dict(recent[0])
+        index_status["update_task"] = update_task
+        index_status["auto_update"] = self._danbooru_auto_update_status()
+        builder = getattr(self, "_danbooru_builder", None)
+        index_status["checkpoint"] = (
+            builder.checkpoint_status() if builder is not None else {"available": False}
+        )
+        localized_index = getattr(self, "_localized_character_aliases", None)
+        index_status["localized_aliases"] = (
+            localized_index.status()
+            if localized_index is not None
+            else {
+                "ready": False,
+                "entry_count": 0,
+                "alias_count": 0,
+                "csv_loaded": False,
+                "csv_error": "",
+            }
+        )
         configured_validation = self.settings.danbooru_validation_mode
         effective_validation = getattr(
             self._prompt_composer,
@@ -12891,93 +13231,248 @@ QQ快捷指令:
             "data_url": f"data:{media_type};base64,{encoded}",
         }
 
-    async def web_ui_update_danbooru_index(self) -> dict[str, Any]:
-        """Start one atomic local-index refresh and keep the previous DB on failure."""
+    async def web_ui_update_danbooru_index(
+        self,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a persistent atomic index refresh and retain the old DB on failure."""
 
+        request = dict(payload or {})
+        requested_by = (
+            "scheduler"
+            if str(request.get("_requested_by") or "").casefold() == "scheduler"
+            else "webui"
+        )
+        mode = str(request.get("mode") or "url").strip().casefold()
+        if mode not in {"url", "official_api"}:
+            raise WebUiActionError("Danbooru 更新模式仅支持 url 或 official_api")
         source_url = self.settings.danbooru_index_url.strip()
-        if not source_url:
+        if mode == "url" and not source_url:
             raise WebUiActionError("请先在全局设置中填写 Danbooru 索引数据源 URL")
-        running = self._danbooru_update_task
+
+        store = self._require_task_store()
+        running = getattr(self, "_danbooru_update_task", None)
         if running is not None and not running.done():
+            active_run_id = next(
+                (
+                    identifier
+                    for identifier, task in self._background_task_runs.items()
+                    if task is running
+                ),
+                "",
+            )
+            active = store.get_task(active_run_id) if active_run_id else None
             return {
-                "task": dict(self._danbooru_update_state),
-                "message": "Danbooru 索引更新已在进行，请勿重复提交",
-                "status": self._danbooru_index.status(),
+                "run_id": active_run_id,
+                "task": active or {},
+                "mode": str((active or {}).get("mode") or mode),
+                "already_running": True,
+                "message": "Danbooru 索引更新已在进行，已打开现有任务",
+                "index": self._danbooru_index.status(),
             }
 
-        task_id = f"danbooru-index-{int(time.time() * 1000)}"
+        metadata = {
+            "operation": "danbooru_index_update",
+            "source": source_url if mode == "url" else self.settings.danbooru_api_base_url,
+            "old_revision": str(self._danbooru_index.status().get("revision") or ""),
+        }
+        run_id = store.create_task(
+            "danbooru_index_update",
+            mode=mode,
+            requested_by=requested_by,
+            total_items=7,
+            metadata=metadata,
+        )
+        cancel_event = threading.Event()
+        self._danbooru_cancel_events[run_id] = cancel_event
         self._danbooru_update_state = {
-            "id": task_id,
-            "status": "running",
-            "started_at": time.time(),
+            "id": run_id,
+            "status": "queued",
+            "started_at": 0.0,
             "finished_at": 0.0,
             "error": "",
         }
 
         async def update() -> None:
-            try:
-                await self._danbooru_index.update_from_url(
-                    source_url,
-                    timeout=self.settings.danbooru_index_timeout,
-                    max_bytes=self.settings.danbooru_index_max_size_mb
-                    * 1024
-                    * 1024,
+            last_progress = {"phase": "", "time": 0.0}
+
+            async def progress(event: dict[str, Any]) -> None:
+                task_info = store.get_task(run_id)
+                if task_info is None or task_info.get("status") not in {"queued", "running"}:
+                    return
+                completed = max(0, min(7, int(event.get("completed") or 0)))
+                store.heartbeat(run_id, completed_items=completed, total_items=7)
+                phase = str(event.get("phase") or "run")[:100]
+                now = time.monotonic()
+                if phase == last_progress["phase"] and now - last_progress["time"] < 2.0:
+                    return
+                last_progress.update({"phase": phase, "time": now})
+                details = {
+                    key: value
+                    for key, value in event.items()
+                    if key not in {"message"} and isinstance(value, (str, int, float, bool))
+                }
+                store.append_event(
+                    run_id,
+                    phase,
+                    str(event.get("message") or "Danbooru 索引任务正在执行"),
+                    event_code=str(event.get("event") or "danbooru_progress")[:100],
+                    details=details,
                 )
+
+            try:
+                store.start_task(run_id, total_items=7)
+                self._danbooru_update_state.update(
+                    {"status": "running", "started_at": time.time()}
+                )
+                await progress(
+                    {
+                        "phase": "preflight",
+                        "event": "update_preflight",
+                        "message": "正在校验更新模式、数据源和当前快照。",
+                        "completed": 0,
+                    }
+                )
+                if mode == "official_api":
+                    options = DanbooruBuildOptions(
+                        base_url=self.settings.danbooru_api_base_url,
+                        proxy_url=self.settings.danbooru_api_proxy_url,
+                        mode=self.settings.danbooru_api_mode,
+                        general_min_posts=self.settings.danbooru_api_general_min_posts,
+                        meta_min_posts=self.settings.danbooru_api_meta_min_posts,
+                        page_size=self.settings.danbooru_api_page_size,
+                        request_interval_ms=self.settings.danbooru_api_request_interval_ms,
+                        timeout_seconds=self.settings.danbooru_api_timeout,
+                        max_records=self.settings.danbooru_api_max_records,
+                        include_aliases=self.settings.danbooru_api_include_aliases,
+                    )
+                    result = await self._danbooru_builder.build(
+                        options,
+                        progress=progress,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    await progress(
+                        {
+                            "phase": "resolve_source",
+                            "event": "source_resolved",
+                            "message": "数据源 URL 已校验，正在下载并流式构建快照。",
+                            "completed": 1,
+                        }
+                    )
+                    result = await self._danbooru_index.update_from_url(
+                        source_url,
+                        timeout=self.settings.danbooru_index_timeout,
+                        max_bytes=self.settings.danbooru_index_max_size_mb
+                        * 1024
+                        * 1024,
+                    )
+                    await progress(
+                        {
+                            "phase": "activate_snapshot",
+                            "event": "snapshot_activated",
+                            "message": "URL 数据源已构建并原子激活新的本地索引。",
+                            "completed": 7,
+                        }
+                    )
+                task_info = store.get_task(run_id)
+                if task_info is not None and task_info.get("status") in {"queued", "running"}:
+                    store.finish_task(
+                        run_id,
+                        "succeeded",
+                        completed_items=7,
+                        failed_items=0,
+                        result={"index": result, "mode": mode},
+                    )
+                self._danbooru_update_state.update(
+                    {"status": "completed", "finished_at": time.time(), "error": ""}
+                )
+                logger.info(f"[{PLUGIN_NAME}] Danbooru local tag index updated: mode={mode}")
             except asyncio.CancelledError:
-                self._danbooru_update_state = {
-                    **self._danbooru_update_state,
-                    "status": "cancelled",
-                    "finished_at": time.time(),
-                    "error": "update cancelled",
-                }
+                cancel_event.set()
+                task_info = store.get_task(run_id)
+                if task_info is not None and task_info.get("status") in {"queued", "running"}:
+                    store.finish_task(
+                        run_id,
+                        "cancelled",
+                        failed_items=0,
+                        error_code="cancelled_by_operator",
+                        error_summary="管理员取消了 Danbooru 索引更新；旧快照仍然有效",
+                    )
+                self._danbooru_update_state.update(
+                    {
+                        "status": "cancelled",
+                        "finished_at": time.time(),
+                        "error": "update cancelled",
+                    }
+                )
                 raise
-            except DanbooruIndexError as exc:
-                self._danbooru_update_state = {
-                    **self._danbooru_update_state,
-                    "status": "failed",
-                    "finished_at": time.time(),
-                    "error": str(exc),
-                }
+            except (DanbooruBuildError, DanbooruIndexError) as exc:
+                task_info = store.get_task(run_id)
+                if task_info is not None and task_info.get("status") in {"queued", "running"}:
+                    store.finish_task(
+                        run_id,
+                        "failed",
+                        completed_items=int(task_info.get("completed_items") or 0),
+                        failed_items=1,
+                        error_code=getattr(exc, "code", "danbooru_update_failed"),
+                        error_summary=str(getattr(exc, "user_message", exc)),
+                    )
+                self._danbooru_update_state.update(
+                    {
+                        "status": "failed",
+                        "finished_at": time.time(),
+                        "error": str(exc),
+                    }
+                )
                 logger.warning(
                     f"[{PLUGIN_NAME}] Danbooru index update failed; "
                     f"the previous snapshot is retained: {exc}"
                 )
             except Exception as exc:
-                self._danbooru_update_state = {
-                    **self._danbooru_update_state,
-                    "status": "failed",
-                    "finished_at": time.time(),
-                    "error": type(exc).__name__,
-                }
+                task_info = store.get_task(run_id)
+                if task_info is not None and task_info.get("status") in {"queued", "running"}:
+                    store.finish_task(
+                        run_id,
+                        "failed",
+                        completed_items=int(task_info.get("completed_items") or 0),
+                        failed_items=1,
+                        error_code="unexpected_error",
+                        error_summary=type(exc).__name__,
+                    )
+                self._danbooru_update_state.update(
+                    {
+                        "status": "failed",
+                        "finished_at": time.time(),
+                        "error": type(exc).__name__,
+                    }
+                )
                 logger.error(
                     f"[{PLUGIN_NAME}] unexpected Danbooru index update failure: {exc}",
                     exc_info=True,
                 )
-            else:
-                self._danbooru_update_state = {
-                    **self._danbooru_update_state,
-                    "status": "completed",
-                    "finished_at": time.time(),
-                    "error": "",
-                }
-                logger.info(f"[{PLUGIN_NAME}] Danbooru local tag index updated")
+            finally:
+                self._danbooru_cancel_events.pop(run_id, None)
 
         background = asyncio.create_task(
             update(),
-            name=f"{PLUGIN_NAME}:{task_id}",
+            name=f"{PLUGIN_NAME}:{run_id}",
         )
         self._danbooru_update_task = background
-        self._background_task_runs[task_id] = background
+        self._background_task_runs[run_id] = background
         background.add_done_callback(
-            lambda _task, identifier=task_id: self._background_task_runs.pop(
+            lambda _task, identifier=run_id: self._background_task_runs.pop(
                 identifier,
                 None,
             )
         )
         return {
-            "task": dict(self._danbooru_update_state),
-            "message": "Danbooru 索引后台更新已开始；失败时会保留当前旧库",
-            "status": self._danbooru_index.status(),
+            "run_id": run_id,
+            "task": store.get_task(run_id) or {},
+            "mode": mode,
+            "already_running": False,
+            "message": "Danbooru 索引后台任务已创建；失败或取消时会保留当前旧库",
+            "index": self._danbooru_index.status(),
         }
 
     async def web_ui_check_experimental_profiles(self) -> dict[str, Any]:
@@ -15152,6 +15647,9 @@ QQ快捷指令:
         task = self._background_task_runs.get(run_id)
         if task is None or task.done():
             raise WebUiActionError("任务当前不在此插件实例中运行")
+        cancel_event = getattr(self, "_danbooru_cancel_events", {}).get(run_id)
+        if cancel_event is not None:
+            cancel_event.set()
         task.cancel()
         store.append_event(
             run_id,
@@ -16437,6 +16935,9 @@ QQ快捷指令:
                                 authorized_canonicals=tuple(
                                     job.llm_external_character_authorities
                                 ),
+                                expected_revision_signature=(
+                                    job.danbooru_revision_signature
+                                ),
                             )
                         )
                         _, explicit_user_loras = extract_lora_selections(
@@ -16493,6 +16994,9 @@ QQ快捷指令:
                                 clean_prompt,
                                 authorized_canonicals=tuple(
                                     job.llm_external_character_authorities
+                                ),
+                                expected_revision_signature=(
+                                    job.danbooru_revision_signature
                                 ),
                             )
                         )
@@ -17314,6 +17818,12 @@ QQ快捷指令:
                 self._web_ui_start_task,
                 return_exceptions=True,
             )
+        if self._danbooru_scheduler_task and not self._danbooru_scheduler_task.done():
+            self._danbooru_scheduler_task.cancel()
+            await asyncio.gather(
+                self._danbooru_scheduler_task,
+                return_exceptions=True,
+            )
         if self._web_ui is not None:
             await self._web_ui.close()
 
@@ -17331,11 +17841,14 @@ QQ快捷指令:
         background_runs = [
             task for task in self._background_task_runs.values() if not task.done()
         ]
+        for cancel_event in getattr(self, "_danbooru_cancel_events", {}).values():
+            cancel_event.set()
         for task in background_runs:
             task.cancel()
         if background_runs:
             await asyncio.gather(*background_runs, return_exceptions=True)
         self._background_task_runs.clear()
+        getattr(self, "_danbooru_cancel_events", {}).clear()
 
         for task in list(self._cleanup_tasks):
             task.cancel()

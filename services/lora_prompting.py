@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 
 from ..core.lora import LoraWorkflowError, canonical_lora_name
 from ..models import LoraSelection
+from .danbooru_index import escape_prompt_tag
 from .lora_catalog import FUNCTIONAL_LORA_CATEGORIES, LoraRecord
 from .lora_presets import (
     LoraPreset,
@@ -452,9 +453,10 @@ def build_lora_trigger_plan(
             raise LoraWorkflowError(
                 f"verified character trigger does not match LoRA metadata: {selection.name}"
             )
-        # Preserve the exact atomic term supplied by current Manager metadata;
-        # the verified mapping is selection evidence, not prompt authority.
-        resolved_character_triggers[key] = matches[0]
+        # This path is backed by an exact Danbooru character binding. Emit its
+        # prompt form with one (and only one) parenthesis escape layer. Other
+        # Manager, preset and user-authored terms remain byte-for-byte free-form.
+        resolved_character_triggers[key] = escape_prompt_tag(matches[0])
 
     conflicting_character_terms: set[str] = set()
     for selection in selections:

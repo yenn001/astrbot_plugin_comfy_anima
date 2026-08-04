@@ -34,6 +34,7 @@ class CharacterIdentityResolution:
     candidate_count: int = 0
     candidates: tuple[str, ...] = ()
     conflicting_works: tuple[str, ...] = ()
+    confirmed_work: str = ""
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class _LookupSpec:
     value: str
     variant: str
     expected_work: str = ""
+    allow_qualifierless_canonical: bool = False
 
 
 def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
@@ -151,23 +153,58 @@ def _lookup_specs(
     canonical_tag: str,
     identity_candidates: Sequence[str],
     work_hints: Sequence[str],
+    confirmed_works: Sequence[str] = (),
 ) -> tuple[_LookupSpec, ...]:
     specs: list[_LookupSpec] = []
-    global_works = _dedupe(work_hints)
+    global_works = _dedupe((*work_hints, *confirmed_works))
     safe_global_works = tuple(
         work for raw in global_works if (work := _safe_lookup_value(raw))
     )[:4]
 
-    def add(value: str, variant: str, expected_work: str = "") -> None:
+    confirmed_work_set = frozenset(_dedupe(confirmed_works))
+    explicit_qualified_identity = bool(
+        _work_qualifier(canonical_tag)
+        or any(_work_qualifier(value) for value in identity_candidates[:8])
+    )
+
+    def add(
+        value: str,
+        variant: str,
+        expected_work: str = "",
+        *,
+        allow_qualifierless_canonical: bool = False,
+    ) -> None:
         safe = _safe_lookup_value(value)
         work = _safe_lookup_value(expected_work)
         if not safe:
             return
-        specs.append(_LookupSpec(safe, variant, work))
+        specs.append(
+            _LookupSpec(
+                safe,
+                variant,
+                work,
+                bool(
+                    allow_qualifierless_canonical
+                    and work
+                    and work in confirmed_work_set
+                ),
+            )
+        )
 
     canonical = _safe_lookup_value(canonical_tag)
     if canonical:
-        add(canonical, "canonical_exact", _work_qualifier(canonical))
+        canonical_work = _work_qualifier(canonical)
+        expected_work = canonical_work or (
+            safe_global_works[0] if len(safe_global_works) == 1 else ""
+        )
+        add(
+            canonical,
+            "canonical_exact",
+            expected_work,
+            allow_qualifierless_canonical=(
+                not canonical_work and not explicit_qualified_identity
+            ),
+        )
         stripped, work = _strip_last_qualifier(canonical)
         if stripped and work:
             add(stripped, "alias_without_work", work)
@@ -179,7 +216,14 @@ def _lookup_specs(
         expected_work = _work_qualifier(safe) or (
             safe_global_works[0] if len(safe_global_works) == 1 else ""
         )
-        add(safe, "provider_candidate_exact", expected_work)
+        add(
+            safe,
+            "provider_candidate_exact",
+            expected_work,
+            allow_qualifierless_canonical=(
+                "_(" not in safe and not explicit_qualified_identity
+            ),
+        )
         stripped, stripped_work = _strip_last_qualifier(safe)
         if stripped and stripped_work:
             add(stripped, "provider_candidate_alias_without_work", stripped_work)
@@ -199,6 +243,9 @@ def _lookup_specs(
             segment,
             "user_ascii_exact",
             safe_global_works[0] if len(safe_global_works) == 1 else "",
+            allow_qualifierless_canonical=(
+                "_(" not in segment and not explicit_qualified_identity
+            ),
         )
         if "_(" not in segment:
             for work in safe_global_works:
@@ -226,12 +273,35 @@ def _work_matches(canonical_tag: str, expected_work: str) -> bool:
     return _work_qualifier(canonical_tag) == expected
 
 
-def _verified_hit(lookup: TagLookup, expected_work: str) -> bool:
-    return bool(
+def _verified_hit(
+    lookup: TagLookup,
+    expected_work: str,
+    *,
+    query: str = "",
+    allow_qualifierless_canonical: bool = False,
+) -> bool:
+    if not (
         lookup.found
         and lookup.verified
         and str(lookup.category or "").casefold() == "character"
-        and _work_matches(lookup.canonical_tag or lookup.tag, expected_work)
+    ):
+        return False
+    canonical = normalize_tag(lookup.canonical_tag or lookup.tag)
+    if _work_matches(canonical, expected_work):
+        return True
+    if not (
+        expected_work
+        and allow_qualifierless_canonical
+        and not _work_qualifier(canonical)
+    ):
+        return False
+    # A Copyright-exact work hint may accompany a qualifierless Character tag,
+    # but it must never turn a short alias into identity authority.  The
+    # Character side therefore still has to be the exact canonical itself.
+    return bool(
+        normalize_tag(query) == canonical
+        and str(getattr(lookup, "match_type", "") or "").casefold()
+        in {"canonical", "exact"}
     )
 
 
@@ -264,9 +334,20 @@ def _copyright_punctuation_key(value: str) -> str:
 def _discover_unique_copyright(
     index: DanbooruTagIndex,
     value: str,
+    initial_lookup: TagLookup | None = None,
 ) -> str:
     """Discover one punctuation-only Copyright variant, then exact-confirm it."""
 
+    initial = (
+        (initial_lookup,)
+        if initial_lookup is not None
+        else _lookup_many(index, (value,), "copyright")
+    )
+    if initial and str(getattr(initial[0], "match_type", "") or "") in {
+        "alias_ambiguous",
+        "canonical_category_mismatch",
+    }:
+        return ""
     target_key = _copyright_punctuation_key(value)
     tokens = re.findall(r"[a-z0-9]+", normalize_tag(value))
     search = getattr(index, "search", None)
@@ -320,7 +401,7 @@ def _confirmed_copyright_work_hints(
         if _verified_copyright_hit(lookup):
             canonical = _safe_lookup_value(lookup.canonical_tag or lookup.tag)
         if not canonical:
-            canonical = _discover_unique_copyright(index, raw)
+            canonical = _discover_unique_copyright(index, raw, lookup)
         if canonical and canonical not in confirmed:
             confirmed.append(canonical)
     return tuple(confirmed)
@@ -366,14 +447,19 @@ def _normalize_provider_work_evidence(
     for raw in safe_works:
         if raw in resolved:
             continue
-        canonical = _discover_unique_copyright(index, raw)
+        matching_lookup = next(
+            (
+                lookup
+                for candidate, lookup in zip(safe_works, lookups)
+                if candidate == raw
+            ),
+            None,
+        )
+        canonical = _discover_unique_copyright(index, raw, matching_lookup)
         if canonical:
             resolved[raw] = canonical
 
     confirmed_works = tuple(dict.fromkeys(resolved.values()))
-    if len(confirmed_works) > 1:
-        return canonical_tag, bounded_candidates, bounded_hints, confirmed_works
-
     def normalize_qualified(value: str) -> str:
         safe = _safe_lookup_value(value)
         if not safe:
@@ -391,7 +477,7 @@ def _normalize_provider_work_evidence(
         normalize_qualified(canonical_tag),
         tuple(normalize_qualified(value) for value in bounded_candidates),
         normalized_hints,
-        (),
+        confirmed_works,
     )
 
 
@@ -414,26 +500,28 @@ def resolve_character_identity(
         canonical_tag,
         identity_candidates,
         work_hints,
-        conflicting_works,
+        confirmed_works,
     ) = _normalize_provider_work_evidence(
         index,
         canonical_tag=canonical_tag,
         identity_candidates=identity_candidates,
         work_hints=work_hints,
     )
-    if conflicting_works:
+    if len(confirmed_works) > 1:
         return CharacterIdentityResolution(
             ambiguous=True,
             match_variant="copyright_exact_conflict",
-            candidate_count=len(conflicting_works),
-            conflicting_works=conflicting_works[:8],
+            candidate_count=len(confirmed_works),
+            conflicting_works=confirmed_works[:8],
         )
+    confirmed_work = confirmed_works[0] if len(confirmed_works) == 1 else ""
 
     specs = _lookup_specs(
         target_query,
         canonical_tag,
         identity_candidates,
         work_hints,
+        confirmed_works,
     )
     if not specs:
         return CharacterIdentityResolution()
@@ -441,7 +529,12 @@ def resolve_character_identity(
     lookups = _lookup_many(index, [spec.value for spec in specs])
     exact_hits: list[tuple[_LookupSpec, TagLookup, str]] = []
     for spec, lookup in zip(specs, lookups):
-        if not _verified_hit(lookup, spec.expected_work):
+        if not _verified_hit(
+            lookup,
+            spec.expected_work,
+            query=spec.value,
+            allow_qualifierless_canonical=spec.allow_qualifierless_canonical,
+        ):
             continue
         canonical = normalize_tag(lookup.canonical_tag or lookup.tag)
         exact_hits.append((spec, lookup, canonical))
@@ -457,6 +550,7 @@ def resolve_character_identity(
             query_count=len(specs),
             candidate_count=1,
             candidates=unique_exact,
+            confirmed_work=confirmed_work,
         )
     if len(unique_exact) > 1:
         return CharacterIdentityResolution(
@@ -465,6 +559,36 @@ def resolve_character_identity(
             query_count=len(specs),
             candidate_count=len(unique_exact),
             candidates=unique_exact[:8],
+        )
+    blocked_exact = tuple(
+        lookup
+        for lookup in lookups
+        if str(getattr(lookup, "match_type", "") or "")
+        in {"alias_ambiguous", "canonical_category_mismatch"}
+    )
+    if blocked_exact:
+        blocked_candidates = tuple(
+            dict.fromkeys(
+                canonical
+                for lookup in blocked_exact
+                for candidate in getattr(lookup, "candidates", ())
+                if (canonical := _candidate_canonical(candidate))
+            )
+        )[:8]
+        variants = {
+            str(getattr(lookup, "match_type", "") or "")
+            for lookup in blocked_exact
+        }
+        return CharacterIdentityResolution(
+            ambiguous=True,
+            match_variant=(
+                "global_alias_ambiguous"
+                if "alias_ambiguous" in variants
+                else "canonical_category_mismatch"
+            ),
+            query_count=len(specs),
+            candidate_count=len(blocked_candidates),
+            candidates=blocked_candidates,
         )
     if not allow_discovery:
         return CharacterIdentityResolution(query_count=len(specs))
@@ -530,6 +654,7 @@ def resolve_character_identity(
         query_count=len(specs),
         candidate_count=len(verified_tags),
         candidates=tuple(dict.fromkeys(verified_tags))[:8],
+        confirmed_work=confirmed_work,
     )
 
 
@@ -600,7 +725,10 @@ def resolve_user_adjacent_character_alias(
         tuple(
             root
             for root in prompt_roots
-            if _work_qualifier(root) in confirmed_works
+            if (
+                not _work_qualifier(root)
+                or _work_qualifier(root) in confirmed_works
+            )
         )
         if confirmed_works
         else prompt_roots
@@ -653,6 +781,7 @@ def resolve_user_adjacent_character_alias(
                 query_count=resolved.query_count,
                 candidate_count=max(1, len(exact_candidates)),
                 candidates=exact_roots,
+                confirmed_work=resolved.confirmed_work,
             )
         if resolved.ambiguous:
             return resolved
@@ -690,6 +819,7 @@ def resolve_user_adjacent_character_alias(
         query_count=discovered.query_count,
         candidate_count=discovered.candidate_count,
         candidates=discovered.candidates,
+        confirmed_work=discovered.confirmed_work,
     )
 
 

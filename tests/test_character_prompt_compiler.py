@@ -123,6 +123,40 @@ class CharacterPromptCompilerTests(unittest.TestCase):
         self.assertNotIn("nikke", result.prompt)
         self.assertIn("blue_archive", result.prompt)
 
+    def test_qualifierless_character_uses_separate_confirmed_work(self) -> None:
+        result = compile_character_prompt(
+            "1girl, hatsune miku, vocaloid, blue archive, stage",
+            "",
+            (
+                CharacterPromptEvidence(
+                    "Hatsune Miku",
+                    "hatsune_miku",
+                    confirmed_work="vocaloid",
+                ),
+            ),
+            prompt_character_terms=(("hatsune miku", "hatsune_miku"),),
+            prompt_copyright_terms=(
+                ("vocaloid", "vocaloid"),
+                ("blue archive", "blue_archive"),
+            ),
+        )
+
+        self.assertIn("hatsune_miku", result.prompt)
+        self.assertIn("vocaloid", result.prompt)
+        self.assertNotIn("blue archive", result.prompt)
+
+    def test_qualifierless_character_does_not_guess_a_work(self) -> None:
+        result = compile_character_prompt(
+            "1girl, hatsune miku, vocaloid, stage",
+            "",
+            (CharacterPromptEvidence("Hatsune Miku", "hatsune_miku"),),
+            prompt_character_terms=(("hatsune miku", "hatsune_miku"),),
+            prompt_copyright_terms=(("vocaloid", "vocaloid"),),
+        )
+
+        self.assertIn("hatsune_miku", result.prompt)
+        self.assertNotIn("vocaloid", result.prompt)
+
     def test_drops_relation_sentence_that_repeats_removed_trait(self) -> None:
         result = compile_character_prompt(
             (

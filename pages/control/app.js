@@ -35,6 +35,7 @@ let activeTaskRestoreChecked = false;
 let currentLoraDetailName = "";
 let currentUiTheme = "workshop";
 let promptStatusData = null;
+let promptIndexTaskRunId = "";
 let experimentalProfileItems = [];
 let promptActiveTab = "composer";
 let promptAssetItems = [];
@@ -198,6 +199,13 @@ const numberFields = new Set([
   "prompt_diagnostics_capacity",
   "danbooru_index_timeout",
   "danbooru_index_max_size_mb",
+  "danbooru_api_general_min_posts",
+  "danbooru_api_meta_min_posts",
+  "danbooru_api_page_size",
+  "danbooru_api_request_interval_ms",
+  "danbooru_api_timeout",
+  "danbooru_api_max_records",
+  "danbooru_auto_update_interval_hours",
 ]);
 
 const booleanFields = new Set([
@@ -211,6 +219,8 @@ const booleanFields = new Set([
   "enable_prompt_composer_v2",
   "enable_prompt_diagnostics",
   "prompt_diagnostics_include_content",
+  "danbooru_api_include_aliases",
+  "danbooru_auto_update_enabled",
   "enable_reverse_prompt",
   "enable_reverse_json_formatter",
   "enable_reverse_json_repair_retry",
@@ -2922,6 +2932,12 @@ function renderPromptStatus(data) {
   const indexReady = Boolean(index.ready);
   const tagCount = promptNumber(index.tag_count ?? index.tags);
   const aliasCount = promptNumber(index.alias_count ?? index.aliases);
+  const uniqueAliasCount = promptNumber(index.unique_alias_count);
+  const ambiguousAliasCount = promptNumber(index.ambiguous_alias_count);
+  const canonicalConflictCount = promptNumber(index.canonical_conflict_alias_count);
+  const localizedAliases = index.localized_aliases && typeof index.localized_aliases === "object"
+    ? index.localized_aliases
+    : {};
   const diagnosticItems = promptDiagnosticItems(data);
   const diagnosticCount = promptNumber(
     diagnostics.count ?? diagnostics.size ?? composer.count,
@@ -2931,30 +2947,80 @@ function renderPromptStatus(data) {
     diagnostics.capacity ?? diagnostics.max_items ?? composer.capacity ?? data?.prompt_diagnostics_capacity,
     settings.prompt_diagnostics_capacity || 0,
   );
+  const updateTask = index.update_task && typeof index.update_task === "object"
+    ? index.update_task
+    : {};
+  const updateRunId = String(updateTask.run_id || updateTask.id || "");
+  const updateStatus = String(updateTask.status || "").toLowerCase();
+  const updateActive = activeTaskStatuses.has(updateStatus);
+  const updateModeLabel = updateTask.mode === "official_api" ? "官方 API" : "URL";
+  const autoUpdate = index.auto_update && typeof index.auto_update === "object"
+    ? index.auto_update
+    : {};
+  promptIndexTaskRunId = updateRunId;
+  const taskButton = document.querySelector("#prompt-index-task");
+  taskButton.hidden = !updateRunId;
+  taskButton.textContent = updateActive ? "查看更新进度" : "查看最近任务";
 
   document.querySelector("#prompt-composer-state").textContent = composerEnabled ? "ON" : "OFF";
   document.querySelector("#prompt-composer-detail").textContent = `负面词 ${negativeMode} · 校验 ${validationLabel}`;
-  document.querySelector("#prompt-index-state").textContent = indexReady ? "READY" : "EMPTY";
-  document.querySelector("#prompt-index-detail").textContent = indexReady
-    ? `${tagCount.toLocaleString()} Tags · ${aliasCount.toLocaleString()} Aliases`
-    : (index.error || "尚未导入本地索引");
+  document.querySelector("#prompt-index-state").textContent = updateActive
+    ? "BUILDING"
+    : (indexReady ? "READY" : "EMPTY");
+  document.querySelector("#prompt-index-detail").textContent = updateActive
+    ? `${updateModeLabel} · ${taskProgress(updateTask).toFixed(0)}% · 当前 ${tagCount.toLocaleString()} Tags`
+    : (indexReady
+      ? `${tagCount.toLocaleString()} Tags · ${aliasCount.toLocaleString()} Aliases`
+      : (index.error || "尚未导入本地索引"));
   document.querySelector("#prompt-diagnostic-count").textContent = diagnosticCount.toLocaleString();
   document.querySelector("#prompt-diagnostic-capacity").textContent = diagnosticCapacity
     ? `内存上限 ${diagnosticCapacity} 条 · 重载清空`
     : "仅保存在内存";
-  document.querySelector("#prompt-index-badge").textContent = indexReady ? "READY" : "NOT READY";
+  document.querySelector("#prompt-index-badge").textContent = updateActive
+    ? (updateStatus === "queued" ? "QUEUED" : "RUNNING")
+    : (indexReady ? "READY" : "NOT READY");
   document.querySelector("#prompt-index-tags").textContent = tagCount.toLocaleString();
   document.querySelector("#prompt-index-aliases").textContent = aliasCount.toLocaleString();
+  document.querySelector("#prompt-index-unique-aliases").textContent = uniqueAliasCount.toLocaleString();
+  document.querySelector("#prompt-index-ambiguous-aliases").textContent = `${ambiguousAliasCount.toLocaleString()} / ${canonicalConflictCount.toLocaleString()}`;
   document.querySelector("#prompt-index-revision").textContent = index.revision || index.version || "—";
   document.querySelector("#prompt-index-updated").textContent = promptTimestamp(index.imported_at || index.updated_at);
-  document.querySelector("#prompt-index-source").textContent = index.source || index.url || settings.danbooru_index_url || "尚未配置或导入";
+  document.querySelector("#prompt-index-source-updated").textContent = promptTimestamp(index.source_updated_at);
+  document.querySelector("#prompt-index-source-cutoff").textContent = promptTimestamp(index.source_cutoff_at);
+  document.querySelector("#prompt-index-localized").textContent = localizedAliases.ready
+    ? `${promptNumber(localizedAliases.entry_count).toLocaleString()} 条${localizedAliases.csv_loaded ? " · CSV 已加载" : " · 内置/运行时"}`
+    : (localizedAliases.csv_error ? `CSV 异常：${localizedAliases.csv_error}` : "未加载");
+  document.querySelector("#prompt-index-source").textContent = index.source
+    || index.url
+    || settings.danbooru_index_url
+    || settings.danbooru_api_base_url
+    || "尚未配置或导入";
   const categories = index.category_counts || index.categories || {};
   document.querySelector("#prompt-index-categories").textContent = Object.keys(categories).length
     ? Object.entries(categories).map(([name, count]) => `${name} ${promptNumber(count).toLocaleString()}`).join(" · ")
     : "—";
-  document.querySelector("#prompt-index-status").textContent = index.error
-    ? `索引状态异常：${index.error}`
-    : (indexReady ? "本地索引可用；更新失败时仍会保留当前版本。" : "尚无可用索引；可先在设置中填写数据源 URL。 ");
+  let indexStatusText = "";
+  if (updateActive) {
+    indexStatusText = `${updateModeLabel} 索引任务${taskStatusLabel(updateStatus)}；${indexReady ? "当前旧索引继续可用。" : "当前尚无可用旧索引。"}`;
+  } else if (updateStatus === "succeeded") {
+    indexStatusText = `最近一次 ${updateModeLabel} 索引任务已成功；本地索引已原子切换。`;
+  } else if (["failed", "timed_out", "cancelled", "interrupted", "partial"].includes(updateStatus)) {
+    const reason = updateTask.error_summary || updateTask.error || index.error || "旧索引已保留";
+    indexStatusText = `最近一次 ${updateModeLabel} 索引任务${taskStatusLabel(updateStatus)}：${reason}`;
+  } else if (index.error) {
+    indexStatusText = `索引状态异常：${index.error}`;
+  } else {
+    indexStatusText = indexReady
+      ? "本地索引可用；更新失败时仍会保留当前版本。"
+      : "尚无可用索引；可从官方 API 生成，或先配置自定义数据源 URL。";
+  }
+  if (autoUpdate.enabled) {
+    const nextRun = promptTimestamp(autoUpdate.next_run_at);
+    indexStatusText += ` 自动更新：每 ${promptNumber(autoUpdate.interval_hours)} 小时；下次 ${nextRun}。`;
+  } else {
+    indexStatusText += " 自动更新未启用。";
+  }
+  document.querySelector("#prompt-index-status").textContent = indexStatusText;
   renderPromptDiagnosticHistory(diagnosticItems);
 }
 
@@ -3117,22 +3183,39 @@ async function clearPromptDiagnostics() {
   }
 }
 
-async function updateDanbooruIndex() {
+async function updateDanbooruIndex(mode = "url") {
+  const normalizedMode = mode === "official_api" ? "official_api" : "url";
+  const official = normalizedMode === "official_api";
   if (!(await confirmAction(
-    "从全局设置中的数据源 URL 下载并原子更新本地 Danbooru 索引？失败时会保留当前版本。",
-    {title: "更新 Danbooru 索引", confirmLabel: "开始更新", danger: false},
+    official
+      ? "从 Danbooru 官方公开 API 流式生成完整本地索引？任务会进入任务中心，失败或取消时保留当前版本。"
+      : "从全局设置中的数据源 URL 下载并原子更新本地 Danbooru 索引？任务会进入任务中心，失败或取消时保留当前版本。",
+    {
+      title: official ? "从官方 API 生成索引" : "从 URL 更新索引",
+      confirmLabel: official ? "开始生成" : "开始更新",
+      danger: false,
+    },
   ))) return;
-  const button = document.querySelector("#prompt-index-update");
+  const button = document.querySelector(
+    official ? "#prompt-index-official-update" : "#prompt-index-update",
+  );
   const status = document.querySelector("#prompt-index-status");
-  setBusy(button, true, "正在更新…");
-  status.textContent = "正在下载、校验并构建本地索引，请勿重复提交…";
+  setBusy(button, true, official ? "正在创建…" : "正在更新…");
+  status.textContent = official
+    ? "正在创建官方 API 索引任务…"
+    : "正在创建 URL 索引更新任务…";
   try {
-    const data = await api("/api/danbooru/update", {method: "POST"});
-    status.textContent = data.message || "Danbooru 索引更新完成。";
+    const data = await api("/api/danbooru/update", {
+      method: "POST",
+      body: JSON.stringify({mode: normalizedMode}),
+    });
+    status.textContent = data.message || "Danbooru 索引任务已创建。";
     showToast(status.textContent);
     await loadPromptStatus({quiet: true});
+    const runId = String(data.run_id || data.task?.run_id || data.task?.id || "");
+    if (runId) await openTaskCenter(runId);
   } catch (error) {
-    status.textContent = `索引更新失败：${error.message}`;
+    status.textContent = `索引任务创建失败：${error.message}`;
     showToast(error.message, true);
   } finally {
     setBusy(button, false);
@@ -4617,7 +4700,11 @@ document.querySelector("#console-copy").addEventListener("click", copyVisibleCon
 document.querySelector("#console-clear").addEventListener("click", clearConsoleLogs);
 document.querySelector("#prompt-diagnostic-form").addEventListener("submit", diagnosePrompt);
 document.querySelector("#prompt-diagnostics-clear").addEventListener("click", clearPromptDiagnostics);
-document.querySelector("#prompt-index-update").addEventListener("click", updateDanbooruIndex);
+document.querySelector("#prompt-index-update").addEventListener("click", () => updateDanbooruIndex("url"));
+document.querySelector("#prompt-index-official-update").addEventListener("click", () => updateDanbooruIndex("official_api"));
+document.querySelector("#prompt-index-task").addEventListener("click", () => {
+  if (promptIndexTaskRunId) openTaskCenter(promptIndexTaskRunId);
+});
 document.querySelector("#prompt-status-refresh").addEventListener("click", () => loadPromptStatus());
 document.querySelector("#prompt-experiments-refresh").addEventListener("click", () => loadExperimentalProfiles());
 document.querySelector("#prompt-workbench-tabs").addEventListener("click", (event) => {

@@ -91,6 +91,24 @@ class PluginSettingsTests(unittest.TestCase):
         self.assertFalse(disabled.enable_reverse_json_formatter)
         self.assertFalse(disabled.enable_reverse_json_repair_retry)
 
+    def test_danbooru_auto_update_defaults_off_and_clamps_interval(self) -> None:
+        defaults = PluginSettings.from_mapping({})
+        low = PluginSettings.from_mapping(
+            {
+                "danbooru_auto_update_enabled": "true",
+                "danbooru_auto_update_interval_hours": 1,
+            }
+        )
+        high = PluginSettings.from_mapping(
+            {"danbooru_auto_update_interval_hours": 99999}
+        )
+
+        self.assertFalse(defaults.danbooru_auto_update_enabled)
+        self.assertEqual(defaults.danbooru_auto_update_interval_hours, 168)
+        self.assertTrue(low.danbooru_auto_update_enabled)
+        self.assertEqual(low.danbooru_auto_update_interval_hours, 24)
+        self.assertEqual(high.danbooru_auto_update_interval_hours, 2160)
+
     def test_v170_global_capabilities_have_safe_defaults(self) -> None:
         settings = PluginSettings.from_mapping({})
 
@@ -243,7 +261,7 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "1.9.23")
+        self.assertEqual(PLUGIN_VERSION, "1.9.24")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
         self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-04", changelog)

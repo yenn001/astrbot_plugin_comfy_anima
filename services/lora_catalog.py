@@ -29,6 +29,8 @@ from ..models import LoraSelection, PluginSettings
 
 MAX_CATALOG_BYTES = 10 * 1024 * 1024
 MAX_MANAGER_PREVIEW_BYTES = 4 * 1024 * 1024
+MAX_CHARACTER_IDENTITIES_PER_LORA = 24
+MAX_WORK_IDENTITIES_PER_LORA = 24
 GENERIC_IDENTITY_TERMS = {
     "anima",
     "lora",
@@ -1053,6 +1055,7 @@ class LoraCatalogService:
 
         identity_sources = (title, *trigger_words)
         for source_index, source in enumerate(identity_sources):
+            source = cls._clean_identity_text(source)
             aliases.append(source)
             for match in re.finditer(
                 r"([^()]*)\(([^()]{2,100})\)",
@@ -1066,7 +1069,6 @@ class LoraCatalogService:
                 name_key = cls._compact_search_text(name)
                 if name and (
                     source_index == 0
-                    or detected_works
                     or (name_key and name_key in identity_hint_blob)
                 ):
                     character_candidates.append(name)
@@ -1088,7 +1090,7 @@ class LoraCatalogService:
             subject_without_work = cls._clean_character_candidate(subject)
             subject_key = cls._compact_search_text(subject_without_work)
             if subject_without_work and (
-                detected_works or (subject_key and subject_key in identity_hint_blob)
+                subject_key and subject_key in identity_hint_blob
             ):
                 character_candidates.append(subject_without_work)
 
@@ -1107,8 +1109,14 @@ class LoraCatalogService:
             if fallback:
                 character_candidates.append(fallback)
 
-        characters = cls._dedupe_identity_terms(character_candidates, limit=3)
-        works = cls._dedupe_identity_terms(work_candidates, limit=3)
+        characters = cls._dedupe_identity_terms(
+            character_candidates,
+            limit=MAX_CHARACTER_IDENTITIES_PER_LORA,
+        )
+        works = cls._dedupe_identity_terms(
+            work_candidates,
+            limit=MAX_WORK_IDENTITIES_PER_LORA,
+        )
         work_aliases = cls._work_aliases(works)
         aliases.extend((*characters, *works, *work_aliases))
         aliases.extend(
@@ -1188,6 +1196,155 @@ class LoraCatalogService:
         if best and record.favorite:
             best += 2
         return best
+
+    @classmethod
+    def _strict_character_identity_matches(
+        cls,
+        record: LoraRecord,
+        query: str,
+    ) -> bool:
+        """Require character evidence before fuzzy-selecting a character LoRA.
+
+        Catalog aliases also contain works and descriptive tags for discovery.
+        Those broad fields may rank a record, but they must not authorize a
+        strict character selection on their own.
+        """
+        query_normalized = cls._normalize_search_text(query)
+        query_compact = cls._compact_search_text(query)
+        if not query_compact or cls._is_generic_identity(query):
+            return False
+
+        work_keys = {
+            cls._compact_search_text(part)
+            for part in re.split(r"[/|;；]+", record.source_work)
+            if cls._compact_search_text(part)
+        }
+        if source_work_key := cls._compact_search_text(record.source_work):
+            work_keys.add(source_work_key)
+        for work in cls._detect_work_groups(record.source_work):
+            work_keys.update(
+                cls._compact_search_text(alias)
+                for alias in cls._work_aliases((work,))
+            )
+        if query_compact in work_keys:
+            return False
+
+        def value_matches(value: Any, *, exact: bool = False) -> bool:
+            normalized = cls._normalize_search_text(value)
+            compact = cls._compact_search_text(value)
+            if not compact:
+                return False
+            if query_normalized == normalized or query_compact == compact:
+                return True
+            if exact:
+                return False
+            if normalized.isascii():
+                pattern = rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])"
+                return re.search(pattern, query_normalized) is not None
+            return normalized in query_normalized
+
+        character_terms = cls._dedupe_identity_terms(
+            cls._clean_character_candidate(part)
+            for part in re.split(r"[/|;；]+", record.character_name)
+        )
+        character_keys = {
+            cls._compact_search_text(term) for term in character_terms
+        }
+        file_identity_key = cls._compact_search_text(
+            canonical_lora_name(record.name).rsplit("/", 1)[-1]
+        )
+        trigger_entries: list[tuple[str, str, str, str]] = []
+        trigger_candidate_keys: set[str] = set()
+        for trigger in record.trigger_words:
+            cleaned = cls._clean_identity_text(trigger).rstrip(",")
+            subject = cls._clean_identity_text(cleaned.split(",", 1)[0])
+            candidate = cls._clean_character_candidate(subject)
+            candidate_key = cls._compact_search_text(candidate)
+            trigger_entries.append((cleaned, subject, candidate, candidate_key))
+            if candidate_key:
+                trigger_candidate_keys.add(candidate_key)
+
+        trusted_character_keys = {
+            key
+            for key in character_keys
+            if key
+            and (
+                key in file_identity_key
+                or file_identity_key in key
+                or key in trigger_candidate_keys
+            )
+        }
+        untrusted_character_keys = character_keys - trusted_character_keys
+        if any(
+            cls._compact_search_text(term) in trusted_character_keys
+            and value_matches(term)
+            for term in character_terms
+        ):
+            return True
+
+        verified_trigger_subjects: list[str] = []
+        trigger_alias_keys: set[str] = set()
+        for cleaned, subject, candidate, candidate_key in trigger_entries:
+            trigger_alias_keys.update(
+                key
+                for key in (
+                    cls._compact_search_text(cleaned),
+                    cls._compact_search_text(subject),
+                )
+                if key
+            )
+            if not candidate_key:
+                continue
+            known_character = candidate_key in trusted_character_keys
+            if known_character:
+                verified_trigger_subjects.append(candidate)
+                if value_matches(cleaned, exact=True) or value_matches(subject):
+                    return True
+
+        broad_tag_keys = {
+            cls._compact_search_text(tag) for tag in record.tags if str(tag).strip()
+        }
+        verified_trigger_keys = {
+            cls._compact_search_text(subject)
+            for subject in verified_trigger_subjects
+        }
+        for alias in record.aliases:
+            if not value_matches(alias, exact=True):
+                continue
+            alias_key = cls._compact_search_text(alias)
+            if not alias_key or alias_key in work_keys:
+                continue
+            if alias_key in untrusted_character_keys:
+                alias_text = cls._normalize_search_text(alias)
+                if (
+                    not trusted_character_keys
+                    or alias_text.isascii()
+                    or len(alias_text) > 32
+                    or " " in alias_text
+                ):
+                    continue
+            is_identity_related = any(
+                key and (key in alias_key or alias_key in key)
+                for key in (*trusted_character_keys, *verified_trigger_keys)
+            )
+            if alias_key in trigger_alias_keys and not is_identity_related:
+                continue
+            if alias_key in broad_tag_keys and not is_identity_related:
+                continue
+            return True
+        return False
+
+    @classmethod
+    def _record_requires_strict_character_identity(cls, record: LoraRecord) -> bool:
+        category = str(record.category or "").strip().casefold()
+        return bool(
+            category in {"character", "mixed"}
+            or record.character_name.strip()
+            or any(
+                cls._normalize_search_text(tag) == "character"
+                for tag in record.tags
+            )
+        )
 
     @classmethod
     def search_records(
@@ -1808,6 +1965,16 @@ class LoraCatalogService:
                     (
                         (self._search_score(candidate, selection.name), candidate)
                         for candidate in records
+                        if not (
+                            strict
+                            and self._record_requires_strict_character_identity(
+                                candidate
+                            )
+                            and not self._strict_character_identity_matches(
+                                candidate,
+                                selection.name,
+                            )
+                        )
                     ),
                     key=lambda item: (-item[0], item[1].name.casefold()),
                 )

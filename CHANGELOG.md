@@ -2,6 +2,18 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.24] - 2026-08-04
+
+### Danbooru Schema v2、持续更新与统一角色证据链
+
+- 本地 Danbooru 索引升级到 Schema v2，支持 Alias 一对多、全局歧义与 canonical/category 冲突；旧 Schema v1 继续只读兼容，但不会被错误升格为新快照能力。括号无论被转义一层或多层，最终只输出一层 ComfyUI 安全转义。
+- 新增从官方 `/tags.json` 与 `/tag_aliases.json` 生成索引的持久任务。使用固定 API 高水位、正向 ID 游标、identity/full 模式、General/Meta 阈值、代理、限速、429/5xx 重试、断点续传、内容哈希、完整性退化保护和原子替换；失败或取消保留旧库。
+- 新增可选定期更新：默认关闭，开启后默认每 168 小时运行；启动到期补跑、失败 6 小时退避、重复任务复用，并在任务中心和提示词工坊显示当前状态与下次时间。
+- 新增共享 LoRA 身份证据层。当前角色/作品元数据、实时训练触发词、未过期语义档案、中文/罗马字配对和管理员多语言 CSV 只发现候选；本地 Character/Copyright exact 才能授权。新下载但尚未归档的角色 LoRA 请求也会开放最新 LoRA 工具并强制刷新。
+- 修复多角色 LoRA 截断、作品名误选唯一角色 LoRA、描述词污染严格别名、`Fate/Grand Order` 拆分、`hatsune_miku` 无作品后缀、空格/下划线不等价、角色括号误作权重、索引更新过程中混用 revision，以及 LLM 未声明的未知 `character_(work)` 绕过最终门等问题。
+- WebUI 两套入口同步增加官方 API 参数、自动更新开关、进度、检查点、Alias/冲突/来源截止与本地化 CSV 状态。本版不增加 Python 依赖、ComfyUI 节点、模型或工作流文件。
+- `--llm cc u` 现在作为明确的换角 Ultra 入口加入帮助与回归。Standard 最多采用 6 项可信稳定外貌，Ultra 最多采用 10 项；本地 exact、Gallery 与当前 LoRA 证据门保持不变，不会用更高预算换取角色幻觉。
+
 ## [1.9.23] - 2026-08-04
 
 ### 本地快照缺项角色授权与终端修复兼容

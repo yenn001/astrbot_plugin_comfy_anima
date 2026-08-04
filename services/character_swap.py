@@ -688,7 +688,10 @@ def _clean_text(value: Any, limit: int = 500) -> str:
 def _identity_key(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     text = _WEIGHT_SUFFIX_RE.sub("", text)
-    return re.sub(r"[^0-9a-z@_\u3400-\u9fff]+", "", text)
+    # Spaces and underscores are presentation variants in Danbooru/Manager
+    # metadata.  Keeping one while dropping the other made otherwise identical
+    # values such as ``BanG Dream!`` and ``bang_dream!`` compare differently.
+    return re.sub(r"[^0-9a-z@\u3400-\u9fff]+", "", text)
 
 
 def _is_generic_source_query(value: Any) -> bool:
@@ -1498,7 +1501,7 @@ def _trusted_identity_signature(
     }
     works = {
         _identity_key(value)
-        for value in _split_names(record.source_work)
+        for value in _work_title_candidates(record.source_work)
         if _identity_key(value)
     }
     entry = semantic_index.entry_for(record)
@@ -1866,6 +1869,22 @@ def _split_names(value: Any) -> tuple[str, ...]:
     return _dedupe_text(_SPLIT_NAME_RE.split(_clean_text(value)))
 
 
+def _work_title_candidates(value: Any) -> tuple[str, ...]:
+    """Keep a complete work title before emitting legacy split hints.
+
+    LoRA metadata often serializes translated work aliases with ``/`` or
+    ``|``, but those characters can also belong to the real Copyright name
+    (for example ``Fate/Grand Order``). The complete value therefore remains
+    the first candidate. Split values are discovery hints only; downstream
+    callers must still exact-confirm Copyright/Character evidence.
+    """
+
+    complete = _clean_text(value)
+    if not complete:
+        return ()
+    return _dedupe_text((complete, *_SPLIT_NAME_RE.split(complete)))
+
+
 def _split_prompt_terms(prompt: str) -> tuple[str, ...]:
     """Split top-level prompt terms without damaging weighted groups."""
 
@@ -1931,12 +1950,26 @@ def _target_identity_insert_index(terms: Sequence[str]) -> int:
     return 0
 
 
-def _is_character_record(record: LoraRecord) -> bool:
+def _is_character_record(
+    record: LoraRecord,
+    semantic_index: LoraSemanticIndex | None = None,
+) -> bool:
     category = str(record.category or "").strip().casefold()
     # Character identity evidence is authoritative even if an older archive or
     # manual edit left the broad category stale. Failing closed here prevents
     # a misclassified character LoRA from surviving a semantic replacement.
-    return category == "character" or bool(str(record.character_name or "").strip())
+    if category == "character" or bool(str(record.character_name or "").strip()):
+        return True
+    if semantic_index is None:
+        return False
+    entry = semantic_index.entry_for(record)
+    if not _entry_is_fresh(entry, record):
+        return False
+    assert entry is not None
+    return bool(
+        entry.effective_values("character_names")
+        or entry.effective_category == "character"
+    )
 
 
 def _entry_is_fresh(entry: Optional[SemanticEntry], record: LoraRecord) -> bool:
@@ -1960,7 +1993,7 @@ def _trusted_identity_values(
     values.extend((canonical, basename))
     record_names = _split_names(record.character_name)
     values.extend(record_names)
-    record_works = _split_names(record.source_work)
+    record_works = _work_title_candidates(record.source_work)
     # A work title is contextual evidence, not a character identity. Likewise,
     # LoraRecord.aliases mixes filenames, titles, tags and trained words without
     # provenance, so neither may independently authorize an automatic swap.
@@ -2124,7 +2157,7 @@ def _trusted_source_work_keys(
     record: LoraRecord,
     semantic_index: LoraSemanticIndex,
 ) -> frozenset[str]:
-    values = list(_split_names(record.source_work))
+    values = list(_work_title_candidates(record.source_work))
     entry = semantic_index.entry_for(record)
     if _entry_is_fresh(entry, record):
         assert entry is not None
@@ -2299,7 +2332,7 @@ def character_lookup_hints_for_query(
             hints.append(root)
     works = tuple(
         value
-        for value in _split_names(record.source_work)
+        for value in _work_title_candidates(record.source_work)
         if _identity_key(value)
     )
     if _entry_is_fresh(entry, record):
@@ -2383,7 +2416,7 @@ def resolve_character_record(
         )
     matches: list[tuple[int, LoraRecord, str]] = []
     for record in records:
-        if not _is_character_record(record):
+        if not _is_character_record(record, semantic_index):
             continue
         if requested_work_keys and not (
             set(requested_work_keys)
@@ -2425,7 +2458,7 @@ def resolve_character_record(
     if not matches and not explicit_path and not explicit_file:
         fuzzy_matches: list[tuple[int, LoraRecord, str]] = []
         for record in records:
-            if not _is_character_record(record):
+            if not _is_character_record(record, semantic_index):
                 continue
             if requested_work_keys and not (
                 set(requested_work_keys)

@@ -827,8 +827,78 @@
   "danbooru_index_max_size_mb": {
     "description": "Danbooru 索引下载大小上限（MB）",
     "type": "int",
-    "hint": "范围 1 到 128 MB；同时受 50 万记录、Tag/别名长度和单条别名数量硬限制",
-    "default": 64
+    "hint": "范围 1 到 512 MB；大型索引建议使用 CSV，下载和 SQLite 构建使用临时文件并在成功后原子替换",
+    "default": 256
+  },
+  "danbooru_api_base_url": {
+    "description": "Danbooru 官方 API 或兼容镜像根地址",
+    "type": "string",
+    "hint": "默认使用 https://danbooru.donmai.us；也可填写可信局域网 HTTP 镜像。禁止凭据、查询参数、片段与重定向",
+    "default": "https://danbooru.donmai.us"
+  },
+  "danbooru_api_proxy_url": {
+    "description": "Danbooru API HTTP 代理（可选）",
+    "type": "string",
+    "hint": "用于无法直连 Danbooru 的服务器，例如 http://192.168.10.x:7890。不要在 URL 中写入账号或密码",
+    "default": ""
+  },
+  "danbooru_api_mode": {
+    "description": "Danbooru 官方 API 生成模式",
+    "type": "string",
+    "options": ["identity", "full"],
+    "hint": "identity：角色、作品、画师全量，General/Meta 按帖子阈值；full：五类全部抓取，耗时与磁盘占用明显更高",
+    "default": "identity"
+  },
+  "danbooru_api_general_min_posts": {
+    "description": "Identity 模式 General 最低帖子数",
+    "type": "int",
+    "default": 10
+  },
+  "danbooru_api_meta_min_posts": {
+    "description": "Identity 模式 Meta 最低帖子数",
+    "type": "int",
+    "default": 10
+  },
+  "danbooru_api_page_size": {
+    "description": "Danbooru API 单页记录数",
+    "type": "int",
+    "hint": "范围 1 到 1000；使用 ID 游标和检查点恢复，不使用受限的数字页码",
+    "default": 1000
+  },
+  "danbooru_api_request_interval_ms": {
+    "description": "Danbooru API 请求间隔（毫秒）",
+    "type": "int",
+    "hint": "建议保持 500 到 1000 毫秒且并发为 1；429 会遵循 Retry-After 后有限重试",
+    "default": 750
+  },
+  "danbooru_api_timeout": {
+    "description": "Danbooru API 单次请求超时（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "danbooru_api_max_records": {
+    "description": "Danbooru API 生成最大 canonical 数",
+    "type": "int",
+    "hint": "范围 1000 到 3000000；超过时保留旧索引和断点，不激活不完整快照",
+    "default": 2000000
+  },
+  "danbooru_api_include_aliases": {
+    "description": "生成时抓取 active Tag Alias",
+    "type": "bool",
+    "hint": "建议开启。歧义别名只返回候选，不会取得 exact 授权",
+    "default": true
+  },
+  "danbooru_auto_update_enabled": {
+    "description": "定期自动生成 Danbooru 本地索引",
+    "type": "bool",
+    "hint": "默认关闭。开启后使用上面的官方 API/兼容镜像设置；到期会在插件启动后补跑，已有任务会复用，失败保留旧库",
+    "default": false
+  },
+  "danbooru_auto_update_interval_hours": {
+    "description": "Danbooru 自动更新周期（小时）",
+    "type": "int",
+    "hint": "范围 24 到 2160 小时，默认每 7 天更新一次；失败后最早 6 小时重试",
+    "default": 168
   },
   "enable_prompt_asset_library": {
     "description": "启用视觉提示词资产库",

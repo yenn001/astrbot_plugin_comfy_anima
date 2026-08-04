@@ -64,9 +64,32 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             verified_character_triggers={record.name: r"toki \(blue archive\)"},
         )
 
-        self.assertEqual(plan.added, ("toki (blue archive)",))
+        self.assertEqual(plan.added, (r"toki_\(blue_archive\)",))
+        self.assertIn(r"toki_\(blue_archive\)", plan.prompt)
         self.assertNotIn("masterpiece", plan.prompt)
         self.assertNotIn("white bodysuit", plan.prompt)
+
+    def test_verified_character_trigger_has_one_escape_layer_only(self) -> None:
+        record = LoraRecord(
+            "characters/rio.safetensors",
+            category="character",
+            character_name="Rio",
+            trigger_words=(r"rio \\\\(blue archive\\\\)", "black bodysuit"),
+        )
+        free_form = r"1girl, custom\namespace, (portrait emphasis:1.2)"
+
+        plan = build_lora_trigger_plan(
+            prompt=free_form,
+            negative_prompt="",
+            selections=(LoraSelection(record.name, 0.8),),
+            records_by_name={"characters/rio": record},
+            verified_character_triggers={record.name: r"rio \(blue archive\)"},
+        )
+
+        self.assertEqual(plan.added, (r"rio_\(blue_archive\)",))
+        self.assertEqual(plan.prompt.count(r"rio_\(blue_archive\)"), 1)
+        self.assertNotIn(r"rio_\\(blue_archive\\)", plan.prompt)
+        self.assertTrue(plan.prompt.startswith(free_form))
 
     def test_identity_trigger_matches_spaced_name_to_underscore_tag(self) -> None:
         record = LoraRecord(
@@ -151,8 +174,11 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(plan.added, ("toki (armed) (blue archive)",))
-        self.assertIn("toki (armed) (blue archive)", plan.prompt)
+        self.assertEqual(
+            plan.added,
+            (r"toki_\(armed\)_\(blue_archive\)",),
+        )
+        self.assertIn(r"toki_\(armed\)_\(blue_archive\)", plan.prompt)
         self.assertNotIn("himari", plan.prompt)
         self.assertNotIn("eimi", plan.prompt)
         self.assertNotIn("rio", plan.prompt)

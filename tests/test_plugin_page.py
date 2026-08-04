@@ -12,6 +12,7 @@ from ..services.plugin_page import (
     PluginPageApi,
     V170ApiValidationError,
     decode_plugin_gateway_body,
+    validate_danbooru_update_payload,
 )
 
 
@@ -26,6 +27,7 @@ class _Controller:
         self.prompt_diagnostics_cleared = 0
         self.deleted_prompt_plan = None
         self.danbooru_updates = 0
+        self.danbooru_update_payloads = []
         self.v170_calls = {}
 
     async def web_ui_bootstrap(self):
@@ -57,9 +59,10 @@ class _Controller:
         self.prompt_diagnostics_cleared += 1
         return {"message": "cleared"}
 
-    async def web_ui_update_danbooru_index(self):
+    async def web_ui_update_danbooru_index(self, payload):
         self.danbooru_updates += 1
-        return {"message": "updated"}
+        self.danbooru_update_payloads.append(payload)
+        return {"message": "updated", "run_id": "danbooru-run-1"}
 
     async def web_ui_check_experimental_profiles(self):
         return {"items": [{"id": "artist_mixer", "ready": False}]}
@@ -239,8 +242,34 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleared["message"], "cleared")
         self.assertEqual(self.controller.prompt_diagnostics_cleared, 1)
         self.assertEqual(updated["message"], "updated")
+        self.assertEqual(updated["run_id"], "danbooru-run-1")
         self.assertEqual(self.controller.danbooru_updates, 1)
+        self.assertEqual(
+            self.controller.danbooru_update_payloads[-1],
+            {"mode": "url"},
+        )
         self.assertEqual(experiments["items"][0]["id"], "artist_mixer")
+
+        official = await self.api.dispatch(
+            {
+                "method": "POST",
+                "path": "/api/danbooru/update",
+                "body": {"mode": "official_api"},
+            }
+        )
+        self.assertEqual(official["run_id"], "danbooru-run-1")
+        self.assertEqual(
+            self.controller.danbooru_update_payloads[-1],
+            {"mode": "official_api"},
+        )
+        with self.assertRaises(V170ApiValidationError):
+            await self.api.dispatch(
+                {
+                    "method": "POST",
+                    "path": "/api/danbooru/update",
+                    "body": {"mode": "db_export"},
+                }
+            )
 
         with self.assertRaises(PluginPageActionError):
             await self.api.dispatch(
@@ -759,6 +788,16 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
             "danbooru_index_url",
             "danbooru_index_timeout",
             "danbooru_index_max_size_mb",
+            "danbooru_api_base_url",
+            "danbooru_api_proxy_url",
+            "danbooru_api_mode",
+            "danbooru_api_general_min_posts",
+            "danbooru_api_meta_min_posts",
+            "danbooru_api_page_size",
+            "danbooru_api_request_interval_ms",
+            "danbooru_api_timeout",
+            "danbooru_api_max_records",
+            "danbooru_api_include_aliases",
         )
         scripts = []
         styles = []
@@ -785,8 +824,45 @@ class PluginPageApiTests(unittest.IsolatedAsyncioTestCase):
                 "/api/experiments/check",
             ):
                 self.assertIn(route, script)
+            self.assertIn('value="danbooru_index_update"', html)
+            self.assertIn('id="prompt-index-official-update"', html)
+            self.assertIn('id="prompt-index-task"', html)
+            self.assertIn(">从URL更新</button>", html)
+            self.assertIn(">从官方API生成</button>", html)
+            self.assertIn("updateDanbooruIndex(\"official_api\")", script)
+            self.assertIn("if (runId) await openTaskCenter(runId);", script)
+            self.assertIn("index.update_task", script)
+            self.assertIn('name="danbooru_api_base_url" type="url"', html)
+            self.assertIn('name="danbooru_api_proxy_url" type="url"', html)
+            self.assertIn('<option value="identity">身份优先</option>', html)
+            self.assertIn('<option value="full">五类全量</option>', html)
+            for field in (
+                "danbooru_api_general_min_posts",
+                "danbooru_api_meta_min_posts",
+                "danbooru_api_page_size",
+                "danbooru_api_request_interval_ms",
+                "danbooru_api_timeout",
+                "danbooru_api_max_records",
+            ):
+                self.assertIn(f'"{field}",', script)
+            self.assertIn('"danbooru_api_include_aliases",', script)
+            self.assertIn("settings.danbooru_api_base_url", script)
         self.assertEqual(scripts[0], scripts[1])
         self.assertEqual(styles[0], styles[1])
+
+    def test_danbooru_update_payload_is_strict_and_backward_compatible(self) -> None:
+        self.assertEqual(validate_danbooru_update_payload(None), {"mode": "url"})
+        self.assertEqual(validate_danbooru_update_payload({}), {"mode": "url"})
+        self.assertEqual(
+            validate_danbooru_update_payload({"mode": " OFFICIAL_API "}),
+            {"mode": "official_api"},
+        )
+        with self.assertRaises(V170ApiValidationError):
+            validate_danbooru_update_payload({"mode": 1})
+        with self.assertRaises(V170ApiValidationError):
+            validate_danbooru_update_payload(
+                {"mode": "url", "unexpected": True}
+            )
 
 
 if __name__ == "__main__":

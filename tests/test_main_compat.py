@@ -824,6 +824,18 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                             "aliases": ["roxy"],
                             "count": 456,
                         },
+                        {
+                            "tag": "shared_character",
+                            "category": "character",
+                            "aliases": ["shared_identity"],
+                            "count": 100,
+                        },
+                        {
+                            "tag": "shared_artist",
+                            "category": "artist",
+                            "aliases": ["shared_identity"],
+                            "count": 200,
+                        },
                     ],
                 }
             ).encode(),
@@ -884,6 +896,25 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(batch["queries"][0]["verified"])
         self.assertFalse(batch["queries"][1]["verified"])
         self.assertTrue(batch["queries"][2]["verified"])
+
+        ambiguous_batch = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="shared_identity",
+                    mode="batch",
+                    category="character",
+                )
+            )
+        )
+        self.assertFalse(ambiguous_batch["queries"][0]["verified"])
+        self.assertEqual(
+            {
+                item["canonical_tag"]
+                for item in ambiguous_batch["queries"][0]["results"]
+            },
+            {"shared_character", "shared_artist"},
+        )
 
         invalid_limit = json.loads(
             asyncio.run(
@@ -1034,6 +1065,10 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
     def test_danbooru_background_failure_keeps_existing_status(self) -> None:
         async def run_case() -> None:
+            task_module = importlib.import_module(
+                "astrbot_plugin_comfy_anima.services.task_store"
+            )
+
             class Index:
                 @staticmethod
                 def status():
@@ -1043,28 +1078,41 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                 async def update_from_url(*_args, **_kwargs):
                     raise self.main.DanbooruIndexError("network unavailable")
 
-            plugin = object.__new__(self.main.ComfyAnimaPlugin)
-            plugin.settings = types.SimpleNamespace(
-                danbooru_index_url="https://example.test/tags.json",
-                danbooru_index_timeout=5,
-                danbooru_index_max_size_mb=1,
-            )
-            plugin._danbooru_index = Index()
-            plugin._danbooru_update_task = None
-            plugin._danbooru_update_state = {
-                "id": "",
-                "status": "idle",
-                "started_at": 0.0,
-                "finished_at": 0.0,
-                "error": "",
-            }
-            plugin._background_task_runs = {}
+            with tempfile.TemporaryDirectory() as directory:
+                plugin = object.__new__(self.main.ComfyAnimaPlugin)
+                plugin.settings = types.SimpleNamespace(
+                    danbooru_index_url="https://example.test/tags.json",
+                    danbooru_index_timeout=5,
+                    danbooru_index_max_size_mb=1,
+                )
+                plugin._danbooru_index = Index()
+                plugin._danbooru_update_task = None
+                plugin._danbooru_update_state = {
+                    "id": "",
+                    "status": "idle",
+                    "started_at": 0.0,
+                    "finished_at": 0.0,
+                    "error": "",
+                }
+                plugin._task_store = task_module.TaskStore(
+                    Path(directory) / "tasks.sqlite3"
+                )
+                plugin._task_store_error = ""
+                plugin._danbooru_cancel_events = {}
+                plugin._background_task_runs = {}
 
-            response = await plugin.web_ui_update_danbooru_index()
-            self.assertEqual(response["task"]["status"], "running")
-            await plugin._danbooru_update_task
-            self.assertEqual(plugin._danbooru_update_state["status"], "failed")
-            self.assertEqual(plugin._danbooru_index.status()["revision"], "old-revision")
+                response = await plugin.web_ui_update_danbooru_index()
+                self.assertIn(response["task"]["status"], {"queued", "running"})
+                await plugin._danbooru_update_task
+                stored = plugin._task_store.get_task(response["run_id"])
+                self.assertEqual(stored["status"], "failed")
+                self.assertEqual(
+                    plugin._danbooru_update_state["status"], "failed"
+                )
+                self.assertEqual(
+                    plugin._danbooru_index.status()["revision"], "old-revision"
+                )
+                plugin._task_store.close()
 
         asyncio.run(run_case())
 
@@ -1451,6 +1499,73 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(plugin._scene_needs_lora_tools("风格GZC，原神甘雨"))
         self.assertTrue(plugin._scene_needs_lora_tools("风格使用 UNKNOWN，JK制服"))
 
+    def test_danbooru_auto_update_status_is_due_after_success_interval(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            danbooru_auto_update_enabled=True,
+            danbooru_auto_update_interval_hours=168,
+        )
+        plugin._danbooru_update_task = None
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.main.TaskStore(Path(directory) / "tasks.sqlite3")
+            try:
+                created_at = time.time() - 8 * 24 * 3600
+                run_id = store.create_task(
+                    "danbooru_index_update",
+                    mode="official_api",
+                    requested_by="scheduler",
+                    timestamp=created_at,
+                )
+                store.start_task(run_id, timestamp=created_at + 1)
+                store.finish_task(
+                    run_id,
+                    "succeeded",
+                    timestamp=created_at + 2,
+                )
+                plugin._task_store = store
+
+                status = plugin._danbooru_auto_update_status()
+            finally:
+                store.close()
+
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["due"])
+        self.assertEqual(status["interval_hours"], 168)
+        self.assertEqual(status["last_status"], "succeeded")
+
+    def test_failed_danbooru_auto_update_uses_six_hour_retry_backoff(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            danbooru_auto_update_enabled=True,
+            danbooru_auto_update_interval_hours=168,
+        )
+        plugin._danbooru_update_task = None
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.main.TaskStore(Path(directory) / "tasks.sqlite3")
+            try:
+                created_at = time.time() - 7 * 3600
+                run_id = store.create_task(
+                    "danbooru_index_update",
+                    mode="official_api",
+                    requested_by="scheduler",
+                    timestamp=created_at,
+                )
+                store.start_task(run_id, timestamp=created_at + 1)
+                store.finish_task(
+                    run_id,
+                    "failed",
+                    error_code="network_error",
+                    timestamp=created_at + 2,
+                )
+                plugin._task_store = store
+
+                status = plugin._danbooru_auto_update_status()
+            finally:
+                store.close()
+
+        self.assertTrue(status["due"])
+        self.assertEqual(status["last_status"], "failed")
+
     def test_direct_draw_reports_prompt_protocol_failure_without_handler_crash(
         self,
     ) -> None:
@@ -1661,6 +1776,81 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prompt, "1girl, original character, green hair, forest")
         self.assertEqual(negative, "bad hands")
+
+    def test_undeclared_unknown_qualified_character_cannot_pass_through(self) -> None:
+        async def run_case() -> None:
+            plugin, _events = self._llm_character_validation_plugin()
+
+            async def no_external(*_args, **_kwargs):
+                return self.main.CharacterIdentityResolution(), None
+
+            plugin._resolve_current_lora_gallery_identity = no_external
+            with self.assertRaises(self.main.CharacterPromptCompileError) as caught:
+                await plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, viola_\(bang_dream!\), maid, selfie",
+                    negative_prompt="",
+                    character_queries=(),
+                    user_request="画一个女仆自拍",
+                    records=(),
+                    source="test",
+                )
+
+            self.assertEqual(caught.exception.code, "character_resolution_unverified")
+
+        asyncio.run(run_case())
+
+    def test_character_validation_retries_once_after_index_revision_change(self) -> None:
+        async def run_case() -> None:
+            plugin, events = self._llm_character_validation_plugin()
+
+            class ChangingIndex(_ExactCharacterIndex):
+                def __init__(self):
+                    self.status_calls = 0
+
+                def status(self):
+                    self.status_calls += 1
+                    revision = "old" if self.status_calls == 1 else "new"
+                    return {
+                        "ready": True,
+                        "schema_version": "2",
+                        "revision": revision,
+                        "sha256": revision,
+                    }
+
+            plugin._danbooru_index = ChangingIndex()
+            job = self.main.GenerationJob("user", "draw", 0.0)
+            prompt, _negative = await plugin._compile_llm_character_prompt(
+                job,
+                prompt="1girl, original character, forest",
+                negative_prompt="",
+                character_queries=(),
+                user_request="画一个原创角色",
+                records=(),
+                source="test",
+            )
+
+            self.assertEqual(prompt, "1girl, original character, forest")
+            self.assertEqual(job.danbooru_revision_signature, "2|new|new")
+            self.assertTrue(
+                any(
+                    "llm_character_validation_revision_retry" in event
+                    for event in events
+                )
+            )
+
+        asyncio.run(run_case())
+
+    def test_final_character_gate_rejects_revision_drift(self) -> None:
+        async def run_case() -> None:
+            plugin, _events = self._llm_character_validation_plugin()
+            with self.assertRaisesRegex(self.main.LoraWorkflowError, "发生变化"):
+                await plugin._verified_prompt_character_canonicals(
+                    r"1girl, rio_\(blue_archive\)",
+                    expected_revision_signature="2|older|older",
+                )
+
+        asyncio.run(run_case())
 
     def test_inferred_base_character_wins_over_unrequested_variant(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2236,6 +2426,63 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kept, (selection,))
         self.assertEqual(overrides, {key: "toki (blue archive)"})
         self.assertEqual(filtered, ())
+
+    def test_exact_bound_lora_without_trigger_uses_canonical_base_anchor(self) -> None:
+        record = LoraRecord(
+            "toki_no_trigger.safetensors",
+            category="character",
+            character_name="Asuma Toki",
+            source_work="Blue Archive",
+            trigger_words=(),
+        )
+
+        anchor = self.main.ComfyAnimaPlugin._identity_anchor_activation_trigger(
+            record,
+            "toki_(blue_archive)",
+        )
+
+        self.assertEqual(anchor, "toki")
+
+    def test_chinese_only_lora_metadata_binds_through_localized_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "phoebe_(wuthering_waves)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "wuthering_waves",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            plugin._localized_character_aliases = (
+                self.main.LocalizedCharacterAliasIndex()
+            )
+            plugin._runtime_semantic_index = LoraSemanticIndex.empty
+            record = LoraRecord(
+                "phoebe.safetensors",
+                category="character",
+                character_name="菲比",
+                source_work="鸣潮",
+                trigger_words=(),
+            )
+
+            canonicals = asyncio.run(
+                plugin._verified_record_character_canonicals(record)
+            )
+
+        self.assertEqual(canonicals, ("phoebe_(wuthering_waves)",))
 
     def test_variant_trigger_binds_through_exact_character_and_work_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5090,7 +5337,12 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
                                 "category": "character",
                                 "aliases": ["miku_hatsune"],
                                 "count": 128767,
-                            }
+                            },
+                            {
+                                "tag": "vocaloid",
+                                "category": "copyright",
+                                "count": 900000,
+                            },
                         ]
                     }
                 ).encode(),

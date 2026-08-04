@@ -239,7 +239,19 @@ class PluginSettings:
     danbooru_validation_mode: str = "report"
     danbooru_index_url: str = ""
     danbooru_index_timeout: int = 30
-    danbooru_index_max_size_mb: int = 64
+    danbooru_index_max_size_mb: int = 256
+    danbooru_api_base_url: str = "https://danbooru.donmai.us"
+    danbooru_api_proxy_url: str = ""
+    danbooru_api_mode: str = "identity"
+    danbooru_api_general_min_posts: int = 10
+    danbooru_api_meta_min_posts: int = 10
+    danbooru_api_page_size: int = 1000
+    danbooru_api_request_interval_ms: int = 750
+    danbooru_api_timeout: int = 60
+    danbooru_api_max_records: int = 2_000_000
+    danbooru_api_include_aliases: bool = True
+    danbooru_auto_update_enabled: bool = False
+    danbooru_auto_update_interval_hours: int = 168
     enable_prompt_asset_library: bool = True
     prompt_asset_remote_import_enabled: bool = False
     prompt_asset_max_download_mb: int = 16
@@ -597,8 +609,64 @@ class PluginSettings:
                 _as_int(data.get("danbooru_index_timeout"), 30, 5),
             ),
             danbooru_index_max_size_mb=min(
-                128,
-                _as_int(data.get("danbooru_index_max_size_mb"), 64, 1),
+                512,
+                _as_int(data.get("danbooru_index_max_size_mb"), 256, 1),
+            ),
+            danbooru_api_base_url=(
+                str(
+                    data.get(
+                        "danbooru_api_base_url",
+                        "https://danbooru.donmai.us",
+                    )
+                ).strip()
+                or "https://danbooru.donmai.us"
+            ),
+            danbooru_api_proxy_url=str(
+                data.get("danbooru_api_proxy_url", "")
+            ).strip(),
+            danbooru_api_mode=(
+                str(data.get("danbooru_api_mode", "identity")).strip().casefold()
+                if str(data.get("danbooru_api_mode", "identity")).strip().casefold()
+                in {"identity", "full"}
+                else "identity"
+            ),
+            danbooru_api_general_min_posts=min(
+                1_000_000,
+                _as_int(data.get("danbooru_api_general_min_posts"), 10, 0),
+            ),
+            danbooru_api_meta_min_posts=min(
+                1_000_000,
+                _as_int(data.get("danbooru_api_meta_min_posts"), 10, 0),
+            ),
+            danbooru_api_page_size=min(
+                1000,
+                _as_int(data.get("danbooru_api_page_size"), 1000, 1),
+            ),
+            danbooru_api_request_interval_ms=min(
+                10_000,
+                _as_int(data.get("danbooru_api_request_interval_ms"), 750, 250),
+            ),
+            danbooru_api_timeout=min(
+                300,
+                _as_int(data.get("danbooru_api_timeout"), 60, 10),
+            ),
+            danbooru_api_max_records=min(
+                3_000_000,
+                _as_int(data.get("danbooru_api_max_records"), 2_000_000, 1_000),
+            ),
+            danbooru_api_include_aliases=_as_bool(
+                data.get("danbooru_api_include_aliases"), True
+            ),
+            danbooru_auto_update_enabled=_as_bool(
+                data.get("danbooru_auto_update_enabled"), False
+            ),
+            danbooru_auto_update_interval_hours=min(
+                2160,
+                _as_int(
+                    data.get("danbooru_auto_update_interval_hours"),
+                    168,
+                    24,
+                ),
             ),
             enable_prompt_asset_library=_as_bool(
                 data.get("enable_prompt_asset_library"), True
@@ -877,3 +945,4 @@ class GenerationJob:
     llm_elapsed_seconds: float = 0.0
     llm_call_count: int = 0
     llm_external_character_authorities: dict[str, str] = field(default_factory=dict)
+    danbooru_revision_signature: str = ""

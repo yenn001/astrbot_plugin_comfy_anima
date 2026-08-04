@@ -53,6 +53,24 @@ class CharacterIdentityResolverTests(unittest.TestCase):
                     "count": 28000,
                 },
                 {
+                    "tag": "hatsune_miku",
+                    "category": "character",
+                    "aliases": ["miku_hatsune"],
+                    "count": 180000,
+                },
+                {
+                    "tag": "vocaloid",
+                    "category": "copyright",
+                    "aliases": [],
+                    "count": 900000,
+                },
+                {
+                    "tag": "blue_archive",
+                    "category": "copyright",
+                    "aliases": [],
+                    "count": 500000,
+                },
+                {
                     "tag": "honkai:_star_rail",
                     "category": "copyright",
                     "aliases": [],
@@ -139,6 +157,66 @@ class CharacterIdentityResolverTests(unittest.TestCase):
         self.assertTrue(result.verified)
         self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
 
+    def test_qualifierless_character_keeps_copyright_exact_work_separate(
+        self,
+    ) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="Hatsune Miku",
+            identity_candidates=("hatsune_miku",),
+            work_hints=("vocaloid",),
+            allow_discovery=False,
+        )
+
+        self.assertTrue(result.verified)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(result.canonical_tag, "hatsune_miku")
+        self.assertEqual(result.confirmed_work, "vocaloid")
+        self.assertEqual(result.match_variant, "provider_candidate_exact")
+
+    def test_qualifierless_character_rejects_unverified_work_hint(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="Hatsune Miku",
+            identity_candidates=("hatsune_miku",),
+            work_hints=("not_a_real_work",),
+            allow_discovery=False,
+        )
+
+        self.assertFalse(result.verified)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(result.confirmed_work, "")
+
+    def test_qualifierless_character_rejects_multiple_exact_work_hints(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="Hatsune Miku",
+            canonical_tag="hatsune_miku",
+            work_hints=("vocaloid", "blue_archive"),
+            allow_discovery=False,
+        )
+
+        self.assertFalse(result.verified)
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(result.match_variant, "copyright_exact_conflict")
+        self.assertEqual(
+            set(result.conflicting_works),
+            {"vocaloid", "blue_archive"},
+        )
+
+    def test_explicit_wrong_qualifier_cannot_fall_back_to_bare_character(
+        self,
+    ) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="hatsune_miku",
+            canonical_tag="hatsune_miku_(blue_archive)",
+            allow_discovery=False,
+        )
+
+        self.assertFalse(result.verified)
+        self.assertFalse(result.ambiguous)
+
     def test_conflicting_exact_candidates_fail_closed(self) -> None:
         result = resolve_character_identity(
             self.index,
@@ -164,6 +242,86 @@ class CharacterIdentityResolverTests(unittest.TestCase):
 
         self.assertTrue(result.verified)
         self.assertEqual(result.canonical_tag, "toki_(blue_archive)")
+
+    def test_global_ambiguous_alias_cannot_reenter_through_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "hero_(fixture_work)",
+                                "category": "character",
+                                "aliases": ["shared_identity"],
+                                "count": 100,
+                            },
+                            {
+                                "tag": "fixture_artist",
+                                "category": "artist",
+                                "aliases": ["shared_identity"],
+                                "count": 200,
+                            },
+                            {
+                                "tag": "fixture_work",
+                                "category": "copyright",
+                                "count": 300,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            result = resolve_character_identity(
+                index,
+                target_query="shared identity",
+                identity_candidates=("shared_identity",),
+                work_hints=("fixture_work",),
+                allow_discovery=True,
+            )
+
+        self.assertFalse(result.verified)
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(result.match_variant, "global_alias_ambiguous")
+        self.assertIn("hero_(fixture_work)", result.candidates)
+
+    def test_wrong_category_canonical_cannot_be_reinterpreted_as_character(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "shared", "category": "general", "count": 300},
+                            {
+                                "tag": "hero_(fixture_work)",
+                                "category": "character",
+                                "aliases": ["shared"],
+                                "count": 100,
+                            },
+                            {
+                                "tag": "fixture_work",
+                                "category": "copyright",
+                                "count": 300,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            result = resolve_character_identity(
+                index,
+                target_query="shared",
+                identity_candidates=("shared",),
+                work_hints=("fixture_work",),
+                allow_discovery=True,
+            )
+
+        self.assertFalse(result.verified)
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(result.match_variant, "canonical_category_mismatch")
 
     def test_user_adjacent_alias_selects_base_identity_without_lora(self) -> None:
         result = resolve_user_adjacent_character_alias(
@@ -422,6 +580,45 @@ class CharacterIdentityResolverTests(unittest.TestCase):
                 index,
                 target_query="流萤",
                 canonical_tag="firefly_(honkai_star_rail)",
+                allow_discovery=False,
+            )
+
+        self.assertFalse(result.verified)
+        self.assertFalse(result.ambiguous)
+
+    def test_cross_category_work_alias_cannot_bypass_global_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "hero_(foo_bar)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "foo_bar",
+                                "category": "copyright",
+                                "aliases": ["foo-bar"],
+                            },
+                            {
+                                "tag": "foo_artist",
+                                "category": "artist",
+                                "aliases": ["foo-bar"],
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            result = resolve_character_identity(
+                index,
+                target_query="hero from foo-bar",
+                canonical_tag="hero_(foo-bar)",
+                identity_candidates=("hero",),
+                work_hints=("foo-bar",),
                 allow_discovery=False,
             )
 

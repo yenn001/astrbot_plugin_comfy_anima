@@ -113,6 +113,22 @@ class LocalizedCharacterResolution:
 # ``菲比`` is deliberately work-required because the same localized name can map
 # to several unrelated Phoebe characters.
 _BUILTIN_ENTRIES = (
+    *(
+        LocalizedAliasEntry(
+            alias=alias,
+            canonical_tag="hatsune_miku",
+            category="character",
+            work="vocaloid",
+            locale=locale,
+            source="builtin-curated-fact",
+            license="facts-only",
+            revision="2026-08-04",
+        )
+        for alias, locale in (
+            ("初音未来", "zh-CN"),
+            ("初音未來", "zh-TW"),
+        )
+    ),
     LocalizedAliasEntry(
         alias="菲比",
         canonical_tag="phoebe_(wuthering_waves)",
@@ -351,11 +367,40 @@ class LocalizedCharacterAliasIndex:
                 and re.search(r"[a-z]", normalized_name)
             ):
                 confirmed_work = confirmed_works[0]
-                candidate_tag = (
-                    normalized_name
-                    if canonical_work_for_character(normalized_name)
-                    else f"{normalized_name}_({confirmed_work})"
-                )
+                direct_lookup = index.lookup(normalized_name, "character")
+                if bool(getattr(direct_lookup, "verified", False)):
+                    canonical = normalize_tag(
+                        direct_lookup.canonical_tag or direct_lookup.tag
+                    )
+                    canonical_work = canonical_work_for_character(canonical)
+                    exact_qualifierless = bool(
+                        not canonical_work
+                        and canonical == normalized_name
+                        and str(
+                            getattr(direct_lookup, "match_type", "") or ""
+                        ).casefold()
+                        in {"canonical", "exact"}
+                    )
+                    if canonical_work == confirmed_work or exact_qualifierless:
+                        candidate = LocalizedAliasCandidate(
+                            canonical_tag=canonical,
+                            category="character",
+                            matched_alias=str(name).strip(),
+                            work=confirmed_work,
+                            verified=True,
+                            match_type="localized_work_ascii_character_exact",
+                            source="derived-localized-work",
+                        )
+                        return LocalizedCharacterResolution(
+                            canonical_tag=canonical,
+                            verified=True,
+                            match_type=candidate.match_type,
+                            candidate_count=1,
+                            candidates=(candidate,),
+                            confirmed_work=confirmed_work,
+                        )
+
+                candidate_tag = f"{normalized_name}_({confirmed_work})"
                 lookup = index.lookup(candidate_tag, "character")
                 if bool(getattr(lookup, "verified", False)):
                     canonical = normalize_tag(lookup.canonical_tag or lookup.tag)
@@ -416,15 +461,20 @@ class LocalizedCharacterAliasIndex:
                 character_lookup.canonical_tag or character_lookup.tag
             )
             canonical_work = canonical_work_for_character(canonical)
-            if entry.work and canonical_work != entry.work:
+            effective_work = canonical_work or entry.work
+            if entry.work and canonical_work and canonical_work != entry.work:
                 continue
-            if confirmed_works and canonical_work not in confirmed_works:
+            if confirmed_works and effective_work not in confirmed_works:
                 continue
-            if canonical_work and not self._verified_copyright(index, canonical_work):
+            if effective_work and not self._verified_copyright(index, effective_work):
                 continue
             verified_entries.append(
                 LocalizedAliasEntry(
-                    **{**entry.__dict__, "canonical_tag": canonical, "work": canonical_work}
+                    **{
+                        **entry.__dict__,
+                        "canonical_tag": canonical,
+                        "work": effective_work,
+                    }
                 )
             )
         unique = {
@@ -484,6 +534,28 @@ class LocalizedCharacterAliasIndex:
         effective_limit = max(1, min(int(limit), 12))
         name, work = split_localized_character_query(query)
         if requested_category in {"", "character"}:
+            if (
+                work
+                and contains_localized_text(name)
+                and not self.resolve_work(work, index)
+                and work.isascii()
+                and re.search(r"[A-Za-z]", work)
+            ):
+                adjacent = index.lookup(work, "character")
+                if bool(getattr(adjacent, "verified", False)):
+                    canonical = normalize_tag(adjacent.canonical_tag or adjacent.tag)
+                    if canonical:
+                        return (
+                            LocalizedAliasCandidate(
+                                canonical_tag=canonical,
+                                category="character",
+                                matched_alias=work,
+                                work=canonical_work_for_character(canonical),
+                                verified=True,
+                                match_type="localized_adjacent_ascii_alias_exact",
+                                source="user-adjacent-alias",
+                            ),
+                        )
             resolution = self.resolve_character(name, work, index)
             if resolution.candidates:
                 return resolution.candidates[:effective_limit]

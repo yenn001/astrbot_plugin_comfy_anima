@@ -51,6 +51,7 @@ class CharacterPromptEvidence:
     match_variant: str = ""
     query_count: int = 0
     candidate_count: int = 0
+    confirmed_work: str = ""
 
 
 @dataclass(frozen=True)
@@ -230,7 +231,13 @@ def compile_character_prompt(
     allowed_keys = frozenset(canonical_by_key)
     canonical_tags = tuple(dict.fromkeys(canonical_by_key.values()))
     expected_works = frozenset(
-        work for canonical in canonical_tags if (work := _work_qualifier(canonical))
+        work
+        for evidence in verified
+        for value in (
+            _work_qualifier(evidence.canonical_tag),
+            normalize_tag(evidence.confirmed_work),
+        )
+        if (work := normalize_tag(value))
     )
     character_by_source = {
         _prompt_term_key(source): normalize_tag(canonical)
@@ -269,7 +276,7 @@ def compile_character_prompt(
             continue
         exact_copyright = copyright_by_source.get(key, "")
         if exact_copyright:
-            if expected_works and normalize_tag(exact_copyright) not in expected_works:
+            if normalize_tag(exact_copyright) not in expected_works:
                 removed.append(term)
                 continue
             kept.append(escape_prompt_tag(exact_copyright))

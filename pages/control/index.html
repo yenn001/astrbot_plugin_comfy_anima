@@ -265,6 +265,20 @@
                 <label><span>索引超时（秒）</span><input name="danbooru_index_timeout" type="number" min="5" max="300" step="1"></label>
                 <label><span>索引上限（MB）</span><input name="danbooru_index_max_size_mb" type="number" min="1" max="512" step="1"></label>
                 <p class="span-4 muted">终止守卫会完整缓冲普通聊天回复，并检查本轮 LoRA、Danbooru 与 Prompt Plan 查询是否全部成功；明确绘图最终必须只有一个合法 pic，纯资产查询误出的 pic 会被移除。Composer 只做本地分层、去重、冲突检查与确定性负面词补充，不展示模型思维过程。Danbooru guarded 只约束 LLM 声明的角色、作品与画师硬锚点，不拦截用户原始 Tags 或 LoRA 触发词。</p>
+                <div class="span-4 section-divider"><span>Danbooru 官方 API 索引生成器</span></div>
+                <label class="span-2"><span>官方 API / 兼容镜像根地址</span><input name="danbooru_api_base_url" type="url" placeholder="https://danbooru.donmai.us"></label>
+                <label class="span-2"><span>HTTP 代理（可选）</span><input name="danbooru_api_proxy_url" type="url" placeholder="http://192.168.10.x:7890（不要填写凭据）"></label>
+                <label><span>生成模式</span><select name="danbooru_api_mode"><option value="identity">身份优先</option><option value="full">五类全量</option></select></label>
+                <label><span>General 最低帖子数</span><input name="danbooru_api_general_min_posts" type="number" min="0" max="1000000" step="1"></label>
+                <label><span>Meta 最低帖子数</span><input name="danbooru_api_meta_min_posts" type="number" min="0" max="1000000" step="1"></label>
+                <label class="toggle"><input name="danbooru_api_include_aliases" type="checkbox"><span>抓取 active Tag Alias</span></label>
+                <label><span>单页记录数</span><input name="danbooru_api_page_size" type="number" min="1" max="1000" step="1"></label>
+                <label><span>请求间隔（毫秒）</span><input name="danbooru_api_request_interval_ms" type="number" min="250" max="10000" step="1"></label>
+                <label><span>单次请求超时（秒）</span><input name="danbooru_api_timeout" type="number" min="10" max="300" step="1"></label>
+                <label><span>最大 canonical 数</span><input name="danbooru_api_max_records" type="number" min="1000" max="3000000" step="1"></label>
+                <label class="toggle"><input name="danbooru_auto_update_enabled" type="checkbox"><span>启用定期自动更新</span></label>
+                <label><span>自动更新周期（小时）</span><input name="danbooru_auto_update_interval_hours" type="number" min="24" max="2160" step="1"></label>
+                <p class="span-4 muted">身份优先模式会全量抓取 Character、Copyright 与 Artist，并按帖子数阈值筛选 General / Meta；五类全量模式耗时和磁盘占用更高。生成任务使用单并发、ID 游标、断点恢复和原子切换；服务器无法直连时请配置无凭据 HTTP 代理或可信局域网镜像。</p>
                 <label class="span-4"><span>System Prompt</span><textarea name="auto_draw_system_prompt" rows="9" placeholder="留空使用插件内置导演提示词"></textarea></label>
                 <div class="span-4 section-divider"><span>在线图片反推</span></div>
                 <label class="toggle"><input name="enable_reverse_prompt" type="checkbox"><span>启用 /反推 与 /反推画图</span></label>
@@ -590,7 +604,7 @@
               <button id="task-refresh" class="secondary inverse" type="button">刷新任务</button>
             </div>
             <div class="task-toolbar">
-              <label><span>任务类型</span><select id="task-type-filter"><option value="">全部类型</option><option value="lora_semantic_analysis">LoRA 语义建档</option><option value="lora_archive">旧版 LoRA 建档</option><option value="lora_metadata">LoRA 元数据</option><option value="lora_download">LoRA 下载</option><option value="asset_delete">资产删除</option><option value="reverse_prompt">图片反推</option><option value="reverse_draw">反推画图</option><option value="rtx_upscale">RTX 放大</option><option value="inpaint">局部重绘</option></select></label>
+              <label><span>任务类型</span><select id="task-type-filter"><option value="">全部类型</option><option value="lora_semantic_analysis">LoRA 语义建档</option><option value="lora_archive">旧版 LoRA 建档</option><option value="lora_metadata">LoRA 元数据</option><option value="lora_download">LoRA 下载</option><option value="danbooru_index_update">Danbooru 索引更新</option><option value="asset_delete">资产删除</option><option value="reverse_prompt">图片反推</option><option value="reverse_draw">反推画图</option><option value="rtx_upscale">RTX 放大</option><option value="inpaint">局部重绘</option></select></label>
               <label><span>运行状态</span><select id="task-status-filter"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="succeeded">成功</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="timed_out">超时</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option></select></label>
               <p id="task-list-status" class="task-list-status" role="status">等待读取持久任务记录…</p>
             </div>
@@ -849,8 +863,8 @@
               </article>
               <article class="card dark-card prompt-index-card">
                 <div class="card-head"><div><p class="eyebrow">TAG LEDGER</p><h2>Danbooru 索引</h2></div><span id="prompt-index-badge" class="ticket-tag">NOT READ</span></div>
-                <dl class="prompt-index-facts"><div><dt>Tags</dt><dd id="prompt-index-tags">0</dd></div><div><dt>Aliases</dt><dd id="prompt-index-aliases">0</dd></div><div><dt>版本</dt><dd id="prompt-index-revision">—</dd></div><div><dt>更新时间</dt><dd id="prompt-index-updated">—</dd></div><div class="wide"><dt>来源</dt><dd id="prompt-index-source">尚未配置或导入</dd></div><div class="wide"><dt>分类</dt><dd id="prompt-index-categories">—</dd></div></dl>
-                <div class="prompt-action-row"><button id="prompt-index-update" class="secondary inverse" type="button">立即更新索引</button><button id="prompt-status-refresh" class="ghost inverse" type="button">刷新状态</button></div><p id="prompt-index-status" class="live-line" role="status">更新失败时会继续保留原有索引。</p>
+                <dl class="prompt-index-facts"><div><dt>Tags</dt><dd id="prompt-index-tags">0</dd></div><div><dt>Alias 边</dt><dd id="prompt-index-aliases">0</dd></div><div><dt>唯一 Alias</dt><dd id="prompt-index-unique-aliases">0</dd></div><div><dt>歧义 / 冲突</dt><dd id="prompt-index-ambiguous-aliases">0 / 0</dd></div><div><dt>版本</dt><dd id="prompt-index-revision">—</dd></div><div><dt>导入时间</dt><dd id="prompt-index-updated">—</dd></div><div><dt>源数据更新</dt><dd id="prompt-index-source-updated">—</dd></div><div><dt>抓取截止</dt><dd id="prompt-index-source-cutoff">—</dd></div><div class="wide"><dt>本地化别名</dt><dd id="prompt-index-localized">—</dd></div><div class="wide"><dt>来源</dt><dd id="prompt-index-source">尚未配置或导入</dd></div><div class="wide"><dt>分类</dt><dd id="prompt-index-categories">—</dd></div></dl>
+                <div class="prompt-action-row"><button id="prompt-index-update" class="secondary inverse" type="button">从URL更新</button><button id="prompt-index-official-update" class="secondary inverse" type="button">从官方API生成</button><button id="prompt-index-task" class="ghost inverse" type="button" hidden>查看索引任务</button><button id="prompt-status-refresh" class="ghost inverse" type="button">刷新状态</button></div><p id="prompt-index-status" class="live-line" role="status">更新任务会进入任务中心；失败或取消时继续保留原有索引。</p>
               </article>
             </div>
             <article class="card prompt-result-card"><div class="card-head"><div><p class="eyebrow">COMPOSITION PROOF</p><h2>三层诊断结果</h2></div><span id="prompt-result-id" class="ticket-tag">NO RESULT</span></div><div id="prompt-diagnostic-result" class="prompt-diagnostic-result"><div class="empty-state">提交一条提示词后，这里会展示可验证的分层结果与修订记录。</div></div></article>

@@ -53,6 +53,7 @@ class _Controller:
         self.prompt_diagnostics_cleared = 0
         self.deleted_prompt_plan = None
         self.danbooru_updates = 0
+        self.danbooru_update_payloads = []
         self.experiment_checks = 0
         self.v170_calls = {}
 
@@ -164,9 +165,14 @@ class _Controller:
         self.prompt_diagnostics_cleared += 1
         return {"message": "cleared"}
 
-    async def web_ui_update_danbooru_index(self):
+    async def web_ui_update_danbooru_index(self, payload):
         self.danbooru_updates += 1
-        return {"message": "updated", "status": {"ready": True}}
+        self.danbooru_update_payloads.append(payload)
+        return {
+            "run_id": "danbooru-run-1",
+            "message": "updated",
+            "status": {"ready": True},
+        }
 
     async def web_ui_check_experimental_profiles(self):
         self.experiment_checks += 1
@@ -517,6 +523,16 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             "danbooru_index_url",
             "danbooru_index_timeout",
             "danbooru_index_max_size_mb",
+            "danbooru_api_base_url",
+            "danbooru_api_proxy_url",
+            "danbooru_api_mode",
+            "danbooru_api_general_min_posts",
+            "danbooru_api_meta_min_posts",
+            "danbooru_api_page_size",
+            "danbooru_api_request_interval_ms",
+            "danbooru_api_timeout",
+            "danbooru_api_max_records",
+            "danbooru_api_include_aliases",
         )
         for field in fields:
             with self.subTest(field=field):
@@ -536,6 +552,40 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             "/api/experiments/check",
         ):
             self.assertIn(route, self.javascript)
+        self.assertIn('value="danbooru_index_update"', self.html)
+        self.assertIn('id="prompt-index-update"', self.html)
+        self.assertIn('id="prompt-index-official-update"', self.html)
+        self.assertIn('id="prompt-index-task"', self.html)
+        for element_id in (
+            "prompt-index-unique-aliases",
+            "prompt-index-ambiguous-aliases",
+            "prompt-index-source-updated",
+            "prompt-index-source-cutoff",
+            "prompt-index-localized",
+        ):
+            self.assertIn(f'id="{element_id}"', self.html)
+        self.assertIn(">从URL更新</button>", self.html)
+        self.assertIn(">从官方API生成</button>", self.html)
+        self.assertIn("updateDanbooruIndex(\"url\")", self.javascript)
+        self.assertIn("updateDanbooruIndex(\"official_api\")", self.javascript)
+        self.assertIn("if (runId) await openTaskCenter(runId);", self.javascript)
+        self.assertIn("index.update_task", self.javascript)
+        self.assertIn('name="danbooru_api_base_url" type="url"', self.html)
+        self.assertIn('name="danbooru_api_proxy_url" type="url"', self.html)
+        self.assertIn('<option value="identity">身份优先</option>', self.html)
+        self.assertIn('<option value="full">五类全量</option>', self.html)
+        for field in (
+            "danbooru_api_general_min_posts",
+            "danbooru_api_meta_min_posts",
+            "danbooru_api_page_size",
+            "danbooru_api_request_interval_ms",
+            "danbooru_api_timeout",
+            "danbooru_api_max_records",
+        ):
+            with self.subTest(serialized_number=field):
+                self.assertIn(f'"{field}",', self.javascript)
+        self.assertIn('"danbooru_api_include_aliases",', self.javascript)
+        self.assertIn("settings.danbooru_api_base_url", self.javascript)
         self.assertNotIn("chain-of-thought", self.html.casefold())
         self.assertNotIn("思维链", self.html)
 
@@ -549,7 +599,6 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             (plugin_root / "web" / "app.css").read_bytes(),
             (plugin_root / "pages" / "control" / "app.css").read_bytes(),
         )
-
     def test_preset_editor_supports_alias_note_edit_and_trigger_provenance(self) -> None:
         for field in ("identifier", "aliases", "note", "trigger_words"):
             self.assertIn(f'name="{field}"', self.html)
@@ -1126,12 +1175,48 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleared.status, 200)
         self.assertEqual(self.controller.prompt_diagnostics_cleared, 1)
 
+        missing_danbooru_csrf = await self.client.post(
+            "/api/danbooru/update",
+            json={"mode": "official_api"},
+        )
+        self.assertEqual(missing_danbooru_csrf.status, 403)
+
         updated = await self.client.post(
             "/api/danbooru/update",
             headers={"X-CSRF-Token": csrf},
         )
         self.assertEqual(updated.status, 200)
         self.assertEqual(self.controller.danbooru_updates, 1)
+        self.assertEqual(
+            self.controller.danbooru_update_payloads[-1],
+            {"mode": "url"},
+        )
+        updated_payload = await updated.json()
+        self.assertEqual(updated_payload["data"]["run_id"], "danbooru-run-1")
+
+        official = await self.client.post(
+            "/api/danbooru/update",
+            json={"mode": "official_api"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(official.status, 200)
+        self.assertEqual(
+            self.controller.danbooru_update_payloads[-1],
+            {"mode": "official_api"},
+        )
+
+        invalid_mode = await self.client.post(
+            "/api/danbooru/update",
+            json={"mode": "db_export"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(invalid_mode.status, 400)
+        extra_field = await self.client.post(
+            "/api/danbooru/update",
+            json={"mode": "url", "url": "https://example.test"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(extra_field.status, 400)
 
         experiments = await self.client.get("/api/experiments/check")
         self.assertEqual(experiments.status, 200)

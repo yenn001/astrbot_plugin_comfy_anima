@@ -158,6 +158,33 @@ def _bounded_bool(value: Any, field: str) -> bool:
     return value
 
 
+def validate_danbooru_update_payload(
+    payload: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Validate the shared standalone/native Danbooru update contract."""
+
+    if payload is None:
+        data: dict[str, Any] = {}
+    elif isinstance(payload, Mapping):
+        data = dict(payload)
+    else:
+        raise V170ApiValidationError("Danbooru 更新请求体必须是 JSON 对象")
+    unknown = sorted(set(data) - {"mode"})
+    if unknown:
+        raise V170ApiValidationError(
+            "Danbooru 更新请求包含不支持的字段：" + "、".join(unknown)
+        )
+    raw_mode = data.get("mode", "url")
+    if not isinstance(raw_mode, str):
+        raise V170ApiValidationError("Danbooru 更新模式必须是字符串")
+    mode = raw_mode.strip().casefold() or "url"
+    if mode not in {"url", "official_api"}:
+        raise V170ApiValidationError(
+            "Danbooru 更新模式仅支持 url 或 official_api"
+        )
+    return {"mode": mode}
+
+
 def _bounded_text_list(
     value: Any,
     field: str,
@@ -902,7 +929,9 @@ class PluginPageApi:
         if method == "DELETE" and path == "/api/prompt/diagnostics":
             return await self._controller.web_ui_clear_prompt_diagnostics()
         if method == "POST" and path == "/api/danbooru/update":
-            return await self._controller.web_ui_update_danbooru_index()
+            return await self._controller.web_ui_update_danbooru_index(
+                validate_danbooru_update_payload(body)
+            )
         if method == "GET" and path == "/api/experiments/check":
             return await self._controller.web_ui_check_experimental_profiles()
 
@@ -1238,6 +1267,7 @@ __all__ = [
     "V170ApiPayloadTooLargeError",
     "V170ApiValidationError",
     "decode_plugin_gateway_body",
+    "validate_danbooru_update_payload",
     "validate_lora_preview_query",
     "validate_lora_preview_response",
     "validate_prompt_asset_facets_query",

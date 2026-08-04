@@ -5,6 +5,7 @@ import csv
 import io
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -71,9 +72,21 @@ class DanbooruTagIndexTests(unittest.TestCase):
             normalize_tag(r"Ｋｅｉ  \(Blue   Archive\)"),
             "kei_(blue_archive)",
         )
+        self.assertEqual(
+            normalize_tag(r"Ｋｅｉ  \\\\(Blue   Archive\\\\)"),
+            "kei_(blue_archive)",
+        )
+        self.assertEqual(
+            normalize_tag(r"namespace\character_\\\(work\\\)"),
+            r"namespace\character_(work)",
+        )
         self.assertEqual(normalize_tag("Artist’s Style"), "artist's_style")
         self.assertEqual(
             escape_prompt_tag("kei_(blue_archive)"), r"kei_\(blue_archive\)"
+        )
+        self.assertEqual(
+            escape_prompt_tag(r"kei_\\\\(blue_archive\\\\)"),
+            r"kei_\(blue_archive\)",
         )
 
     def test_json_import_exact_canonical_and_alias_are_verified(self) -> None:
@@ -91,6 +104,11 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.assertEqual(len(status["sha256"]), 64)
         self.assertEqual(status["category_counts"], {"artist": 1, "character": 2})
         self.assertEqual(status["provenance_counts"], {"memory://fixture": 3})
+        self.assertEqual(status["schema_version"], "2")
+        self.assertEqual(status["alias_key_count"], 3)
+        self.assertEqual(status["unique_alias_count"], 3)
+        self.assertEqual(status["ambiguous_alias_count"], 0)
+        self.assertEqual(status["canonical_conflict_alias_count"], 0)
 
         canonical = self.index.lookup(r"Kei \(Blue Archive\)", "character")
         self.assertTrue(canonical.verified)
@@ -161,12 +179,15 @@ class DanbooruTagIndexTests(unittest.TestCase):
             "character",
         )
 
-        self.assertEqual([item.query for item in results], [
-            "roxy",
-            "missing",
-            r"kei \(blue archive\)",
-            "roxy",
-        ])
+        self.assertEqual(
+            [item.query for item in results],
+            [
+                "roxy",
+                "missing",
+                r"kei \(blue archive\)",
+                "roxy",
+            ],
+        )
         self.assertTrue(results[0].verified)
         self.assertFalse(results[1].found)
         self.assertTrue(results[2].verified)
@@ -183,7 +204,10 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.index.import_bytes(payload)
 
         self.assertEqual(
-            [item.canonical_tag for item in self.index.search("literal%", mode="prefix")],
+            [
+                item.canonical_tag
+                for item in self.index.search("literal%", mode="prefix")
+            ],
             ["literal%tag"],
         )
         self.assertEqual(
@@ -241,7 +265,7 @@ class DanbooruTagIndexTests(unittest.TestCase):
             'kei_(blue_archive),4,456,"kei_(student)_(blue_archive)"\n'
             'long_alias_tag,0,1,"' + ("x" * 300) + '"\n'
             'shared_alias,0,2,"shared"\n'
-            'shared,0,3,\n'
+            "shared,0,3,\n"
         ).encode()
         status = self.index.import_bytes(
             payload,
@@ -258,6 +282,10 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.assertFalse(self.index.lookup("x" * 300).found)
         self.assertTrue(self.index.lookup("shared").verified)
         self.assertEqual(self.index.lookup("shared").canonical_tag, "shared")
+        self.assertEqual(status["alias_count"], 4)
+        self.assertEqual(status["alias_key_count"], 4)
+        self.assertEqual(status["unique_alias_count"], 3)
+        self.assertEqual(status["canonical_conflict_alias_count"], 1)
 
     def test_failed_import_preserves_old_snapshot(self) -> None:
         before = self.index.import_bytes(self.payload())
@@ -269,6 +297,12 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.assertEqual(after["sha256"], before_sha)
         self.assertIn("invalid tag count", after["error"])
         self.assertTrue(self.index.lookup("roxy").verified)
+
+        with self.assertRaisesRegex(DanbooruIndexError, "CSV must be UTF-8"):
+            self.index.import_bytes(
+                b"tag,category,count\n\xff,0,1\n", content_type="csv"
+            )
+        self.assertEqual(self.index.status()["sha256"], before_sha)
 
     def test_remote_record_cannot_spoof_source_and_count_error_is_redacted(
         self,
@@ -307,16 +341,205 @@ class DanbooruTagIndexTests(unittest.TestCase):
         self.assertNotIn(secret, str(raised.exception))
         self.assertNotIn(secret, self.index.status()["error"])
 
-    def test_duplicate_alias_or_canonical_conflict_is_atomic(self) -> None:
+    def test_ambiguous_aliases_are_candidates_and_never_verified(self) -> None:
+        payload = json.dumps(
+            [
+                {
+                    "tag": "one_character",
+                    "category": "character",
+                    "aliases": ["same"],
+                    "count": 10,
+                },
+                {
+                    "tag": "two_artist",
+                    "category": "artist",
+                    "aliases": ["same"],
+                    "count": 20,
+                },
+            ]
+        ).encode()
+        status = self.index.import_bytes(payload)
+        self.assertEqual(status["alias_count"], 2)
+        self.assertEqual(status["alias_key_count"], 1)
+        self.assertEqual(status["unique_alias_count"], 0)
+        self.assertEqual(status["ambiguous_alias_count"], 1)
+
+        lookup = self.index.lookup("same")
+        self.assertFalse(lookup.verified)
+        self.assertFalse(lookup.found)
+        self.assertEqual(lookup.match_type, "alias_ambiguous")
+        self.assertEqual(
+            [item.canonical_tag for item in lookup.candidates],
+            ["two_artist", "one_character"],
+        )
+        self.assertTrue(all(not item.verified for item in lookup.candidates))
+
+        category_lookup = self.index.lookup("same", "character")
+        self.assertFalse(category_lookup.verified)
+        self.assertFalse(category_lookup.found)
+        self.assertEqual(
+            [item.canonical_tag for item in category_lookup.candidates],
+            ["one_character"],
+            "a category filter must not turn a globally ambiguous alias into exact evidence",
+        )
+        exact_search = self.index.search("same", mode="exact")
+        self.assertEqual(len(exact_search), 2)
+        self.assertTrue(all(not item.verified for item in exact_search))
+        batch = self.index.lookup_many(("same",), "character")[0]
+        self.assertFalse(batch.verified)
+        self.assertEqual(len(batch.candidates), 1)
+
+    def test_canonical_priority_blocks_cross_category_alias_reinterpretation(
+        self,
+    ) -> None:
+        payload = json.dumps(
+            [
+                {"tag": "shared", "category": "general", "count": 50},
+                {
+                    "tag": "character_owner",
+                    "category": "character",
+                    "aliases": ["shared"],
+                    "count": 10,
+                },
+            ]
+        ).encode()
+        status = self.index.import_bytes(payload)
+        self.assertEqual(status["canonical_conflict_alias_count"], 1)
+        canonical = self.index.lookup("shared")
+        self.assertTrue(canonical.verified)
+        self.assertEqual(canonical.canonical_tag, "shared")
+        character = self.index.lookup("shared", "character")
+        self.assertFalse(character.verified)
+        self.assertFalse(character.found)
+        self.assertEqual(character.match_type, "canonical_category_mismatch")
+
+    def test_duplicate_canonical_is_atomic(self) -> None:
         self.index.import_bytes(self.payload())
         conflicting = json.dumps(
             [
-                {"tag": "one", "aliases": ["same"]},
-                {"tag": "two", "aliases": ["same"]},
+                {"tag": "same canonical"},
+                {"tag": "same_canonical"},
             ]
         ).encode()
         with self.assertRaises(DanbooruIndexError):
             self.index.import_bytes(conflicting)
+        self.assertTrue(self.index.lookup("roxy").verified)
+
+    def test_schema_one_snapshot_remains_readable_until_atomic_v2_replacement(
+        self,
+    ) -> None:
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE tags (
+                    id INTEGER PRIMARY KEY,
+                    tag TEXT NOT NULL,
+                    normalized_tag TEXT NOT NULL UNIQUE,
+                    tag_length INTEGER NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    count INTEGER NOT NULL DEFAULT 0,
+                    provenance TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE aliases (
+                    id INTEGER PRIMARY KEY,
+                    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL UNIQUE,
+                    alias_length INTEGER NOT NULL
+                );
+                INSERT INTO metadata(key, value) VALUES
+                    ('schema_version', '1'),
+                    ('revision', 'legacy');
+                INSERT INTO tags
+                    (id, tag, normalized_tag, tag_length, category, count, provenance)
+                VALUES
+                    (1, 'legacy_character', 'legacy_character', 16,
+                     'character', 7, '{"source":"legacy"}');
+                INSERT INTO aliases
+                    (tag_id, alias, normalized_alias, alias_length)
+                VALUES (1, 'legacy', 'legacy', 6);
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        before = self.index.status()
+        self.assertTrue(before["ready"])
+        self.assertEqual(before["schema_version"], "1")
+        self.assertEqual(before["unique_alias_count"], 1)
+        self.assertTrue(self.index.lookup("legacy", "character").verified)
+
+        after = self.index.import_bytes(self.payload())
+        self.assertEqual(after["schema_version"], "2")
+        self.assertFalse(self.index.lookup("legacy").found)
+        self.assertTrue(self.index.lookup("roxy").verified)
+
+    def test_csv_file_import_streams_without_path_read_bytes(self) -> None:
+        csv_path = Path(self.directory.name) / "stream.csv"
+        csv_path.write_text(
+            "tag,category,count,aliases\n"
+            + "".join(
+                f"stream_tag_{index},0,{index},stream_alias_{index}\n"
+                for index in range(250)
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("CSV import must not read the whole file"),
+        ):
+            status = self.index.import_file(csv_path)
+        self.assertEqual(status["tag_count"], 250)
+        self.assertTrue(self.index.lookup("stream_alias_249").verified)
+
+    def test_build_from_records_is_lazy_and_owns_schema(self) -> None:
+        consumed: list[int] = []
+
+        def records():
+            for index in range(3):
+                consumed.append(index)
+                yield {
+                    "tag": f"generated_{index}",
+                    "category": "character",
+                    "aliases": ["shared_generated"] if index < 2 else ["unique_2"],
+                    "count": index,
+                }
+
+        status = self.index.build_from_records(
+            records(),
+            source="generated://fixture",
+            metadata={
+                "schema_version": "999",
+                "dataset": "danbooru_public_api",
+                "source_updated_at": "2026-08-04T00:00:00Z",
+                "source_max_tag_id": 123,
+            },
+            revision="generator-r1",
+        )
+        self.assertEqual(consumed, [0, 1, 2])
+        self.assertEqual(status["schema_version"], "2")
+        self.assertEqual(status["revision"], "generator-r1")
+        self.assertEqual(status["dataset"], "danbooru_public_api")
+        self.assertEqual(status["source_max_tag_id"], "123")
+        self.assertEqual(status["ambiguous_alias_count"], 1)
+        self.assertFalse(self.index.lookup("shared_generated").verified)
+        self.assertTrue(self.index.lookup("unique_2").verified)
+
+    def test_streaming_record_limit_failure_preserves_old_snapshot(self) -> None:
+        old = self.index.import_bytes(self.payload())
+        csv_path = Path(self.directory.name) / "too-many.csv"
+        csv_path.write_text(
+            "tag,category,count\none,0,1\ntwo,0,2\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(danbooru_index_module, "MAX_INDEX_RECORDS", 1):
+            with self.assertRaisesRegex(DanbooruIndexError, "too many records"):
+                self.index.import_file(csv_path)
+        self.assertEqual(self.index.status()["sha256"], old["sha256"])
         self.assertTrue(self.index.lookup("roxy").verified)
 
     def test_parallel_reads_during_replacements_are_safe(self) -> None:
@@ -443,6 +666,120 @@ class DanbooruTagIndexUrlTests(unittest.IsolatedAsyncioTestCase):
                     str(server.make_url("/large.csv")), max_bytes=128
                 )
             self.assertEqual(self.index.status()["sha256"], old_sha)
+
+    async def test_csv_url_update_spools_to_file_without_import_bytes(self) -> None:
+        fixture = b"tag,category,count,aliases\nremote_tag,4,12,remote_alias\n"
+
+        async def valid(_request: web.Request) -> web.Response:
+            return web.Response(body=fixture, content_type="text/csv")
+
+        app = web.Application()
+        app.router.add_get("/tags.csv", valid)
+        async with TestServer(app) as server:
+            with mock.patch.object(
+                self.index,
+                "import_bytes",
+                side_effect=AssertionError(
+                    "URL update must import the spooled CSV file"
+                ),
+            ):
+                status = await self.index.update_from_url(
+                    str(server.make_url("/tags.csv"))
+                )
+        self.assertTrue(status["ready"])
+        self.assertTrue(self.index.lookup("remote_alias", "character").verified)
+        self.assertFalse(
+            list(self.index.path.parent.glob(f".{self.index.path.name}.download.*"))
+        )
+
+    async def test_build_cancellation_is_cooperative_and_keeps_old_snapshot(
+        self,
+    ) -> None:
+        old = self.index.import_bytes(DanbooruTagIndexTests.payload())
+        fixture = b"tag,category,count\nreplacement,0,1\n"
+        started = threading.Event()
+
+        async def valid(_request: web.Request) -> web.Response:
+            return web.Response(body=fixture, content_type="text/csv")
+
+        original_builder = self.index._build_database
+
+        def waiting_builder(*args, **kwargs) -> None:
+            cancel_event = kwargs.get("cancel_event")
+            started.set()
+            while cancel_event is not None and not cancel_event.is_set():
+                time.sleep(0.005)
+            original_builder(*args, **kwargs)
+
+        app = web.Application()
+        app.router.add_get("/cancel.csv", valid)
+        async with TestServer(app) as server:
+            with mock.patch.object(
+                self.index,
+                "_build_database",
+                side_effect=waiting_builder,
+            ):
+                task = asyncio.create_task(
+                    self.index.update_from_url(str(server.make_url("/cancel.csv")))
+                )
+                self.assertTrue(await asyncio.to_thread(started.wait, 1.0))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        self.assertEqual(self.index.status()["sha256"], old["sha256"])
+        self.assertTrue(self.index.lookup("roxy").verified)
+        self.assertFalse(
+            list(self.index.path.parent.glob(f".{self.index.path.name}.*.tmp"))
+        )
+
+    async def test_build_timeout_sets_cooperative_stop_and_keeps_old_snapshot(
+        self,
+    ) -> None:
+        old = self.index.import_bytes(DanbooruTagIndexTests.payload())
+        fixture = b"tag,category,count\nreplacement,0,1\n"
+        started = threading.Event()
+
+        async def valid(_request: web.Request) -> web.Response:
+            return web.Response(body=fixture, content_type="text/csv")
+
+        original_builder = self.index._build_database
+
+        def waiting_builder(*args, **kwargs) -> None:
+            cancel_event = kwargs.get("cancel_event")
+            started.set()
+            while cancel_event is not None and not cancel_event.is_set():
+                time.sleep(0.005)
+            original_builder(*args, **kwargs)
+
+        async def immediate_timeout(*_args, **_kwargs):
+            await asyncio.to_thread(started.wait, 1.0)
+            raise asyncio.TimeoutError
+
+        app = web.Application()
+        app.router.add_get("/timeout.csv", valid)
+        async with TestServer(app) as server:
+            with (
+                mock.patch.object(
+                    self.index,
+                    "_build_database",
+                    side_effect=waiting_builder,
+                ),
+                mock.patch.object(
+                    self.index,
+                    "_wait_for_build",
+                    side_effect=immediate_timeout,
+                ),
+            ):
+                with self.assertRaisesRegex(DanbooruIndexError, "build timed out"):
+                    await self.index.update_from_url(
+                        str(server.make_url("/timeout.csv"))
+                    )
+
+        self.assertEqual(self.index.status()["sha256"], old["sha256"])
+        self.assertFalse(
+            list(self.index.path.parent.glob(f".{self.index.path.name}.*.tmp"))
+        )
 
     async def test_rejects_public_plain_http_and_credentials(self) -> None:
         with self.assertRaises(DanbooruIndexError):

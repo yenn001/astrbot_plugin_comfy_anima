@@ -503,6 +503,51 @@ class CharacterResolverTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "character_suggestion")
         self.assertIn("米浴", raised.exception.user_message)
 
+    def test_slash_work_title_is_preserved_before_discovery_variants(self) -> None:
+        scathach = _record(
+            "characters/scathach_fgo.safetensors",
+            "Scathach",
+            "scathach-fgo-sha",
+            triggers=(r"scathach \(fate/grand order\)",),
+            source_work="Fate/Grand Order",
+        )
+        index = LoraSemanticIndex.empty()
+
+        self.assertIs(
+            resolve_character_record(
+                (scathach,),
+                "《Fate/Grand Order》的Scathach",
+                index,
+            ),
+            scathach,
+        )
+        _, works = character_lookup_hints_for_query(
+            (scathach,),
+            "Scathach",
+            index,
+        )
+        self.assertEqual(
+            works[:3],
+            ("Fate/Grand Order", "Fate", "Grand Order"),
+        )
+
+    def test_slash_work_parsing_does_not_change_explicit_lora_paths(self) -> None:
+        scathach = _record(
+            "characters/fate/scathach_fgo.safetensors",
+            "Scathach",
+            "scathach-explicit-sha",
+            source_work="Fate/Grand Order",
+        )
+
+        self.assertIs(
+            resolve_character_record(
+                (scathach,),
+                "lora:characters/fate/scathach_fgo.safetensors",
+                LoraSemanticIndex.empty(),
+            ),
+            scathach,
+        )
+
     def test_unproven_record_alias_and_work_title_cannot_authorize_swap(self) -> None:
         kiki = _record(
             "characters/character_full_name.safetensors",

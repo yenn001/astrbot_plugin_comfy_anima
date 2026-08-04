@@ -19,6 +19,7 @@ from ..models import PluginSettings
 from .plugin_page import (
     V170ApiPayloadTooLargeError,
     V170ApiValidationError,
+    validate_danbooru_update_payload,
     validate_lora_preview_query,
     validate_lora_preview_response,
     validate_prompt_asset_facets_query,
@@ -76,7 +77,9 @@ class WebUiController(Protocol):
 
     async def web_ui_clear_prompt_diagnostics(self) -> dict[str, Any]: ...
 
-    async def web_ui_update_danbooru_index(self) -> dict[str, Any]: ...
+    async def web_ui_update_danbooru_index(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
     async def web_ui_check_experimental_profiles(self) -> dict[str, Any]: ...
 
@@ -648,10 +651,14 @@ class WebUiService:
             self._controller.web_ui_clear_prompt_diagnostics()
         )
 
-    async def _update_danbooru_index(self, _request: web.Request) -> web.Response:
-        return await self._controller_response(
-            self._controller.web_ui_update_danbooru_index()
-        )
+    async def _update_danbooru_index(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = await self._read_json(request) if request.can_read_body else {}
+            return await self._controller.web_ui_update_danbooru_index(
+                validate_danbooru_update_payload(payload)
+            )
+
+        return await self._controller_response(operation())
 
     async def _check_experimental_profiles(
         self, _request: web.Request

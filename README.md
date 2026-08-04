@@ -1,10 +1,10 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v1.9.23
+> 当前版本：v1.9.24
 
 面向 AstrBot、aiocqhttp / NapCat QQ 与 ComfyUI 的 Anima 绘图插件。它把自然语言分镜、直接 Tags、生图、图片反推、无蒙版整图改图、单角色语义换角、RTX 放大、遮罩重绘、视觉提示词资产、Prompt Lab 与 LoRA 视觉管理放在同一套受控流程中。
 
-v1.9.23 修复“当前角色 LoRA 与在线 Danbooru Gallery 都认识角色，但本地索引快照暂时缺项”时的错误拒绝。唯一当前角色 LoRA 只负责提供有界角色名与作品候选；本地 Copyright exact 和 Gallery 非弃用 Character exact 必须共同确认同一 canonical，授权结果再绑定到该 LoRA 文件并贯穿最终校验。资产查询后的无工具修复同时兼容严格 JSON、结构化结果和 `<pic>`，错误散文、歧义、多角色或跨作品结果仍不会提交 ComfyUI。
+v1.9.24 将 Danbooru 本地索引升级为 Schema v2，并新增官方 API/兼容镜像生成器与可选定期更新。角色、作品、LoRA 元数据、实时触发词、未过期语义档案和管理员多语言 CSV 统一进入共享发现层；只有本地 Character/Copyright exact 可以授权，歧义、错作品、过期档案和未知限定角色仍会在提交 ComfyUI 前停止。
 
 本插件针对仓库内附带的 Anima 工作流与 manifest 设计，不是任意 ComfyUI 工作流的通用适配器。开始部署前，建议先阅读“八项工作流能力”和“依赖”两节。
 
@@ -43,7 +43,7 @@ v1.9.23 修复“当前角色 LoRA 与在线 Danbooru Gallery 都认识角色，
 - 自然语言绘图：由 AstrBot 中已配置的聊天 Provider 生成画面意图，再由本地 Prompt Composer v2 整理为“硬控制与 LoRA / 视觉短语 / 英文场景关系句”三层提示词；不增加第二次 LLM 调用。
 - 直接 Tags：`/画图` 和 `/画图no` 默认跳过 LLM，直接把用户输入写入工作流；显式 `--llm c` / `--llmcc` / `--lcc` 可对一段完整旧 Tags 执行受控文字换角。
 - 图片反推：使用 AstrBot 多模态 Provider 提取结构化 Tags、构图、角色候选和置信度。
-- 精确角色检索：换角会先查本地 Danbooru Character canonical 与唯一 alias；本地快照没有新角色时，再用 ComfyUI Danbooru Gallery 的 Character autocomplete 对 LoRA 元数据和用户名称产生的有限候选做 exact 验证。Prefix、keyword、Embedding 与 Rerank 只负责候选发现和排序，多个不同角色冲突时停止而不猜选。
+- 精确角色检索：换角会先查本地 Danbooru Character canonical 与唯一 alias；LoRA 的中文名、罗马字、作品、实时训练触发词、未过期语义档案和管理员 CSV 共用同一候选发现层。本地快照没有新角色时，再用 ComfyUI Danbooru Gallery 的 Character autocomplete 对唯一当前 LoRA 产生的有限候选做 exact 验证。Prefix、keyword、Embedding 与 Rerank 只负责候选发现和排序，多个不同角色冲突时停止而不猜选。
 - 底图控制生成：Pose 锁定人体姿态，Depth 约束空间结构，Lineart 按线稿生成上色成图，Reference 柔和参考外观、配色与画风；支持组合与自然语言。
 - 无蒙版整图改图：引用一张图后直接说换衣、换背景、换表情或重新画一张；原图像素接入 img2img，插件按保守、平衡或自由模式控制改动幅度。
 - 单角色语义换角：从图片或完整 Tags 中移除原角色身份，保留服装、姿势、构图、背景和风格，再以目标 LoRA、exact canonical 与槽位化稳定外貌重建整张图。Gallery 档案使用安全级、solo、单一精确 Character 样本，排除 alternate hair、palette swap、genderbend 与 cosplay；按发色、瞳色、发长、发型、发饰、永久标记和独特部件聚合最多十项，只缓存档案与支持率，不保存帖子或图片。
@@ -74,7 +74,7 @@ LoRA 控制和其可信触发词会先去重，再插入场景关系句之前；
 
 Ultra 仍只输出“一行有序 Tags + 一句英文关系句”，不会把三段展示文本、分析小标题或十几个独立加权长句交给 ComfyUI。高质量来自可见关系和构图控制，不会默认堆叠 `8k`、`absurdres`、`masterpiece` 或整段权重。简单肖像不会为了凑数添加不可见脚部、复杂背景或固定 bokeh；多人场景会明确区分每个角色的身份、服装、朝向和空间关系。
 
-`--llm c`、`--llmcc` 与 `--lcc` 不是第三档普通扩写，而是仅限 `/画图`、`/画图no` 的显式文字换角模式；普通聊天不会因为提到“换角色”就自动启用。追加 `u`（例如 `--llm c u`、`--lcc u`）只提高目标身份外观的规划密度，仍遵守同一套身份删除与内容保留规则。
+`--llm c`、`--llm cc`、`--llmcc` 与 `--lcc` 不是第三档普通扩写，而是仅限 `/画图`、`/画图no` 的显式文字换角模式；普通聊天不会因为提到“换角色”就自动启用。追加 `u`（例如 `--llm cc u`、`--llmcc u`、`--lcc u`）启用 Ultra 可信外貌规划：Standard 最多采用 6 项经 Gallery/当前 LoRA 验证的稳定外貌，Ultra 最多采用 10 项；仍不会让模型凭记忆编造身份、衣装或场景事实。
 
 `adaptive_negative_mode` 提供三种本地负面词策略：
 
@@ -84,7 +84,9 @@ Ultra 仍只输出“一行有序 Tags + 一句英文关系句”，不会把三
 
 自动负面词不会覆盖用户显式 negative，也不会把正面要求、角色身份或换装后需要保留的特征反向加入 negative。
 
-插件可使用管理员自行提供的离线 Danbooru Tag 索引做硬锚点检查，但**安装包不附带任何第三方标签库或索引数据**。在全局设置填写 `danbooru_index_url` 后，可从“提示词工坊”手动更新 JSON / CSV 数据：HTTPS 可访问可信远端；明文 HTTP 仅允许回环或私有局域网地址。更新采用临时库校验与原子替换，下载、解析或校验失败时保留上一份可用索引。
+插件可使用管理员自行提供的离线 Danbooru Tag 索引做硬锚点检查，但**安装包不附带任何第三方标签库或索引数据**。除了填写 `danbooru_index_url` 手动导入 JSON/CSV，还可在“提示词工坊”从 Danbooru 官方公开 API 或兼容镜像生成 Schema v2：`identity` 模式全量保留 Character、Copyright、Artist，并按帖子阈值筛选 General/Meta；`full` 模式抓取五类。生成器使用固定高水位、ID 游标、单并发限速、429/5xx 有界重试、断点续传、内容哈希和原子替换，失败或取消时保留上一份可用索引。
+
+定期更新默认关闭。开启 `danbooru_auto_update_enabled` 后，插件按 `danbooru_auto_update_interval_hours`（默认 168 小时）复用同一官方 API 持久任务；启动时到期会补跑，失败最早 6 小时后重试，已有手动或自动任务不会并发。若服务器不能直连 Danbooru，必须先配置无凭据 HTTP 代理或可信局域网镜像。
 
 导入器同时兼容带表头的 JSON/CSV，以及 Anima 常见的无表头 `tag,category,count,aliases` 导出；无表头数据中的超长或无法唯一确认的别名会被丢弃，但 canonical tag 会保留。
 
