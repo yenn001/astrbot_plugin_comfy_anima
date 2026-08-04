@@ -132,6 +132,27 @@ class TaskStoreTests(unittest.TestCase):
         interrupted = self.store.recent_tasks(statuses=["interrupted"])
         self.assertEqual([item["run_id"] for item in interrupted], [running])
 
+    def test_non_resumable_queued_image_tasks_are_interrupted_selectively(self) -> None:
+        image = self.store.create_task("character_swap", status="queued")
+        generation = self.store.create_task("generation", status="queued")
+        resumable = self.store.create_task("lora_archive", status="queued")
+
+        changed = self.store.interrupt_queued_tasks(
+            ("generation", "character_swap")
+        )
+
+        self.assertEqual(changed, 2)
+        self.assertEqual(self.store.get_task(image)["status"], "interrupted")
+        self.assertEqual(self.store.get_task(generation)["status"], "interrupted")
+        self.assertEqual(self.store.get_task(resumable)["status"], "queued")
+        events = self.store.read_events(run_id=image, limit=20)["entries"]
+        self.assertTrue(
+            any(
+                item["event_code"] == "queued_task_interrupted_on_startup"
+                for item in events
+            )
+        )
+
     def test_runtime_logs_persist_incrementally_and_redact_secrets(self) -> None:
         base = time.time()
         first = self.store.append_runtime_log(

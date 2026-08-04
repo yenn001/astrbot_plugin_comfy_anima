@@ -109,6 +109,15 @@ class PluginSettingsTests(unittest.TestCase):
         self.assertEqual(low.danbooru_auto_update_interval_hours, 24)
         self.assertEqual(high.danbooru_auto_update_interval_hours, 2160)
 
+    def test_per_user_image_queue_defaults_and_clamps(self) -> None:
+        defaults = PluginSettings.from_mapping({})
+        disabled = PluginSettings.from_mapping({"max_queued_jobs_per_user": -5})
+        high = PluginSettings.from_mapping({"max_queued_jobs_per_user": 999})
+
+        self.assertEqual(defaults.max_queued_jobs_per_user, 3)
+        self.assertEqual(disabled.max_queued_jobs_per_user, 0)
+        self.assertEqual(high.max_queued_jobs_per_user, 10)
+
     def test_v170_global_capabilities_have_safe_defaults(self) -> None:
         settings = PluginSettings.from_mapping({})
 
@@ -261,7 +270,7 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "2.0.0")
+        self.assertEqual(PLUGIN_VERSION, "2.0.1")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
         self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-04", changelog)

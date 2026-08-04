@@ -1,8 +1,16 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v2.0.0
+> 当前版本：v2.0.1
 
 面向 AstrBot、NapCat / OneBot v11 与 ComfyUI 的 Anima 绘图插件。它提供自然语言分镜、直接 Tags、图片反推、多人语义换角、整图改图、底图控制、RTX 放大、遮罩重绘、LoRA 管理、Danbooru 本地索引、任务中心和两套管理页面。
+
+## v2.0.1 个人图片任务队列
+
+- 同一用户已有图片任务时，新指令会进入插件 FIFO 队列，不再要求任务结束后重新发送。
+- 默认每位用户可等待 3 个任务，可在两套 WebUI 用“每用户等待队列”调整为 0–10；设为 0 可恢复旧的直接拒绝行为。
+- 入队时立即回复等待位置，前序任务结束后自动通知并执行。普通生图、反推、反推画图、换角、改图、底图控制、放大和重绘共用同一队列。
+- `/anima status` 同时显示运行项和等待数；`/anima cancel current|queue|all` 可分别取消当前任务、等待项或全部图片任务。任务中心也可取消单个排队任务。
+- 队列不持久化原图、提示词或消息对象。插件重启后无法安全恢复的 queued 图片任务会标记为 interrupted，不会永久显示排队中。
 
 - 项目地址：<https://github.com/yenn001/astrbot_plugin_comfy_anima>
 - 更新记录：[CHANGELOG.md](CHANGELOG.md)
@@ -106,6 +114,15 @@ python -m pip install -r requirements.txt
    ```
 
 建议保持 `strict_lora_validation=true`。启用 LoRA Manager 时，每次独立 LoRA 操作都会先刷新 Manager 与 ComfyUI 实际可加载清单；提交前仍会再次强制复核。
+
+连续提交任务时无需等待上一张完成：
+
+```text
+/anima status
+/anima cancel current
+/anima cancel queue
+/anima cancel all
+```
 
 ## 常用绘图
 

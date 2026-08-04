@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v2.0.0
+AstrBot Comfy Anima 插件 v2.0.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v2.0.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 2.0.0
+版本: 2.0.1
 日期: 2026-08-04
 """
 
@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -347,6 +347,7 @@ WEB_UI_EDITABLE_FIELDS = (
     "rtx_scale",
     "rtx_quality",
     "max_concurrent_jobs",
+    "max_queued_jobs_per_user",
     "provider_max_concurrent_jobs",
     "enable_parallel_preflight",
     "enable_local_intent_router",
@@ -438,6 +439,20 @@ WEB_UI_EDITABLE_FIELDS = (
     "web_ui_session_ttl",
 )
 
+IMAGE_TASK_TYPES = frozenset(
+    {
+        "generation",
+        "reverse_prompt",
+        "reverse_draw",
+        "semantic_redraw",
+        "rtx_upscale",
+        "character_swap",
+        "inpaint",
+        "control_generation",
+        "image_tool",
+    }
+)
+
 
 class _DisabledPromptDiagnosticsStore:
     """Drop diagnostics while preserving PromptComposer's small store contract."""
@@ -496,6 +511,7 @@ class ComfyAnimaPlugin(Star):
             self._task_store = TaskStore(
                 self._persistent_data_dir / "task_events.sqlite3"
             )
+            self._task_store.interrupt_queued_tasks(IMAGE_TASK_TYPES)
         except TaskStoreError as exc:
             self._task_store_error = str(exc)
             logger.error(
@@ -658,6 +674,7 @@ class ComfyAnimaPlugin(Star):
         }
         self._log_console_attached = self._log_console.attach(logger)
         self._active_jobs: dict[str, GenerationJob] = {}
+        self._queued_jobs: dict[str, deque[GenerationJob]] = {}
         self._jobs_lock = asyncio.Lock()
         self._workflow_switch_lock = asyncio.Lock()
         self._lora_preset_transaction_lock = asyncio.Lock()
@@ -4780,13 +4797,24 @@ class ComfyAnimaPlugin(Star):
             return
 
         user_id = str(event.get_sender_id() or "unknown")
-        job_or_error = await self._create_job(user_id, options, event)
+        job_or_error = await self._create_job(
+            user_id,
+            options,
+            event,
+            notify_queue=False,
+        )
         if isinstance(job_or_error, str):
             yield event.plain_result(f"{MessageEmoji.WARNING} {job_or_error}")
             return
         job = job_or_error
 
-        if self.settings.send_generation_notice:
+        if job.was_queued:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 已加入个人图片队列｜"
+                f"等待位置 {job.queue_position}/{self._queued_job_capacity()}。"
+                "前序任务结束后会自动执行，无需重复发送。"
+            )
+        elif self.settings.send_generation_notice:
             pipeline = self._resolve_generation_pipeline(options)
             mode_text = {
                 "base": "Anima 原图",
@@ -4848,9 +4876,7 @@ class ComfyAnimaPlugin(Star):
             )
             return
         finally:
-            async with self._jobs_lock:
-                if self._active_jobs.get(user_id) is job:
-                    self._active_jobs.pop(user_id, None)
+            self._clear_lora_operation_snapshot(event)
 
         if director_warning:
             yield event.plain_result(
@@ -5669,12 +5695,20 @@ think 控制块内容会被自动忽略。"""
         user_id = str(event.get_sender_id() or "unknown")
         async with self._jobs_lock:
             job = self._active_jobs.get(user_id)
-            local_total = len(self._active_jobs)
+            pending = tuple(self._queued_job_map().get(user_id, ()))
+            queued_total = self._queued_job_count_unlocked()
+            active_total = len(self._active_jobs)
+            local_total = active_total + queued_total
 
         personal = "无进行中任务"
         if job:
             elapsed = max(0, int(time.monotonic() - job.created_at))
-            personal = f"状态={job.state}，已等待 {elapsed} 秒"
+            personal = (
+                f"当前状态={job.state}，提交后 {elapsed} 秒，"
+                f"个人等待队列 {len(pending)} 个"
+            )
+        elif pending:
+            personal = f"当前无运行项，个人等待队列 {len(pending)} 个"
 
         queue_text = "ComfyUI 队列不可用"
         if self._client:
@@ -5688,24 +5722,64 @@ think 控制块内容会被自动忽略。"""
 
         yield event.plain_result(
             f"{MessageEmoji.INFO} 个人: {personal}\n"
-            f"插件任务数: {local_total}\n{queue_text}"
+            f"插件任务数: {local_total}（运行 {active_total}，"
+            f"等待 {queued_total}）\n{queue_text}"
         )
 
     @anima.command("cancel")
-    async def cmd_cancel(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
-        """取消当前用户提交的生成任务。"""
+    async def cmd_cancel(
+        self,
+        event: AstrMessageEvent,
+        scope: str = "",
+    ) -> AsyncGenerator[Any, None]:
+        """取消当前、等待队列或当前用户的全部图片任务。"""
+
         user_id = str(event.get_sender_id() or "unknown")
+        normalized = str(scope or "").strip().casefold()
+        aliases = {
+            "": "current",
+            "current": "current",
+            "当前": "current",
+            "queue": "queue",
+            "queued": "queue",
+            "等待": "queue",
+            "队列": "queue",
+            "all": "all",
+            "全部": "all",
+        }
+        selected = aliases.get(normalized)
+        if selected is None:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 用法: /anima cancel [current|queue|all]"
+            )
+            return
         async with self._jobs_lock:
-            job = self._active_jobs.get(user_id)
-        if not job or not job.task or job.task.done():
+            active = self._active_jobs.get(user_id)
+            queued = tuple(self._queued_job_map().get(user_id, ()))
+        targets: list[GenerationJob] = []
+        if selected in {"current", "all"} and active is not None:
+            targets.append(active)
+        if selected in {"queue", "all"}:
+            targets.extend(queued)
+        targets = [
+            job for job in targets if job.task is not None and not job.task.done()
+        ]
+        if not targets:
             yield event.plain_result(f"{MessageEmoji.INFO} 你没有可取消的任务")
             return
 
-        if job.prompt_id and self._client:
-            await self._client.cancel(job.prompt_id)
-        job.task.cancel()
+        for job in targets:
+            await self._cancel_image_job(
+                job,
+                summary="用户通过 QQ 指令取消了图片任务。",
+            )
+        label = {
+            "current": "当前任务",
+            "queue": "等待队列",
+            "all": "全部图片任务",
+        }[selected]
         yield event.plain_result(
-            f"{MessageEmoji.SUCCESS} 已发送取消请求。"
+            f"{MessageEmoji.SUCCESS} 已请求取消{label}，共 {len(targets)} 个。"
             "若任务正在 ComfyUI 执行，是否立即中断取决于插件配置。"
         )
 
@@ -5742,7 +5816,7 @@ think 控制块内容会被自动忽略。"""
 /anima draw <提示词> [--pipeline base|rtx|iterative] - 生成图片
 /anima prompt <剧情> - 仅预览 LLM 分镜提示词
 /anima status - 查看任务状态
-/anima cancel - 取消自己的任务
+/anima cancel [current|queue|all] - 取消当前任务、等待队列或全部任务
 /anima ping - 测试 ComfyUI 连接
 /anima help - 查看帮助
 
@@ -11329,6 +11403,9 @@ QQ快捷指令:
     async def web_ui_bootstrap(self) -> dict[str, Any]:
         """Return a secret-free snapshot for the management dashboard."""
         settings = self.settings
+        async with self._jobs_lock:
+            active_job_count = len(self._active_jobs)
+            queued_job_count = self._queued_job_count_unlocked()
         workflow_runtime: dict[str, Any] = {
             "profile_id": "",
             "display_name": "工作流未就绪",
@@ -11425,7 +11502,9 @@ QQ快捷指令:
         workflow_runtime["pipelines"] = pipeline_rows
         return {
             "version": PLUGIN_VERSION,
-            "active_jobs": len(self._active_jobs),
+            "active_jobs": active_job_count + queued_job_count,
+            "running_jobs": active_job_count,
+            "queued_jobs": queued_job_count,
             "plugin_page_registered": self._plugin_page_registered,
             "plugin_page_path": f"/plugin-page/{PLUGIN_NAME}/control",
             "web_ui_error": self._web_ui_error,
@@ -11446,6 +11525,7 @@ QQ快捷指令:
                 "rtx_scale": settings.rtx_scale,
                 "rtx_quality": settings.rtx_quality,
                 "max_concurrent_jobs": settings.max_concurrent_jobs,
+                "max_queued_jobs_per_user": settings.max_queued_jobs_per_user,
                 "user_cooldown": settings.user_cooldown,
                 "send_generation_notice": settings.send_generation_notice,
                 "enable_prompt_llm": settings.enable_prompt_llm,
@@ -11603,6 +11683,7 @@ QQ快捷指令:
             )
             supplied.add("default_generation_pipeline")
         numeric_ranges = {
+            "max_queued_jobs_per_user": (0, 10),
             "iterative_scale": (1.1, 2.0),
             "iterative_steps": (1, 4),
             "iterative_denoise": (0.1, 0.8),
@@ -11635,6 +11716,7 @@ QQ快捷指令:
             if not minimum <= value <= maximum:
                 raise WebUiActionError(f"{key} 必须在 {minimum:g} 到 {maximum:g} 之间")
             if key in {
+                "max_queued_jobs_per_user",
                 "iterative_steps",
                 "character_swap_timeout",
                 "prompt_diagnostics_capacity",
@@ -15750,13 +15832,15 @@ QQ快捷指令:
         if not value or len(value) > 255:
             raise WebUiActionError("请选择一个工作流")
         async with self._workflow_switch_lock:
-            running = [
-                job
-                for job in self._active_jobs.values()
-                if job.task is not None and not job.task.done()
-            ]
-            if running:
-                raise WebUiActionError("当前有图片任务运行中，请等待任务结束后再切换工作流")
+            async with self._jobs_lock:
+                busy = any(
+                    job.task is not None and not job.task.done()
+                    for job in self._active_jobs.values()
+                ) or any(self._queued_job_map().values())
+            if busy:
+                raise WebUiActionError(
+                    "当前有图片任务运行中或仍在等待队列，请等待或取消后再切换工作流"
+                )
             try:
                 descriptors = self._workflow_registry.describe()
                 if value.isdigit():
@@ -16068,6 +16152,30 @@ QQ快捷指令:
             raise WebUiActionError("任务不存在或已超过保留期限")
         if task_info.get("status") not in {"queued", "running"}:
             raise WebUiActionError("该任务已经结束，不能取消")
+        async with self._jobs_lock:
+            image_jobs = tuple(self._active_jobs.values()) + tuple(
+                job
+                for queue in self._queued_job_map().values()
+                for job in queue
+            )
+            image_job = next(
+                (job for job in image_jobs if job.task_run_id == run_id),
+                None,
+            )
+        if image_job is not None and image_job.task is not None:
+            store.append_event(
+                run_id,
+                "cancel",
+                "管理员请求取消图片任务。",
+                level="WARNING",
+                event_code="cancel_requested",
+                details={"queued": image_job.state == "queued"},
+            )
+            await self._cancel_image_job(
+                image_job,
+                summary="管理员通过任务中心取消了图片任务。",
+            )
+            return {"run_id": run_id, "message": "已请求取消图片任务"}
         task = self._background_task_runs.get(run_id)
         if task is None or task.done():
             raise WebUiActionError("任务当前不在此插件实例中运行")
@@ -16084,34 +16192,361 @@ QQ快捷指令:
         )
         return {"run_id": run_id, "message": "已请求取消任务"}
 
-    async def _create_job(
-        self, user_id: str, options: GenerationOptions, event: AstrMessageEvent
-    ) -> GenerationJob | str:
-        """检查重复任务和冷却，并登记新任务。"""
+    def _queued_job_map(self) -> dict[str, deque[GenerationJob]]:
+        queues = getattr(self, "_queued_jobs", None)
+        if queues is None:
+            queues = {}
+            self._queued_jobs = queues
+        return queues
+
+    def _queued_job_capacity(self) -> int:
+        return max(
+            0,
+            min(
+                10,
+                int(
+                    getattr(
+                        getattr(self, "settings", None),
+                        "max_queued_jobs_per_user",
+                        3,
+                    )
+                    or 0
+                ),
+            ),
+        )
+
+    def _queued_job_count_unlocked(self) -> int:
+        return sum(len(queue) for queue in self._queued_job_map().values())
+
+    @staticmethod
+    def _image_task_type(label: str) -> str:
+        return {
+            "reverse prompt": "reverse_prompt",
+            "reverse draw": "reverse_draw",
+            "semantic redraw": "semantic_redraw",
+            "RTX upscale": "rtx_upscale",
+            "character swap": "character_swap",
+            "inpaint": "inpaint",
+            "control draw": "control_generation",
+        }.get(label, "image_tool")
+
+    async def _send_job_notice(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+    ) -> None:
+        sender = getattr(event, "send", None)
+        if not callable(sender):
+            return
+        try:
+            await sender(event.plain_result(message))
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] queue notice could not be sent: {type(exc).__name__}"
+            )
+
+    async def _cancel_image_job(
+        self,
+        job: GenerationJob,
+        *,
+        summary: str,
+    ) -> None:
+        """Cancel one active or not-yet-started job without leaving stale rows."""
+
+        ready = job.ready_event
+        task_info = (
+            self._task_store.get_task(job.task_run_id)
+            if self._task_store is not None and job.task_run_id
+            else None
+        )
+        queued_not_started = bool(
+            (task_info is not None and task_info.get("status") == "queued")
+            or (
+                job.state == "queued"
+                and ready is not None
+                and not ready.is_set()
+            )
+        )
+        if job.prompt_id and self._client:
+            await self._client.cancel(job.prompt_id)
+        if job.task is not None and not job.task.done():
+            job.task.cancel()
+        if not queued_not_started:
+            return
+        job.state = "cancelled"
+        if self._task_store is not None and job.task_run_id:
+            if task_info is not None and task_info.get("status") in {"queued", "running"}:
+                self._task_store.finish_task(
+                    job.task_run_id,
+                    "cancelled",
+                    completed_items=0,
+                    failed_items=0,
+                    error_code="cancelled",
+                    error_summary=summary,
+                )
+        await self._release_image_job(job)
+
+    async def _register_image_job(
+        self,
+        job: GenerationJob,
+        event: AstrMessageEvent,
+    ) -> str:
+        """Register one active or per-user FIFO job and return an error string."""
+
         now = time.monotonic()
+        user_id = job.user_id
         async with self._jobs_lock:
-            existing = self._active_jobs.get(user_id)
-            if existing and existing.task and not existing.task.done():
-                return "你已有生成任务，请先等待完成或使用 /anima cancel"
+            queues = self._queued_job_map()
+            queue = queues.setdefault(user_id, deque())
+            active = self._active_jobs.get(user_id)
+            if active is not None and active.task is not None and active.task.done():
+                self._active_jobs.pop(user_id, None)
+                active = None
+            if active is None and queue:
+                while queue:
+                    candidate = queue.popleft()
+                    if candidate.task is not None and candidate.task.done():
+                        continue
+                    self._active_jobs[user_id] = candidate
+                    candidate.state = "starting"
+                    candidate.ready_event.set()
+                    active = candidate
+                    break
 
-            bypass_cooldown = bool(
-                event.is_admin() and self.settings.admin_ignore_cooldown
-            )
-            if not bypass_cooldown:
-                last_request = self._last_request_at.get(user_id, 0.0)
-                remaining = self.settings.user_cooldown - (now - last_request)
-                if remaining > 0:
-                    return f"操作过快，请在 {int(remaining) + 1} 秒后重试"
-
-            job = GenerationJob(
-                user_id=user_id,
-                prompt_preview=options.prompt[:80],
-                created_at=now,
-            )
-            job.task = asyncio.create_task(self._execute_job(job, options, event))
-            self._active_jobs[user_id] = job
+            if active is None and not queue:
+                bypass_cooldown = bool(
+                    event.is_admin() and self.settings.admin_ignore_cooldown
+                )
+                if not bypass_cooldown:
+                    remaining = self.settings.user_cooldown - (
+                        now - self._last_request_at.get(user_id, 0.0)
+                    )
+                    if remaining > 0:
+                        queues.pop(user_id, None)
+                        return f"操作过快，请在 {int(remaining) + 1} 秒后重试"
+                self._active_jobs[user_id] = job
+                job.state = "starting"
+                job.ready_event.set()
+            else:
+                capacity = self._queued_job_capacity()
+                if capacity <= 0:
+                    if not queue:
+                        queues.pop(user_id, None)
+                    return "你已有图片任务，当前配置未启用个人等待队列"
+                if len(queue) >= capacity:
+                    return (
+                        f"个人图片队列已满（最多等待 {capacity} 个）；"
+                        "可用 /anima cancel queue 清空等待项"
+                    )
+                job.was_queued = True
+                job.queue_position = len(queue) + 1
+                job.state = "queued"
+                queue.append(job)
             self._last_request_at[user_id] = now
-            return job
+        return ""
+
+    async def _release_image_job(self, job: GenerationJob) -> None:
+        """Remove one job and promote the next live job for the same user."""
+
+        async with self._jobs_lock:
+            user_id = job.user_id
+            queues = self._queued_job_map()
+            queue = queues.get(user_id, deque())
+            if self._active_jobs.get(user_id) is job:
+                self._active_jobs.pop(user_id, None)
+                while queue:
+                    next_job = queue.popleft()
+                    if next_job.task is not None and next_job.task.done():
+                        continue
+                    self._active_jobs[user_id] = next_job
+                    next_job.state = "starting"
+                    next_job.ready_event.set()
+                    break
+            else:
+                try:
+                    queue.remove(job)
+                except ValueError:
+                    pass
+            if not queue:
+                queues.pop(user_id, None)
+
+    def _create_image_task_record(self, job: GenerationJob) -> None:
+        if self._task_store is None:
+            return
+        job.task_run_id = self._task_store.create_task(
+            job.task_type,
+            mode="qq_command",
+            requested_by=job.user_id,
+            total_items=1,
+            metadata={"operation": job.task_type},
+        )
+        if job.was_queued:
+            self._task_store.append_event(
+                job.task_run_id,
+                "queue",
+                "图片任务已进入个人 FIFO 队列，等待前序任务完成。",
+                event_code="image_task_queued",
+                details={
+                    "queue_position": job.queue_position,
+                    "queue_capacity": self._queued_job_capacity(),
+                },
+            )
+
+    async def _run_registered_image_job(
+        self,
+        job: GenerationJob,
+        event: AstrMessageEvent,
+        operation: Any,
+    ) -> Any:
+        try:
+            await job.ready_event.wait()
+            if job.was_queued:
+                await self._send_job_notice(
+                    event,
+                    f"{MessageEmoji.DRAW} 已轮到你的排队任务，现已自动开始执行。",
+                )
+            if self._task_store is not None and job.task_run_id:
+                self._task_store.start_task(job.task_run_id, total_items=1)
+                self._task_store.append_event(
+                    job.task_run_id,
+                    "run",
+                    (
+                        "语义换角任务开始执行，正在校验输入与实时 LoRA 状态。"
+                        if job.task_type == "character_swap"
+                        else (
+                            "整图语义重绘任务开始执行，正在读取原图并规划修改约束。"
+                            if job.task_type == "semantic_redraw"
+                            else "图片任务开始执行，正在读取本次显式提供或引用的输入。"
+                        )
+                    ),
+                    event_code="image_task_started",
+                    details={"waited_in_queue": job.was_queued},
+                )
+            result = await operation(job)
+            if self._task_store is not None and job.task_run_id:
+                self._task_store.append_event(
+                    job.task_run_id,
+                    "run",
+                    "图片任务的全部阶段已执行完成。",
+                    event_code="image_task_succeeded",
+                    details={"final_state": job.state},
+                )
+                self._task_store.finish_task(
+                    job.task_run_id,
+                    "succeeded",
+                    completed_items=1,
+                    failed_items=0,
+                    result={"final_state": job.state},
+                )
+            return result
+        except asyncio.CancelledError:
+            job.state = "cancelled"
+            if job.prompt_id and self._client:
+                await self._client.cancel(job.prompt_id)
+            if self._task_store is not None and job.task_run_id:
+                task_info = self._task_store.get_task(job.task_run_id)
+                if task_info is not None and task_info.get("status") in {
+                    "queued",
+                    "running",
+                }:
+                    self._task_store.finish_task(
+                        job.task_run_id,
+                        "cancelled",
+                        completed_items=0,
+                        failed_items=0,
+                        error_code="cancelled",
+                        error_summary=(
+                            "用户取消了尚在队列中的图片任务。"
+                            if job.was_queued and not job.ready_event.is_set()
+                            else "用户或管理员取消了图片任务。"
+                        ),
+                    )
+            raise
+        except Exception as exc:
+            failed_stage = job.failed_stage or job.state
+            job.failed_stage = failed_stage
+            job.state = "failed"
+            error_code = str(getattr(exc, "code", "image_task_failed"))[:80]
+            if not re.fullmatch(r"[a-z0-9_\-]+", error_code):
+                error_code = "image_task_failed"
+            if self._task_store is not None and job.task_run_id:
+                safe_message = str(
+                    getattr(exc, "user_message", type(exc).__name__)
+                )[:500]
+                exception_details = (
+                    dict(exc.details)
+                    if isinstance(exc, CharacterSwapError)
+                    and isinstance(exc.details, Mapping)
+                    else {}
+                )
+                self._task_store.append_event(
+                    job.task_run_id,
+                    "run",
+                    "图片任务在当前阶段失败。",
+                    level="ERROR",
+                    event_code="image_task_failed",
+                    details={
+                        **exception_details,
+                        "final_state": job.state,
+                        "failed_stage": failed_stage,
+                        "error_type": type(exc).__name__,
+                        "error_code": error_code,
+                    },
+                )
+                self._task_store.finish_task(
+                    job.task_run_id,
+                    "failed",
+                    completed_items=0,
+                    failed_items=1,
+                    error_code=error_code,
+                    error_summary=safe_message,
+                )
+            raise
+        finally:
+            await self._release_image_job(job)
+
+    async def _create_job(
+        self,
+        user_id: str,
+        options: GenerationOptions,
+        event: AstrMessageEvent,
+        *,
+        notify_queue: bool = True,
+    ) -> GenerationJob | str:
+        """Register a normal generation job in the shared per-user queue."""
+
+        job = GenerationJob(
+            user_id=user_id,
+            prompt_preview=options.prompt[:80],
+            created_at=time.monotonic(),
+            ready_event=asyncio.Event(),
+            task_type="generation",
+        )
+        error = await self._register_image_job(job, event)
+        if error:
+            return error
+        try:
+            self._create_image_task_record(job)
+        except Exception:
+            await self._release_image_job(job)
+            raise
+        job.task = asyncio.create_task(
+            self._run_registered_image_job(
+                job,
+                event,
+                lambda current: self._execute_job(current, options, event),
+            )
+        )
+        if job.was_queued and notify_queue:
+            await self._send_job_notice(
+                event,
+                (
+                    f"{MessageEmoji.INFO} 已加入个人图片队列｜"
+                    f"等待位置 {job.queue_position}/{self._queued_job_capacity()}。"
+                    "前序任务结束后会自动执行，无需重复发送。"
+                ),
+            )
+        return job
 
     async def _run_job(
         self, event: AstrMessageEvent, options: GenerationOptions
@@ -16126,9 +16561,6 @@ QQ快捷指令:
             return await job.task
         finally:
             self._clear_lora_operation_snapshot(event)
-            async with self._jobs_lock:
-                if self._active_jobs.get(user_id) is job:
-                    self._active_jobs.pop(user_id, None)
 
     async def _run_auxiliary_job(
         self,
@@ -16136,146 +16568,39 @@ QQ快捷指令:
         label: str,
         operation: Any,
     ) -> Any:
-        """Apply the normal per-user duplicate and cooldown rules to image tools."""
+        """Register every auxiliary image command in the shared FIFO queue."""
         user_id = str(event.get_sender_id() or "unknown")
-        now = time.monotonic()
-        async with self._jobs_lock:
-            existing = self._active_jobs.get(user_id)
-            if existing and existing.task and not existing.task.done():
-                raise ValueError("你已有图片任务，请等待完成或先取消当前任务")
-            bypass_cooldown = bool(
-                event.is_admin() and self.settings.admin_ignore_cooldown
+        job = GenerationJob(
+            user_id=user_id,
+            prompt_preview=label[:80],
+            created_at=time.monotonic(),
+            ready_event=asyncio.Event(),
+            task_type=self._image_task_type(label),
+        )
+        error = await self._register_image_job(job, event)
+        if error:
+            raise ValueError(error)
+        try:
+            self._create_image_task_record(job)
+        except Exception:
+            await self._release_image_job(job)
+            raise
+        job.task = asyncio.create_task(
+            self._run_registered_image_job(job, event, operation)
+        )
+        if job.was_queued:
+            await self._send_job_notice(
+                event,
+                (
+                    f"{MessageEmoji.INFO} 已加入个人图片队列｜"
+                    f"等待位置 {job.queue_position}/{self._queued_job_capacity()}。"
+                    "前序任务结束后会自动执行，无需重复发送。"
+                ),
             )
-            if not bypass_cooldown:
-                remaining = self.settings.user_cooldown - (
-                    now - self._last_request_at.get(user_id, 0.0)
-                )
-                if remaining > 0:
-                    raise ValueError(f"操作过快，请在 {int(remaining) + 1} 秒后重试")
-            job = GenerationJob(
-                user_id=user_id,
-                prompt_preview=label[:80],
-                created_at=now,
-            )
-            task_type = {
-                "reverse prompt": "reverse_prompt",
-                "reverse draw": "reverse_draw",
-                "semantic redraw": "semantic_redraw",
-                "RTX upscale": "rtx_upscale",
-                "character swap": "character_swap",
-                "inpaint": "inpaint",
-                "control draw": "control_generation",
-            }.get(label, "image_tool")
-            if self._task_store is not None:
-                job.task_run_id = self._task_store.create_task(
-                    task_type,
-                    mode="qq_command",
-                    requested_by=user_id,
-                    total_items=1,
-                    metadata={"operation": task_type},
-                )
-                self._task_store.start_task(job.task_run_id, total_items=1)
-                self._task_store.append_event(
-                    job.task_run_id,
-                    "run",
-                    (
-                        "语义换角任务开始执行，正在校验输入与实时 LoRA 状态。"
-                        if task_type == "character_swap"
-                        else (
-                            "整图语义重绘任务开始执行，正在读取原图并规划修改约束。"
-                            if task_type == "semantic_redraw"
-                            else "图片任务开始执行，正在读取本次显式提供或引用的图片。"
-                        )
-                    ),
-                    event_code="image_task_started",
-                )
-
-            async def runner() -> Any:
-                try:
-                    result = await operation(job)
-                    if self._task_store is not None and job.task_run_id:
-                        self._task_store.append_event(
-                            job.task_run_id,
-                            "run",
-                            "图片任务的全部阶段已执行完成。",
-                            event_code="image_task_succeeded",
-                            details={"final_state": job.state},
-                        )
-                        self._task_store.finish_task(
-                            job.task_run_id,
-                            "succeeded",
-                            completed_items=1,
-                            failed_items=0,
-                            result={"final_state": job.state},
-                        )
-                    return result
-                except asyncio.CancelledError:
-                    job.state = "cancelled"
-                    if job.prompt_id and self._client:
-                        await self._client.cancel(job.prompt_id)
-                    if self._task_store is not None and job.task_run_id:
-                        self._task_store.finish_task(
-                            job.task_run_id,
-                            "cancelled",
-                            completed_items=0,
-                            failed_items=0,
-                            error_code="cancelled",
-                            error_summary="用户或管理员取消了图片任务。",
-                        )
-                    raise
-                except Exception as exc:
-                    failed_stage = job.failed_stage or job.state
-                    job.failed_stage = failed_stage
-                    job.state = "failed"
-                    error_code = str(
-                        getattr(exc, "code", "image_task_failed")
-                    )[:80]
-                    if not re.fullmatch(r"[a-z0-9_\-]+", error_code):
-                        error_code = "image_task_failed"
-                    if self._task_store is not None and job.task_run_id:
-                        safe_message = str(
-                            getattr(exc, "user_message", type(exc).__name__)
-                        )[:500]
-                        exception_details = (
-                            dict(exc.details)
-                            if isinstance(exc, CharacterSwapError)
-                            and isinstance(exc.details, Mapping)
-                            else {}
-                        )
-                        self._task_store.append_event(
-                            job.task_run_id,
-                            "run",
-                            "图片任务在当前阶段失败。",
-                            level="ERROR",
-                            event_code="image_task_failed",
-                            details={
-                                **exception_details,
-                                "final_state": job.state,
-                                "failed_stage": failed_stage,
-                                "error_type": type(exc).__name__,
-                                "error_code": error_code,
-                            },
-                        )
-                        self._task_store.finish_task(
-                            job.task_run_id,
-                            "failed",
-                            completed_items=0,
-                            failed_items=1,
-                            error_code=error_code,
-                            error_summary=safe_message,
-                        )
-                    raise
-
-            job.task = asyncio.create_task(runner())
-            self._active_jobs[user_id] = job
-            self._last_request_at[user_id] = now
         try:
             return await job.task
         finally:
             self._clear_lora_operation_snapshot(event)
-            async with self._jobs_lock:
-                if self._active_jobs.get(user_id) is job:
-                    self._active_jobs.pop(user_id, None)
 
     def _record_image_task_phase(
         self,
@@ -18317,8 +18642,13 @@ QQ快捷指令:
             await self._web_ui.close()
 
         async with self._jobs_lock:
-            jobs = list(self._active_jobs.values())
+            jobs = list(self._active_jobs.values()) + [
+                job
+                for queue in self._queued_job_map().values()
+                for job in queue
+            ]
             self._active_jobs.clear()
+            self._queued_job_map().clear()
         for job in jobs:
             if job.task and not job.task.done():
                 job.task.cancel()

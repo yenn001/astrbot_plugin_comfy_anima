@@ -3923,6 +3923,252 @@ class AuxiliaryImageTaskFailureTests(unittest.IsolatedAsyncioTestCase):
             store.close()
 
 
+class PerUserImageQueueTests(unittest.IsolatedAsyncioTestCase):
+    """同一用户的图片任务应进入 FIFO，而不是要求重新发送。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        cls.task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+    class Event:
+        def __init__(self, sender: str = "tester") -> None:
+            self.sender = sender
+            self.messages = []
+
+        def get_sender_id(self):
+            return self.sender
+
+        @staticmethod
+        def is_admin():
+            return False
+
+        @staticmethod
+        def plain_result(text):
+            return text
+
+        async def send(self, message):
+            self.messages.append(message)
+
+    def _plugin(self, store, *, capacity: int = 3):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._jobs_lock = asyncio.Lock()
+        plugin._active_jobs = {}
+        plugin._queued_jobs = {}
+        plugin._last_request_at = {}
+        plugin._task_store = store
+        plugin._client = None
+        plugin.settings = types.SimpleNamespace(
+            admin_ignore_cooldown=False,
+            user_cooldown=30,
+            max_queued_jobs_per_user=capacity,
+        )
+        return plugin
+
+    async def test_second_image_task_is_persisted_and_runs_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            second_started = asyncio.Event()
+            order = []
+
+            async def first_operation(job):
+                order.append("first")
+                first_started.set()
+                await release_first.wait()
+                job.state = "completed"
+                return "first-result"
+
+            async def second_operation(job):
+                order.append("second")
+                second_started.set()
+                job.state = "completed"
+                return "second-result"
+
+            first = asyncio.create_task(
+                plugin._run_auxiliary_job(
+                    self.Event(),
+                    "reverse draw",
+                    first_operation,
+                )
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second_event = self.Event()
+            second = asyncio.create_task(
+                plugin._run_auxiliary_job(
+                    second_event,
+                    "character swap",
+                    second_operation,
+                )
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            self.assertFalse(second_started.is_set())
+            self.assertTrue(any("等待位置 1/3" in item for item in second_event.messages))
+            tasks = store.recent_tasks(limit=10)
+            self.assertEqual({item["status"] for item in tasks}, {"queued", "running"})
+            queued_task = next(item for item in tasks if item["status"] == "queued")
+            queued_events = store.read_events(
+                run_id=queued_task["run_id"],
+                limit=20,
+            )["entries"]
+            self.assertTrue(
+                any(item["event_code"] == "image_task_queued" for item in queued_events)
+            )
+
+            release_first.set()
+            self.assertEqual(await asyncio.wait_for(first, timeout=1), "first-result")
+            self.assertEqual(await asyncio.wait_for(second, timeout=1), "second-result")
+            self.assertEqual(order, ["first", "second"])
+            self.assertTrue(
+                any("已轮到你的排队任务" in item for item in second_event.messages)
+            )
+            self.assertEqual(plugin._active_jobs, {})
+            self.assertEqual(plugin._queued_jobs, {})
+            self.assertEqual(
+                {item["status"] for item in store.recent_tasks(limit=10)},
+                {"succeeded"},
+            )
+            store.close()
+
+    async def test_normal_generation_uses_the_same_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            execution_order = []
+
+            async def execute(job, options, _event):
+                execution_order.append(options.prompt)
+                if options.prompt == "first":
+                    first_started.set()
+                    await release_first.wait()
+                job.state = "completed"
+                return ([], 1, options.prompt, "", None)
+
+            plugin._execute_job = execute
+            first = await plugin._create_job(
+                "tester",
+                self.main.GenerationOptions(prompt="first"),
+                self.Event(),
+            )
+            self.assertIsInstance(first, self.main.GenerationJob)
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second_event = self.Event()
+            second = await plugin._create_job(
+                "tester",
+                self.main.GenerationOptions(prompt="second"),
+                second_event,
+            )
+            self.assertIsInstance(second, self.main.GenerationJob)
+            self.assertTrue(second.was_queued)
+            self.assertEqual(second.task_type, "generation")
+            self.assertTrue(any("等待位置 1/3" in item for item in second_event.messages))
+
+            release_first.set()
+            await asyncio.wait_for(first.task, timeout=1)
+            await asyncio.wait_for(second.task, timeout=1)
+            self.assertEqual(execution_order, ["first", "second"])
+            self.assertEqual(
+                {item["task_type"] for item in store.recent_tasks(limit=10)},
+                {"generation"},
+            )
+            store.close()
+
+    async def test_queue_capacity_rejects_only_after_waiting_slots_are_full(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store, capacity=1)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def blocking(job):
+                first_started.set()
+                await release_first.wait()
+                job.state = "completed"
+                return "done"
+
+            async def queued(job):
+                job.state = "completed"
+                return "queued"
+
+            first = asyncio.create_task(
+                plugin._run_auxiliary_job(self.Event(), "reverse draw", blocking)
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second = asyncio.create_task(
+                plugin._run_auxiliary_job(self.Event(), "reverse draw", queued)
+            )
+            await asyncio.sleep(0)
+            with self.assertRaisesRegex(ValueError, "队列已满"):
+                await plugin._run_auxiliary_job(
+                    self.Event(),
+                    "reverse draw",
+                    queued,
+                )
+            release_first.set()
+            await asyncio.wait_for(first, timeout=1)
+            await asyncio.wait_for(second, timeout=1)
+            store.close()
+
+    async def test_web_ui_can_cancel_a_queued_image_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store)
+            plugin._background_task_runs = {}
+            plugin._danbooru_cancel_events = {}
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            queued_started = asyncio.Event()
+
+            async def blocking(job):
+                first_started.set()
+                await release_first.wait()
+                job.state = "completed"
+
+            async def should_not_start(job):
+                queued_started.set()
+                job.state = "completed"
+
+            first = asyncio.create_task(
+                plugin._run_auxiliary_job(self.Event(), "reverse draw", blocking)
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second = asyncio.create_task(
+                plugin._run_auxiliary_job(
+                    self.Event(),
+                    "character swap",
+                    should_not_start,
+                )
+            )
+            await asyncio.sleep(0)
+            queued_task = next(
+                item
+                for item in store.recent_tasks(limit=10)
+                if item["status"] == "queued"
+            )
+
+            result = await plugin.web_ui_cancel_task(queued_task["run_id"])
+            self.assertEqual(result["message"], "已请求取消图片任务")
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+            self.assertFalse(queued_started.is_set())
+            self.assertEqual(
+                store.get_task(queued_task["run_id"])["status"],
+                "cancelled",
+            )
+            release_first.set()
+            await asyncio.wait_for(first, timeout=1)
+            store.close()
+
+
 class CharacterSwapClassifierRoutingTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -6161,6 +6407,8 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin._active_workflow_name = "anima_api.json"
         plugin._active_jobs = {}
+        plugin._queued_jobs = {}
+        plugin._jobs_lock = asyncio.Lock()
         plugin._pipeline_builders = {}
         plugin._control_workflow_builder = None
         plugin._control_initialization_error = ""
@@ -6853,6 +7101,9 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         }
         plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
         invalid = (
+            {"max_queued_jobs_per_user": -1},
+            {"max_queued_jobs_per_user": 11},
+            {"max_queued_jobs_per_user": 1.5},
             {"prompt_asset_max_download_mb": 17},
             {"prompt_lab_batch_capacity": 3},
             {"prompt_lab_ttl_seconds": 59},

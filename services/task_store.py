@@ -749,6 +749,65 @@ class TaskStore:
                 self._after_write_locked()
             return max(0, int(cursor.rowcount))
 
+    def interrupt_queued_tasks(
+        self,
+        task_types: Sequence[str],
+        *,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Mark non-resumable in-memory queued tasks interrupted on startup."""
+
+        normalized = tuple(
+            dict.fromkeys(
+                _bounded_text(value, 100).strip()
+                for value in task_types
+                if _bounded_text(value, 100).strip()
+            )
+        )
+        if not normalized:
+            return 0
+        placeholders = ",".join("?" for _ in normalized)
+        now = self._timestamp(timestamp)
+        with self._lock:
+            queued = self._execute_locked(
+                f"SELECT run_id FROM task_runs "
+                f"WHERE status = 'queued' AND task_type IN ({placeholders})",
+                normalized,
+            ).fetchall()
+            cursor = self._execute_locked(
+                f"""
+                UPDATE task_runs
+                SET status = 'interrupted', heartbeat_at = ?, ended_at = ?,
+                    error_code = CASE
+                        WHEN error_code = '' THEN 'plugin_restarted'
+                        ELSE error_code
+                    END,
+                    error_summary = CASE
+                        WHEN error_summary = ''
+                        THEN 'Plugin restarted before queued image task could start'
+                        ELSE error_summary
+                    END
+                WHERE status = 'queued' AND task_type IN ({placeholders})
+                """,
+                (now, now, *normalized),
+            )
+            for row in queued:
+                self._append_event_locked(
+                    str(row["run_id"]),
+                    "lifecycle",
+                    "插件重新启动，尚未开始的内存图片队列任务已标记为中断。",
+                    level="WARNING",
+                    event_code="queued_task_interrupted_on_startup",
+                    details={
+                        "status": "interrupted",
+                        "error_code": "plugin_restarted",
+                    },
+                    timestamp=now,
+                )
+            if queued:
+                self._after_write_locked()
+            return max(0, int(cursor.rowcount))
+
     def append_runtime_log(
         self,
         level: str,

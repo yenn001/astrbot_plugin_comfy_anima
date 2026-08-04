@@ -296,6 +296,7 @@ class PluginSettings:
     send_generation_notice: bool = True
     allow_global_interrupt: bool = False
     max_concurrent_jobs: int = 1
+    max_queued_jobs_per_user: int = 3
     user_cooldown: int = 30
     request_timeout: int = 30
     generation_timeout: int = 1200
@@ -775,6 +776,10 @@ class PluginSettings:
             send_generation_notice=_as_bool(data.get("send_generation_notice"), True),
             allow_global_interrupt=_as_bool(data.get("allow_global_interrupt"), False),
             max_concurrent_jobs=_as_int(data.get("max_concurrent_jobs"), 1, 1),
+            max_queued_jobs_per_user=min(
+                10,
+                _as_int(data.get("max_queued_jobs_per_user"), 3, 0),
+            ),
             user_cooldown=_as_int(data.get("user_cooldown"), 30),
             request_timeout=_as_int(data.get("request_timeout"), 30, 1),
             generation_timeout=_as_int(data.get("generation_timeout"), 1200, 10),
@@ -938,8 +943,12 @@ class GenerationJob:
     prompt_preview: str
     created_at: float
     task: Any = None
+    ready_event: Any = None
     prompt_id: Optional[str] = None
     state: str = "queued"
+    task_type: str = "generation"
+    was_queued: bool = False
+    queue_position: int = 0
     task_run_id: str = ""
     failed_stage: str = ""
     lora_snapshot: Any = None

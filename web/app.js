@@ -147,6 +147,7 @@ const taskStatusLabels = {
 };
 
 const taskTypeLabels = {
+  generation: "图片生成",
   lora_semantic_analysis: "LoRA 语义建档",
   lora_archive: "LoRA AI 建档",
   lora_metadata: "LoRA 元数据",
@@ -156,6 +157,8 @@ const taskTypeLabels = {
   asset_delete: "资产删除",
   reverse_prompt: "图片反推",
   reverse_draw: "反推画图",
+  control_generation: "底图控制",
+  character_swap: "语义换角",
   semantic_redraw: "整图语义重绘",
   rtx_upscale: "RTX 放大",
   inpaint: "遮罩局部重绘",
@@ -174,6 +177,7 @@ const numberFields = new Set([
   "default_width",
   "default_height",
   "max_concurrent_jobs",
+  "max_queued_jobs_per_user",
   "user_cooldown",
   "rtx_scale",
   "iterative_scale",

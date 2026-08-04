@@ -750,6 +750,12 @@
     "hint": "显存有限时建议保持 1",
     "default": 1
   },
+  "max_queued_jobs_per_user": {
+    "description": "每位用户最多等待的图片任务数",
+    "type": "int",
+    "hint": "已有任务时自动进入个人 FIFO 队列；0 表示关闭排队并恢复直接拒绝",
+    "default": 3
+  },
   "provider_max_concurrent_jobs": {
     "description": "LLM/反推模型最大并发准备数",
     "type": "int",
