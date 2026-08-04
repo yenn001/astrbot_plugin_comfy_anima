@@ -21,7 +21,7 @@ from ..core.lora import canonical_lora_name
 from .lora_catalog import LoraRecord
 
 
-SEMANTIC_SCHEMA_VERSION = 2
+SEMANTIC_SCHEMA_VERSION = 3
 
 PROVENANCE_SOURCES = (
     "observed",
@@ -80,6 +80,7 @@ SEMANTIC_FIELDS = (
     "category",
     "character_names",
     "source_works",
+    "activation_terms",
     "artist_style_names",
     "aliases",
 )
@@ -253,6 +254,59 @@ def _facts_from_values(
 
 
 @dataclass(frozen=True)
+class LoraIdentityBinding:
+    """One reviewed Character/Copyright ownership pair for a LoRA file."""
+
+    character_canonical: str
+    copyright_canonical: str = ""
+    activation_terms: tuple[str, ...] = ()
+    source: str = "manual"
+    verified_revision: str = ""
+    verified_at: str = ""
+
+    def __post_init__(self) -> None:
+        character = _clean_text(self.character_canonical)
+        work = _clean_text(self.copyright_canonical)
+        if not character:
+            raise LoraSemanticError("LoRA identity binding requires a Character canonical")
+        if self.source not in {"manual", "observed"}:
+            raise LoraSemanticError("LoRA identity binding source must be manual or observed")
+        object.__setattr__(self, "character_canonical", character)
+        object.__setattr__(self, "copyright_canonical", work)
+        object.__setattr__(
+            self,
+            "activation_terms",
+            tuple(dict.fromkeys(_clean_text(item) for item in self.activation_terms if _clean_text(item)))[:24],
+        )
+        object.__setattr__(self, "verified_revision", _clean_text(self.verified_revision))
+        object.__setattr__(self, "verified_at", _clean_text(self.verified_at))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "character_canonical": self.character_canonical,
+            "copyright_canonical": self.copyright_canonical,
+            "activation_terms": list(self.activation_terms),
+            "source": self.source,
+            "verified_revision": self.verified_revision,
+            "verified_at": self.verified_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "LoraIdentityBinding":
+        activation_terms = payload.get("activation_terms", ())
+        if not isinstance(activation_terms, (list, tuple)):
+            raise LoraSemanticError("LoRA identity activation_terms must be an array")
+        return cls(
+            character_canonical=str(payload.get("character_canonical") or ""),
+            copyright_canonical=str(payload.get("copyright_canonical") or ""),
+            activation_terms=tuple(str(item) for item in activation_terms),
+            source=str(payload.get("source") or "manual"),
+            verified_revision=str(payload.get("verified_revision") or ""),
+            verified_at=str(payload.get("verified_at") or ""),
+        )
+
+
+@dataclass(frozen=True)
 class SemanticEntry:
     """Semantic information for one loadable LoRA identity."""
 
@@ -263,8 +317,10 @@ class SemanticEntry:
     category: tuple[SemanticFact, ...] = ()
     character_names: tuple[SemanticFact, ...] = ()
     source_works: tuple[SemanticFact, ...] = ()
+    activation_terms: tuple[SemanticFact, ...] = ()
     artist_style_names: tuple[SemanticFact, ...] = ()
     aliases: tuple[SemanticFact, ...] = ()
+    identity_bindings: tuple[LoraIdentityBinding, ...] = ()
     analysis_summary: str = ""
     analysis_confidence: float = 0.0
     source_fingerprint: str = ""
@@ -344,7 +400,7 @@ class SemanticEntry:
             fact.source == "manual"
             for field_name in SEMANTIC_FIELDS
             for fact in self.facts(field_name)
-        )
+        ) or any(binding.source == "manual" for binding in self.identity_bindings)
 
     @property
     def overlay_valid(self) -> bool:
@@ -364,6 +420,9 @@ class SemanticEntry:
                 field_name: [fact.to_dict() for fact in self.facts(field_name)]
                 for field_name in SEMANTIC_FIELDS
             },
+            "identity_bindings": [
+                binding.to_dict() for binding in self.identity_bindings
+            ],
             "analysis_summary": self.analysis_summary,
             "analysis_confidence": self.analysis_confidence,
             "source_fingerprint": self.source_fingerprint,
@@ -380,7 +439,7 @@ class SemanticEntry:
 
         parsed_fields: dict[str, tuple[SemanticFact, ...]] = {}
         for field_name in SEMANTIC_FIELDS:
-            raw_facts = semantic.get(field_name, ())
+            raw_facts = semantic.get(field_name, [])
             if not isinstance(raw_facts, list):
                 raise LoraSemanticError(f"Semantic field {field_name} must be a list")
             parsed_fields[field_name] = tuple(
@@ -388,6 +447,9 @@ class SemanticEntry:
                 for item in raw_facts
                 if isinstance(item, Mapping)
             )
+        raw_bindings = payload.get("identity_bindings", [])
+        if not isinstance(raw_bindings, list):
+            raise LoraSemanticError("LoRA identity_bindings must be an array")
         return cls(
             identity_key=str(payload.get("identity_key") or ""),
             canonical_name=str(payload.get("canonical_name") or ""),
@@ -399,6 +461,11 @@ class SemanticEntry:
             updated_at=str(payload.get("updated_at") or ""),
             error=str(payload.get("error") or ""),
             present=bool(payload.get("present", True)),
+            identity_bindings=tuple(
+                LoraIdentityBinding.from_dict(item)
+                for item in raw_bindings
+                if isinstance(item, Mapping)
+            ),
             **parsed_fields,
         )
 
@@ -458,7 +525,7 @@ class LoraSemanticIndex:
         if not isinstance(payload, Mapping):
             raise LoraSemanticError("LoRA semantic index must be a JSON object")
         version = payload.get("schema_version")
-        if version == SEMANTIC_SCHEMA_VERSION:
+        if version in {2, SEMANTIC_SCHEMA_VERSION}:
             raw_entries = payload.get("entries", {})
             if not isinstance(raw_entries, Mapping):
                 raise LoraSemanticError("LoRA semantic entries must be an object")
@@ -593,6 +660,7 @@ class LoraSemanticIndex:
             "category": "category",
             "character_names": "character_names",
             "source_works": "source_works",
+            "activation_terms": "activation_terms",
             "artist_style_names": "artist_style_names",
             "aliases": "aliases",
         }
@@ -828,6 +896,7 @@ def _term_score(
 __all__ = [
     "ANALYSIS_STATUSES",
     "LoraSemanticError",
+    "LoraIdentityBinding",
     "LoraSemanticIndex",
     "PROVENANCE_SOURCES",
     "SEMANTIC_CATEGORIES",

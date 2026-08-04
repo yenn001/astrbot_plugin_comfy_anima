@@ -22,6 +22,7 @@ from ..services.character_swap import (
 )
 from ..services.lora_catalog import LoraRecord
 from ..services.lora_semantic import (
+    LoraIdentityBinding,
     LoraSemanticIndex,
     SemanticEntry,
     SemanticFact,
@@ -3437,9 +3438,155 @@ class CharacterSwapPlanningTests(unittest.TestCase):
         self.assertIn("school uniform", plan.prompt)
         self.assertNotIn("denia_wuwa", plan.prompt)
 
-    def test_obvious_multi_subject_prompt_is_rejected(self) -> None:
-        with self.assertRaisesRegex(CharacterSwapError, "单角色"):
-            self._prepare(prompt="2girls, denia_wuwa, school uniform")
+    def test_multi_subject_without_unique_selector_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CharacterSwapError, "自然语言"):
+            self.planner.prepare(
+                CharacterSwapRequest("", "Kallen Kaslana"),
+                positive_prompt="2girls, denia_wuwa, school uniform",
+                negative_prompt="",
+                records=self.records,
+            )
+
+    def test_multi_subject_hair_selector_replaces_only_selected_character(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest(
+                "黄色头发的角色",
+                "Kallen Kaslana",
+                source_subject_count=2,
+                protected_subject_terms=("red hair", "school uniform"),
+            ),
+            positive_prompt=(
+                "2girls, yellow hair, red hair, school uniform, standing, outdoors"
+            ),
+            negative_prompt="bad anatomy",
+            records=self.records,
+        )
+        classification = self.planner.deterministic_classification(preparation)
+
+        self.assertIsNotNone(classification)
+        assert classification is not None
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertNotIn("yellow hair", plan.kept_terms)
+        self.assertIn("red hair", plan.kept_terms)
+        self.assertIn("red hair", plan.prompt)
+        self.assertIn("school uniform", plan.prompt)
+        self.assertNotIn("yellow hair", plan.negative_prompt)
+        self.assertEqual(plan.source_subject_count, 2)
+        self.assertEqual(plan.source_selector_basis, "unique_hair_color")
+        self.assertIn("red hair", plan.protected_subject_terms)
+        self.assertIn("school uniform", plan.protected_subject_terms)
+
+    def test_multi_subject_classifier_cannot_remove_other_character_term(self) -> None:
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("黄色头发的角色", "Kallen Kaslana"),
+            positive_prompt="2girls, yellow hair, red hair, outdoors",
+            negative_prompt="",
+            records=self.records,
+        )
+        payload = _classification_payload(
+            len(preparation.tags),
+            source_identity_ids=[1, 2],
+            style_quality_ids=[0, 3],
+            subject_count=2,
+        )
+        classification = self.planner.parse_classification(
+            json.dumps(payload),
+            tag_count=len(preparation.tags),
+            target_trigger_count=len(preparation.target_trigger_words),
+        )
+
+        with self.assertRaisesRegex(CharacterSwapError, "未被自然语言选择器"):
+            self.planner.finalize(preparation, classification)
+
+    def test_bound_target_lora_keeps_canonical_separate_from_activation(self) -> None:
+        black_denia = _record(
+            "black deniav1-2.safetensors",
+            "Denia",
+            "ab" * 32,
+            triggers=("black_denia", "black hair"),
+            source_work="Wuthering Waves",
+        )
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(black_denia.name, black_denia.sha256),
+            canonical_name=black_denia.name,
+            sha256=black_denia.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "manual"),),
+            character_names=(SemanticFact("Denia", "manual"),),
+            source_works=(SemanticFact("Wuthering Waves", "manual"),),
+            activation_terms=(SemanticFact("black_denia", "manual"),),
+            identity_bindings=(
+                LoraIdentityBinding(
+                    character_canonical="denia_(wuthering_waves)",
+                    copyright_canonical="wuthering_waves",
+                    activation_terms=("black_denia",),
+                ),
+            ),
+            source_fingerprint=black_denia.source_fingerprint,
+        )
+        planner = CharacterSwapPlanner(
+            LoraSemanticIndex(entries={entry.identity_key: entry})
+        )
+        preparation = planner.prepare(
+            CharacterSwapRequest(
+                "",
+                "Denia",
+                semantic_identity_index_verified=True,
+                semantic_identity_canonical_tag="denia_(wuthering_waves)",
+            ),
+            positive_prompt="1girl, old heroine, blue hair, standing",
+            negative_prompt="",
+            records=(black_denia,),
+            fallback_target_tags=(r"denia_\(wuthering_waves\)",),
+        )
+
+        self.assertEqual(
+            preparation.deterministic_target_trigger,
+            "denia_(wuthering_waves)",
+        )
+        self.assertEqual(preparation.target_activation_terms, ("black_denia",))
+        self.assertNotEqual(
+            preparation.deterministic_target_trigger,
+            preparation.target_activation_terms[0],
+        )
+
+    def test_multi_subject_explicit_source_preserves_other_character_lora(self) -> None:
+        target = _record(
+            "characters/target.safetensors",
+            "Target Hero",
+            "ef" * 32,
+            triggers=("target_hero",),
+        )
+        records = (*self.records, target)
+        preparation = self.planner.prepare(
+            CharacterSwapRequest("Denia", "Target Hero"),
+            positive_prompt=(
+                "<lora:characters/denia:0.8>, <lora:characters/kallen:0.7>, "
+                "2girls, denia_wuwa, kallen_kaslana, standing, outdoors"
+            ),
+            negative_prompt="",
+            records=records,
+        )
+        classification = self.planner.deterministic_classification(preparation)
+
+        self.assertIsNotNone(classification)
+        assert classification is not None
+        plan = self.planner.finalize(preparation, classification)
+
+        self.assertEqual(
+            plan.preserved_character_lora_names,
+            ("characters/kallen.safetensors",),
+        )
+        self.assertEqual(
+            {selection.name for selection in plan.loras},
+            {
+                "characters/kallen.safetensors",
+                "characters/target.safetensors",
+            },
+        )
+        self.assertNotIn("denia_wuwa", plan.prompt)
+        self.assertIn("kallen_kaslana", plan.prompt)
 
     def test_weighted_group_cannot_hide_source_identity(self) -> None:
         preparation = self.planner.prepare(

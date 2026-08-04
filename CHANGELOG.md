@@ -2,6 +2,19 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.0.0] - 2026-08-04
+
+### 多人语义换角与 LoRA 三层身份架构
+
+- 语义换角从单主体升级为最多六个可观察角色槽位。用户继续使用自然语言指定来源角色，例如“把黄色头发的角色换成目标角色”，插件按明确身份、唯一性别、唯一外观组合、衣装/动作组合的顺序选择；左右方向只在双胞胎式歧义无法消除时作为最后兜底，不新增 `--subject` 一类参数。
+- 多人场景会保护未选中的角色特征和角色 LoRA。被选中角色的身份与稳定外貌才允许移除；其他角色的头发、服装、动作、位置和 LoRA 不得被分类模型越权删除。`--preview` 继续保证不提交 ComfyUI。
+- `/画图 ... --llm cc u`、`--llm c u`、`--llmcc u`、`--lcc u` 与 `/反推画图 ... --l cc u` 共用同一换角入口。反推结果可表达最多六个角色的性别、外观、衣装、动作和位置；VLM 只负责观察，本地确定性代码负责选择与保护。
+- LoRA 语义档案升级为 Schema v3，彻底分离 LoRA 文件身份、共享/角色专用激活词和 Danbooru Character/Copyright canonical。文件名、标题、别名、描述或激活词只可帮助发现，不能授权角色身份；LLM 也不能写入身份绑定字段。
+- 新增 `identity_bindings[]` 与 `activation_terms[]`。人工绑定有 SHA-256 时跟随 LoRA 文件内容，Manager 描述、Tags 或训练词变化不会令其失效；文件 SHA 改变后立即失效。无 SHA 时才使用语义指纹保护。
+- 修复 `black deniav1-2.safetensors`、`black_denia` 与 `denia_(wuthering_waves)` 被误当成同一名字的问题。普通 `/画图 --llm`、文字换角和反推换角都可同时保留正确 canonical 与一个或多个独立激活词；激活词不会进入 Character exact，也不能借同名碰撞注入额外身份。
+- 两套 WebUI 的 LoRA 详情同步增加共享激活词和逐角色 Danbooru exact 绑定编辑。保存时实时核对 Character/Copyright exact 与作品一致性；旧客户端未发送新字段时保留已有绑定，显式空数组才清除。
+- Prompt Contract 升级到 v3.0，明确多人角色归属、身份授权与激活词边界。本版不增加 Python 依赖、ComfyUI 自定义节点、模型或工作流文件。
+
 ## [1.9.24] - 2026-08-04
 
 ### Danbooru Schema v2、持续更新与统一角色证据链

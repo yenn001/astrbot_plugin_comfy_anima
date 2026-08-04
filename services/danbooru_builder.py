@@ -32,7 +32,7 @@ from .danbooru_index import (
 
 DEFAULT_API_BASE_URL = "https://danbooru.donmai.us"
 DEFAULT_USER_AGENT = (
-    "AstrBot-Comfy-Anima-Indexer/1.9.24 "
+    "AstrBot-Comfy-Anima-Indexer/2.0.0 "
     "(https://github.com/yenn001/astrbot_plugin_comfy_anima)"
 )
 MAX_PAGE_BYTES = 8 * 1024 * 1024

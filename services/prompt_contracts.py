@@ -12,7 +12,7 @@ import re
 from collections.abc import Iterable
 
 
-PROMPT_CONTRACT_VERSION = "2.2"
+PROMPT_CONTRACT_VERSION = "3.0"
 
 TASK_DRAW = "draw"
 TASK_PROMPT_PLAN = "prompt_plan"
@@ -61,7 +61,7 @@ _TASK_TRANSPORTS[TASK_MASKED_REDRAW] = frozenset({TRANSPORT_EDIT})
 
 
 CORE_AUTHORITY_CONTRACT = """
-Anima Prompt Contract v2 authority boundary:
+Anima Prompt Contract v3 authority boundary:
 - The user request is the highest authority for visible identity, clothing,
   action, relation, camera, scene and lighting. Never add a person, body trait,
   outfit, prop, action result or setting merely to make the prompt richer.
@@ -172,10 +172,13 @@ Runtime LoRA capability:
   uniquely matched current asset; if no unique result exists, continue with
   verified semantic identity rather than guessing a file.
 - A character LoRA must bind to the same exact-confirmed Character canonical.
-  Its activation trigger may use a training variant syntax that is not itself a
-  Danbooru Character tag; current character-name plus work metadata remains the
-  binding authority. Armed, Bunny, Dress or other distinct indexed identities
-  never substitute for the base identity unless explicitly requested and exact.
+  File name, display name and activation terms are separate namespaces and never
+  authorize identity. A fingerprint-bound `identity_bindings` row plus current
+  Character/Copyright exact is the authority. Activation terms may use arbitrary
+  training syntax and may coexist with the canonical, but must not be queried or
+  emitted as a second Character identity. Armed, Bunny, Dress or other distinct
+  indexed identities never substitute for the base identity unless explicitly
+  requested and exact.
 - Do not claim a lookup or save succeeded unless the corresponding tool returned
   success. Tool metadata aids retrieval but never overrides user-visible facts.
 """.strip()

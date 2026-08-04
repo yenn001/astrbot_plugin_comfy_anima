@@ -64,6 +64,13 @@ _APPEARANCE_OR_OUTFIT_MARKERS = (
     "swimsuit",
     "bikini",
     "lingerie",
+    "bodysuit",
+    "leotard",
+    "underwear",
+    "panties",
+    "bra",
+    "stockings",
+    "thighhighs",
     "发色",
     "头发",
     "眼睛",
@@ -111,6 +118,32 @@ def _split_trigger_text(value: str) -> tuple[str, ...]:
         for token in _TRIGGER_SPLIT_RE.split(str(value or ""))
         if token.strip()
     )
+
+
+def _bound_activation_terms(values: Iterable[str]) -> tuple[str, ...]:
+    """Normalize file-bound activation terms without treating them as identity."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for token in _split_trigger_text(str(raw or "")):
+            value = token.strip(" ,")
+            if not value:
+                continue
+            if "<lora:" in value.casefold() or "\x00" in value:
+                raise LoraWorkflowError(
+                    "bound character activation term contains forbidden syntax"
+                )
+            # Activation terms are literal prompt tags, not Comfy weighting
+            # expressions. Keep their spelling while emitting exactly one
+            # escape layer around parentheses.
+            value = re.sub(r"\\*([()])", r"\\\1", value)
+            key = _term_key(value)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(value)
+    return tuple(normalized)
 
 
 def _clean_metadata_trigger(value: str) -> str:
@@ -320,6 +353,7 @@ def build_lora_trigger_plan(
     presets: tuple[LoraPreset, ...] = (),
     suppressed_terms: Iterable[str] = (),
     verified_character_triggers: Mapping[str, str] | None = None,
+    bound_character_activation_terms: Mapping[str, Iterable[str]] | None = None,
 ) -> LoraTriggerPlan:
     """Append only explicit, role-appropriate trigger words.
 
@@ -327,9 +361,11 @@ def build_lora_trigger_plan(
     LoRAs receive one reliable identity trigger only, so default clothes and
     appearance tags cannot defeat an explicit outfit change.  A preset's
     manually saved trigger string supplements the latest role-appropriate
-    Manager metadata for its members.  ``verified_character_triggers`` may
-    select one exact metadata identity from a multi-character LoRA; mismatched
-    evidence fails closed instead of silently loading an unbound variant.
+    Manager metadata for its members. ``verified_character_triggers`` may
+    select one exact metadata identity from a legacy multi-character LoRA and
+    must still match current metadata. ``bound_character_activation_terms``
+    are already authorized by a file-bound Danbooru identity binding; they are
+    injected as activation only and never become character identity evidence.
     """
 
     prompt_text = str(prompt or "").strip(" ,")
@@ -345,6 +381,11 @@ def build_lora_trigger_plan(
     verified_overrides = {
         _canonical_key(name): str(trigger or "").strip()
         for name, trigger in (verified_character_triggers or {}).items()
+        if _canonical_key(name)
+    }
+    bound_activation_overrides = {
+        _canonical_key(name): _bound_activation_terms(terms)
+        for name, terms in (bound_character_activation_terms or {}).items()
         if _canonical_key(name)
     }
 
@@ -384,12 +425,12 @@ def build_lora_trigger_plan(
             manual_triggers.append((trigger, f"preset {preset.name}"))
 
     effective_roles: dict[str, str] = {}
-    resolved_character_triggers: dict[str, str] = {}
+    resolved_character_triggers: dict[str, tuple[str, ...]] = {}
     for selection in selections:
         key = _canonical_key(selection.name)
         record = records_by_name.get(key)
         if record is None:
-            if key in verified_overrides:
+            if key in verified_overrides or key in bound_activation_overrides:
                 raise LoraWorkflowError(
                     f"verified character trigger has no fresh LoRA metadata: {selection.name}"
                 )
@@ -402,6 +443,7 @@ def build_lora_trigger_plan(
             record_category == "character"
             or str(record.character_name or "").strip()
             or key in verified_overrides
+            or key in bound_activation_overrides
         ):
             role = PRESET_CATEGORY_CHARACTER
         else:
@@ -409,23 +451,33 @@ def build_lora_trigger_plan(
         effective_roles[key] = role
 
         has_override = key in verified_overrides
+        has_bound_activation = key in bound_activation_overrides
         if role != PRESET_CATEGORY_CHARACTER:
-            if has_override:
+            if has_override or has_bound_activation:
                 raise LoraWorkflowError(
                     f"verified character trigger targets non-character LoRA: {selection.name}"
                 )
             continue
 
+        if has_bound_activation:
+            terms = bound_activation_overrides[key]
+            if not terms:
+                raise LoraWorkflowError(
+                    f"bound character LoRA has no activation terms: {selection.name}"
+                )
+            resolved_character_triggers[key] = terms
+            continue
+
         if not has_override:
-            resolved_character_triggers[key] = choose_character_identity_trigger(record)
+            trigger = choose_character_identity_trigger(record)
+            resolved_character_triggers[key] = (trigger,) if trigger else ()
             continue
 
         override_key = _term_key(verified_overrides[key])
-        override_candidates = (
-            character_identity_trigger_candidates(record)
-            if record_category == "character"
-            or str(record.character_name or "").strip()
-            else atomic_lora_trigger_terms(record)
+        override_candidates = tuple(
+            trigger
+            for trigger in atomic_lora_trigger_terms(record)
+            if is_character_identity_trigger_candidate(trigger)
         )
         matches = tuple(
             candidate
@@ -456,7 +508,7 @@ def build_lora_trigger_plan(
         # This path is backed by an exact Danbooru character binding. Emit its
         # prompt form with one (and only one) parenthesis escape layer. Other
         # Manager, preset and user-authored terms remain byte-for-byte free-form.
-        resolved_character_triggers[key] = escape_prompt_tag(matches[0])
+        resolved_character_triggers[key] = (escape_prompt_tag(matches[0]),)
 
     conflicting_character_terms: set[str] = set()
     for selection in selections:
@@ -467,12 +519,16 @@ def build_lora_trigger_plan(
         role = effective_roles.get(key) or str(record.category or "").casefold()
         if role != PRESET_CATEGORY_CHARACTER:
             continue
-        identity_trigger_key = _term_key(resolved_character_triggers.get(key, ""))
+        identity_trigger_keys = {
+            _term_key(value)
+            for value in resolved_character_triggers.get(key, ())
+            if _term_key(value)
+        }
         for trigger in _metadata_trigger_terms(record):
             trigger_key = _term_key(trigger)
             if (
                 trigger_key
-                and trigger_key != identity_trigger_key
+                and trigger_key not in identity_trigger_keys
                 and trigger_key in negative
             ):
                 conflicting_character_terms.add(trigger_key)
@@ -513,9 +569,10 @@ def build_lora_trigger_plan(
                 append_trigger(trigger, selection.name)
             continue
         if role == PRESET_CATEGORY_CHARACTER or role == "character":
-            trigger = resolved_character_triggers.get(key, "")
-            if trigger:
-                append_trigger(trigger, selection.name)
+            triggers = resolved_character_triggers.get(key, ())
+            if triggers:
+                for trigger in triggers:
+                    append_trigger(trigger, selection.name)
             else:
                 skipped.append(
                     f"{selection.name}: no reliable character identity trigger"
@@ -523,9 +580,10 @@ def build_lora_trigger_plan(
             continue
         if role == PRESET_CATEGORY_MIXED or role == "mixed":
             if record.character_name:
-                trigger = resolved_character_triggers.get(key, "")
-                if trigger:
-                    append_trigger(trigger, selection.name)
+                character_triggers = resolved_character_triggers.get(key, ())
+                if character_triggers:
+                    for trigger in character_triggers:
+                        append_trigger(trigger, selection.name)
                 else:
                     skipped.append(
                         f"{selection.name}: mixed LoRA has no reliable identity trigger"

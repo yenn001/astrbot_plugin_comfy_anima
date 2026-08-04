@@ -475,6 +475,24 @@ def insert_tags_before_scene_sentence(
     return prefix or scene
 
 
+def remove_prompt_terms(prompt: str, terms: Iterable[str]) -> str:
+    """Remove exact top-level tags while preserving any trailing scene prose."""
+
+    removal_keys = {_dedupe_key(term) for term in terms if _dedupe_key(term)}
+    if not removal_keys:
+        return _clean_text(prompt)
+    tag_block, scene = split_hybrid_prompt(prompt)
+    kept = tuple(
+        term
+        for term in _split_top_level_commas(tag_block)
+        if _dedupe_key(term) not in removal_keys
+    )
+    prefix = ", ".join(kept)
+    if prefix and scene:
+        return f"{prefix}. {scene}"
+    return prefix or scene
+
+
 def _looks_like_visual_phrase(value: str) -> bool:
     text = _clean_text(value)
     if not text or _LORA_TAG_RE.fullmatch(text):
@@ -1010,5 +1028,6 @@ __all__ = [
     "PromptLayers",
     "compose_prompt",
     "insert_tags_before_scene_sentence",
+    "remove_prompt_terms",
     "split_hybrid_prompt",
 ]

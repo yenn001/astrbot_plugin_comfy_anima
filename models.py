@@ -867,7 +867,9 @@ class GenerationOptions:
     suppress_default_style: bool = False
     suppressed_prompt_terms: tuple[str, ...] = ()
     lora_identity_expectations: tuple["LoraIdentityExpectation", ...] = ()
+    lora_activation_overrides: tuple[tuple[str, str], ...] = ()
     character_swap_target_lora: str = ""
+    character_swap_preserved_character_loras: tuple[str, ...] = ()
     character_swap_forbid_character_loras: bool = False
     pipeline: str = ""
     inpaint_mode: str = ""

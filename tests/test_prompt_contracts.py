@@ -1,4 +1,4 @@
-"""Task-scoped Prompt Contract v2 behavior tests."""
+"""Task-scoped Prompt Contract v3 behavior tests."""
 
 import unittest
 

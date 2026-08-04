@@ -21,7 +21,11 @@ from .localized_character_aliases import (
     contains_localized_text,
 )
 from .lora_catalog import LoraRecord
-from .lora_semantic import LoraSemanticIndex
+from .lora_semantic import (
+    LoraIdentityBinding,
+    LoraSemanticIndex,
+    semantic_source_fingerprint,
+)
 
 
 @dataclass(frozen=True)
@@ -162,6 +166,73 @@ def build_lora_identity_discovery(
     )
 
 
+def _manual_identity_authority(
+    record: LoraRecord,
+    *,
+    semantic_index: LoraSemanticIndex,
+    tag_index: DanbooruTagIndex,
+) -> tuple[LoraIdentityBinding, ...] | None:
+    """Return a fingerprint-bound manual ownership override when one exists.
+
+    File names and activation terms remain searchable metadata.  They cannot add
+    another Character identity once an administrator has explicitly bound this
+    exact LoRA file to reviewed Danbooru canonicals.
+    """
+
+    entry = semantic_index.entry_for(record)
+    if entry is None or not entry.present:
+        return None
+    record_sha = str(record.sha256 or "").strip().casefold()
+    entry_sha = str(entry.sha256 or "").strip().casefold()
+    if record_sha:
+        if not entry_sha or entry_sha != record_sha:
+            return None
+    elif entry.source_fingerprint != semantic_source_fingerprint(record):
+        return None
+    if not entry.identity_bindings:
+        return None
+    normalized_characters = tuple(
+        normalize_tag(binding.character_canonical)
+        for binding in entry.identity_bindings
+    )
+    character_lookups = tag_index.lookup_many(normalized_characters, "character")
+    if len(character_lookups) != len(normalized_characters) or any(
+        not lookup.verified for lookup in character_lookups
+    ):
+        return ()
+    verified_bindings: list[LoraIdentityBinding] = []
+    for binding, character_lookup in zip(entry.identity_bindings, character_lookups):
+        canonical = normalize_tag(character_lookup.canonical_tag or character_lookup.tag)
+        if canonical != normalize_tag(binding.character_canonical):
+            return ()
+        work = normalize_tag(binding.copyright_canonical)
+        if work:
+            work_lookup = tag_index.lookup(work, "copyright")
+            verified_work = normalize_tag(work_lookup.canonical_tag or work_lookup.tag)
+            if not work_lookup.verified or verified_work != work:
+                return ()
+            canonical_work = canonical_work_for_character(canonical)
+            if canonical_work and canonical_work != verified_work:
+                return ()
+        verified_bindings.append(binding)
+    return tuple(verified_bindings)
+
+
+def resolve_lora_identity_bindings(
+    record: LoraRecord,
+    *,
+    semantic_index: LoraSemanticIndex,
+    tag_index: DanbooruTagIndex,
+) -> tuple[LoraIdentityBinding, ...]:
+    """Return only content-bound identity pairs that still exact-verify now."""
+
+    return _manual_identity_authority(
+        record,
+        semantic_index=semantic_index,
+        tag_index=tag_index,
+    ) or ()
+
+
 def resolve_lora_character_canonicals(
     record: LoraRecord,
     *,
@@ -170,6 +241,18 @@ def resolve_lora_character_canonicals(
     localized_index: LocalizedCharacterAliasIndex | None = None,
     query: str = "",
 ) -> tuple[str, ...]:
+    manual_authority = _manual_identity_authority(
+        record,
+        semantic_index=semantic_index,
+        tag_index=tag_index,
+    )
+    if manual_authority is not None:
+        return tuple(
+            dict.fromkeys(
+                normalize_tag(binding.character_canonical)
+                for binding in manual_authority
+            )
+        )
     discovery = build_lora_identity_discovery(
         record,
         semantic_index=semantic_index,
@@ -195,4 +278,5 @@ __all__ = [
     "LoraIdentityDiscovery",
     "build_lora_identity_discovery",
     "resolve_lora_character_canonicals",
+    "resolve_lora_identity_bindings",
 ]

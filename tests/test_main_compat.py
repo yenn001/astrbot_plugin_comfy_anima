@@ -26,6 +26,7 @@ from ..services.danbooru_index import (
 )
 from ..services.lora_catalog import LoraRecord
 from ..services.lora_semantic import (
+    LoraIdentityBinding,
     LoraSemanticIndex,
     SemanticEntry,
     SemanticFact,
@@ -2021,7 +2022,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
             )
             key = self.main.canonical_lora_name(record.name).casefold()
             selection = LoraSelection(record.name, 0.65)
-            kept, overrides, filtered = asyncio.run(
+            kept, overrides, bound_overrides, filtered = asyncio.run(
                 plugin._bind_llm_character_loras(
                     job,
                     prompt=prompt + ", viola",
@@ -2030,6 +2031,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     strict_keys=frozenset({key}),
                 )
             )
+            self.assertEqual(bound_overrides, {})
             english_job = self.main.GenerationJob("user", "draw", 0.0)
             english_prompt, _ = asyncio.run(
                 plugin._compile_llm_character_prompt(
@@ -2100,6 +2102,148 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("llm_character_lora_metadata_bound" in row for row in events))
         self.assertTrue(
             any("llm_character_lora_identity_anchor_used" in row for row in events)
+        )
+
+    def test_bound_lora_uses_activation_without_treating_it_as_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "revision": "denia-r1",
+                        "tags": [
+                            {
+                                "tag": "denia_(wuthering_waves)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "wuthering_waves",
+                                "category": "copyright",
+                            },
+                            {
+                                "tag": "black_denia_(other_work)",
+                                "category": "character",
+                            },
+                            {"tag": "other_work", "category": "copyright"},
+                        ],
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            record = LoraRecord(
+                "black deniav1-2.safetensors",
+                sha256="ab" * 32,
+                category="character",
+                character_name="black denia",
+                source_work="other work",
+                trigger_words=("black_denia",),
+            )
+            entry = SemanticEntry(
+                identity_key=semantic_identity_key(record.name, record.sha256),
+                canonical_name=record.name,
+                sha256=record.sha256,
+                analysis_status="searchable",
+                category=(SemanticFact("character", "manual"),),
+                activation_terms=(SemanticFact("black_denia", "manual"),),
+                identity_bindings=(
+                    LoraIdentityBinding(
+                        character_canonical="denia_(wuthering_waves)",
+                        copyright_canonical="wuthering_waves",
+                        activation_terms=("black_denia",),
+                    ),
+                ),
+                source_fingerprint="stale-manager-metadata",
+            )
+            semantic = LoraSemanticIndex(entries={entry.identity_key: entry})
+            plugin, events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            plugin._runtime_semantic_index = lambda: semantic
+            selection = LoraSelection(record.name, 0.85)
+            key = self.main.canonical_lora_name(record.name).casefold()
+            job = self.main.GenerationJob("user", "draw", 0.0)
+
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    job,
+                    prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                    strict_keys=frozenset({key}),
+                )
+            )
+            trigger_plan = self.main.build_lora_trigger_plan(
+                prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+                negative_prompt="",
+                selections=kept,
+                records_by_name={key: record},
+                verified_character_triggers=overrides,
+                bound_character_activation_terms=bound_overrides,
+            )
+            final_canonicals = asyncio.run(
+                plugin._verified_prompt_character_canonicals(
+                    trigger_plan.prompt,
+                    non_identity_activation_terms=tuple(
+                        term
+                        for terms in bound_overrides.values()
+                        for term in terms
+                    ),
+                )
+            )
+
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(overrides, {})
+        self.assertEqual(bound_overrides, {key: ("black_denia",)})
+        self.assertEqual(filtered, ())
+        self.assertIn("black_denia", trigger_plan.prompt)
+        self.assertIn(r"denia_\(wuthering_waves\)", trigger_plan.prompt)
+        self.assertEqual(final_canonicals, ("denia_(wuthering_waves)",))
+        self.assertTrue(
+            any("llm_character_lora_identity_binding_used" in row for row in events)
+        )
+
+    def test_character_swap_submission_preserves_all_bound_activation_terms(
+        self,
+    ) -> None:
+        record = LoraRecord(
+            "black deniav1-2.safetensors",
+            sha256="ab" * 32,
+            category="character",
+            character_name="black denia",
+            trigger_words=("legacy_wrong_trigger",),
+        )
+        plan = self.main.CharacterSwapPlan(
+            prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+            negative_prompt="",
+            loras=(LoraSelection(record.name, 0.65),),
+            expectations=(),
+            target_record=record,
+            source_record=None,
+            target_identity_trigger="denia_(wuthering_waves)",
+            removed_terms=(),
+            kept_terms=("1girl", "jiangshi"),
+            added_terms=("denia_(wuthering_waves)",),
+            suppressed_terms=(),
+            suppress_default_style=False,
+            target_activation_terms=("black_denia", "denia_variant"),
+        )
+
+        pairs = self.main._character_swap_activation_overrides(plan)
+
+        self.assertEqual(
+            pairs,
+            (
+                (record.name, "black_denia"),
+                (record.name, "denia_variant"),
+            ),
+        )
+        self.assertEqual(
+            self.main._group_lora_activation_overrides(pairs),
+            {
+                self.main.canonical_lora_name(record.name).casefold(): (
+                    "black_denia",
+                    "denia_variant",
+                )
+            },
         )
 
     def test_gallery_fallback_rejects_offline_wrong_category_and_ambiguous_loras(
@@ -2329,7 +2473,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                 self.main.canonical_lora_name(armed.name).casefold(): armed,
             }
 
-            kept, overrides, filtered = asyncio.run(
+            kept, overrides, bound_overrides, filtered = asyncio.run(
                 plugin._bind_llm_character_loras(
                     self.main.GenerationJob("user", "draw", 0.0),
                     prompt=r"1girl, toki_\(blue_archive\), playboy bunny, selfie",
@@ -2337,6 +2481,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     resolved_records=records,
                 )
             )
+            self.assertEqual(bound_overrides, {})
 
         self.assertEqual(kept, (LoraSelection(style.name, 0.5),))
         self.assertEqual(overrides, {})
@@ -2373,7 +2518,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             selection = LoraSelection(disguised.name, 0.8)
-            kept, overrides, filtered = asyncio.run(
+            kept, overrides, bound_overrides, filtered = asyncio.run(
                 plugin._bind_llm_character_loras(
                     self.main.GenerationJob("user", "draw", 0.0),
                     prompt=r"1girl, toki_\(blue_archive\), selfie",
@@ -2383,6 +2528,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
             )
+            self.assertEqual(bound_overrides, {})
 
         self.assertEqual(kept, ())
         self.assertEqual(overrides, {})
@@ -2414,7 +2560,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
             selection = LoraSelection(record.name, 0.75)
             key = self.main.canonical_lora_name(record.name).casefold()
 
-            kept, overrides, filtered = asyncio.run(
+            kept, overrides, bound_overrides, filtered = asyncio.run(
                 plugin._bind_llm_character_loras(
                     self.main.GenerationJob("user", "draw", 0.0),
                     prompt=r"1girl, toki_\(blue_archive\), selfie",
@@ -2422,6 +2568,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     resolved_records={key: record},
                 )
             )
+            self.assertEqual(bound_overrides, {})
 
         self.assertEqual(kept, (selection,))
         self.assertEqual(overrides, {key: "toki (blue archive)"})
@@ -2521,7 +2668,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
             selection = LoraSelection(record.name, 0.65)
             key = self.main.canonical_lora_name(record.name).casefold()
 
-            kept, overrides, filtered = asyncio.run(
+            kept, overrides, bound_overrides, filtered = asyncio.run(
                 plugin._bind_llm_character_loras(
                     self.main.GenerationJob("user", "draw", 0.0),
                     prompt=r"1girl, kei_\(blue_archive\), maid, selfie",
@@ -2529,6 +2676,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     resolved_records={key: record},
                 )
             )
+            self.assertEqual(bound_overrides, {})
 
         self.assertEqual(kept, (selection,))
         self.assertEqual(
@@ -2899,6 +3047,35 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0].source_query, "")
         self.assertEqual(captured[0].target_query, "赛马娘的米浴")
         self.assertFalse(captured[0].use_target_lora)
+
+    async def test_reverse_draw_character_change_ultra_options_are_stripped_first(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+
+        async def handle(_event, request):
+            captured.append(request)
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = handle
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        class Event:
+            message_str = (
+                "/反推画图 把黄色头发的角色换成目标角色:"
+                "BlueArchive日鞠(himari) --l cc u"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(replies, ["SWAP_IMAGE"])
+        self.assertEqual(captured[0].source_query, "黄色头发的角色")
+        self.assertNotIn("--l", captured[0].target_query)
+        self.assertEqual(captured[0].prompt_expansion_mode, "ultra")
 
     async def test_control_command_infers_pose_depth_without_reference(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)

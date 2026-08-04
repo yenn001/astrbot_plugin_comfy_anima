@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..services.lora_catalog import LoraRecord
 from ..services.lora_semantic import (
+    LoraIdentityBinding,
     LoraSemanticError,
     LoraSemanticIndex,
     SemanticEntry,
@@ -83,7 +84,7 @@ class SemanticIdentityTests(unittest.TestCase):
 
 
 class SemanticSerializationTests(unittest.TestCase):
-    def test_version_two_round_trip_preserves_provenance(self) -> None:
+    def test_version_three_round_trip_preserves_provenance_and_bindings(self) -> None:
         record = _record("characters/denia.safetensors")
         entry = _entry(
             record,
@@ -91,6 +92,15 @@ class SemanticSerializationTests(unittest.TestCase):
                 _fact("Denia", "observed"),
                 _fact("达妮娅", "derived"),
                 _fact("丹瑾", "manual"),
+            ),
+            activation_terms=(_fact("black_denia", "manual"),),
+            identity_bindings=(
+                LoraIdentityBinding(
+                    character_canonical="denia_(wuthering_waves)",
+                    copyright_canonical="wuthering_waves",
+                    activation_terms=("black_denia",),
+                    verified_revision="schema-v2-r1",
+                ),
             ),
         )
         original = LoraSemanticIndex(entries={entry.identity_key: entry})
@@ -101,6 +111,29 @@ class SemanticSerializationTests(unittest.TestCase):
         self.assertEqual(
             [fact.source for fact in facts], ["observed", "derived", "manual"]
         )
+        restored_entry = restored.entries[entry.identity_key]
+        self.assertEqual(
+            restored_entry.identity_bindings[0].character_canonical,
+            "denia_(wuthering_waves)",
+        )
+        self.assertEqual(
+            restored_entry.effective_values("activation_terms"),
+            ("black_denia",),
+        )
+
+    def test_version_two_payload_migrates_without_inventing_bindings(self) -> None:
+        record = _record("characters/denia.safetensors")
+        payload = LoraSemanticIndex(entries={}).to_dict()
+        payload["schema_version"] = 2
+        entry = _entry(record).to_dict()
+        entry.pop("identity_bindings", None)
+        entry["semantic"].pop("activation_terms", None)
+        payload["entries"] = {entry["identity_key"]: entry}
+
+        migrated = LoraSemanticIndex.from_payload(payload)
+
+        self.assertEqual(migrated.schema_version, 3)
+        self.assertEqual(migrated.entries[entry["identity_key"]].identity_bindings, ())
 
     def test_load_missing_file_returns_empty_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

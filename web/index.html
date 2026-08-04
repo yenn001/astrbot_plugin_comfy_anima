@@ -534,6 +534,8 @@
                   <label><span>作品名（逗号或换行）</span><textarea name="source_works" rows="3"></textarea></label>
                   <label><span>画师 / 风格名（逗号或换行）</span><textarea name="artist_style_names" rows="3"></textarea></label>
                 </div>
+                <label><span>共享 LoRA 激活词（每行一项，不作为角色身份）</span><textarea name="activation_terms" rows="3"></textarea></label>
+                <label><span>Danbooru exact 身份绑定（每行：角色 canonical | 作品 canonical | 专用激活词）</span><textarea name="identity_bindings" rows="4" placeholder="denia_(wuthering_waves) | wuthering_waves | black_denia"></textarea></label>
                 <label><span>自然语言别名、译名、简称</span><textarea name="aliases" rows="4"></textarea></label>
                 <div class="inline-actions"><button id="lora-semantic-save" class="primary" type="submit">保存人工审核</button><button id="lora-detail-reanalyze" class="secondary" type="button">重新 AI 建档</button></div>
               </form>

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v1.9.24
+AstrBot Comfy Anima 插件 v2.0.0
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v1.9.24
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 1.9.24
+版本: 2.0.0
 日期: 2026-08-04
 """
 
@@ -141,6 +141,7 @@ from .services.lora_catalog import LoraCatalogError, LoraCatalogService, LoraRec
 from .services.lora_identity_evidence import (
     build_lora_identity_discovery,
     resolve_lora_character_canonicals,
+    resolve_lora_identity_bindings,
 )
 from .services.lora_retrieval import LoraHybridSearchService
 from .services.lora_snapshot import LoraOperationSnapshot, record_identity
@@ -151,8 +152,10 @@ from .services.lora_analysis import (
 from .services.lora_archiver import LoraArchiveError, LoraArchiveService
 from .services.lora_downloader import LoraDownloadError, LoraDownloadService
 from .services.lora_semantic import (
+    LoraIdentityBinding,
     SEMANTIC_CATEGORIES,
     SEMANTIC_FIELDS,
+    SEMANTIC_SCHEMA_VERSION,
     LoraSemanticError,
     LoraSemanticIndex,
     SemanticEntry,
@@ -206,7 +209,11 @@ from .services.prompt_contracts import (
     looks_like_conversation_draw_intent,
 )
 from .services.prompt_assets import PromptAssetError, PromptAssetLibrary
-from .services.prompt_composer import PromptComposer, PromptDiagnosticsStore
+from .services.prompt_composer import (
+    PromptComposer,
+    PromptDiagnosticsStore,
+    remove_prompt_terms,
+)
 from .services.provider_response import response_error_code
 from .services.prompt_lab import PromptLab, PromptLabBatch, PromptLabError
 from .services.prompt_plans import (
@@ -219,6 +226,11 @@ from .services.reverse_prompt import (
     ReversePromptError,
     ReversePromptService,
     parse_json_object_with_strategy,
+)
+from .services.subject_slots import (
+    ObservedSubject,
+    SubjectSelectionError,
+    select_observed_subject,
 )
 from .services.semantic_edit import (
     build_semantic_edit_contract,
@@ -288,6 +300,37 @@ _CHAT_DRAW_ASSET_TOOLS = frozenset(
         "list_anima_prompt_plans",
     }
 )
+
+
+def _group_lora_activation_overrides(
+    values: tuple[tuple[str, str], ...],
+) -> dict[str, tuple[str, ...]]:
+    """Group activation-only terms without promoting them to identity evidence."""
+
+    grouped: dict[str, list[str]] = {}
+    for name, raw_term in values:
+        key = canonical_lora_name(name).casefold()
+        term = str(raw_term or "").strip()
+        if not key or not term:
+            continue
+        bucket = grouped.setdefault(key, [])
+        if term not in bucket:
+            bucket.append(term)
+    return {key: tuple(terms) for key, terms in grouped.items()}
+
+
+def _character_swap_activation_overrides(
+    plan: CharacterSwapPlan,
+) -> tuple[tuple[str, str], ...]:
+    """Preserve every file-bound target activation term for final injection."""
+
+    if plan.target_record is None:
+        return ()
+    return tuple(
+        (plan.target_record.name, term)
+        for term in plan.target_activation_terms
+        if str(term or "").strip()
+    )
 
 
 WEB_UI_EDITABLE_FIELDS = (
@@ -2263,12 +2306,33 @@ class ComfyAnimaPlugin(Star):
             )
             formatter = getattr(self._lora_catalog, "format_records_for_llm", None)
             if callable(formatter):
-                return await formatter(
+                formatted = await formatter(
                     ranked,
                     force_refresh=True,
                     detail=bool(detail),
                     retrieval_info=diagnostics,
                 )
+                binding_lines: list[str] = []
+                semantic_index = self._runtime_semantic_index()
+                for record in ranked:
+                    entry = semantic_index.entry_for(record)
+                    if entry is None or not entry.identity_bindings:
+                        continue
+                    for binding in entry.identity_bindings:
+                        activation = ", ".join(binding.activation_terms) or "none"
+                        binding_lines.append(
+                            f"- {canonical_lora_name(record.name)} | "
+                            f"identity: {binding.character_canonical} | "
+                            f"work: {binding.copyright_canonical or 'none'} | "
+                            f"activation-only: {activation}"
+                        )
+                if binding_lines:
+                    formatted += (
+                        "\nIdentity bindings (file and activation names are not "
+                        "Character tags):\n"
+                        + "\n".join(binding_lines[:24])
+                    )
+                return formatted
             return await self._lora_catalog.format_for_llm(
                 query=keyword,
                 limit=effective_limit,
@@ -3643,22 +3707,6 @@ class ComfyAnimaPlugin(Star):
         supplement = self._extract_command_text(
             event.message_str, requirement, command="反推画图"
         )
-        swap_request = parse_natural_character_swap(supplement)
-        if swap_request is not None:
-            try:
-                width, height = self._extract_resolution_request(supplement)
-                swap_request = replace(
-                    swap_request,
-                    width=width,
-                    height=height,
-                    preset=self._find_requested_style_preset(supplement),
-                )
-            except ValueError as exc:
-                yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
-                return
-            async for response in self._handle_character_swap(event, swap_request):
-                yield response
-            return
         # `/反推画图` historically allows an empty supplement.  Append a
         # private parser sentinel so the normal generation option parser can
         # still accept option-only forms such as `--m p d`, then remove it
@@ -3677,6 +3725,56 @@ class ComfyAnimaPlugin(Star):
             " ",
             parsed_options.prompt,
         ).strip()
+        swap_request = parse_natural_character_swap(reverse_requirement)
+        if swap_request is not None:
+            try:
+                natural_width, natural_height = self._extract_resolution_request(
+                    reverse_requirement
+                )
+                swap_request = replace(
+                    swap_request,
+                    width=parsed_options.width or natural_width,
+                    height=parsed_options.height or natural_height,
+                    preset=(
+                        parsed_options.lora_preset
+                        or self._find_requested_style_preset(reverse_requirement)
+                    ),
+                    negative_prompt=parsed_options.negative_prompt,
+                    preview=(
+                        swap_request.preview
+                        or parsed_options.character_swap_preview
+                    ),
+                    mode=(
+                        parsed_options.character_swap_mode or swap_request.mode
+                    ),
+                    use_target_lora=(
+                        parsed_options.character_swap_use_target_lora
+                        if parsed_options.character_swap_use_target_lora is not None
+                        else swap_request.use_target_lora
+                    ),
+                    target_lora_strength=(
+                        parsed_options.character_swap_target_lora_strength
+                        or swap_request.target_lora_strength
+                    ),
+                    pipeline=parsed_options.pipeline,
+                    prompt_expansion_mode=parsed_options.prompt_expansion_mode,
+                    seed=parsed_options.seed,
+                    steps=parsed_options.steps,
+                    cfg=parsed_options.cfg,
+                    enable_upscale=parsed_options.enable_upscale,
+                    denoise=parsed_options.denoise,
+                )
+            except ValueError as exc:
+                yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
+                return
+            async for response in self._handle_character_swap(event, swap_request):
+                yield response
+            return
+        if parsed_options.prompt_edit_mode == "character_change":
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 反推换角需要写明：把哪个角色换成目标角色"
+            )
+            return
         control_mode_source = "explicit"
         control_modes = parsed_options.control_modes
         if not control_modes:
@@ -5512,11 +5610,12 @@ class ComfyAnimaPlugin(Star):
 示例: /画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx
 华丽示例: /画图 双人奇幻宫殿海报，薄纱与金属材质，宏大逆光 --l u --pipeline rtx
 文字换角（仅显式指令）: --llm c、--llm cc、--llmcc、--lcc；Ultra 可写 --llm cc u、--llmcc u 或 --lcc u
-格式: /画图 <完整原 Tags>，把角色换成<目标角色>[，额外覆盖要求] --lcc
-示例: /画图 1girl, roxy migurdia, blue hair, twin braids, school uniform, standing，把角色换成甘雨，穿JK制服 --lcc u
-该模式会清除旧角色姓名与稳定外貌；保留服装、动作、表情、构图和背景，除非后半句明确修改。
+格式: /画图 <完整原 Tags>，把<来源角色描述>换成<目标角色>[，额外覆盖要求] --lcc
+单人示例: /画图 1girl, roxy migurdia, blue hair, twin braids, school uniform, standing，把角色换成甘雨，穿JK制服 --lcc u
+多人示例: /画图 2girls, yellow hair, red hair, school uniform，把黄色头发的角色换成BlueArchive日鞠(himari) --lcc u
+该模式只清除被自然语言选中的来源角色身份与稳定外貌；其他角色的特征和角色 LoRA 会被保护。选择不唯一时停止，不猜选。
 目标 LoRA 可唯一确认时使用；缺失或同一身份有多个版本时使用纯语义 Tags。明确文件名或跨身份歧义不会猜选。写“请使用/必须使用角色 LoRA”会强制绑定，缺失时明确停止而不回退。
-已知角色以 character_(作品) canonical Tag 为主锚点；外貌只保留 0~4 项高置信稳定特征，模糊信息直接留空。
+已知角色以 Character canonical 与独立 Copyright exact 为主锚点；Standard 最多采用 6 项、Ultra 最多采用 10 项可信稳定外貌，模糊信息直接留空。
 本地 Danbooru character exact 会固定主锚点；“置信度100%”等用户文字不会覆盖安全阈值，今汐/今夕等斜杠别名也不会被误当作 LoRA 路径。
 
 3 个可选生图管线（先由 Anima 生成）:
@@ -5537,7 +5636,7 @@ class ComfyAnimaPlugin(Star):
 
 /反推 [关注点] - 发送或引用图片，返回结构化 Anima 提示词
 /反推画图 [补充要求] [--m p|d|l|r] - 反推后可直接接 Anima 控制生成
-/换角色 A -> B [选项] - 引用单图进行单角色语义换角
+/换角色 A -> B [选项] - 引用单图进行语义换角；多人图可用发色、衣装、动作等自然语言指定来源
 /换角色 A -> B [选项] | <完整 Tags> - 对现有 Tags 语义换角
 /换角色会先刷新并精确查找目标角色 LoRA；LoRA 仅作可选增强，无法唯一选定同一目标身份的版本时改用普通语义 Tags；跨身份歧义或明确文件请求仍会停止。
 --no-character-lora / --no-lora - 强制不加载目标角色 LoRA，仅用语义 Tags；只支持 keep-outfit
@@ -5671,7 +5770,7 @@ QQ快捷指令:
 /反推 [关注点] - 在线图片反推
 /反推画图 [补充要求] [--m p|d|l|r] - 反推并可接底图控制生成
 /改图 [要求] - 无蒙版整图修改；支持换衣、换背景、换表情或重新画一张
-/换角色 A -> B [选项] - 单图语义换角
+/换角色 A -> B [选项] - 单图语义换角；多人图用自然语言描述来源角色
 /换角色 A -> B [选项] | <完整 Tags> - Tags 语义换角
 /comfy帮助 - 完整帮助
 
@@ -5699,7 +5798,7 @@ QQ快捷指令:
 --no-character-lora / --no-lora（强制纯语义 Tags，不加载目标角色 LoRA；仅 keep-outfit）
 自然语言“请使用/必须使用角色 LoRA”（强制绑定唯一命中的目标 LoRA；缺失时不回退）
 目标角色 LoRA 完全未命中，或同一身份存在多个无法唯一选定的版本时，会自动改用纯语义 Tags；跨身份歧义、近似名称和显式文件请求仍会停止并要求确认。
-已知角色只要求一个经验证的 character_(作品) 主锚点；外貌可为 0~4 项且必须高置信。Danbooru character exact、LoRA exact、Provider 高置信和普通 Provider 结果使用分层校验阈值。
+已知角色要求经验证的 Character canonical 与独立 Copyright exact；Standard 外貌最多 6 项、Ultra 最多 10 项且必须高置信。多人图只修改被选中的来源角色，其他角色特征和 LoRA 保持受保护。
 用户正文中的置信度声明会被忽略；斜杠可用于角色别名，只有 lora: 前缀或 .safetensors/.ckpt/.pt/.bin 后缀才进入严格文件语义。
 
 示例:
@@ -7269,6 +7368,7 @@ QQ快捷指令:
         *,
         authorized_canonicals: tuple[str, ...] = (),
         expected_revision_signature: str = "",
+        non_identity_activation_terms: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         """Return locally exact or request-locally authorized final identities."""
 
@@ -7284,7 +7384,16 @@ QQ快捷指令:
             raise LoraWorkflowError(
                 "Danbooru 索引在角色规划后发生变化，已停止提交；请重试本次绘图"
             )
-        terms = split_character_validation_terms(prompt)
+        activation_keys = {
+            normalize_tag(value)
+            for value in non_identity_activation_terms
+            if normalize_tag(value)
+        }
+        terms = tuple(
+            term
+            for term in split_character_validation_terms(prompt)
+            if normalize_tag(term) not in activation_keys
+        )
         if not terms:
             return ()
         try:
@@ -7357,6 +7466,41 @@ QQ快捷指令:
             )
         return tuple(dict.fromkeys((*local_canonicals, *external_canonicals)))
 
+    async def _bound_lora_activation_terms(
+        self,
+        selections: tuple[LoraSelection, ...],
+        resolved_records: Mapping[str, LoraRecord],
+    ) -> tuple[str, ...]:
+        """Return reviewed activation-only terms for currently bound LoRA files."""
+
+        index = getattr(self, "_danbooru_index", None)
+        if index is None or not self._danbooru_index_ready():
+            return ()
+        terms: list[str] = []
+        semantic_index = self._runtime_semantic_index()
+        for selection in selections:
+            key = canonical_lora_name(selection.name).casefold()
+            record = resolved_records.get(key)
+            if record is None:
+                continue
+            bindings = await asyncio.to_thread(
+                resolve_lora_identity_bindings,
+                record,
+                semantic_index=semantic_index,
+                tag_index=index,
+            )
+            if not bindings:
+                continue
+            entry = semantic_index.entry_for(record)
+            terms.extend(
+                term
+                for binding in bindings
+                for term in binding.activation_terms
+            )
+            if entry is not None:
+                terms.extend(entry.effective_values("activation_terms"))
+        return tuple(dict.fromkeys(term for term in terms if str(term).strip()))
+
     async def _bind_llm_character_loras(
         self,
         job: GenerationJob,
@@ -7365,8 +7509,13 @@ QQ快捷指令:
         selections: tuple[LoraSelection, ...],
         resolved_records: Mapping[str, LoraRecord],
         strict_keys: frozenset[str] = frozenset(),
-    ) -> tuple[tuple[LoraSelection, ...], dict[str, str], tuple[str, ...]]:
-        """Keep only character LoRAs that exact-bind to the compiled identity."""
+    ) -> tuple[
+        tuple[LoraSelection, ...],
+        dict[str, str],
+        dict[str, tuple[str, ...]],
+        tuple[str, ...],
+    ]:
+        """Bind identity and activation independently for character LoRAs."""
 
         external_authorities = dict(job.llm_external_character_authorities)
         expected = frozenset(
@@ -7378,11 +7527,12 @@ QQ快捷指令:
         )
         index = getattr(self, "_danbooru_index", None)
         if index is None or not self._danbooru_index_ready():
-            return selections, {}, ()
+            return selections, {}, {}, ()
 
         candidate_rows: list[
             tuple[LoraSelection, LoraRecord, tuple[str, ...], bool]
         ] = []
+        identity_bindings_by_key: dict[str, tuple[LoraIdentityBinding, ...]] = {}
         lookup_terms: list[str] = []
         for selection in selections:
             key = canonical_lora_name(selection.name).casefold()
@@ -7391,6 +7541,16 @@ QQ快捷指令:
                 continue
             role = str(record.category or "").strip().casefold()
             declared_character = role == "character" or bool(record.character_name)
+            identity_bindings = await asyncio.to_thread(
+                resolve_lora_identity_bindings,
+                record,
+                semantic_index=self._runtime_semantic_index(),
+                tag_index=index,
+            )
+            if identity_bindings:
+                identity_bindings_by_key[key] = identity_bindings
+                candidate_rows.append((selection, record, (), True))
+                continue
             triggers = tuple(
                 dict.fromkeys(
                     (
@@ -7444,6 +7604,7 @@ QQ快捷指令:
         }
         accepted_character_keys: set[str] = set()
         overrides: dict[str, str] = {}
+        bound_activation_overrides: dict[str, tuple[str, ...]] = {}
         filtered: list[str] = []
         for selection, record, triggers in character_rows:
             key = canonical_lora_name(selection.name).casefold()
@@ -7464,6 +7625,58 @@ QQ快捷指令:
                 accepted_character_keys.add(key)
                 overrides[key] = selected_trigger
                 continue
+            identity_bindings = identity_bindings_by_key.get(key, ())
+            binding_matches = tuple(
+                binding
+                for binding in identity_bindings
+                if normalize_tag(binding.character_canonical) in expected
+            )
+            if len(binding_matches) == 1:
+                binding = binding_matches[0]
+                semantic_entry = self._runtime_semantic_index().entry_for(record)
+                shared_activation_terms = (
+                    semantic_entry.effective_values("activation_terms")
+                    if semantic_entry is not None
+                    else ()
+                )
+                activation_candidates = tuple(
+                    dict.fromkeys(
+                        (
+                            *binding.activation_terms,
+                            *shared_activation_terms,
+                        )
+                    )
+                )
+                selected_activations = tuple(
+                    value
+                    for value in activation_candidates
+                    if str(value or "").strip()
+                )
+                if not selected_activations:
+                    identity_anchor = self._identity_anchor_activation_trigger(
+                        record,
+                        binding.character_canonical,
+                    )
+                    selected_activations = (
+                        (identity_anchor,) if identity_anchor else ()
+                    )
+                if selected_activations:
+                    accepted_character_keys.add(key)
+                    bound_activation_overrides[key] = selected_activations
+                    self._record_image_task_phase(
+                        job,
+                        "lora",
+                        "角色 LoRA 已通过文件绑定的 Danbooru exact 身份与独立激活词计划。",
+                        "llm_character_lora_identity_binding_used",
+                        details={
+                            "binding_count": 1,
+                            "activation_is_identity_authority": False,
+                            "identity_specific_activation": bool(
+                                binding.activation_terms
+                            ),
+                        },
+                    )
+                    continue
             metadata_canonicals = await self._verified_record_character_canonicals(
                 record
             )
@@ -7517,8 +7730,15 @@ QQ快捷指令:
                         )
                     continue
             if key in strict_keys:
+                semantic_entry = self._runtime_semantic_index().entry_for(record)
+                if semantic_entry is None or not semantic_entry.identity_bindings:
+                    raise LoraWorkflowError(
+                        f"已明确选择的角色 LoRA 尚未建立 Danbooru exact 身份绑定："
+                        f"{record.name}；请在 WebUI LoRA 详情中填写角色、作品与激活词绑定"
+                    )
                 raise LoraWorkflowError(
-                    f"已明确选择的角色 LoRA 无法与最终 exact 身份唯一绑定：{record.name}"
+                    f"已明确选择的角色 LoRA 身份绑定与最终 exact 角色不一致或已失效："
+                    f"{record.name}"
                 )
             filtered.append(record.name)
 
@@ -7540,7 +7760,7 @@ QQ快捷指令:
                 or key in accepted_character_keys
             )
         )
-        return kept, overrides, tuple(filtered)
+        return kept, overrides, bound_activation_overrides, tuple(filtered)
 
     async def _verified_record_character_canonicals(
         self,
@@ -8553,22 +8773,59 @@ QQ快捷指令:
                                     self.context,
                                     event,
                                     image_path,
-                                    "只记录单一人物、衣装、姿势、构图、背景和光线，"
-                                    "不要执行换角或补造不可见事实。",
+                                    "逐个记录所有可见人物的身份、外观、衣装、动作和位置，"
+                                    "同时记录整体构图、背景和光线；不要执行换角或补造不可见事实。",
                                     reverse_progress,
                                     profile="swap",
                                 ),
                             )
                         )
-                    if len(reverse_result.characters) > 1:
-                        raise CharacterSwapError(
-                            "图片反推识别到多个角色；首版语义换角只支持单角色",
-                            code="multiple_subjects",
-                        )
                     source_query = request.source_query
-                    if not source_query and reverse_result.characters:
+                    source_subject_count = max(1, len(reverse_result.characters))
+                    source_selector_terms: tuple[str, ...] = ()
+                    protected_subject_terms: tuple[str, ...] = ()
+                    source_selector_basis = "single_subject"
+                    source_selector_direction_used = False
+                    if len(reverse_result.characters) > 1:
+                        observed_subjects = tuple(
+                            ObservedSubject(
+                                name=item.name,
+                                source_work=item.source_work,
+                                gender=item.gender,
+                                appearance_tags=item.appearance_tags,
+                                outfit_tags=item.outfit_tags,
+                                action_tags=item.action_tags,
+                                position=item.position,
+                                confidence=item.confidence,
+                            )
+                            for item in reverse_result.characters
+                        )
+                        try:
+                            selected_index, selection = select_observed_subject(
+                                observed_subjects,
+                                source_query,
+                            )
+                        except SubjectSelectionError as exc:
+                            raise CharacterSwapError(
+                                str(exc),
+                                code=exc.code,
+                                details=exc.details,
+                            ) from exc
+                        selected_subject = reverse_result.characters[selected_index]
+                        source_selector_terms = selection.matched_terms
+                        protected_subject_terms = selection.protected_terms
+                        source_selector_basis = selection.basis
+                        source_selector_direction_used = selection.direction_used
+                        if not source_query and selected_subject.confidence >= 0.7:
+                            source_query = selected_subject.name
+                    elif reverse_result.characters:
                         candidate = reverse_result.characters[0]
-                        if candidate.confidence >= 0.7:
+                        source_selector_terms = (
+                            *candidate.appearance_tags,
+                            *candidate.outfit_tags,
+                            *candidate.action_tags,
+                        )
+                        if not source_query and candidate.confidence >= 0.7:
                             source_query = candidate.name
                     if not source_query:
                         raise CharacterSwapError(
@@ -8587,6 +8844,13 @@ QQ快捷指令:
                         source_query=source_query,
                         width=width,
                         height=height,
+                        source_subject_count=source_subject_count,
+                        source_selector_terms=source_selector_terms,
+                        protected_subject_terms=protected_subject_terms,
+                        source_selector_basis=source_selector_basis,
+                        source_selector_direction_used=(
+                            source_selector_direction_used
+                        ),
                     )
                     positive_prompt = reverse_result.positive_tags
                     negative_prompt = ", ".join(
@@ -8919,6 +9183,15 @@ QQ快捷指令:
                         ),
                         "source_tag_evidence": source_tag_evidence,
                         "source_lora_present": preparation.source_record is not None,
+                        "source_subject_count": preparation.source_subject_count,
+                        "multi_subject": preparation.multi_subject,
+                        "source_selector_basis": preparation.source_selector_basis,
+                        "source_selector_term_count": len(
+                            preparation.source_selector_terms
+                        ),
+                        "protected_subject_term_count": len(
+                            preparation.protected_subject_terms
+                        ),
                         "semantic_identity_confidence": round(
                             effective_request.semantic_identity_confidence,
                             4,
@@ -9123,6 +9396,15 @@ QQ快捷指令:
                             effective_request.ignored_control_directives
                         ),
                         "final_lora_count": len(plan.loras),
+                        "source_subject_count": plan.source_subject_count,
+                        "multi_subject": plan.multi_subject,
+                        "source_selector_basis": plan.source_selector_basis,
+                        "protected_subject_term_count": len(
+                            plan.protected_subject_terms
+                        ),
+                        "preserved_character_lora_count": len(
+                            plan.preserved_character_lora_names
+                        ),
                     },
                 )
                 if effective_request.preview:
@@ -9156,10 +9438,16 @@ QQ快捷指令:
                         suppress_default_style=plan.suppress_default_style,
                         suppressed_prompt_terms=plan.suppressed_terms,
                         lora_identity_expectations=plan.expectations,
+                        lora_activation_overrides=(
+                            _character_swap_activation_overrides(plan)
+                        ),
                         character_swap_target_lora=(
                             plan.target_record.name
                             if plan.target_record is not None
                             else ""
+                        ),
+                        character_swap_preserved_character_loras=(
+                            plan.preserved_character_lora_names
                         ),
                         character_swap_target_lora_strength=(
                             effective_request.target_lora_strength
@@ -9168,6 +9456,7 @@ QQ快捷指令:
                         ),
                         character_swap_forbid_character_loras=(
                             plan.target_record is None
+                            and not plan.preserved_character_lora_names
                         ),
                         pipeline=effective_request.pipeline,
                         denoise=effective_request.denoise,
@@ -13722,6 +14011,12 @@ QQ快捷指令:
                 "category": entry.effective_category or category,
                 "character_names": list(entry.effective_values("character_names")),
                 "source_works": list(entry.effective_values("source_works")),
+                "activation_terms": list(
+                    entry.effective_values("activation_terms")
+                ),
+                "identity_bindings": [
+                    binding.to_dict() for binding in entry.identity_bindings
+                ],
                 "artist_style_names": list(
                     entry.effective_values("artist_style_names")
                 ),
@@ -13737,6 +14032,7 @@ QQ快捷指令:
                     "category",
                     "character_names",
                     "source_works",
+                    "activation_terms",
                     "artist_style_names",
                     "aliases",
                 )
@@ -13765,6 +14061,10 @@ QQ快捷指令:
             "archive_stale": analysis_status == "stale",
             "classified_at": entry.updated_at if entry is not None else "",
             "manual_override": entry.has_manual_facts if entry is not None else False,
+            "identity_bound": bool(entry and entry.identity_bindings),
+            "identity_binding_count": (
+                len(entry.identity_bindings) if entry is not None else 0
+            ),
             "has_manual_override": entry.has_manual_facts if entry is not None else False,
             "category_source": (
                 "manual"
@@ -14054,7 +14354,7 @@ QQ快捷指令:
                 message = getattr(exc, "user_message", str(exc))
                 raise WebUiActionError(message) from exc
             return {
-                "schema_version": 2,
+                "schema_version": SEMANTIC_SCHEMA_VERSION,
                 "status": self._semantic_catalog_status(records),
                 "items": [self._web_ui_lora_item_v2(record) for record in records],
             }
@@ -14108,6 +14408,14 @@ QQ快捷指令:
         name = str(payload.get("name") or "").strip()
         if not name:
             raise WebUiActionError("请提供需要人工审核的 LoRA 精确名称")
+        requested_schema = payload.get("semantic_schema_version")
+        if requested_schema is not None:
+            try:
+                requested_schema_value = int(requested_schema)
+            except (TypeError, ValueError) as exc:
+                raise WebUiActionError("LoRA 语义档案版本必须是整数") from exc
+            if requested_schema_value != SEMANTIC_SCHEMA_VERSION:
+                raise WebUiActionError("LoRA 语义档案版本不匹配，请刷新页面后重试")
         try:
             records = await self._lora_catalog.refresh_for_operation()
         except LoraCatalogError as exc:
@@ -14146,10 +14454,21 @@ QQ快捷指令:
                 raise WebUiActionError(f"{field_name} 中存在过长内容")
             return cleaned
 
+        semantic_index = self._runtime_semantic_index()
+        previous = semantic_index.entry_for(record)
         manual_values = {
             "category": (category,),
             "character_names": values("character_names"),
             "source_works": values("source_works"),
+            "activation_terms": (
+                values("activation_terms")
+                if "activation_terms" in payload
+                else tuple(
+                    fact.value
+                    for fact in (previous.facts("activation_terms") if previous else ())
+                    if fact.source == "manual"
+                )
+            ),
             "artist_style_names": values("artist_style_names"),
             "aliases": values("aliases"),
         }
@@ -14162,9 +14481,113 @@ QQ快捷指令:
             and manual_values["artist_style_names"]
         ):
             raise WebUiActionError("混合分类必须同时填写角色名和画师/风格名")
+        async def verified_canonical(
+            value: str,
+            category_name: str,
+        ) -> str:
+            index = getattr(self, "_danbooru_index", None)
+            if index is None or not self._danbooru_index_ready():
+                raise WebUiActionError(
+                    "本地 Danbooru 索引未就绪，不能保存身份授权字段"
+                )
+            normalized = normalize_tag(value)
+            if not normalized:
+                raise WebUiActionError("Danbooru canonical 不能为空")
+            try:
+                lookup = await asyncio.to_thread(
+                    index.lookup,
+                    normalized,
+                    category_name,
+                )
+            except (DanbooruIndexError, OSError, RuntimeError, ValueError) as exc:
+                raise WebUiActionError("Danbooru 身份绑定校验失败") from exc
+            canonical = normalize_tag(
+                str(
+                    getattr(lookup, "canonical_tag", "")
+                    or getattr(lookup, "tag", "")
+                    or ""
+                )
+            )
+            if not bool(getattr(lookup, "verified", False)) or canonical != normalized:
+                raise WebUiActionError(
+                    f"未通过 {category_name} exact：{normalized}"
+                )
+            return canonical
 
-        semantic_index = self._runtime_semantic_index()
-        previous = semantic_index.entry_for(record)
+        identity_bindings = previous.identity_bindings if previous else ()
+        if "identity_bindings" in payload:
+            if category not in {"character", "mixed"}:
+                raise WebUiActionError("只有角色或混合分类可以保存 Danbooru 身份绑定")
+            if not record.sha256:
+                raise WebUiActionError("当前 LoRA 缺少 SHA-256，不能保存持久身份绑定")
+            raw_bindings = payload.get("identity_bindings")
+            if not isinstance(raw_bindings, list) or len(raw_bindings) > 24:
+                raise WebUiActionError("identity_bindings 必须是至多 24 项的数组")
+            binding_rows: list[LoraIdentityBinding] = []
+            revision = ""
+            index = getattr(self, "_danbooru_index", None)
+            if index is not None and self._danbooru_index_ready():
+                try:
+                    revision = self._danbooru_revision_signature(
+                        await asyncio.to_thread(index.status)
+                    )
+                except (DanbooruIndexError, OSError, RuntimeError, ValueError):
+                    revision = ""
+            for raw_binding in raw_bindings:
+                if not isinstance(raw_binding, Mapping):
+                    raise WebUiActionError("identity_bindings 每项必须是对象")
+                character_canonical = await verified_canonical(
+                    str(raw_binding.get("character_canonical") or ""),
+                    "character",
+                )
+                copyright_value = str(
+                    raw_binding.get("copyright_canonical") or ""
+                ).strip()
+                copyright_canonical = (
+                    await verified_canonical(copyright_value, "copyright")
+                    if copyright_value
+                    else ""
+                )
+                character_work = canonical_work_for_character(character_canonical)
+                if (
+                    copyright_canonical
+                    and character_work
+                    and character_work != copyright_canonical
+                ):
+                    raise WebUiActionError(
+                        "角色 canonical 与作品 canonical 不属于同一作品"
+                    )
+                raw_activation = raw_binding.get("activation_terms", [])
+                if isinstance(raw_activation, str):
+                    raw_activation = re.split(r"[\n,，;；|]+", raw_activation)
+                if not isinstance(raw_activation, (list, tuple, set)):
+                    raise WebUiActionError("绑定 activation_terms 必须是文本或数组")
+                activation_terms = tuple(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in raw_activation
+                        if str(item).strip()
+                    )
+                )
+                if len(activation_terms) > 24 or any(
+                    len(item) > 240 for item in activation_terms
+                ):
+                    raise WebUiActionError("绑定 activation_terms 数量或长度超限")
+                binding_rows.append(
+                    LoraIdentityBinding(
+                        character_canonical=character_canonical,
+                        copyright_canonical=copyright_canonical,
+                        activation_terms=activation_terms,
+                        source="manual",
+                        verified_revision=revision,
+                        verified_at=time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(),
+                        ),
+                    )
+                )
+            identity_bindings = tuple(binding_rows)
+
         facts: dict[str, tuple[SemanticFact, ...]] = {}
         for field_name in SEMANTIC_FIELDS:
             retained = tuple(
@@ -14195,6 +14618,7 @@ QQ快捷指令:
             updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             error="",
             present=True,
+            identity_bindings=identity_bindings,
             **facts,
         )
         semantic_index.upsert(entry)
@@ -16354,6 +16778,9 @@ QQ快捷指令:
             records_by_name=resolved_records,
             presets=selected_presets,
             suppressed_terms=options.suppressed_prompt_terms,
+            bound_character_activation_terms=(
+                _group_lora_activation_overrides(options.lora_activation_overrides)
+            ),
         )
         clean_prompt = trigger_plan.prompt
         if not clean_prompt:
@@ -16862,12 +17289,18 @@ QQ快捷指令:
                                 character_keys.append(record_key)
                                 if record_key == target_key:
                                     target_selection = selection
-                        if (
-                            set(character_keys) != {target_key}
-                            or character_keys.count(target_key) != 1
+                        expected_character_keys = {
+                            target_key,
+                            *(
+                                canonical_lora_name(name).casefold()
+                                for name in options.character_swap_preserved_character_loras
+                            ),
+                        }
+                        if set(character_keys) != expected_character_keys or (
+                            character_keys.count(target_key) != 1
                         ):
                             raise LoraWorkflowError(
-                                "提交前角色 LoRA 不变量失效：必须且只能保留目标角色"
+                                "提交前角色 LoRA 不变量失效：未能只替换选中的来源角色"
                             )
                         expected_strength = (
                             options.character_swap_target_lora_strength
@@ -16899,6 +17332,27 @@ QQ快捷指令:
                             raise LoraWorkflowError(
                                 "纯语义换角禁止最终 LoRA 栈包含角色 LoRA"
                             )
+                    elif (
+                        not options.character_swap_target_lora
+                        and options.character_swap_preserved_character_loras
+                    ):
+                        actual_character_keys = {
+                            canonical_lora_name(record.name).casefold()
+                            for selection in dynamic_loras
+                            if (record := resolved_record_for(selection.name)) is not None
+                            and (
+                                str(record.category or "").casefold() == "character"
+                                or bool(record.character_name)
+                            )
+                        }
+                        expected_character_keys = {
+                            canonical_lora_name(name).casefold()
+                            for name in options.character_swap_preserved_character_loras
+                        }
+                        if actual_character_keys != expected_character_keys:
+                            raise LoraWorkflowError(
+                                "提交前其他角色 LoRA 保护不变量失效"
+                            )
                     combined_negative = ", ".join(
                         part
                         for part in (
@@ -16909,7 +17363,19 @@ QQ快捷指令:
                     )
                     expected_character_canonicals: tuple[str, ...] = ()
                     verified_character_triggers: dict[str, str] = {}
+                    bound_character_activation_overrides: dict[
+                        str, tuple[str, ...]
+                    ] = {}
                     if options.validate_llm_characters or use_llm:
+                        bound_activation_terms = await self._bound_lora_activation_terms(
+                            dynamic_loras,
+                            resolved_records,
+                        )
+                        if bound_activation_terms:
+                            clean_prompt = remove_prompt_terms(
+                                clean_prompt,
+                                bound_activation_terms,
+                            )
                         clean_prompt, combined_negative = (
                             await self._compile_llm_character_prompt(
                                 job,
@@ -16960,6 +17426,7 @@ QQ快捷指令:
                         (
                             dynamic_loras,
                             verified_character_triggers,
+                            bound_character_activation_overrides,
                             filtered_character_loras,
                         ) = await self._bind_llm_character_loras(
                             job,
@@ -16985,7 +17452,15 @@ QQ快捷指令:
                         records_by_name=resolved_records,
                         presets=selected_presets,
                         suppressed_terms=options.suppressed_prompt_terms,
-                        verified_character_triggers=verified_character_triggers,
+                        verified_character_triggers={
+                            **verified_character_triggers,
+                        },
+                        bound_character_activation_terms=(
+                            _group_lora_activation_overrides(
+                                options.lora_activation_overrides
+                            )
+                        )
+                        | bound_character_activation_overrides,
                     )
                     clean_prompt = trigger_plan.prompt
                     if options.validate_llm_characters or use_llm:
@@ -16997,6 +17472,20 @@ QQ快捷指令:
                                 ),
                                 expected_revision_signature=(
                                     job.danbooru_revision_signature
+                                ),
+                                non_identity_activation_terms=tuple(
+                                    (
+                                        *verified_character_triggers.values(),
+                                        *(
+                                            term
+                                            for terms in bound_character_activation_overrides.values()
+                                            for term in terms
+                                        ),
+                                        *(
+                                            term
+                                            for _name, term in options.lora_activation_overrides
+                                        ),
+                                    )
                                 ),
                             )
                         )

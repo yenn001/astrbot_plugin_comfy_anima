@@ -15,8 +15,10 @@ from ..services.lora_catalog import LoraRecord
 from ..services.lora_identity_evidence import (
     build_lora_identity_discovery,
     resolve_lora_character_canonicals,
+    resolve_lora_identity_bindings,
 )
 from ..services.lora_semantic import (
+    LoraIdentityBinding,
     LoraSemanticIndex,
     SemanticEntry,
     SemanticFact,
@@ -57,6 +59,16 @@ class LoraIdentityEvidenceTests(unittest.TestCase):
                             "category": "character",
                         },
                         {"tag": "future_series", "category": "copyright"},
+                        {
+                            "tag": "denia_(wuthering_waves)",
+                            "category": "character",
+                        },
+                        {"tag": "wuthering_waves", "category": "copyright"},
+                        {
+                            "tag": "black_denia_(other_work)",
+                            "category": "character",
+                        },
+                        {"tag": "other_work", "category": "copyright"},
                     ],
                 },
                 ensure_ascii=False,
@@ -124,6 +136,75 @@ class LoraIdentityEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(result, ("new_hero_(new_work)",))
+
+    def test_manual_binding_separates_file_activation_and_character_identity(self) -> None:
+        record = self._record(
+            name="black deniav1-2.safetensors",
+            character_name="black denia",
+            source_work="other work",
+            trigger_words=("black_denia",),
+        )
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(record.name, record.sha256),
+            canonical_name=record.name,
+            sha256=record.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "manual"),),
+            character_names=(SemanticFact("Denia", "manual"),),
+            source_works=(SemanticFact("Wuthering Waves", "manual"),),
+            identity_bindings=(
+                LoraIdentityBinding(
+                    character_canonical="denia_(wuthering_waves)",
+                    copyright_canonical="wuthering_waves",
+                    activation_terms=("black_denia",),
+                ),
+            ),
+            source_fingerprint="old-metadata-fingerprint",
+            analysis_confidence=1.0,
+        )
+        semantic = LoraSemanticIndex(entries={entry.identity_key: entry})
+
+        canonicals = resolve_lora_character_canonicals(
+            record,
+            semantic_index=semantic,
+            tag_index=self.index,
+        )
+        bindings = resolve_lora_identity_bindings(
+            record,
+            semantic_index=semantic,
+            tag_index=self.index,
+        )
+
+        self.assertEqual(canonicals, ("denia_(wuthering_waves)",))
+        self.assertEqual(bindings[0].activation_terms, ("black_denia",))
+
+    def test_manual_binding_stops_after_lora_content_sha_changes(self) -> None:
+        original = self._record(name="black deniav1-2.safetensors")
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(original.name, original.sha256),
+            canonical_name=original.name,
+            sha256=original.sha256,
+            analysis_status="searchable",
+            identity_bindings=(
+                LoraIdentityBinding(
+                    character_canonical="denia_(wuthering_waves)",
+                    copyright_canonical="wuthering_waves",
+                    activation_terms=("black_denia",),
+                ),
+            ),
+            source_fingerprint=original.source_fingerprint,
+        )
+        semantic = LoraSemanticIndex(entries={entry.identity_key: entry})
+        changed = replace(original, sha256="cd" * 32)
+
+        self.assertEqual(
+            resolve_lora_identity_bindings(
+                changed,
+                semantic_index=semantic,
+                tag_index=self.index,
+            ),
+            (),
+        )
 
     def test_stale_semantic_fingerprint_cannot_authorize_future_character(self) -> None:
         record = self._record()

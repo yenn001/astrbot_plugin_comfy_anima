@@ -627,6 +627,7 @@ class DedicatedPipelineWorkflowTests(unittest.TestCase):
             "old tags, replace with Ganyu --lcc": "standard",
             "old tags, replace with Ganyu --llm c u": "ultra",
             "old tags, replace with Ganyu --llm cc u": "ultra",
+            "old tags, replace with Ganyu --l cc u": "ultra",
             "old tags, replace with Ganyu --llmcc u": "ultra",
             "old tags, replace with Ganyu --lcc u": "ultra",
         }

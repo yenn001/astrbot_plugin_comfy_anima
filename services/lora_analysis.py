@@ -807,6 +807,7 @@ class LoraAnalysisPipeline:
             "category",
             "character_names",
             "source_works",
+            "activation_terms",
             "artist_style_names",
             "aliases",
         ):
@@ -819,6 +820,7 @@ class LoraAnalysisPipeline:
             "category": (),
             "character_names": (),
             "source_works": (),
+            "activation_terms": (),
             "artist_style_names": (),
             "aliases": (),
         }
@@ -849,6 +851,11 @@ class LoraAnalysisPipeline:
                     0.75,
                 ),
             )
+        derived["activation_terms"] = tuple(
+            SemanticFact(value, "observed", ("fresh_record.trigger_words",), 1.0)
+            for value in detail.trigger_words
+            if _clean_text(value)
+        )
         derived["aliases"] = tuple(
             SemanticFact(value, "derived", ("fresh_record.aliases",), 0.7)
             for value in detail.aliases
@@ -859,6 +866,7 @@ class LoraAnalysisPipeline:
             "category": (proposal.category,),
             "character_names": proposal.character_names,
             "source_works": proposal.source_works,
+            "activation_terms": (),
             "artist_style_names": proposal.artist_style_names,
             "aliases": proposal.aliases,
         }
@@ -898,6 +906,9 @@ class LoraAnalysisPipeline:
             updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             error="",
             present=True,
+            identity_bindings=(
+                previous.identity_bindings if previous is not None else ()
+            ),
             **merged_fields,
         )
 

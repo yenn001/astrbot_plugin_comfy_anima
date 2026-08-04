@@ -1447,6 +1447,14 @@ function detailBlock(title, rows, {wide = false} = {}) {
   return block;
 }
 
+function identityBindingLines(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((binding) => {
+    const activation = valueList(binding?.activation_terms).join(", ");
+    return [binding?.character_canonical || "", binding?.copyright_canonical || "", activation].join(" | ");
+  });
+}
+
 function fillLoraReviewForm(detail) {
   const form = document.querySelector("#lora-semantic-form");
   const semantic = detail.semantic || {};
@@ -1454,6 +1462,8 @@ function fillLoraReviewForm(detail) {
   form.elements.category.value = semantic.category || detail.category || "unclassified";
   form.elements.character_names.value = valueList(semantic.character_names || detail.character_name).join("\n");
   form.elements.source_works.value = valueList(semantic.source_works || detail.source_work).join("\n");
+  form.elements.activation_terms.value = valueList(semantic.activation_terms).join("\n");
+  form.elements.identity_bindings.value = identityBindingLines(semantic.identity_bindings).join("\n");
   form.elements.artist_style_names.value = valueList(semantic.artist_style_names).join("\n");
   form.elements.aliases.value = valueList(semantic.aliases || detail.aliases).join("\n");
 }
@@ -1464,7 +1474,7 @@ function renderLoraDetail(detail) {
   document.querySelector("#lora-detail-name").textContent = detail.name;
   const health = detail.metadata_health || {};
   document.querySelector("#lora-detail-status").textContent =
-    `实时资料健康状态：${health.status || "unknown"} · AI 建档：${archiveStateLabels[detail.analysis_status] || detail.analysis_status || "未建档"}`;
+    `实时资料健康状态：${health.status || "unknown"} · AI 建档：${archiveStateLabels[detail.analysis_status] || detail.analysis_status || "未建档"} · exact 身份：${detail.semantic?.identity_bindings?.length ? `已绑定 ${detail.semantic.identity_bindings.length} 项` : "未绑定"}`;
   content.replaceChildren(
     detailBlock("身份与版本", [
       ["模型名", detail.model_name], ["版本名", detail.version_name], ["基础模型", detail.base_model],
@@ -1473,7 +1483,8 @@ function renderLoraDetail(detail) {
     detailBlock("语义与触发", [
       ["当前分类", detail.semantic?.category || detail.category], ["角色名", detail.semantic?.character_names || detail.character_name],
       ["作品", detail.semantic?.source_works || detail.source_work], ["画师 / 风格", detail.semantic?.artist_style_names],
-      ["别名", detail.semantic?.aliases || detail.aliases], ["完整触发词", detail.trigger_words], ["标签", detail.tags],
+      ["Danbooru exact 绑定", identityBindingLines(detail.semantic?.identity_bindings)], ["共享激活词", detail.semantic?.activation_terms],
+      ["别名", detail.semantic?.aliases || detail.aliases], ["Manager 触发词", detail.trigger_words], ["标签", detail.tags],
     ]),
     detailBlock("Civitai 作者与许可", [
       ["作者", [detail.creator?.display_name, detail.creator?.username].filter(Boolean)], ["作者主页", detail.creator?.profile_url],
@@ -1518,6 +1529,15 @@ async function saveLoraSemantic(event) {
   const form = event.currentTarget;
   const button = document.querySelector("#lora-semantic-save");
   const payload = Object.fromEntries(new FormData(form).entries());
+  payload.semantic_schema_version = 3;
+  payload.identity_bindings = String(payload.identity_bindings || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+    const [characterCanonical = "", copyrightCanonical = "", activationText = ""] = line.split("|").map((part) => part.trim());
+    return {
+      character_canonical: characterCanonical,
+      copyright_canonical: copyrightCanonical,
+      activation_terms: activationText.split(/[,，;；]+/).map((item) => item.trim()).filter(Boolean),
+    };
+  });
   setBusy(button, true, "保存中…");
   try {
     const data = await api("/api/loras/semantic", {method: "PUT", body: JSON.stringify(payload)});

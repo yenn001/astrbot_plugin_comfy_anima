@@ -1,7 +1,7 @@
-"""Fail-closed single-character semantic replacement for Anima prompts.
+"""Fail-closed semantic replacement for one selected Anima subject.
 
 This module deliberately does not perform image editing.  It rewrites a
-single-subject prompt, replaces exactly one character LoRA, and preserves the
+prompt, replaces exactly one selected character identity, and preserves the
 remaining outfit, pose, composition, scene and style terms unless the caller
 explicitly requests the target character's metadata-backed default outfit.
 """
@@ -36,6 +36,10 @@ from .lora_semantic import (
     semantic_source_fingerprint,
 )
 from .provider_response import response_text as _provider_response_text
+from .subject_slots import (
+    SubjectSelectionError,
+    analyze_prompt_subject_selection,
+)
 
 
 SWAP_MODE_KEEP_OUTFIT = "keep-outfit"
@@ -589,6 +593,11 @@ class CharacterSwapRequest:
     ignored_control_directives: tuple[str, ...] = ()
     feature_swap_enabled: bool = False
     feature_swap_categories: tuple[str, ...] = ()
+    source_subject_count: int = 1
+    source_selector_terms: tuple[str, ...] = ()
+    protected_subject_terms: tuple[str, ...] = ()
+    source_selector_basis: str = ""
+    source_selector_direction_used: bool = False
 
     @property
     def source_kind(self) -> str:
@@ -626,11 +635,19 @@ class CharacterSwapPreparation:
     target_trigger_words: tuple[str, ...]
     source_identity_hints: tuple[str, ...]
     target_identity_hints: tuple[str, ...]
+    target_activation_terms: tuple[str, ...] = ()
     verified_target_appearance_terms: tuple[str, ...] = ()
     verified_target_appearance_evidence: tuple[tuple[str, str], ...] = ()
     source_tag_categories: tuple[str, ...] = ()
     source_tag_verified: tuple[bool, ...] = ()
     source_tag_canonicals: tuple[str, ...] = ()
+    source_subject_count: int = 1
+    multi_subject: bool = False
+    source_selector_term_ids: tuple[int, ...] = ()
+    source_selector_terms: tuple[str, ...] = ()
+    protected_subject_terms: tuple[str, ...] = ()
+    source_selector_basis: str = "single_subject"
+    source_selector_direction_used: bool = False
 
 
 @dataclass(frozen=True)
@@ -647,6 +664,8 @@ class CharacterSwapPlan:
     added_terms: tuple[str, ...]
     suppressed_terms: tuple[str, ...]
     suppress_default_style: bool
+    target_activation_terms: tuple[str, ...] = ()
+    preserved_character_lora_names: tuple[str, ...] = ()
     promoted_uncertain_count: int = 0
     promoted_uncertain_outfit_count: int = 0
     promoted_uncertain_visual_count: int = 0
@@ -667,12 +686,29 @@ class CharacterSwapPlan:
     missing_target_feature_categories: tuple[str, ...] = ()
     model_native_fallback_categories: tuple[str, ...] = ()
     target_slot_decisions: tuple[tuple[str, str], ...] = ()
+    source_subject_count: int = 1
+    multi_subject: bool = False
+    source_selector_terms: tuple[str, ...] = ()
+    protected_subject_terms: tuple[str, ...] = ()
+    source_selector_basis: str = "single_subject"
+    source_selector_direction_used: bool = False
 
     def preview_text(self) -> str:
         removed = "、".join(self.removed_terms[:12]) or "无"
         added = "、".join(self.added_terms[:12]) or "无"
+        selector = "、".join(self.source_selector_terms[:8]) or "单角色"
+        protected = "、".join(self.protected_subject_terms[:8]) or "无"
+        subject_summary = (
+            f"识别角色：{self.source_subject_count} 名\n"
+            f"选中依据：{self.source_selector_basis}｜{selector}\n"
+            f"保护其他角色：{protected}\n"
+            if self.multi_subject
+            else ""
+        )
         return (
             "语义换角预览（未提交 ComfyUI）\n"
+            + subject_summary
+            +
             f"目标身份来源：{self.target_record.name if self.target_record else '纯语义 Tags（未使用角色 LoRA）'}\n"
             f"保留 Tags：{len(self.kept_terms)} 项\n"
             f"移除身份：{removed}\n"
@@ -2875,6 +2911,53 @@ class CharacterSwapPlanner:
 
         if preparation.request.mode != SWAP_MODE_KEEP_OUTFIT:
             return None
+        if preparation.multi_subject:
+            source_hint_keys = {
+                _prompt_term_key(value)
+                for value in preparation.source_identity_hints
+                if _prompt_term_key(value)
+            }
+            if preparation.source_record is not None:
+                source_activation = choose_character_identity_trigger(
+                    preparation.source_record
+                )
+                if _prompt_term_key(source_activation):
+                    source_hint_keys.add(_prompt_term_key(source_activation))
+            selected_ids = tuple(
+                index
+                for index in preparation.source_selector_term_ids
+                if 0 <= index < len(preparation.tags)
+                and _prompt_term_key(preparation.tags[index])
+                not in _GENERIC_NON_IDENTITY_KEYS
+                and (
+                    _is_deterministic_source_appearance_term(
+                        preparation.tags[index]
+                    )
+                    or _danbooru_character_parts(preparation.tags[index]) is not None
+                    or _prompt_term_key(preparation.tags[index]) in source_hint_keys
+                )
+            )
+            selected_set = set(selected_ids)
+            return CharacterSwapClassification(
+                source_identity_ids=selected_ids,
+                outfit_ids=(),
+                pose_action_ids=(),
+                composition_ids=(),
+                scene_lighting_ids=(),
+                style_quality_ids=tuple(
+                    index
+                    for index in range(len(preparation.tags))
+                    if index not in selected_set
+                ),
+                uncertain_ids=(),
+                target_identity_trigger_id=(
+                    0 if preparation.target_trigger_words else None
+                ),
+                target_appearance_trigger_ids=(),
+                target_default_outfit_trigger_ids=(),
+                subject_count=preparation.source_subject_count,
+                confidence=1.0,
+            )
         feature_categories = _normalized_feature_swap_categories(
             preparation.request.feature_swap_categories
         )
@@ -3182,6 +3265,29 @@ class CharacterSwapPlanner:
             if target_metadata is not None
             else ()
         )
+        bound_target_identity = ""
+        target_activation_terms: tuple[str, ...] = ()
+        if target_metadata is not None:
+            semantic_entry = self._semantic_index.entry_for(target_metadata)
+            requested_canonical_key = _prompt_term_key(
+                request.semantic_identity_canonical_tag
+            )
+            if semantic_entry is not None and requested_canonical_key:
+                binding_matches = tuple(
+                    binding
+                    for binding in semantic_entry.identity_bindings
+                    if _prompt_term_key(binding.character_canonical)
+                    == requested_canonical_key
+                )
+                if len(binding_matches) == 1:
+                    binding = binding_matches[0]
+                    bound_target_identity = binding.character_canonical
+                    target_activation_terms = _dedupe_text(
+                        (
+                            *binding.activation_terms,
+                            *semantic_entry.effective_values("activation_terms"),
+                        )
+                    )
         if (
             target_metadata is not None
             and request.use_target_lora
@@ -3241,6 +3347,98 @@ class CharacterSwapPlanner:
             positive_prompt,
             max_loras=max(1, len(records)),
         )
+        tags = _split_prompt_terms(clean_prompt)
+        if not tags:
+            raise CharacterSwapError(
+                "移除 LoRA 标签后没有可用于语义换角的画面 Tags",
+                code="empty_swap_prompt",
+            )
+        if len(tags) > 240:
+            raise CharacterSwapError(
+                "换角提示词最多支持 240 个顶层 Tag，请先精简",
+                code="too_many_tags",
+            )
+        try:
+            selector_text = request.source_query
+            if source is not None:
+                source_activation = choose_character_identity_trigger(source)
+                selector_text = " ".join(
+                    _dedupe_text(
+                        (
+                            request.source_query,
+                            *_trusted_identity_values(source, self._semantic_index),
+                            source_activation,
+                        )
+                    )
+                )
+            subject_selection = analyze_prompt_subject_selection(
+                tags,
+                selector_text,
+            )
+            if request.source_subject_count > 1 and not subject_selection.multi_subject:
+                augmented_tags = (*tags, f"{request.source_subject_count}people")
+                subject_selection = analyze_prompt_subject_selection(
+                    augmented_tags,
+                    selector_text,
+                )
+                subject_selection = replace(
+                    subject_selection,
+                    subject_count=request.source_subject_count,
+                    matched_term_ids=tuple(
+                        index
+                        for index in subject_selection.matched_term_ids
+                        if index < len(tags)
+                    ),
+                    matched_terms=tuple(
+                        term
+                        for index, term in zip(
+                            subject_selection.matched_term_ids,
+                            subject_selection.matched_terms,
+                        )
+                        if index < len(tags)
+                    ),
+                    protected_term_ids=tuple(
+                        index
+                        for index in subject_selection.protected_term_ids
+                        if index < len(tags)
+                    ),
+                    protected_terms=tuple(
+                        term
+                        for index, term in zip(
+                            subject_selection.protected_term_ids,
+                            subject_selection.protected_terms,
+                        )
+                        if index < len(tags)
+                    ),
+                )
+        except SubjectSelectionError as exc:
+            raise CharacterSwapError(
+                str(exc),
+                code=exc.code,
+                details=exc.details,
+            ) from exc
+        if subject_selection.multi_subject and request.mode == SWAP_MODE_TARGET_OUTFIT:
+            raise CharacterSwapError(
+                "多人换角暂不支持自动套用目标默认服装；请明确写出要保留或更换的衣装",
+                code="multi_subject_target_outfit_unsupported",
+            )
+        if request.protected_subject_terms:
+            tag_keys = {
+                _prompt_term_key(term): term
+                for term in tags
+                if _prompt_term_key(term)
+            }
+            observed_protected_terms = tuple(
+                tag_keys[key]
+                for term in request.protected_subject_terms
+                if (key := _prompt_term_key(term)) in tag_keys
+            )
+            subject_selection = replace(
+                subject_selection,
+                protected_terms=_dedupe_text(
+                    (*subject_selection.protected_terms, *observed_protected_terms)
+                ),
+            )
 
         resolved_pairs = tuple(
             (selection, _resolve_prompt_lora(selection, records))
@@ -3252,13 +3450,31 @@ class CharacterSwapPlanner:
         distinct_character_keys = {
             _canonical_key(record.name) for _selection, record in character_pairs
         }
-        if len(distinct_character_keys) > 1:
-            raise CharacterSwapError(
-                "提示词中含有多个不同角色 LoRA，无法安全确定要替换哪一个",
-                code="multiple_character_loras",
-        )
+        prompt_source: Optional[LoraRecord] = None
         if character_pairs:
-            prompt_source = character_pairs[0][1]
+            if subject_selection.multi_subject:
+                matching_source_pairs = tuple(
+                    pair
+                    for pair in character_pairs
+                    if source is not None and _same_lora(pair[1], source)
+                )
+                if len(matching_source_pairs) != 1:
+                    raise CharacterSwapError(
+                        "多人提示词含有角色 LoRA，但自然语言选择器无法把唯一一个 LoRA 绑定到待替换角色",
+                        code="multi_subject_character_lora_unbound",
+                        details={
+                            "character_lora_count": len(distinct_character_keys),
+                            "source_selector_basis": subject_selection.basis,
+                        },
+                    )
+                prompt_source = matching_source_pairs[0][1]
+            elif len(distinct_character_keys) > 1:
+                raise CharacterSwapError(
+                    "提示词中含有多个不同角色 LoRA，无法安全确定要替换哪一个",
+                    code="multiple_character_loras",
+                )
+            else:
+                prompt_source = character_pairs[0][1]
             if target_metadata is not None and _same_lora(
                 prompt_source,
                 target_metadata,
@@ -3279,8 +3495,12 @@ class CharacterSwapPlanner:
         removed_character_loras: list[LoraSelection] = []
         for selection, record in resolved_pairs:
             if _is_character_record(record):
-                removed_character_loras.append(selection)
-                continue
+                if source is not None and _same_lora(record, source):
+                    removed_character_loras.append(selection)
+                    continue
+                if not subject_selection.multi_subject:
+                    removed_character_loras.append(selection)
+                    continue
             if replace_source_style and str(record.category or "") in {
                 "artist_style",
                 "mixed",
@@ -3291,27 +3511,21 @@ class CharacterSwapPlanner:
             )
             preserved_records.append(record)
 
-        tags = _split_prompt_terms(clean_prompt)
-        if not tags:
-            raise CharacterSwapError(
-                "移除 LoRA 标签后没有可用于语义换角的画面 Tags",
-                code="empty_swap_prompt",
-            )
-        if len(tags) > 240:
-            raise CharacterSwapError(
-                "换角提示词最多支持 240 个顶层 Tag，请先精简",
-                code="too_many_tags",
-            )
-        _reject_obvious_multi_subject(tags)
-
         verified_fallback_tags = _dedupe_text(fallback_target_tags)
         target_triggers = _dedupe_text(
-            (*metadata_target_triggers, *verified_fallback_tags)
+            (
+                bound_target_identity,
+                *metadata_target_triggers,
+                *verified_fallback_tags,
+            )
         )
         deterministic_trigger = (
-            metadata_target_triggers[0]
-            if target is not None and metadata_target_triggers
-            else ""
+            bound_target_identity
+            or (
+                metadata_target_triggers[0]
+                if target is not None and metadata_target_triggers
+                else ""
+            )
         )
         if not target_triggers:
             if not request.use_target_lora:
@@ -3397,10 +3611,18 @@ class CharacterSwapPlanner:
             removed_character_loras=tuple(removed_character_loras),
             deterministic_target_trigger=deterministic_trigger,
             target_trigger_words=target_triggers,
+            target_activation_terms=target_activation_terms,
             source_identity_hints=source_hints,
             target_identity_hints=target_hints,
             verified_target_appearance_terms=verified_appearance_terms,
             verified_target_appearance_evidence=verified_appearance_evidence,
+            source_subject_count=subject_selection.subject_count,
+            multi_subject=subject_selection.multi_subject,
+            source_selector_term_ids=subject_selection.matched_term_ids,
+            source_selector_terms=subject_selection.matched_terms,
+            protected_subject_terms=subject_selection.protected_terms,
+            source_selector_basis=subject_selection.basis,
+            source_selector_direction_used=subject_selection.direction_used,
         )
 
     @staticmethod
@@ -3649,10 +3871,14 @@ explanations."""
         preparation: CharacterSwapPreparation,
         classification: CharacterSwapClassification,
     ) -> CharacterSwapPlan:
-        if classification.subject_count != 1:
+        if classification.subject_count != preparation.source_subject_count:
             raise CharacterSwapError(
-                "首版语义换角只支持单角色，分类模型判断并非单一人物",
-                code="multiple_subjects",
+                "换角分类返回的角色数量与来源角色选择结果不一致",
+                code="subject_count_mismatch",
+                details={
+                    "expected": preparation.source_subject_count,
+                    "actual": classification.subject_count,
+                },
             )
         semantic_original = bool(
             preparation.target_record is None
@@ -3725,12 +3951,28 @@ explanations."""
             if index < len(preparation.source_tag_categories)
             and preparation.source_tag_categories[index] == "artist"
         }
+        selected_subject_ids = set(preparation.source_selector_term_ids)
         classified_source_identity_ids = set(classification.source_identity_ids)
+        if preparation.multi_subject:
+            out_of_scope_ids = classified_source_identity_ids - selected_subject_ids
+            if out_of_scope_ids:
+                raise CharacterSwapError(
+                    "换角分类试图移除未被自然语言选择器绑定的其他角色 Tags",
+                    code="source_selector_scope_violation",
+                    details={"term_ids": sorted(out_of_scope_ids)},
+                )
+            classified_source_identity_ids.intersection_update(selected_subject_ids)
         classified_source_canonical_ids = {
             index
             for index in classified_source_identity_ids
             if _danbooru_character_parts(preparation.tags[index]) is not None
-        } | exact_character_ids
+        }
+        if not preparation.multi_subject:
+            classified_source_canonical_ids.update(exact_character_ids)
+        else:
+            classified_source_canonical_ids.update(
+                exact_character_ids & selected_subject_ids
+            )
         lineage_anchors = (
             *preparation.source_identity_hints,
             *(
@@ -3741,6 +3983,7 @@ explanations."""
         matching_source_copyright_ids = {
             index
             for index in exact_copyright_ids
+            if (not preparation.multi_subject or index in selected_subject_ids)
             if _matches_source_copyright_context(
                 preparation.tags[index],
                 lineage_anchors,
@@ -3753,11 +3996,17 @@ explanations."""
             index
             for index, term in enumerate(preparation.tags)
             if index not in classified_source_identity_ids
+            and (not preparation.multi_subject or index in selected_subject_ids)
             and (
                 _matches_source_character_lineage(term, lineage_anchors)
                 or _matches_source_copyright_context(term, lineage_anchors)
             )
-        } | exact_character_ids
+        }
+        promoted_source_canonical_ids.update(
+            exact_character_ids
+            if not preparation.multi_subject
+            else exact_character_ids & selected_subject_ids
+        )
         all_deterministic_appearance_ids = {
             index
             for index, term in enumerate(preparation.tags)
@@ -3774,6 +4023,9 @@ explanations."""
             if feature_swap_enabled
             else all_deterministic_appearance_ids
         )
+        if preparation.multi_subject:
+            deterministic_appearance_ids.intersection_update(selected_subject_ids)
+            feature_source_ids.intersection_update(selected_subject_ids)
         deterministic_outfit_ids = {
             index
             for index, term in enumerate(preparation.tags)
@@ -4144,6 +4396,22 @@ explanations."""
                 )
             removed_ids.update(classification.outfit_ids)
             removed_ids.update(deterministic_outfit_ids)
+        protected_keys = {
+            _prompt_term_key(term)
+            for term in preparation.protected_subject_terms
+            if _prompt_term_key(term)
+        }
+        protected_removed_ids = {
+            index
+            for index in removed_ids
+            if _prompt_term_key(preparation.tags[index]) in protected_keys
+        }
+        if protected_removed_ids:
+            raise CharacterSwapError(
+                "换角计划试图移除另一个角色的受保护特征",
+                code="protected_subject_term_removed",
+                details={"term_ids": sorted(protected_removed_ids)},
+            )
         kept_terms = tuple(
             tag for index, tag in enumerate(preparation.tags) if index not in removed_ids
         )
@@ -4367,6 +4635,12 @@ explanations."""
             target_record=preparation.target_record,
             source_record=preparation.source_record,
             target_identity_trigger=target_trigger,
+            target_activation_terms=preparation.target_activation_terms,
+            preserved_character_lora_names=tuple(
+                record.name
+                for record in preparation.preserved_lora_records
+                if _is_character_record(record)
+            ),
             removed_terms=removed_terms,
             kept_terms=kept_terms,
             added_terms=tuple(added_terms),
@@ -4412,6 +4686,14 @@ explanations."""
             missing_target_feature_categories=missing_target_feature_categories,
             model_native_fallback_categories=model_native_fallback_categories,
             target_slot_decisions=tuple(target_slot_decisions),
+            source_subject_count=preparation.source_subject_count,
+            multi_subject=preparation.multi_subject,
+            source_selector_terms=preparation.source_selector_terms,
+            protected_subject_terms=preparation.protected_subject_terms,
+            source_selector_basis=preparation.source_selector_basis,
+            source_selector_direction_used=(
+                preparation.source_selector_direction_used
+            ),
         )
 
     @staticmethod
@@ -4429,17 +4711,23 @@ explanations."""
         character_keys = {
             _canonical_key(record.name) for record in records if _is_character_record(record)
         }
+        preserved_character_keys = {
+            _canonical_key(record.name)
+            for record in preparation.preserved_lora_records
+            if _is_character_record(record)
+        }
         if preparation.target_record is None:
-            if character_keys:
+            if character_keys != preserved_character_keys:
                 raise CharacterSwapError(
-                    "纯语义换角的最终 LoRA 栈仍残留角色 LoRA",
+                    "纯语义换角改变了其他角色的 LoRA 栈",
                     code="final_character_stack_invalid",
                 )
         else:
             target_key = _canonical_key(preparation.target_record.name)
-            if character_keys != {target_key}:
+            expected_character_keys = preserved_character_keys | {target_key}
+            if character_keys != expected_character_keys:
                 raise CharacterSwapError(
-                    "最终 LoRA 栈未能保持唯一目标角色",
+                    "最终 LoRA 栈未能只替换选中的来源角色",
                     code="final_character_stack_invalid",
                 )
             if sum(_canonical_key(item.name) == target_key for item in loras) != 1:
@@ -4507,6 +4795,17 @@ explanations."""
             raise CharacterSwapError(
                 "最终提示词仍残留原角色身份词",
                 code="source_identity_leak",
+            )
+        missing_protected_terms = tuple(
+            term
+            for term in preparation.protected_subject_terms
+            if _prompt_term_key(term) not in positive_keys
+        )
+        if missing_protected_terms:
+            raise CharacterSwapError(
+                "最终提示词丢失了另一个角色的受保护特征",
+                code="protected_subject_term_dropped",
+                details={"missing_count": len(missing_protected_terms)},
             )
 
 

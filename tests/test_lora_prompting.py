@@ -49,6 +49,48 @@ class RuntimeLoraMergeTests(unittest.TestCase):
 
 
 class RuntimeLoraTriggerTests(unittest.TestCase):
+    def test_file_bound_activation_terms_do_not_need_to_match_manager_identity(self) -> None:
+        record = LoraRecord(
+            "black deniav1-2.safetensors",
+            category="character",
+            character_name="black denia",
+            trigger_words=("legacy_wrong_trigger", "black hair"),
+        )
+
+        plan = build_lora_trigger_plan(
+            prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+            negative_prompt="",
+            selections=(LoraSelection(record.name, 0.8),),
+            records_by_name={"black deniav1-2": record},
+            bound_character_activation_terms={
+                record.name: ("black_denia", "denia_variant")
+            },
+        )
+
+        self.assertEqual(plan.added, ("black_denia", "denia_variant"))
+        self.assertNotIn("legacy_wrong_trigger", plan.prompt)
+        self.assertNotIn("black hair", plan.prompt)
+        self.assertIn(r"denia_\(wuthering_waves\)", plan.prompt)
+
+    def test_file_bound_activation_terms_reject_nested_lora_syntax(self) -> None:
+        record = LoraRecord(
+            "characters/denia.safetensors",
+            category="character",
+            character_name="Denia",
+            trigger_words=("denia",),
+        )
+
+        with self.assertRaises(LoraWorkflowError):
+            build_lora_trigger_plan(
+                prompt="1girl, denia",
+                negative_prompt="",
+                selections=(LoraSelection(record.name, 0.8),),
+                records_by_name={"characters/denia": record},
+                bound_character_activation_terms={
+                    record.name: ("<lora:another:1>",)
+                },
+            )
+
     def test_verified_character_override_reclassifies_mislabeled_style_record(self) -> None:
         record = LoraRecord(
             "style/disguised.safetensors",
