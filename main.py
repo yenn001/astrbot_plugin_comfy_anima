@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v2.0.1
+AstrBot Comfy Anima 插件 v2.0.2
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v2.0.1
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 2.0.1
-日期: 2026-08-04
+版本: 2.0.2
+日期: 2026-08-05
 """
 
 import asyncio
@@ -2891,10 +2891,16 @@ class ComfyAnimaPlugin(Star):
         try:
             options = parse_generation_options(
                 command_text,
-                mode_context="generation",
+                mode_context="control_draw",
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        if options.prompt_edit_mode == "character_change":
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 底图控制不直接执行精确语义换角；"
+                "请使用 /反推画图 <换角要求> --l cc --m p|d|l|r"
+            )
             return
         mode_source = "explicit"
         if not options.control_modes:
@@ -2935,10 +2941,16 @@ class ComfyAnimaPlugin(Star):
         try:
             options = parse_generation_options(
                 command_text,
-                mode_context="generation",
+                mode_context="control_draw",
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        if options.prompt_edit_mode == "character_change":
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 控制画图不直接执行精确语义换角；"
+                "请使用 /反推画图 <换角要求> --l cc --m p|d|l|r"
+            )
             return
         mode_source = "explicit"
         if not options.control_modes:
@@ -3003,6 +3015,9 @@ class ComfyAnimaPlugin(Star):
                 lora_preset=self._find_requested_style_preset(message),
                 use_prompt_llm=True,
                 control_modes=modes,
+                semantic_redraw_mode=self._extract_semantic_redraw_mode_request(
+                    message
+                ),
             )
             async for response in self._handle_control_draw(event, options):
                 yield response
@@ -3024,15 +3039,36 @@ class ComfyAnimaPlugin(Star):
             requirement,
             command="改图",
         )
-        swap_request = parse_natural_character_swap(command_text)
+        try:
+            options = parse_generation_options(
+                command_text,
+                mode_context="semantic_redraw",
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+        swap_request = parse_natural_character_swap(options.prompt)
         if swap_request is not None:
+            if options.semantic_redraw_mode:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} /改图 的精确换角不使用 "
+                    "--mode preserve|balanced|free；请删除该选项，"
+                    "或改用普通整图改图要求"
+                )
+                return
             try:
-                width, height = self._extract_resolution_request(command_text)
+                width, height = self._extract_resolution_request(options.prompt)
                 swap_request = replace(
                     swap_request,
-                    width=width,
-                    height=height,
-                    preset=self._find_requested_style_preset(command_text),
+                    width=options.width or width,
+                    height=options.height or height,
+                    preset=(
+                        options.lora_preset
+                        or self._find_requested_style_preset(options.prompt)
+                    ),
+                    negative_prompt=options.negative_prompt,
+                    pipeline=options.pipeline,
+                    denoise=options.denoise,
                 )
             except ValueError as exc:
                 yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
@@ -3041,7 +3077,7 @@ class ComfyAnimaPlugin(Star):
                 yield response
             return
         try:
-            options = self._prepare_semantic_redraw_options(command_text)
+            options = self._finalize_semantic_redraw_options(options)
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
             return
@@ -3091,7 +3127,7 @@ class ComfyAnimaPlugin(Star):
             command="重绘",
         )
         try:
-            options = parse_generation_options(command_text, mode_context="inpaint")
+            options = parse_generation_options(command_text, mode_context="redraw")
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
             return
@@ -3099,15 +3135,27 @@ class ComfyAnimaPlugin(Star):
             command_text
         )
         if not explicit_mask_mode:
-            swap_request = parse_natural_character_swap(command_text)
+            swap_request = parse_natural_character_swap(options.prompt)
             if swap_request is not None:
+                if options.semantic_redraw_mode:
+                    yield event.plain_result(
+                        f"{MessageEmoji.ERROR} /重绘 的精确换角不使用 "
+                        "--mode preserve|balanced|free；请删除该选项"
+                    )
+                    return
                 try:
-                    width, height = self._extract_resolution_request(command_text)
+                    width, height = self._extract_resolution_request(options.prompt)
                     swap_request = replace(
                         swap_request,
-                        width=width,
-                        height=height,
-                        preset=self._find_requested_style_preset(command_text),
+                        width=options.width or width,
+                        height=options.height or height,
+                        preset=(
+                            options.lora_preset
+                            or self._find_requested_style_preset(options.prompt)
+                        ),
+                        negative_prompt=options.negative_prompt,
+                        pipeline=options.pipeline,
+                        denoise=options.denoise,
                     )
                 except ValueError as exc:
                     yield event.plain_result(f"{MessageEmoji.ERROR} 分辨率错误: {exc}")
@@ -3116,7 +3164,7 @@ class ComfyAnimaPlugin(Star):
                     yield response
                 return
             try:
-                semantic_options = self._prepare_semantic_redraw_options(command_text)
+                semantic_options = self._finalize_semantic_redraw_options(options)
             except ValueError as exc:
                 yield event.plain_result(f"{MessageEmoji.ERROR} 改图参数错误: {exc}")
                 return
@@ -3368,6 +3416,14 @@ class ComfyAnimaPlugin(Star):
                 command_text,
                 mode_context="generation",
             )
+            if overrides.control_modes:
+                raise ValueError(
+                    "/方案 不接收底图控制选项；请使用 /底图控制 或 /反推画图"
+                )
+            if overrides.prompt_edit_mode == "character_change":
+                raise ValueError(
+                    "/方案 不直接执行语义换角；请使用 /画图 ... --llm cc"
+                )
             plan, user_delta = await asyncio.to_thread(
                 self._resolve_prompt_plan_request,
                 overrides.prompt,
@@ -3732,7 +3788,7 @@ class ComfyAnimaPlugin(Star):
         try:
             parsed_options = parse_generation_options(
                 f"{supplement} {reverse_sentinel}".strip(),
-                mode_context="generation",
+                mode_context="control_draw",
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
@@ -3744,6 +3800,12 @@ class ComfyAnimaPlugin(Star):
         ).strip()
         swap_request = parse_natural_character_swap(reverse_requirement)
         if swap_request is not None:
+            if parsed_options.semantic_redraw_mode:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 反推精确换角不使用 "
+                    "--mode preserve|balanced|free；请使用 --m k/t 选择换角衣装策略"
+                )
+                return
             try:
                 natural_width, natural_height = self._extract_resolution_request(
                     reverse_requirement
@@ -3914,19 +3976,20 @@ class ComfyAnimaPlugin(Star):
                     "reverse_draw_director_started",
                     details={"reverse_provider_id": reverse_provider},
                 )
-                director_request = reverse_result.drawing_request(
-                    reverse_requirement
-                )
                 if control_modes:
-                    director_request = (
-                        "Anima image-controlled generation. The plugin has "
-                        "already locked these control modes: "
-                        f"{', '.join(control_modes)}. Do not write control-mode "
-                        "names, ControlNet operations or node/model names into "
-                        "the visual tags. Preserve the requested source-image "
-                        "constraints while describing the desired final image. "
-                        "Reverse analysis and user request: "
-                        + director_request
+                    director_request = reverse_result.control_generation_request(
+                        reverse_requirement,
+                        control_modes,
+                        parsed_options.semantic_redraw_mode or "balanced",
+                    )
+                elif parsed_options.semantic_redraw_mode:
+                    director_request = reverse_result.semantic_redraw_request(
+                        reverse_requirement,
+                        parsed_options.semantic_redraw_mode,
+                    )
+                else:
+                    director_request = reverse_result.drawing_request(
+                        reverse_requirement
                     )
                 instruction, director_provider = await self._timed_llm_call(
                     job,
@@ -3999,7 +4062,11 @@ class ComfyAnimaPlugin(Star):
                             "denoise": (
                                 parsed_options.denoise
                                 if parsed_options.denoise is not None
-                                else 0.55
+                                else {
+                                    "preserve": 0.35,
+                                    "balanced": 0.55,
+                                    "free": 0.8,
+                                }.get(parsed_options.semantic_redraw_mode, 0.55)
                             ),
                         },
                     )
@@ -4023,7 +4090,15 @@ class ComfyAnimaPlugin(Star):
                         denoise=(
                             parsed_options.denoise
                             if parsed_options.denoise is not None
-                            else (None if control_modes else 0.55)
+                            else (
+                                None
+                                if control_modes
+                                else {
+                                    "preserve": 0.35,
+                                    "balanced": 0.55,
+                                    "free": 0.8,
+                                }.get(parsed_options.semantic_redraw_mode, 0.55)
+                            )
                         ),
                         use_prompt_llm=False,
                         suppress_default_style=(not bool(style_preset)),
@@ -4119,10 +4194,18 @@ class ComfyAnimaPlugin(Star):
     ) -> AsyncGenerator[Any, None]:
         """Upscale one direct or replied image with the standalone RTX workflow."""
         scale_text = self._extract_command_text(event.message_str, scale, command="放大")
+        if scale_text.strip().startswith("--"):
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 放大命令不支持选项: "
+                f"{scale_text.strip().split()[0]}；用法: /放大 2"
+            )
+            return
         try:
             scale_value = self._parse_rtx_scale(scale_text)
-        except ValueError:
-            yield event.plain_result(f"{MessageEmoji.ERROR} 放大倍率必须是数字，例如 /放大 2")
+        except ValueError as exc:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 放大倍率无效: {exc}；用法: /放大 2"
+            )
             return
         async for response in self._handle_rtx_upscale(event, scale_value):
             yield response
@@ -4771,6 +4854,33 @@ class ComfyAnimaPlugin(Star):
             )
         except ValueError as exc:
             yield event.plain_result(f"{MessageEmoji.ERROR} 参数错误: {exc}")
+            return
+
+        if options.prompt_edit_mode == "character_change":
+            if options.control_modes:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} /anima draw 的文本换角不能与底图控制模式同时使用"
+                )
+                return
+            try:
+                swap_request = self._text_character_swap_request(
+                    options,
+                    options.prompt,
+                    preset=options.lora_preset,
+                    width=options.width,
+                    height=options.height,
+                )
+            except CharacterSwapError as exc:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 文本换角参数错误: {exc.user_message}"
+                )
+                return
+            async for response in self._handle_character_swap(
+                event,
+                swap_request,
+                forward=False,
+            ):
+                yield response
             return
 
         if options.control_modes:
@@ -7014,6 +7124,13 @@ QQ快捷指令:
             return await finish_with_revision_guard(prompt, negative_prompt)
 
         semantic_index = self._runtime_semantic_index()
+        prompt_work_canonicals = tuple(
+            dict.fromkeys(
+                canonical
+                for _term, canonical in prompt_copyright_terms
+                if normalize_tag(canonical)
+            )
+        )
         resolved_rows: list[
             tuple[str, str, Any, tuple[str, ...], tuple[str, ...], str]
         ] = []
@@ -7049,6 +7166,13 @@ QQ快捷指令:
                 dict.fromkeys(
                     (
                         *((explicit_work,) if explicit_work else ()),
+                        *(
+                            prompt_work_canonicals
+                            if not explicit_work
+                            and len(resolution_inputs) == 1
+                            and len(prompt_work_canonicals) == 1
+                            else ()
+                        ),
                         *work_hints,
                         *alias_work_hints,
                     )
@@ -9875,6 +9999,40 @@ QQ快捷指令:
         yield self._make_image_result(event, image_paths, seed, forward=forward)
         self._schedule_cleanup(image_paths)
 
+    @staticmethod
+    def _text_character_swap_request(
+        options: GenerationOptions,
+        prompt: str,
+        *,
+        preset: str,
+        width: Optional[int],
+        height: Optional[int],
+    ) -> CharacterSwapRequest:
+        """Build one text-swap request from already parsed generation options."""
+
+        return parse_text_character_change_request(
+            prompt,
+            preset=preset,
+            mode=options.character_swap_mode or SWAP_MODE_KEEP_OUTFIT,
+            target_lora_strength=(
+                options.character_swap_target_lora_strength
+                if options.character_swap_target_lora_strength is not None
+                else 0.65
+            ),
+            preview=options.character_swap_preview,
+            use_target_lora=options.character_swap_use_target_lora,
+            width=width,
+            height=height,
+            negative_prompt=options.negative_prompt,
+            pipeline=options.pipeline,
+            prompt_expansion_mode=options.prompt_expansion_mode,
+            seed=options.seed,
+            steps=options.steps,
+            cfg=options.cfg,
+            enable_upscale=options.enable_upscale,
+            denoise=options.denoise,
+        )
+
     async def _handle_direct_draw(
         self, event: AstrMessageEvent, prompt: str, *, forward: bool
     ) -> AsyncGenerator[Any, None]:
@@ -9909,33 +10067,12 @@ QQ快捷指令:
                 )
                 return
             try:
-                swap_request = parse_text_character_change_request(
+                swap_request = self._text_character_swap_request(
+                    parsed_options,
                     prompt,
                     preset=preset_name,
-                    mode=(
-                        parsed_options.character_swap_mode
-                        or SWAP_MODE_KEEP_OUTFIT
-                    ),
-                    target_lora_strength=(
-                        parsed_options.character_swap_target_lora_strength
-                        if parsed_options.character_swap_target_lora_strength
-                        is not None
-                        else 0.65
-                    ),
-                    preview=parsed_options.character_swap_preview,
-                    use_target_lora=(
-                        parsed_options.character_swap_use_target_lora
-                    ),
                     width=width,
                     height=height,
-                    negative_prompt=parsed_options.negative_prompt,
-                    pipeline=parsed_options.pipeline,
-                    prompt_expansion_mode=parsed_options.prompt_expansion_mode,
-                    seed=parsed_options.seed,
-                    steps=parsed_options.steps,
-                    cfg=parsed_options.cfg,
-                    enable_upscale=parsed_options.enable_upscale,
-                    denoise=parsed_options.denoise,
                 )
             except CharacterSwapError as exc:
                 yield event.plain_result(
@@ -10847,6 +10984,14 @@ QQ快捷指令:
             command_text,
             mode_context="semantic_redraw",
         )
+        return self._finalize_semantic_redraw_options(options)
+
+    def _finalize_semantic_redraw_options(
+        self,
+        options: GenerationOptions,
+    ) -> GenerationOptions:
+        """Apply inferred semantic-redraw defaults to already parsed options."""
+
         if options.use_prompt_llm is False:
             raise ValueError("整图改图必须使用图片反推与 LLM 语义规划，不支持 --raw")
         detected_width, detected_height = self._extract_resolution_request(options.prompt)
@@ -16964,6 +17109,7 @@ QQ快捷指令:
                     prompt=reverse_result.control_generation_request(
                         options.prompt,
                         options.control_modes,
+                        options.semantic_redraw_mode or "balanced",
                     ),
                 )
                 self._record_image_task_phase(

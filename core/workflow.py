@@ -20,8 +20,10 @@ from typing import Any
 from ..constants import MAX_CFG, MAX_IMAGE_SIDE, MAX_SEED, MAX_STEPS, MIN_IMAGE_SIDE
 from ..models import GenerationOptions, PluginSettings
 from .command_aliases import (
+    CONTEXT_CONTROL_DRAW,
     CONTEXT_GENERATION,
     CONTEXT_INPAINT,
+    CONTEXT_REDRAW,
     CONTEXT_SEMANTIC_REDRAW,
     normalize_command_aliases,
 )
@@ -203,11 +205,11 @@ def _source_prompt_token_indexes(
                 if value in _SOURCE_LLM_EXPANSION_VALUES:
                     index += 1
                     continue
-                if mode_context == "generation" and value in _SOURCE_CHARACTER_CHANGE_VALUES:
+                if mode_context in {"generation", "control_draw"} and value in _SOURCE_CHARACTER_CHANGE_VALUES:
                     index += 1
                     continue
                 if (
-                    mode_context == "generation"
+                    mode_context in {"generation", "control_draw"}
                     and value == "char"
                     and index + 1 < len(tokens)
                     and tokens[index + 1].value.strip().casefold() == "change"
@@ -217,7 +219,7 @@ def _source_prompt_token_indexes(
                 break
             continue
 
-        if mode_context == "generation" and token in _SOURCE_CONTROL_OPTIONS:
+        if mode_context in {"generation", "control_draw"} and token in _SOURCE_CONTROL_OPTIONS:
             if (
                 token == "--m"
                 and character_change_requested
@@ -1120,6 +1122,8 @@ def parse_generation_options(
     tokens = [token.value for token in source_tokens]
     alias_context = {
         "generation": CONTEXT_GENERATION,
+        "control_draw": CONTEXT_CONTROL_DRAW,
+        "redraw": CONTEXT_REDRAW,
         "inpaint": CONTEXT_INPAINT,
         "semantic_redraw": CONTEXT_SEMANTIC_REDRAW,
     }.get(mode_context)
@@ -1227,7 +1231,7 @@ def parse_generation_options(
                     "底图控制请使用 --m p/d/l/r"
                 )
             raw_mode = require_value(token).strip().casefold()
-            if mode_context == "semantic_redraw":
+            if mode_context in {"semantic_redraw", "control_draw"}:
                 aliases = {
                     "preserve": "preserve",
                     "保守": "preserve",
@@ -1245,6 +1249,22 @@ def parse_generation_options(
                     raise ValueError(
                         "--mode 仅支持 preserve、balanced 或 free"
                     )
+            elif mode_context == "redraw":
+                semantic_aliases = {
+                    "preserve": "preserve",
+                    "balanced": "balanced",
+                    "free": "free",
+                }
+                inpaint_aliases = {
+                    "quick": "quick",
+                    "lanpaint": "lanpaint",
+                }
+                semantic_redraw_mode = semantic_aliases.get(raw_mode, "")
+                inpaint_mode = inpaint_aliases.get(raw_mode, "")
+                if not semantic_redraw_mode and not inpaint_mode:
+                    raise ValueError(
+                        "--mode 仅支持 preserve、balanced、free、quick 或 lanpaint"
+                    )
             else:
                 aliases = {
                     "quick": "quick",
@@ -1258,13 +1278,13 @@ def parse_generation_options(
                 if not inpaint_mode:
                     raise ValueError("--mode 仅支持 quick 或 lanpaint")
         elif token == "--swap-mode":
-            if mode_context != "generation":
+            if mode_context not in {"generation", "control_draw"}:
                 raise ValueError("换角模式选项只用于 /画图 与 /画图no")
             character_swap_mode = require_value(token).strip().casefold()
             if character_swap_mode not in {"keep-outfit", "target-outfit"}:
                 raise ValueError("换角模式只支持 keep-outfit 或 target-outfit")
         elif token == "--swap-weight":
-            if mode_context != "generation":
+            if mode_context not in {"generation", "control_draw"}:
                 raise ValueError("换角 LoRA 权重只用于 /画图 与 /画图no")
             try:
                 character_swap_target_lora_strength = float(require_value(token))
@@ -1273,15 +1293,15 @@ def parse_generation_options(
             if not 0.55 <= character_swap_target_lora_strength <= 0.75:
                 raise ValueError("换角角色 LoRA 权重必须在 0.55 到 0.75 之间")
         elif token == "--swap-preview":
-            if mode_context != "generation":
+            if mode_context not in {"generation", "control_draw"}:
                 raise ValueError("换角预览只用于 /画图 与 /画图no")
             character_swap_preview = True
         elif token == "--swap-no-character-lora":
-            if mode_context != "generation":
+            if mode_context not in {"generation", "control_draw"}:
                 raise ValueError("禁用目标角色 LoRA 只用于 /画图 与 /画图no")
             character_swap_use_target_lora = False
         elif token == "--control-mode":
-            if mode_context != "generation":
+            if mode_context not in {"generation", "control_draw"}:
                 raise ValueError("--control-mode 只用于底图控制生成")
             control_mode = require_value(token).strip().casefold()
             if control_mode not in {"pose", "depth", "lineart", "reference"}:
@@ -1295,7 +1315,7 @@ def parse_generation_options(
         elif token == "--no-upscale":
             enable_upscale = False
         elif token in {"--llm", "--llm-character-change"}:
-            if token == "--llm-character-change" and mode_context != "generation":
+            if token == "--llm-character-change" and mode_context not in {"generation", "control_draw"}:
                 raise ValueError("--llmcc/--lcc 仅用于 /画图 与 /画图no")
             use_prompt_llm = True
             if token == "--llm-character-change":
@@ -1330,13 +1350,13 @@ def parse_generation_options(
                     prompt_expansion_mode = normalized_expansion_mode
                     index += 1
                     continue
-                if raw_mode in character_change_aliases and mode_context == "generation":
+                if raw_mode in character_change_aliases and mode_context in {"generation", "control_draw"}:
                     prompt_edit_mode = "character_change"
                     character_change_requested = True
                     index += 1
                     continue
                 if (
-                    mode_context == "generation"
+                    mode_context in {"generation", "control_draw"}
                     and raw_mode == "char"
                     and index + 2 < len(tokens)
                     and tokens[index + 2].strip().casefold() == "change"

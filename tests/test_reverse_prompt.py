@@ -67,6 +67,21 @@ class ReversePromptParserTests(unittest.TestCase):
 
         self.assertIn("插件已锁定的底图约束模式：lineart, pose。", request)
 
+    def test_control_generation_free_mode_does_not_inherit_unrequested_content(self) -> None:
+        result = ReversePromptResult(
+            positive_tags="1girl, school uniform, classroom, daylight",
+        )
+
+        request = result.control_generation_request(
+            "构图不变，换成目标角色并改成夜景",
+            ("depth",),
+            "free",
+        )
+
+        self.assertIn("自由内容模式", request)
+        self.assertIn("不要自动继承", request)
+        self.assertIn("只强制继承所选控制模式", request)
+
     def test_semantic_redraw_request_encodes_delta_and_mode_contract(self) -> None:
         result = ReversePromptResult(
             positive_tags="1girl, school uniform, standing, classroom",

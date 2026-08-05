@@ -221,6 +221,7 @@ class ReversePromptResult:
         self,
         supplement: str,
         modes: tuple[str, ...] | list[str],
+        content_mode: str = "balanced",
     ) -> str:
         """Build a complete director request for image-controlled generation.
 
@@ -239,6 +240,24 @@ class ReversePromptResult:
         )
         if not normalized_modes:
             raise ValueError("control generation requires at least one valid mode")
+
+        normalized_content_mode = str(content_mode or "balanced").strip().casefold()
+        content_mode_rules = {
+            "preserve": (
+                "保守内容模式：除用户明确要求替换的内容外，继续继承原图中与控制约束兼容的"
+                "角色、服装、背景、构图、光线和画风事实。"
+            ),
+            "balanced": (
+                "平衡内容模式：保留锁定的控制约束和不冲突的核心画面事实；用户明确的新内容"
+                "优先，允许删除会妨碍新要求的旧内容。"
+            ),
+            "free": (
+                "自由内容模式：只强制继承所选控制模式锁定的几何、轮廓或参考约束；不要自动"
+                "继承用户未要求保留的旧角色、服装、背景、光线、配色或画风。"
+            ),
+        }
+        if normalized_content_mode not in content_mode_rules:
+            raise ValueError("control content mode must be preserve, balanced, or free")
 
         characters = "none observed"
         if self.characters:
@@ -265,6 +284,7 @@ class ReversePromptResult:
                 "但最终 prompt 只能描述完成后的画面，不得包含 pose、depth、lineart、reference、"
                 "ControlNet、LLLite、preprocessor、sampler、workflow、模型文件名、节点 ID 或其他控制节点术语。"
             ),
+            content_mode_rules[normalized_content_mode],
             f"原图可观察正面 Tags：{self.positive_tags}",
             f"原图构图：{self.composition or '未提供'}",
             f"原图场景说明：{self.scene_description_zh or '未提供'}",

@@ -1,8 +1,16 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v2.0.1
+> 当前版本：v2.0.2
 
 面向 AstrBot、NapCat / OneBot v11 与 ComfyUI 的 Anima 绘图插件。它提供自然语言分镜、直接 Tags、图片反推、多人语义换角、整图改图、底图控制、RTX 放大、遮罩重绘、LoRA 管理、Danbooru 本地索引、任务中心和两套管理页面。
+
+## v2.0.2 命令能力与角色变体修复
+
+- `remielle_dan` 一类基础角色 canonical 会与同根活动/服装变体正确归并；提示词中唯一 Copyright exact 会参与角色声明解析，不再误报“多个身份”。
+- `/底图控制` 与 `/控制画图` 可同时使用 `--m p/d/l/r` 和 `--mode preserve/balanced/free`；控制通道与内容自由度不再冲突。
+- `/反推画图` 支持相同内容模式。无控制通道时按 `preserve=0.35`、`balanced=0.55`、`free=0.8` 设置默认 img2img denoise；显式 `--denoise` 仍优先。
+- `/重绘` 会在同一入口准确区分整图模式与 `quick/lanpaint` 局部模式；`/改图`、`/重绘`、`/反推画图` 都会先剥离选项再识别自然语言换角，避免选项进入角色名。
+- `/方案`、`/anima draw`、`/换角色` 和 `/放大` 不再静默丢弃或误报选项：支持的字段被消费，不支持的字段返回命令专属错误。
 
 ## v2.0.1 个人图片任务队列
 

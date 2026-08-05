@@ -99,6 +99,12 @@ def _identity_root(value: str) -> str:
     return f"{base}_({qualifiers[-1]})"
 
 
+def _identity_base(value: str) -> str:
+    """Remove every parenthesized variant/work suffix from one canonical."""
+
+    return _QUALIFIER_RE.sub("", normalize_tag(value)).rstrip("_")
+
+
 def _safe_lookup_value(value: Any) -> str:
     normalized = normalize_tag(str(value or ""))
     if not normalized or not _SAFE_LOOKUP_RE.fullmatch(normalized):
@@ -202,7 +208,7 @@ def _lookup_specs(
             "canonical_exact",
             expected_work,
             allow_qualifierless_canonical=(
-                not canonical_work and not explicit_qualified_identity
+                not canonical_work
             ),
         )
         stripped, work = _strip_last_qualifier(canonical)
@@ -553,6 +559,49 @@ def resolve_character_identity(
             confirmed_work=confirmed_work,
         )
     if len(unique_exact) > 1:
+        qualifierless_bases = frozenset(
+            canonical for canonical in unique_exact if not _qualifiers(canonical)
+        )
+
+        def effective_root(canonical: str) -> str:
+            base = _identity_base(canonical)
+            if base in qualifierless_bases:
+                return base
+            return _identity_root(canonical)
+
+        roots = {
+            effective_root(canonical)
+            for canonical in unique_exact
+            if effective_root(canonical)
+        }
+        if len(roots) == 1:
+            root = next(iter(roots))
+            selected_canonical = root if root in unique_exact else ""
+            if not selected_canonical:
+                canonical_hits = tuple(
+                    hit
+                    for hit in exact_hits
+                    if hit[0].variant == "canonical_exact"
+                    and effective_root(hit[2]) == root
+                )
+                if len({hit[2] for hit in canonical_hits}) == 1:
+                    selected_canonical = canonical_hits[0][2]
+            if selected_canonical:
+                selected = next(
+                    hit for hit in exact_hits if hit[2] == selected_canonical
+                )
+                return CharacterIdentityResolution(
+                    canonical_tag=selected_canonical,
+                    verified=True,
+                    match_variant="same_identity_variant_base_exact",
+                    match_type=str(
+                        getattr(selected[1], "match_type", "") or "exact"
+                    ),
+                    query_count=len(specs),
+                    candidate_count=len(unique_exact),
+                    candidates=unique_exact[:8],
+                    confirmed_work=confirmed_work,
+                )
         return CharacterIdentityResolution(
             ambiguous=True,
             match_variant="exact_conflict",

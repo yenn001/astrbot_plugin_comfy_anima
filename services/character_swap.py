@@ -4863,15 +4863,22 @@ def parse_character_swap_request(command_text: str) -> CharacterSwapRequest:
 
     head, separator, tags = str(command_text or "").partition("|")
     try:
+        raw_tokens = shlex.split(head.strip(), posix=True)
+    except ValueError as exc:
+        raise CharacterSwapError(
+            f"参数引号不完整：{exc}",
+            code="invalid_swap_arguments",
+        ) from exc
+    try:
         tokens = list(
             normalize_command_aliases(
-                shlex.split(head.strip(), posix=True),
+                raw_tokens,
                 context=CONTEXT_CHARACTER_SWAP,
             )
         )
     except ValueError as exc:
         raise CharacterSwapError(
-            f"参数引号不完整：{exc}",
+            f"换角色参数错误：{exc}",
             code="invalid_swap_arguments",
         ) from exc
     mapping_parts: list[str] = []

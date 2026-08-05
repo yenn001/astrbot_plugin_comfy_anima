@@ -4,8 +4,10 @@ import unittest
 
 from ..core.command_aliases import (
     CONTEXT_CHARACTER_SWAP,
+    CONTEXT_CONTROL_DRAW,
     CONTEXT_GENERATION,
     CONTEXT_INPAINT,
+    CONTEXT_REDRAW,
     CONTEXT_SEMANTIC_REDRAW,
     CommandAliasError,
     normalize_command_aliases,
@@ -150,6 +152,39 @@ class CommandAliasTests(unittest.TestCase):
                 context=CONTEXT_SEMANTIC_REDRAW,
             ),
             ("换衣服", "--mode", "preserve", "--pipeline", "base"),
+        )
+
+    def test_control_draw_separates_control_channels_from_content_mode(self) -> None:
+        self.assertEqual(
+            normalize_command_aliases(
+                ("换角色", "--m", "p", "d", "--mode", "f"),
+                context=CONTEXT_CONTROL_DRAW,
+            ),
+            (
+                "换角色",
+                "--control-mode",
+                "pose",
+                "--control-mode",
+                "depth",
+                "--mode",
+                "free",
+            ),
+        )
+
+    def test_redraw_context_accepts_whole_and_masked_modes(self) -> None:
+        self.assertEqual(
+            normalize_command_aliases(
+                ("换衣服", "--m", "f"),
+                context=CONTEXT_REDRAW,
+            ),
+            ("换衣服", "--mode", "free"),
+        )
+        self.assertEqual(
+            normalize_command_aliases(
+                ("修手", "--m", "l"),
+                context=CONTEXT_REDRAW,
+            ),
+            ("修手", "--mode", "lanpaint"),
         )
         self.assertEqual(
             normalize_command_aliases(

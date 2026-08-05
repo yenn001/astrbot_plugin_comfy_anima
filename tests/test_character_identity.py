@@ -59,6 +59,24 @@ class CharacterIdentityResolverTests(unittest.TestCase):
                     "count": 180000,
                 },
                 {
+                    "tag": "remielle_dan",
+                    "category": "character",
+                    "aliases": [],
+                    "count": 1600,
+                },
+                {
+                    "tag": "remielle_dan_(past)",
+                    "category": "character",
+                    "aliases": [],
+                    "count": 300,
+                },
+                {
+                    "tag": "remielle_dan_(dreamland_fest)",
+                    "category": "character",
+                    "aliases": [],
+                    "count": 200,
+                },
+                {
                     "tag": "vocaloid",
                     "category": "copyright",
                     "aliases": [],
@@ -78,6 +96,12 @@ class CharacterIdentityResolverTests(unittest.TestCase):
                 },
                 {
                     "tag": "genshin_impact",
+                    "category": "copyright",
+                    "aliases": [],
+                    "count": 500000,
+                },
+                {
+                    "tag": "zenless_zone_zero",
                     "category": "copyright",
                     "aliases": [],
                     "count": 500000,
@@ -173,6 +197,43 @@ class CharacterIdentityResolverTests(unittest.TestCase):
         self.assertEqual(result.canonical_tag, "hatsune_miku")
         self.assertEqual(result.confirmed_work, "vocaloid")
         self.assertEqual(result.match_variant, "provider_candidate_exact")
+
+    def test_qualifierless_base_wins_over_same_identity_event_variants(
+        self,
+    ) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="Remielle Dan",
+            canonical_tag="remielle_dan",
+            identity_candidates=(
+                "remielle_dan",
+                "remielle_dan_(past)",
+                "remielle_dan_(dreamland_fest)",
+            ),
+            work_hints=("zenless_zone_zero",),
+            allow_discovery=False,
+        )
+
+        self.assertTrue(result.verified)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(result.canonical_tag, "remielle_dan")
+        self.assertEqual(result.confirmed_work, "zenless_zone_zero")
+        self.assertEqual(
+            result.match_variant,
+            "same_identity_variant_base_exact",
+        )
+        self.assertEqual(result.candidate_count, 3)
+
+    def test_explicit_qualifierless_event_variant_remains_selectable(self) -> None:
+        result = resolve_character_identity(
+            self.index,
+            target_query="Remielle Dan past",
+            canonical_tag="remielle_dan_(past)",
+            allow_discovery=False,
+        )
+
+        self.assertTrue(result.verified)
+        self.assertEqual(result.canonical_tag, "remielle_dan_(past)")
 
     def test_qualifierless_character_rejects_unverified_work_hint(self) -> None:
         result = resolve_character_identity(

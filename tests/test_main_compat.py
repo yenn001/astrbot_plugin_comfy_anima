@@ -1890,6 +1890,57 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(r"toki_\(blue_archive\)", prompt)
         self.assertNotIn(r"toki_\(armed\)_\(blue_archive\)", prompt)
 
+    def test_declared_qualifierless_character_uses_prompt_work_and_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "remielle_dan",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "remielle_dan_(past)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "remielle_dan_(dreamland_fest)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "zenless_zone_zero",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, _events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            prompt, _negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=(
+                        "1girl, zenless_zone_zero, remielle_dan, "
+                        "remielle_dan_(past), "
+                        "remielle_dan_(dreamland_fest), black wings"
+                    ),
+                    negative_prompt="",
+                    character_queries=("remielle dan",),
+                    user_request="draw Remielle Dan from Zenless Zone Zero",
+                    records=(),
+                    source="test",
+                )
+            )
+
+        self.assertIn("remielle_dan", prompt)
+        self.assertIn("zenless_zone_zero", prompt)
+        self.assertNotIn("remielle_dan_(past)", prompt)
+        self.assertNotIn("remielle_dan_(dreamland_fest)", prompt)
+
     def test_inferred_variants_without_base_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
@@ -3129,6 +3180,63 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies, ["CONTROL_IMAGE"])
         self.assertEqual(captured[0].control_modes, ("reference",))
 
+    async def test_control_command_accepts_free_content_mode_with_pose_depth(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        async def handle(_event, options):
+            captured.append(options)
+            yield "CONTROL_IMAGE"
+
+        plugin._handle_control_draw = handle
+
+        class Event:
+            message_str = (
+                "/底图控制 构图和姿势不变，换成新角色 --m p d --mode free"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_control_draw(Event())]
+
+        self.assertEqual(replies, ["CONTROL_IMAGE"])
+        self.assertEqual(captured[0].control_modes, ("pose", "depth"))
+        self.assertEqual(captured[0].semantic_redraw_mode, "free")
+
+    async def test_anima_draw_consumes_character_change_mode(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        captured = []
+
+        async def swap(_event, request, *, forward=False):
+            captured.append((request, forward))
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/anima draw 1girl，把角色换成甘雨 --llmcc"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [
+            item
+            async for item in plugin.cmd_draw(
+                Event(),
+                "1girl，把角色换成甘雨 --llmcc",
+            )
+        ]
+
+        self.assertEqual(replies, ["SWAP_IMAGE"])
+        self.assertEqual(captured[0][0].target_query, "甘雨")
+        self.assertFalse(captured[0][1])
+
     async def test_reverse_draw_can_reuse_one_image_for_pose_depth_control(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image_path = Path(directory) / "input.png"
@@ -3169,6 +3277,13 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             negative_tags="old outfit",
                             drawing_request=lambda requirement: (
                                 f"image facts; request={requirement}"
+                            ),
+                            control_generation_request=(
+                                lambda requirement, modes, content_mode: (
+                                    "image facts; "
+                                    f"request={requirement}; modes={modes}; "
+                                    f"content_mode={content_mode}"
+                                )
                             ),
                         ),
                         "vision-provider",
@@ -3361,9 +3476,9 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_redraw_command_without_mask_language_routes_semantic_redraw(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin._looks_like_inpaint_request = lambda _text: False
-        plugin._prepare_semantic_redraw_options = lambda text: self.main.GenerationOptions(
-            prompt=text,
-            semantic_redraw_mode="preserve",
+        plugin._finalize_semantic_redraw_options = lambda options: replace(
+            options,
+            semantic_redraw_mode=options.semantic_redraw_mode or "preserve",
         )
         plugin._extract_command_text = lambda *_args, **_kwargs: (
             "把角色泳装换成三点式，加一条白丝大腿袜，构图不变"
@@ -3388,6 +3503,83 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         replies = [item async for item in plugin.cmd_inpaint(Event())]
         self.assertEqual(replies, ["SEMANTIC_REDRAW"])
+
+    async def test_redraw_command_free_mode_routes_whole_image_redraw(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._looks_like_inpaint_request = lambda _text: False
+        plugin._extract_command_text = lambda *_args, **_kwargs: (
+            "把衣服换成红裙 --mode free"
+        )
+        plugin._finalize_semantic_redraw_options = lambda options: options
+
+        async def semantic(_event, options):
+            self.assertEqual(options.semantic_redraw_mode, "free")
+            self.assertNotIn("--mode", options.prompt)
+            yield "SEMANTIC_REDRAW"
+
+        plugin._handle_semantic_redraw = semantic
+
+        class Event:
+            message_str = "/重绘 把衣服换成红裙 --mode free"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_inpaint(Event())]
+        self.assertEqual(replies, ["SEMANTIC_REDRAW"])
+
+    async def test_semantic_redraw_strips_options_before_natural_swap(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._extract_pipeline_request = lambda _text: ""
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        async def swap(_event, request):
+            self.assertEqual(request.target_query, "米浴")
+            self.assertNotIn("--mode", request.target_query)
+            self.assertEqual(request.denoise, 0.4)
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/改图 把达妮娅换成米浴 --denoise 0.4"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_semantic_redraw(Event())]
+        self.assertEqual(replies, ["SWAP_IMAGE"])
+
+    async def test_semantic_redraw_rejects_unconsumed_content_mode_for_swap(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "/改图 把达妮娅换成米浴 --mode free"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_semantic_redraw(Event())]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("精确换角不使用", replies[0])
+
+    async def test_upscale_unknown_option_reports_option_error(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "/放大 --mode free"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_rtx_upscale(Event())]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("不支持选项: --mode", replies[0])
 
     async def test_redraw_command_combines_character_and_outfit_change(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
@@ -7747,6 +7939,35 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options.pipeline, "base")
         self.assertEqual(options.negative_prompt, "lowres")
         self.assertIn("IMAGE_RESULT", responses)
+
+    async def test_prompt_plan_rejects_control_and_character_change_options(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            def __init__(self, message_str):
+                self.message_str = message_str
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        control_replies = [
+            item
+            async for item in plugin.cmd_prompt_plan_draw(
+                Event("/方案 EX-005 --m p"),
+                "EX-005 --m p",
+            )
+        ]
+        swap_replies = [
+            item
+            async for item in plugin.cmd_prompt_plan_draw(
+                Event("/方案 EX-005 --llmcc"),
+                "EX-005 --llmcc",
+            )
+        ]
+
+        self.assertIn("不接收底图控制选项", control_replies[0])
+        self.assertIn("不直接执行语义换角", swap_replies[0])
 
     async def test_prompt_plan_command_resolves_id_before_natural_language_delta(self):
         with tempfile.TemporaryDirectory() as directory:

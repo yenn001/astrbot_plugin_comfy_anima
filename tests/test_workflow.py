@@ -417,6 +417,32 @@ class CommandParserTests(unittest.TestCase):
                 mode_context="semantic_redraw",
             )
 
+    def test_control_draw_parses_channels_and_content_freedom_independently(self) -> None:
+        result = parse_generation_options(
+            "构图和姿势不变，换成新角色 --m p d --mode free",
+            mode_context="control_draw",
+        )
+
+        self.assertEqual(result.control_modes, ("pose", "depth"))
+        self.assertEqual(result.semantic_redraw_mode, "free")
+        self.assertEqual(result.prompt, "构图和姿势不变，换成新角色")
+
+    def test_redraw_parser_routes_whole_and_masked_modes_without_pollution(self) -> None:
+        whole = parse_generation_options(
+            "把衣服换成红裙 --mode free",
+            mode_context="redraw",
+        )
+        masked = parse_generation_options(
+            "精修遮罩里的手 --mode lanpaint",
+            mode_context="redraw",
+        )
+
+        self.assertEqual(whole.semantic_redraw_mode, "free")
+        self.assertEqual(whole.inpaint_mode, "")
+        self.assertNotIn("--mode", whole.prompt)
+        self.assertEqual(masked.inpaint_mode, "lanpaint")
+        self.assertEqual(masked.semantic_redraw_mode, "")
+
 
 class DedicatedPipelineWorkflowTests(unittest.TestCase):
     @classmethod

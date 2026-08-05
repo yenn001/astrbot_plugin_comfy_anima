@@ -111,6 +111,13 @@ class CharacterSwapRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(CharacterSwapError, "0.55"):
             parse_character_swap_request("A -> B --weight 1.2")
 
+    def test_alias_validation_error_is_not_reported_as_broken_quotes(self) -> None:
+        with self.assertRaises(CharacterSwapError) as captured:
+            parse_character_swap_request("A -> B --mode free")
+
+        self.assertIn("换角色参数错误", captured.exception.user_message)
+        self.assertNotIn("引号不完整", captured.exception.user_message)
+
     def test_natural_language_parser_is_explicit(self) -> None:
         request = parse_natural_character_swap(
             "把引用图片里的达妮娅换成卡莲，衣服、姿势和背景保持不变"

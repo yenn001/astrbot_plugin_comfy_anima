@@ -25,6 +25,8 @@ from collections.abc import Iterable
 
 
 CONTEXT_GENERATION = "generation"
+CONTEXT_CONTROL_DRAW = "control_draw"
+CONTEXT_REDRAW = "redraw"
 CONTEXT_SEMANTIC_REDRAW = "semantic_redraw"
 CONTEXT_INPAINT = "inpaint"
 CONTEXT_CHARACTER_SWAP = "character_swap"
@@ -32,6 +34,8 @@ CONTEXT_CHARACTER_SWAP = "character_swap"
 SUPPORTED_CONTEXTS = frozenset(
     {
         CONTEXT_GENERATION,
+        CONTEXT_CONTROL_DRAW,
+        CONTEXT_REDRAW,
         CONTEXT_SEMANTIC_REDRAW,
         CONTEXT_INPAINT,
         CONTEXT_CHARACTER_SWAP,
@@ -162,6 +166,11 @@ _INPAINT_MODE_VALUES = {
     "多轮": "lanpaint",
 }
 
+_REDRAW_MODE_VALUES = {
+    **_SEMANTIC_REDRAW_MODE_VALUES,
+    **_INPAINT_MODE_VALUES,
+}
+
 _CHARACTER_SWAP_MODE_VALUES = {
     "k": "keep-outfit",
     "keep-outfit": "keep-outfit",
@@ -275,7 +284,7 @@ def normalize_command_aliases(
     seen_control_modes: set[str] = set()
     index = 0
     generation_character_swap = bool(
-        normalized_context == CONTEXT_GENERATION
+        normalized_context in {CONTEXT_GENERATION, CONTEXT_CONTROL_DRAW}
         and _generation_requests_character_swap(source)
     )
 
@@ -288,7 +297,7 @@ def normalize_command_aliases(
         token = source[index]
 
         if (
-            normalized_context == CONTEXT_GENERATION
+            normalized_context in {CONTEXT_GENERATION, CONTEXT_CONTROL_DRAW}
             and token.casefold() in _CONTROL_OPTIONS
         ):
             if (
@@ -326,7 +335,8 @@ def normalize_command_aliases(
             else None
         ) or option_aliases.get(token.casefold(), token)
         if (
-            normalized_context in {CONTEXT_SEMANTIC_REDRAW, CONTEXT_INPAINT}
+            normalized_context
+            in {CONTEXT_REDRAW, CONTEXT_SEMANTIC_REDRAW, CONTEXT_INPAINT}
             and token.casefold() == "--m"
         ):
             canonical_option = "--mode"
@@ -354,6 +364,14 @@ def normalize_command_aliases(
             elif normalized_context == CONTEXT_SEMANTIC_REDRAW:
                 aliases = _SEMANTIC_REDRAW_MODE_VALUES
                 supported = "p/preserve、b/balanced 或 f/free"
+            elif normalized_context == CONTEXT_CONTROL_DRAW:
+                aliases = _SEMANTIC_REDRAW_MODE_VALUES
+                supported = "p/preserve、b/balanced 或 f/free"
+            elif normalized_context == CONTEXT_REDRAW:
+                aliases = _REDRAW_MODE_VALUES
+                supported = (
+                    "p/preserve、b/balanced、f/free、q/quick 或 l/lanpaint"
+                )
             elif normalized_context == CONTEXT_INPAINT:
                 aliases = _INPAINT_MODE_VALUES
                 supported = "q/quick 或 l/lanpaint"
@@ -384,8 +402,10 @@ def normalize_command_aliases(
 
 __all__ = [
     "CONTEXT_CHARACTER_SWAP",
+    "CONTEXT_CONTROL_DRAW",
     "CONTEXT_GENERATION",
     "CONTEXT_INPAINT",
+    "CONTEXT_REDRAW",
     "CONTEXT_SEMANTIC_REDRAW",
     "SUPPORTED_CONTEXTS",
     "CommandAliasError",
