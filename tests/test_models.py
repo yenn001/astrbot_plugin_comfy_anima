@@ -226,6 +226,7 @@ class PluginSettingsTests(unittest.TestCase):
             "lora_visual_warmup_workers",
             "lora_visual_preview_max_mb",
             "lora_visual_thumbnail_size",
+            "show_chat_generation_details",
         }
 
         for field_name in field_names:
@@ -270,10 +271,10 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "2.0.2")
+        self.assertEqual(PLUGIN_VERSION, "2.0.3")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
-        self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-05", changelog)
+        self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-06", changelog)
 
 
 if __name__ == "__main__":

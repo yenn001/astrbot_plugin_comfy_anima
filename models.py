@@ -294,6 +294,7 @@ class PluginSettings:
     iterative_denoise: float = 0.35
     enable_inpaint: bool = True
     send_generation_notice: bool = True
+    show_chat_generation_details: bool = True
     allow_global_interrupt: bool = False
     max_concurrent_jobs: int = 1
     max_queued_jobs_per_user: int = 3
@@ -774,6 +775,9 @@ class PluginSettings:
             ),
             enable_inpaint=_as_bool(data.get("enable_inpaint"), True),
             send_generation_notice=_as_bool(data.get("send_generation_notice"), True),
+            show_chat_generation_details=_as_bool(
+                data.get("show_chat_generation_details"), True
+            ),
             allow_global_interrupt=_as_bool(data.get("allow_global_interrupt"), False),
             max_concurrent_jobs=_as_int(data.get("max_concurrent_jobs"), 1, 1),
             max_queued_jobs_per_user=min(

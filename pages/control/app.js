@@ -216,6 +216,7 @@ const booleanFields = new Set([
   "enable_upscale",
   "enable_inpaint",
   "send_generation_notice",
+  "show_chat_generation_details",
   "enable_prompt_llm",
   "enable_natural_draw",
   "enable_llm_pic_trigger",

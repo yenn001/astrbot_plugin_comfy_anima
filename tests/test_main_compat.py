@@ -252,6 +252,7 @@ class MainCompatibilityTests(unittest.TestCase):
             enable_llm_pic_trigger=True,
             max_auto_images_per_reply=1,
             enable_inpaint=False,
+            show_chat_generation_details=False,
         )
         plugin._director = types.SimpleNamespace(
             parse_picture_response=lambda *_args, **_kwargs: types.SimpleNamespace(
@@ -291,6 +292,66 @@ class MainCompatibilityTests(unittest.TestCase):
         self.assertEqual(calls[0][1].negative_prompt, "lowres")
         self.assertEqual(calls[0][1].pipeline, "base")
         self.assertIn(("image", "generated.png"), result.chain)
+        self.assertFalse(
+            any(
+                isinstance(component, _Plain) and "Seed:" in component.text
+                for component in result.chain
+            )
+        )
+
+    def test_visible_edit_result_hides_generation_details_when_disabled(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            enable_prompt_composer_v2=False,
+            max_auto_images_per_reply=1,
+            enable_inpaint=True,
+            show_chat_generation_details=False,
+        )
+        plugin._director = types.SimpleNamespace(
+            parse_picture_response=lambda *_args, **_kwargs: types.SimpleNamespace(
+                text="",
+                prompts=(),
+                negative_prompts=(),
+                pipelines=(),
+                edits=(
+                    types.SimpleNamespace(
+                        prompt="red dress",
+                        negative_prompt="blue dress",
+                        mode="quick",
+                    ),
+                ),
+            )
+        )
+        plugin._client = object()
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+        plugin._execute_inpaint_job = AsyncMock()
+
+        async def run_auxiliary_job(event, operation_type, operation):
+            self.assertEqual(operation_type, "inpaint")
+            return [Path("edited.png")], 456, "red dress", "blue dress", "quick"
+
+        plugin._run_auxiliary_job = run_auxiliary_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<edit prompt="red dress" mode="quick">')]
+        )
+        event = types.SimpleNamespace(
+            message_str="change the dress",
+            get_result=lambda: result,
+        )
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertIn(("image", "edited.png"), result.chain)
+        self.assertFalse(
+            any(
+                isinstance(component, _Plain) and "Seed:" in component.text
+                for component in result.chain
+            )
+        )
 
 
 class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -7275,12 +7336,14 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
                 "default_width": 1024,
                 "enable_reverse_json_formatter": False,
                 "enable_reverse_json_repair_retry": False,
+                "show_chat_generation_details": False,
             }
         )
 
         self.assertEqual(plugin.config["default_width"], 1024)
         self.assertFalse(plugin.config["enable_reverse_json_formatter"])
         self.assertFalse(plugin.config["enable_reverse_json_repair_retry"])
+        self.assertFalse(plugin.config["show_chat_generation_details"])
         self.assertEqual(plugin.config["web_ui_password"], "existing-password")
         self.assertEqual(plugin.config.saved, 2)
         self.assertTrue(result["reload_scheduled"])

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v2.0.2
+AstrBot Comfy Anima 插件 v2.0.3
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v2.0.2
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 2.0.2
-日期: 2026-08-05
+版本: 2.0.3
+日期: 2026-08-06
 """
 
 import asyncio
@@ -387,6 +387,7 @@ WEB_UI_EDITABLE_FIELDS = (
     "lora_visual_thumbnail_size",
     "user_cooldown",
     "send_generation_notice",
+    "show_chat_generation_details",
     "enable_prompt_llm",
     "prompt_llm_provider_id",
     "prompt_llm_temperature",
@@ -2718,7 +2719,10 @@ class ComfyAnimaPlugin(Star):
                 )
                 result.chain = new_chain
                 return
-            new_chain.append(Comp.Plain(self._inpaint_summary(image_paths, seed, mode)))
+            if bool(getattr(self.settings, "show_chat_generation_details", True)):
+                new_chain.append(
+                    Comp.Plain(self._inpaint_summary(image_paths, seed, mode))
+                )
             new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
             self._schedule_cleanup(image_paths)
             result.chain = new_chain
@@ -2808,7 +2812,10 @@ class ComfyAnimaPlugin(Star):
                     Comp.Plain(f"{MessageEmoji.ERROR} 自动绘图失败: {message}")
                 )
                 continue
-            new_chain.append(Comp.Plain(self._generation_summary(image_paths, seed)))
+            if bool(getattr(self.settings, "show_chat_generation_details", True)):
+                new_chain.append(
+                    Comp.Plain(self._generation_summary(image_paths, seed))
+                )
             new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
             self._schedule_cleanup(image_paths)
         result.chain = new_chain
@@ -11673,6 +11680,9 @@ QQ快捷指令:
                 "max_queued_jobs_per_user": settings.max_queued_jobs_per_user,
                 "user_cooldown": settings.user_cooldown,
                 "send_generation_notice": settings.send_generation_notice,
+                "show_chat_generation_details": (
+                    settings.show_chat_generation_details
+                ),
                 "enable_prompt_llm": settings.enable_prompt_llm,
                 "prompt_llm_provider_id": settings.prompt_llm_provider_id,
                 "prompt_llm_temperature": settings.prompt_llm_temperature,

@@ -981,6 +981,12 @@
     "type": "bool",
     "default": true
   },
+  "show_chat_generation_details": {
+    "description": "日常聊天自动绘图显示 Seed、耗时与 GPU 明细",
+    "type": "bool",
+    "hint": "关闭后，普通 Bot 对话调用绘图工具时只保留 Bot 文本和图片；显式绘图命令仍显示完整生成信息",
+    "default": true
+  },
   "allow_global_interrupt": {
     "description": "取消任务时允许调用 ComfyUI 全局中断",
     "type": "bool",
