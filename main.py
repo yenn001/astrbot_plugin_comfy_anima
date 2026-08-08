@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v2.1.0
+AstrBot Comfy Anima 插件 v2.1.1
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,7 +8,7 @@ AstrBot Comfy Anima 插件 v2.1.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 2.1.0
+版本: 2.1.1
 日期: 2026-08-08
 """
 
@@ -1682,12 +1682,40 @@ class ComfyAnimaPlugin(Star):
         return bool(getattr(self.settings, "enable_llm_pic_trigger", False))
 
     def _chat_draw_terminal_guard_enabled(self) -> bool:
-        """Return whether optional terminal tracing and repair are enabled."""
+        """Return whether picture-control terminal validation is required."""
 
-        return bool(
-            getattr(self.settings, "enable_llm_pic_trigger", False)
-            and getattr(self.settings, "enable_chat_draw_terminal_guard", True)
-        )
+        # Terminal validation is a transport invariant of the <pic>/<edit>
+        # protocol.  Keeping it behind a second switch can leak a partial
+        # control tag and silently skip ComfyUI submission.
+        return self._chat_draw_protocol_buffering_enabled()
+
+    @staticmethod
+    def _new_chat_draw_terminal_trace(*, intent: bool) -> dict[str, Any]:
+        return {
+            "intent": bool(intent),
+            "called": False,
+            "successful": False,
+            "failed": False,
+            "started_count": 0,
+            "completed_count": 0,
+            "tools": [],
+            "evidence": [],
+            "repair_attempted": False,
+        }
+
+    def _ensure_chat_draw_terminal_trace(
+        self,
+        event: AstrMessageEvent,
+        *,
+        intent: bool,
+    ) -> dict[str, Any]:
+        trace = self._chat_draw_terminal_trace(event)
+        if trace is None:
+            trace = self._new_chat_draw_terminal_trace(intent=intent)
+        else:
+            trace["intent"] = bool(trace.get("intent")) or bool(intent)
+        self._set_chat_draw_terminal_trace(event, trace)
+        return trace
 
     def _chat_draw_terminal_trace(
         self,
@@ -1732,19 +1760,12 @@ class ComfyAnimaPlugin(Star):
         name = str(tool_name or "").strip()
         if name not in _CHAT_DRAW_ASSET_TOOLS:
             return
-        trace = self._chat_draw_terminal_trace(event) or {
-            "intent": looks_like_conversation_draw_intent(
+        trace = self._ensure_chat_draw_terminal_trace(
+            event,
+            intent=looks_like_conversation_draw_intent(
                 str(getattr(event, "message_str", "") or "")
             ),
-            "called": False,
-            "successful": False,
-            "failed": False,
-            "started_count": 0,
-            "completed_count": 0,
-            "tools": [],
-            "evidence": [],
-            "repair_attempted": False,
-        }
+        )
         trace["called"] = True
         trace["started_count"] = int(trace.get("started_count") or 0) + 1
         tools = list(trace.get("tools") or ())
@@ -2198,7 +2219,7 @@ class ComfyAnimaPlugin(Star):
             self._clear_lora_operation_snapshot(event)
             return
         trace = self._chat_draw_terminal_trace(event)
-        if trace is None or not bool(trace.get("called")):
+        if trace is None:
             return
         keep_snapshot = False
         try:
@@ -2231,26 +2252,27 @@ class ComfyAnimaPlugin(Star):
                         replacement,
                     )
                 return
-            all_tools_completed = bool(
-                int(trace.get("started_count") or 0) > 0
-                and int(trace.get("completed_count") or 0)
-                >= int(trace.get("started_count") or 0)
-            )
-            if (
-                not all_tools_completed
-                or bool(trace.get("failed"))
-                or not bool(trace.get("successful"))
-            ):
-                repaired_text = (
-                    f"{MessageEmoji.ERROR} 绘图资产查询失败，绘图未提交 ComfyUI"
+            if bool(trace.get("called")):
+                all_tools_completed = bool(
+                    int(trace.get("started_count") or 0) > 0
+                    and int(trace.get("completed_count") or 0)
+                    >= int(trace.get("started_count") or 0)
                 )
-                self._replace_chat_draw_response(
-                    event,
-                    run_context,
-                    resp,
-                    repaired_text,
-                )
-                return
+                if (
+                    not all_tools_completed
+                    or bool(trace.get("failed"))
+                    or not bool(trace.get("successful"))
+                ):
+                    repaired_text = (
+                        f"{MessageEmoji.ERROR} 绘图资产查询失败，绘图未提交 ComfyUI"
+                    )
+                    self._replace_chat_draw_response(
+                        event,
+                        run_context,
+                        resp,
+                        repaired_text,
+                    )
+                    return
             try:
                 valid_terminal = self._strict_chat_picture_terminal(raw_text)
             except PromptDirectorError:
@@ -2533,6 +2555,11 @@ class ComfyAnimaPlugin(Star):
             return
         if self._access_error(event, "", check_sensitive=False):
             return
+        message = str(getattr(event, "message_str", "") or "")
+        self._ensure_chat_draw_terminal_trace(
+            event,
+            intent=looks_like_conversation_draw_intent(message),
+        )
         director = getattr(self, "_director", None)
         danbooru_context = (
             director.danbooru_runtime_context() if director is not None else ""
@@ -2540,7 +2567,7 @@ class ComfyAnimaPlugin(Star):
         system_prompt = self._auto_draw_system_prompt.strip()
         is_admin = getattr(event, "is_admin", None)
         contract = build_auto_draw_contract(
-            message=str(getattr(event, "message_str", "") or ""),
+            message=message,
             danbooru_context=danbooru_context,
             custom_prompt=system_prompt,
             admin_style_save=callable(is_admin) and bool(is_admin()),
@@ -2581,14 +2608,15 @@ class ComfyAnimaPlugin(Star):
             if self._chat_draw_terminal_guard_enabled()
             else None
         )
-        if trace is not None and bool(trace.get("called")):
-            all_tools_completed = bool(
-                int(trace.get("started_count") or 0) > 0
-                and int(trace.get("completed_count") or 0)
-                >= int(trace.get("started_count") or 0)
-            )
-            if not all_tools_completed:
-                return
+        if trace is not None:
+            if bool(trace.get("called")):
+                all_tools_completed = bool(
+                    int(trace.get("started_count") or 0) > 0
+                    and int(trace.get("completed_count") or 0)
+                    >= int(trace.get("started_count") or 0)
+                )
+                if not all_tools_completed:
+                    return
             preserved = [
                 component
                 for component in result.chain
@@ -2609,7 +2637,9 @@ class ComfyAnimaPlugin(Star):
                     )
                 self._set_chat_draw_terminal_trace(event, None)
                 return
-            if bool(trace.get("failed")) or not bool(trace.get("successful")):
+            if bool(trace.get("called")) and (
+                bool(trace.get("failed")) or not bool(trace.get("successful"))
+            ):
                 result.chain = preserved + [
                     Comp.Plain(
                         f"{MessageEmoji.ERROR} 绘图资产查询失败，绘图未提交 ComfyUI"
@@ -11968,6 +11998,9 @@ QQ快捷指令:
                 "character_swap_timeout": settings.character_swap_timeout,
                 "enable_natural_draw": settings.enable_natural_draw,
                 "enable_llm_pic_trigger": settings.enable_llm_pic_trigger,
+                "enable_chat_draw_terminal_guard": (
+                    settings.enable_chat_draw_terminal_guard
+                ),
                 "enable_reverse_prompt": settings.enable_reverse_prompt,
                 "enable_workflow_reverse": settings.enable_workflow_reverse,
                 "reverse_backend": settings.reverse_backend,
@@ -12139,6 +12172,13 @@ QQ快捷指令:
                 raise WebUiActionError(f"{key} 必须是整数")
 
         normalized = PluginSettings.from_mapping(candidate)
+        # The terminal guard is a compatibility field, not an independent
+        # operator policy. Keep persisted stores canonical whenever the
+        # <pic>/<edit> transport is enabled, including partial WebUI saves.
+        if normalized.enable_llm_pic_trigger:
+            candidate["enable_chat_draw_terminal_guard"] = True
+            supplied.add("enable_chat_draw_terminal_guard")
+            normalized = PluginSettings.from_mapping(candidate)
         if normalized.max_preset_loras > normalized.max_total_dynamic_loras:
             raise WebUiActionError("单个组合 LoRA 上限不能超过单次 LoRA 总上限")
         if normalized.enable_web_ui:

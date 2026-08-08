@@ -538,6 +538,10 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn(f'name="{field}"', self.html)
         self.assertIn(
+            'name="enable_chat_draw_terminal_guard" type="checkbox" checked disabled',
+            self.html,
+        )
+        self.assertIn(
             "Danbooru guarded 只约束 LLM 声明的角色、作品与画师硬锚点",
             self.html,
         )

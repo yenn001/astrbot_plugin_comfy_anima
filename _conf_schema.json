@@ -174,9 +174,9 @@
     "default": true
   },
   "enable_chat_draw_terminal_guard": {
-    "description": "普通聊天绘图终止协议守卫",
+    "description": "普通聊天绘图终止协议守卫（兼容字段）",
     "type": "bool",
-    "hint": "推荐开启。普通聊天回复会先完整缓冲；本轮 LoRA、Danbooru 与 Prompt Plan 工具必须全部成功，明确绘图最终只能包含一个合法 <pic>。裸 Tags 会携带有界资产证据修复一次，仍无效则停止且不会提交 ComfyUI；纯资产查询误出的 <pic> 会被移除。",
+    "hint": "兼容旧配置使用；只要启用 <pic> 解析就始终强制开启，不能单独关闭。普通聊天回复会先完整缓冲并验证最终协议，失败则停止且不会提交 ComfyUI。",
     "default": true
   },
   "enable_reverse_prompt": {

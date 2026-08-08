@@ -480,6 +480,26 @@ _PROMPT_ONLY_ACTION_RE = re.compile(
     r"(?:绘图|生图|英文|中文|danbooru\s*)?(?:提示词|prompt)\b",
     flags=re.IGNORECASE,
 )
+_VISUAL_DELIVERY_CUE_RE = re.compile(
+    r"(?:我要看|我想看|我想要看|给我看|给我看看|让我看|让我看看)"
+    r".{0,80}(?:照片|图片|图像|画面|自拍|成图|效果图)|"
+    r"(?:穿|换上|换成|扮成|cos).{0,40}(?:给我看|让我看|让我看看)|"
+    r"(?:再|重新)(?:出|画|生成|做|来)(?:一遍|一次|一张|一个)?"
+    r"(?:.{0,32})(?:图|照片|图片|自拍|cos|造型|版本)?",
+    flags=re.IGNORECASE,
+)
+_NEGATED_VISUAL_DELIVERY_RE = re.compile(
+    r"(?:不要|不用|别|无需|不想).{0,20}"
+    r"(?:给我看|让我看|看图|看照片|看图片|发图|发照片|发图片)",
+    flags=re.IGNORECASE,
+)
+_EXISTING_IMAGE_ANALYSIS_RE = re.compile(
+    r"(?:看看|看下|看一眼|分析|描述|识别).{0,16}"
+    r"(?:这|那)(?:张|幅|个)?(?:照片|图片|图像)|"
+    r"(?:这|那)(?:张|幅|个)?(?:照片|图片|图像).{0,24}"
+    r"(?:里|中的|内容|是什么|分析|描述|识别)",
+    flags=re.IGNORECASE,
+)
 
 
 def looks_like_conversation_draw_intent(message: str) -> bool:
@@ -491,9 +511,16 @@ def looks_like_conversation_draw_intent(message: str) -> bool:
     positive_source = _NEGATED_DRAW_RE.sub(" ", source)
     positive_source = _NEGATED_QUERY_RE.sub(" ", positive_source)
     positive_source = _PROMPT_ONLY_ACTION_RE.sub(" ", positive_source)
+    positive_source = _NEGATED_VISUAL_DELIVERY_RE.sub(" ", positive_source)
+    if _EXISTING_IMAGE_ANALYSIS_RE.search(positive_source):
+        return False
     if _QUERY_TO_DRAW_RE.search(positive_source) or _QUERY_DIRECT_DRAW_RE.search(
         positive_source
     ):
+        return True
+    if _VISUAL_DELIVERY_CUE_RE.search(positive_source):
+        if _QUERY_ONLY_RE.search(positive_source):
+            return False
         return True
     if not _DRAW_CUE_RE.search(positive_source):
         return False

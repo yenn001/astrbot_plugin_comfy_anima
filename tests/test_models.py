@@ -29,6 +29,16 @@ class PluginSettingsTests(unittest.TestCase):
             {"123456": "full", "654321": "none"},
         )
 
+    def test_chat_picture_terminal_guard_cannot_be_disabled_independently(self) -> None:
+        settings = PluginSettings.from_mapping(
+            {
+                "enable_llm_pic_trigger": True,
+                "enable_chat_draw_terminal_guard": False,
+            }
+        )
+
+        self.assertTrue(settings.enable_chat_draw_terminal_guard)
+
     def test_group_levels_remain_backward_compatible_with_mapping(self) -> None:
         settings = PluginSettings.from_mapping(
             {"group_block_levels": {"123456": "LITE"}}
@@ -292,7 +302,7 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "2.1.0")
+        self.assertEqual(PLUGIN_VERSION, "2.1.1")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
         self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-08", changelog)

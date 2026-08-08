@@ -133,6 +133,10 @@ class ConversationDrawIntentTests(unittest.TestCase):
             "不要介绍了，直接画飞鸟马时",
             "不要画旧角色，画飞鸟马时",
             "别查了，给我画飞鸟马时",
+            "\u6211\u8981\u770b\u9006\u5154\u5973\u90ce\uff01\u770b\u770b\u7167\u7247\u3002",
+            "\u7ed9\u6211\u770b\u770b\u9006\u5154\u5973\u90ce\u7684\u7167\u7247",
+            "\u518d\u51fa\u4e00\u904d cos \u5427",
+            "\u7a7f\u7ed9\u6211\u770b",
         )
 
         for message in messages:
@@ -167,6 +171,8 @@ class ConversationDrawIntentTests(unittest.TestCase):
             "想看有哪些角色 LoRA",
             "这个 LoRA 能画什么？",
             "怎么画飞鸟马时？",
+            "\u6211\u8981\u770b\u8fd9\u5f20\u7167\u7247\u91cc\u662f\u4ec0\u4e48",
+            "\u4e0d\u8981\u7ed9\u6211\u770b\u56fe\uff0c\u53ea\u67e5\u9006\u5154\u5973\u90ce LoRA",
         )
 
         for message in messages:

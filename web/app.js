@@ -1076,7 +1076,10 @@ function populateSettings(settings) {
     const field = form.elements.namedItem(name);
     if (!field) continue;
     if (field.type === "checkbox") {
-      field.checked = Boolean(value);
+      field.checked = name === "enable_chat_draw_terminal_guard"
+        ? true
+        : Boolean(value);
+      if (name === "enable_chat_draw_terminal_guard") field.disabled = true;
     } else if (Array.isArray(value)) {
       field.value = value.join("\n");
     } else {
@@ -1104,7 +1107,9 @@ function collectSettings(form) {
         ? document.querySelector(providerManual[field.name]).value.trim()
         : field.value;
     } else if (booleanFields.has(field.name)) {
-      result[field.name] = field.checked;
+      result[field.name] = field.name === "enable_chat_draw_terminal_guard"
+        ? true
+        : field.checked;
     } else if (numberFields.has(field.name)) {
       result[field.name] = Number(field.value);
     } else if (field.name === "group_whitelist") {

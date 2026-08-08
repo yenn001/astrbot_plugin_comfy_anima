@@ -187,6 +187,19 @@ class MainCompatibilityTests(unittest.TestCase):
     def test_main_module_imports_with_documented_api_surface(self) -> None:
         self.assertTrue(hasattr(self.main, "ComfyAnimaPlugin"))
 
+    def test_webui_bootstrap_exports_all_chat_picture_switches(self) -> None:
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        for field in (
+            "enable_natural_draw",
+            "enable_llm_pic_trigger",
+            "enable_chat_draw_terminal_guard",
+        ):
+            with self.subTest(field=field):
+                self.assertRegex(
+                    source,
+                    rf'"{field}":\s*(?:\(\s*)?settings\.{field}',
+                )
+
     def test_director_output_tool_is_request_local_not_globally_registered(self) -> None:
         source = Path(self.main.__file__).read_text(encoding="utf-8")
         self.assertNotIn(
@@ -441,6 +454,102 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         await plugin.buffer_chat_draw_protocol_response(event)
 
         self.assertIs(event.extras["enable_streaming"], False)
+        self.assertTrue(plugin._chat_draw_terminal_guard_enabled())
+
+    async def test_explicit_photo_request_without_asset_tools_is_repaired(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_chat_draw_terminal_guard = False
+        plugin._auto_draw_system_prompt = ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            _remove_think_content = staticmethod(
+                self.main.PromptDirector._remove_think_content
+            )
+            extract_pic_instructions = staticmethod(
+                self.main.PromptDirector.extract_pic_instructions
+            )
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="1girl, reverse bunny suit, portrait">'
+        )
+        event = self._event(
+            "\u6211\u8981\u770b\u9006\u5154\u5973\u90ce\uff01\u770b\u770b\u7167\u7247\u3002"
+        )
+        request = types.SimpleNamespace(system_prompt="base")
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertFalse(trace["called"])
+
+        response = self._response("\u884c\uff0c\u7a7f\u7ed9\u4f60\u770b\u3002")
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_awaited_once()
+        self.assertIn("<pic", response.completion_text)
+
+    async def test_decorating_order_repairs_no_tool_draw_intent(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("再出一遍 cos 吧")
+        plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+        plugin._repair_chat_draw_terminal = AsyncMock(return_value="still prose")
+        result = types.SimpleNamespace(chain=[_Plain("行，马上穿给你看。")])
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        plugin._repair_chat_draw_terminal.assert_awaited_once()
+        self.assertIn("ComfyUI", result.chain[-1].text)
+        self.assertNotIn("<pic", result.chain[-1].text)
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+    async def test_no_tool_negated_request_cannot_submit_picture(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin._auto_draw_system_prompt = ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="must not run">'
+        )
+        event = self._event("不要给我看图，只查逆兔女郎 LoRA")
+        request = types.SimpleNamespace(system_prompt="base")
+
+        await plugin.inject_auto_draw_prompt(event, request)
+        response = self._response('<pic prompt="must not run">')
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("ComfyUI", response.completion_text)
 
     async def test_disabled_picture_trigger_never_starts_terminal_trace(self) -> None:
         plugin, _cleared = self._plugin()
@@ -7370,6 +7479,8 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "enable_web_ui": True,
                 "web_ui_password": "existing-password",
+                "enable_llm_pic_trigger": True,
+                "enable_chat_draw_terminal_guard": False,
                 "default_width": 832,
                 "max_preset_loras": 12,
                 "max_total_dynamic_loras": 12,
@@ -7392,6 +7503,7 @@ class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plugin.config["enable_reverse_json_formatter"])
         self.assertFalse(plugin.config["enable_reverse_json_repair_retry"])
         self.assertFalse(plugin.config["show_chat_generation_details"])
+        self.assertTrue(plugin.config["enable_chat_draw_terminal_guard"])
         self.assertEqual(plugin.config["web_ui_password"], "existing-password")
         self.assertEqual(plugin.config.saved, 2)
         self.assertTrue(result["reload_scheduled"])

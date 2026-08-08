@@ -387,6 +387,7 @@ class PluginSettings:
             经过类型清洗的插件配置。
         """
         data = config or {}
+        pic_trigger_enabled = _as_bool(data.get("enable_llm_pic_trigger"), True)
         return cls(
             comfyui_url=str(data.get("comfyui_url", cls.comfyui_url)).strip(),
             api_token=str(data.get("api_token", "")).strip(),
@@ -464,11 +465,11 @@ class PluginSettings:
                 data.get("director_extra_instruction", "")
             ).strip(),
             enable_natural_draw=_as_bool(data.get("enable_natural_draw"), True),
-            enable_llm_pic_trigger=_as_bool(data.get("enable_llm_pic_trigger"), True),
-            enable_chat_draw_terminal_guard=_as_bool(
-                data.get("enable_chat_draw_terminal_guard"),
-                True,
-            ),
+            enable_llm_pic_trigger=pic_trigger_enabled,
+            # The terminal guard is a transport-safety invariant, not an
+            # independently disableable feature. Disable ordinary-chat image
+            # controls through enable_llm_pic_trigger instead.
+            enable_chat_draw_terminal_guard=pic_trigger_enabled,
             auto_draw_system_prompt=str(
                 data.get("auto_draw_system_prompt", "")
             ).strip(),
