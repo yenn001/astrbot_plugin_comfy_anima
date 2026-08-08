@@ -180,10 +180,93 @@
     "default": true
   },
   "enable_reverse_prompt": {
-    "description": "启用在线图片反推",
+    "description": "启用图片反推",
     "type": "bool",
-    "hint": "开放 /反推 与 /反推画图；只会处理用户明确发送或引用的图片",
+    "hint": "开放 /反推 与 /反推画图；实际后端由 reverse_backend 决定",
     "default": true
+  },
+  "enable_workflow_reverse": {
+    "description": "启用本地工作流反推",
+    "type": "bool",
+    "hint": "workflow 后端需要 wd_tagger_mira、可用 ONNX、配套 selected_tags CSV 与文本输出节点；依赖缺失时明确报错，不静默调用视觉模型",
+    "default": true
+  },
+  "reverse_backend": {
+    "description": "图片反推后端",
+    "type": "string",
+    "options": ["vision", "workflow", "hybrid"],
+    "hint": "vision 保留原多模态模型；workflow 只运行本地 Mira WD Tagger；hybrid 仅在显式选择时允许兼容回退",
+    "default": "workflow"
+  },
+  "reverse_workflow_file": {
+    "description": "本地反推 API 工作流",
+    "type": "string",
+    "hint": "必须是经过审核的 LoadImage -> wd_tagger_mira -> 文本输出最小工作流",
+    "default": "workflow/anima_reverse_tagger_api.json"
+  },
+  "reverse_workflow_timeout": {
+    "description": "本地反推工作流超时（秒）",
+    "type": "int",
+    "hint": "范围 10 到 300",
+    "default": 120
+  },
+  "reverse_tagger_model": {
+    "description": "Mira WD Tagger ONNX 模型",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/onnx 的安全路径；对应 Tag Mapping 文件也必须存在",
+    "default": "wd-convnext-tagger-v3.onnx"
+  },
+  "reverse_general_threshold": {
+    "description": "WD Tagger General 阈值",
+    "type": "float",
+    "hint": "范围 0 到 1",
+    "default": 0.55
+  },
+  "reverse_character_threshold": {
+    "description": "WD Tagger Character 阈值",
+    "type": "float",
+    "hint": "范围 0 到 1",
+    "default": 0.6
+  },
+  "reverse_categories": {
+    "description": "WD Tagger 输出分类",
+    "type": "list",
+    "hint": "允许 rating、artist、general、character、copyright、meta、model、quality；默认只启用 Copyright、Character、General",
+    "default": ["copyright", "character", "general"]
+  },
+  "reverse_session_method": {
+    "description": "WD Tagger 推理会话",
+    "type": "string",
+    "options": ["CPU", "GPU", "GPU Release"],
+    "hint": "A佬原工作流使用 CPU；只有 ComfyUI 节点明确支持时才切换 GPU 模式",
+    "default": "CPU"
+  },
+  "enable_control_stack_v2": {
+    "description": "启用 Anima Control Stack v2",
+    "type": "bool",
+    "hint": "支持最多两张去重底图和 Pose、Depth、Lineart、Reference 四个独立通道；关闭后保留旧单图兼容行为",
+    "default": true
+  },
+  "control_default_fidelity": {
+    "description": "控制网默认保真强度",
+    "type": "string",
+    "options": ["strict", "balanced", "loose"],
+    "hint": "strict 强约束，balanced 平衡，loose 弱约束",
+    "default": "balanced"
+  },
+  "control_default_resize_policy": {
+    "description": "控制图默认缩放策略",
+    "type": "string",
+    "options": ["fit", "crop", "stretch"],
+    "hint": "每个通道在工作流计划中独立保存；当前设置作为未显式指定时的默认值",
+    "default": "fit"
+  },
+  "control_default_reference_scope": {
+    "description": "Reference 默认软约束范围",
+    "type": "string",
+    "options": ["appearance", "style", "color"],
+    "hint": "Reference 只影响外观、画风或配色，不保证角色身份锁定",
+    "default": "appearance"
   },
   "enable_reverse_json_formatter": {
     "description": "启用反推 JSON 格式整理器",

@@ -16,6 +16,8 @@
   "462": {"inputs": {"text": "", "loras": {"__value__": []}, "model": ["44", 0], "clip": ["45", 0]}, "class_type": "Lora Loader (LoraManager)", "_meta": {"title": "1️⃣Lora堆（动态）"}},
   "500": {"inputs": {"image": "example.png"}, "class_type": "LoadImage", "_meta": {"title": "底图输入"}},
   "501": {"inputs": {"image": ["500", 0], "upscale_method": "lanczos", "width": 832, "height": 1216, "crop": "disabled"}, "class_type": "ImageScale", "_meta": {"title": "底图适配目标画布"}},
+  "502": {"inputs": {"image": "example.png"}, "class_type": "LoadImage", "_meta": {"title": "第二底图输入"}},
+  "503": {"inputs": {"image": ["502", 0], "upscale_method": "lanczos", "width": 832, "height": 1216, "crop": "disabled"}, "class_type": "ImageScale", "_meta": {"title": "第二底图适配目标画布"}},
   "510": {"inputs": {"image": ["501", 0], "detect_hand": "enable", "detect_body": "enable", "detect_face": "enable", "resolution": 1216, "scale_stick_for_xinsr_cn": "disable"}, "class_type": "OpenposePreprocessor", "_meta": {"title": "Pose 预处理"}},
   "511": {"inputs": {"model": ["462", 0], "lllite_name": "Anima/anima-lllite-pose-1.safetensors", "image": ["510", 0], "strength": 0.9, "start_percent": 0.0, "end_percent": 0.9, "preserve_wrapper": true}, "class_type": "AnimaLLLiteApply", "_meta": {"title": "Pose 控制"}},
   "520": {"inputs": {"image": ["501", 0], "ckpt_name": "depth_anything_v2_vitl.pth", "resolution": 1216}, "class_type": "DepthAnythingV2Preprocessor", "_meta": {"title": "Depth 预处理"}},

@@ -42,8 +42,8 @@ from ..constants import (
 
 
 PROFILE_SCHEMA = "astrbot-comfy-anima-environment-profile"
-PROFILE_SCHEMA_VERSION = 2
-LEGACY_PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 3
+LEGACY_PROFILE_SCHEMA_VERSIONS = frozenset({1, 2})
 MAX_PROFILE_NAME_LENGTH = 64
 MAX_TEXT_FIELD_LENGTH = 2048
 MAX_NODE_LIST_ITEMS = 32
@@ -59,6 +59,7 @@ ENVIRONMENT_FIELD_DEFAULTS: dict[str, Any] = {
     "iterative_workflow_file": "workflow/anima_iterative_api.json",
     "inpaint_crop_workflow_file": "workflow/anima_inpaint_crop_api.json",
     "lanpaint_workflow_file": "workflow/anima_lanpaint_api.json",
+    "reverse_workflow_file": "workflow/anima_reverse_tagger_api.json",
     "workflow_dir": "workflow",
     "unet_catalog_url": "",
     "unet_loader_node_id": "429",
@@ -90,8 +91,10 @@ _V1_ADDED_WORKFLOW_FIELDS = frozenset(
         "iterative_workflow_file",
         "inpaint_crop_workflow_file",
         "lanpaint_workflow_file",
+        "reverse_workflow_file",
     }
 )
+_V2_ADDED_WORKFLOW_FIELDS = frozenset({"reverse_workflow_file"})
 
 _URL_FIELDS = frozenset(
     {
@@ -111,6 +114,7 @@ _PATH_FIELDS = frozenset(
         "iterative_workflow_file",
         "inpaint_crop_workflow_file",
         "lanpaint_workflow_file",
+        "reverse_workflow_file",
         "workflow_dir",
     }
 )
@@ -328,15 +332,18 @@ def _validate_stored_environment_settings(
     *,
     schema_version: int,
 ) -> dict[str, Any]:
-    """Validate a stored snapshot and migrate the known v1 workflow gap."""
+    """Validate a stored snapshot and migrate known workflow-path additions."""
 
     if schema_version == PROFILE_SCHEMA_VERSION:
         return validate_environment_settings(settings)
-    if schema_version != LEGACY_PROFILE_SCHEMA_VERSION:
+    if schema_version not in LEGACY_PROFILE_SCHEMA_VERSIONS:
         raise ConfigProfileValidationError("version 不受支持")
     partial = validate_environment_settings(settings, require_all=False)
     missing = ENVIRONMENT_FIELDS - set(partial)
-    unsupported_missing = missing - _V1_ADDED_WORKFLOW_FIELDS
+    allowed_missing = (
+        _V1_ADDED_WORKFLOW_FIELDS if schema_version == 1 else _V2_ADDED_WORKFLOW_FIELDS
+    )
+    unsupported_missing = missing - allowed_missing
     if unsupported_missing:
         names = ", ".join(sorted(unsupported_missing))
         raise ConfigProfileValidationError(f"配置档案缺少字段：{names}")
@@ -523,10 +530,7 @@ class ConfigProfileService:
         if payload.get("schema") != PROFILE_SCHEMA:
             raise ConfigProfileValidationError("不是 Comfy Anima 环境配置档案")
         raw_version = payload.get("version")
-        if raw_version not in {
-            LEGACY_PROFILE_SCHEMA_VERSION,
-            PROFILE_SCHEMA_VERSION,
-        }:
+        if raw_version not in {*LEGACY_PROFILE_SCHEMA_VERSIONS, PROFILE_SCHEMA_VERSION}:
             raise ConfigProfileValidationError("不支持的配置档案版本")
         raw_profile = payload.get("profile")
         if not isinstance(raw_profile, Mapping):
@@ -656,10 +660,7 @@ class ConfigProfileService:
         if raw.get("schema") != PROFILE_SCHEMA:
             raise ConfigProfileValidationError("schema 不匹配")
         raw_version = raw.get("version")
-        if raw_version not in {
-            LEGACY_PROFILE_SCHEMA_VERSION,
-            PROFILE_SCHEMA_VERSION,
-        }:
+        if raw_version not in {*LEGACY_PROFILE_SCHEMA_VERSIONS, PROFILE_SCHEMA_VERSION}:
             raise ConfigProfileValidationError("version 不受支持")
         raw_profiles = raw.get("profiles")
         if not isinstance(raw_profiles, Mapping):

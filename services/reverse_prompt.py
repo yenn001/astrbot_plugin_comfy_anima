@@ -180,13 +180,13 @@ class ReversePromptResult:
     text_in_image: tuple[str, ...] = ()
     uncertain_terms: tuple[str, ...] = ()
     confidence: float = 0.0
+    confidence_available: bool = True
 
     def render(self, provider_id: str) -> str:
-        lines = [
-            f"反推模型：{provider_id}",
-            f"综合置信度：{self.confidence:.2f}",
-            f"正面提示词：\n{self.positive_tags}",
-        ]
+        lines = [f"反推后端：{provider_id}"]
+        if self.confidence_available:
+            lines.append(f"综合置信度：{self.confidence:.2f}")
+        lines.append(f"正面提示词：\n{self.positive_tags}")
         if self.negative_tags:
             lines.append(f"负面提示词：\n{self.negative_tags}")
         if self.composition:

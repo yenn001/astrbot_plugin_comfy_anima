@@ -2,6 +2,17 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.0] - 2026-08-08
+
+### 本地反推、角色声明分层与 Control Stack v2
+
+- 新增 `CharacterIdentityClaim` 来源分层。用户明确作品与角色、严格角色 LoRA 和真实歧义继续 fail closed；绘图导演给出的未知裸名称或虚构作品限定降级为 `creative_fallback`，不再把 DeepSeek 娘、模型娘、网络拟人或原创 OC 错当成必须存在的 Danbooru 角色。
+- 新增本地 `LoadImage -> wd_tagger_mira -> ShowText|pysssss` 反推工作流和能力声明证据。默认 `reverse_backend=workflow`，支持显式 `vision` 和 `hybrid`；workflow 失败不静默调用视觉模型，多人空间绑定能力不足时明确停止。
+- `/反推` 输出安全规范化 Tags；`/反推画图` 无修改要求时直接复用 Tags，带修改时视觉图像不会传给绘图导演。反推工作流支持独立模型、General/Character 阈值、分类、Session 和超时配置。
+- Anima Control Stack v2 支持最多两张 SHA 去重输入、四个唯一通道和回复图优先顺序。每个 Pose、Depth、Lineart、Reference 通道独立保存来源、强度、作用窗口、缩放策略与 Reference 范围；未使用分支从工作流物理删除。
+- 双图自然绑定支持“姿势用图1，构图用图2”。来源不完整或冲突时只报告计划问题，不提交 ComfyUI。自由模式和纯 Pose/Depth 结构重画跳过不必要的反推；保守/平衡内容模式才读取源图 Tags。
+- 新增 Control Stack v2 WebUI 设置、反推依赖配置、环境档案 schema v3 迁移、双图工作流合同与普通聊天图片终端强制缓冲。本版不自动下载模型或自定义节点。
+
 ## [2.0.3] - 2026-08-06
 
 ### 日常聊天自动绘图结果精简

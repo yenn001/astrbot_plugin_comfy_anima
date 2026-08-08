@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -162,6 +163,71 @@ class IncomingImageService:
                 await self._materialize_component(image_type(file=refs[0]))
             )
         raise IncomingImageError("请发送一张图片，或回复图片后再使用该指令")
+
+    async def collect_many(self, event: Any, *, limit: int = 2) -> list[Path]:
+        """Collect a deterministic, content-deduplicated image list.
+
+        Reply images are always ordered before direct attachments. This method
+        intentionally differs from :meth:`collect_one`, whose ambiguity rules
+        remain unchanged for existing single-image commands.
+        """
+
+        if limit < 1 or limit > 2:
+            raise IncomingImageError("一次最多只能处理两张底图")
+
+        direct = self._direct_images(event)
+        quoted = self._quoted_images(event)
+        refs = [] if quoted else await self._quoted_refs(event)
+        if len(quoted) > 2 or len(refs) > 2:
+            raise IncomingImageError("引用消息中最多只能读取两张图片")
+        if len(direct) > 2:
+            raise IncomingImageError("当前消息最多只能发送两张图片")
+
+        image_type = getattr(Comp, "Image", None)
+        quoted_components: list[Any] = list(quoted)
+        if not quoted_components and refs:
+            if image_type is None:
+                raise IncomingImageError("当前 AstrBot 版本无法读取引用图片")
+            quoted_components = [image_type(file=ref) for ref in refs]
+
+        components = [*quoted_components, *direct]
+        if not components:
+            raise IncomingImageError("请发送图片，或回复图片后再使用该指令")
+
+        collected: list[Path] = []
+        digests: set[str] = set()
+        try:
+            for component in components:
+                copied = await self._copy_and_validate(
+                    await self._materialize_component(component)
+                )
+                digest = await asyncio.to_thread(self._sha256, copied)
+                if digest in digests:
+                    copied.unlink(missing_ok=True)
+                    continue
+                if len(collected) >= limit:
+                    copied.unlink(missing_ok=True)
+                    raise IncomingImageError(f"一次最多只能处理 {limit} 张不同图片")
+                digests.add(digest)
+                collected.append(copied)
+            return collected
+        except Exception:
+            for path in collected:
+                path.unlink(missing_ok=True)
+            raise
+
+    async def collect_up_to_two(self, event: Any) -> list[Path]:
+        """Named compatibility wrapper for dual-source control requests."""
+
+        return await self.collect_many(event, limit=2)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     async def collect_inpaint_pair(self, event: Any) -> InpaintImagePair:
         """Collect a fail-closed source/mask pair for redraw.

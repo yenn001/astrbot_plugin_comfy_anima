@@ -30,6 +30,10 @@
   "defaults": {
     "pipeline": "control",
     "control_image_node_id": "501",
+    "control_image_sources": {
+      "1": {"input_node_id": "500", "scale_node_id": "501"},
+      "2": {"input_node_id": "502", "scale_node_id": "503"}
+    },
     "width": 832,
     "height": 1216,
     "steps": 8,

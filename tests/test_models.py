@@ -91,6 +91,27 @@ class PluginSettingsTests(unittest.TestCase):
         self.assertFalse(disabled.enable_reverse_json_formatter)
         self.assertFalse(disabled.enable_reverse_json_repair_retry)
 
+    def test_reverse_workflow_schema_defaults_match_safe_runtime_defaults(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        settings = PluginSettings.from_mapping({})
+        fields = {
+            "enable_workflow_reverse",
+            "reverse_backend",
+            "reverse_workflow_file",
+            "reverse_workflow_timeout",
+            "reverse_tagger_model",
+            "reverse_general_threshold",
+            "reverse_character_threshold",
+            "reverse_categories",
+            "reverse_session_method",
+        }
+
+        for field_name in fields:
+            self.assertEqual(schema[field_name]["default"], getattr(settings, field_name))
+        self.assertTrue(settings.enable_workflow_reverse)
+        self.assertEqual(settings.reverse_backend, "workflow")
+
     def test_danbooru_auto_update_defaults_off_and_clamps_interval(self) -> None:
         defaults = PluginSettings.from_mapping({})
         low = PluginSettings.from_mapping(
@@ -271,10 +292,10 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "2.0.3")
+        self.assertEqual(PLUGIN_VERSION, "2.1.0")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
-        self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-06", changelog)
+        self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-08", changelog)
 
 
 if __name__ == "__main__":

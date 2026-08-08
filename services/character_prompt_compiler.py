@@ -41,6 +41,16 @@ class CharacterPromptCompileError(ValueError):
 
 
 @dataclass(frozen=True)
+class CharacterIdentityClaim:
+    """One character declaration with explicit provenance and authority."""
+
+    name: str
+    work: str = ""
+    source: str = "director_candidate"
+    strict: bool = False
+
+
+@dataclass(frozen=True)
 class CharacterPromptEvidence:
     """One exact-confirmed character and its bounded appearance evidence."""
 

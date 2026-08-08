@@ -70,6 +70,62 @@ def _as_string_list(value: Any, default: list[str]) -> list[str]:
     return list(default)
 
 
+_REVERSE_TAGGER_DEFAULT_CATEGORIES = ["copyright", "character", "general"]
+_REVERSE_TAGGER_CATEGORIES = frozenset(
+    {
+        "rating",
+        "artist",
+        "general",
+        "character",
+        "copyright",
+        "meta",
+        "model",
+        "quality",
+    }
+)
+
+
+def _as_reverse_backend(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    return normalized if normalized in {"vision", "workflow", "hybrid"} else "workflow"
+
+
+def _as_reverse_tagger_model(value: Any) -> str:
+    default = "wd-convnext-tagger-v3.onnx"
+    normalized = str(value or "").strip().replace("\\", "/")
+    path = Path(normalized)
+    if (
+        not normalized
+        or len(normalized) > 255
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.suffix.casefold() != ".onnx"
+        or normalized.startswith("~")
+        or any(character in normalized for character in ":\0\r\n")
+    ):
+        return default
+    return normalized
+
+
+def _as_reverse_tagger_categories(value: Any) -> list[str]:
+    raw = _as_string_list(value, _REVERSE_TAGGER_DEFAULT_CATEGORIES)
+    result: list[str] = []
+    for item in raw:
+        normalized = str(item or "").strip().casefold()
+        if normalized in _REVERSE_TAGGER_CATEGORIES and normalized not in result:
+            result.append(normalized)
+    return result or list(_REVERSE_TAGGER_DEFAULT_CATEGORIES)
+
+
+def _as_reverse_tagger_session(value: Any) -> str:
+    normalized = " ".join(str(value or "").strip().split()).casefold()
+    return {
+        "cpu": "CPU",
+        "gpu": "GPU",
+        "gpu release": "GPU Release",
+    }.get(normalized, "CPU")
+
+
 def _as_mapping_list(value: Any) -> list[dict[str, Any]]:
     """保留 template_list 中的字典项并复制，避免修改原配置对象。"""
     if not isinstance(value, list):
@@ -160,6 +216,17 @@ class PluginSettings:
     auto_draw_system_prompt: str = ""
     max_auto_images_per_reply: int = 1
     enable_reverse_prompt: bool = True
+    enable_workflow_reverse: bool = True
+    reverse_backend: str = "workflow"
+    reverse_workflow_file: str = "workflow/anima_reverse_tagger_api.json"
+    reverse_workflow_timeout: int = 120
+    reverse_tagger_model: str = "wd-convnext-tagger-v3.onnx"
+    reverse_general_threshold: float = 0.55
+    reverse_character_threshold: float = 0.6
+    reverse_categories: list[str] = field(
+        default_factory=lambda: list(_REVERSE_TAGGER_DEFAULT_CATEGORIES)
+    )
+    reverse_session_method: str = "CPU"
     enable_reverse_json_formatter: bool = True
     enable_reverse_json_repair_retry: bool = True
     reverse_prompt_provider_id: str = ""
@@ -167,6 +234,10 @@ class PluginSettings:
     reverse_prompt_temperature: float = 0.1
     reverse_prompt_max_tokens: int = 1600
     reverse_prompt_system_prompt: str = ""
+    enable_control_stack_v2: bool = True
+    control_default_fidelity: str = "balanced"
+    control_default_resize_policy: str = "fit"
+    control_default_reference_scope: str = "appearance"
     max_input_image_size_mb: int = 20
     max_input_image_pixels: int = 40_000_000
     workflow_dir: str = "workflow"
@@ -405,6 +476,53 @@ class PluginSettings:
                 data.get("max_auto_images_per_reply"), 1, 1
             ),
             enable_reverse_prompt=_as_bool(data.get("enable_reverse_prompt"), True),
+            enable_workflow_reverse=_as_bool(
+                data.get("enable_workflow_reverse"),
+                True,
+            ),
+            reverse_backend=_as_reverse_backend(data.get("reverse_backend")),
+            reverse_workflow_file=(
+                str(
+                    data.get(
+                        "reverse_workflow_file",
+                        "workflow/anima_reverse_tagger_api.json",
+                    )
+                ).strip()
+                or "workflow/anima_reverse_tagger_api.json"
+            ),
+            reverse_workflow_timeout=min(
+                300,
+                _as_int(data.get("reverse_workflow_timeout"), 120, 10),
+            ),
+            reverse_tagger_model=_as_reverse_tagger_model(
+                data.get("reverse_tagger_model")
+            ),
+            reverse_general_threshold=min(
+                1.0,
+                _as_float(
+                    data.get(
+                        "reverse_general_threshold",
+                        data.get("reverse_tagger_general_threshold"),
+                    ),
+                    0.55,
+                ),
+            ),
+            reverse_character_threshold=min(
+                1.0,
+                _as_float(
+                    data.get(
+                        "reverse_character_threshold",
+                        data.get("reverse_tagger_character_threshold"),
+                    ),
+                    0.6,
+                ),
+            ),
+            reverse_categories=_as_reverse_tagger_categories(
+                data.get("reverse_categories", data.get("reverse_tagger_categories"))
+            ),
+            reverse_session_method=_as_reverse_tagger_session(
+                data.get("reverse_session_method", data.get("reverse_tagger_session"))
+            ),
             enable_reverse_json_formatter=_as_bool(
                 data.get("enable_reverse_json_formatter"),
                 True,
@@ -431,6 +549,39 @@ class PluginSettings:
             reverse_prompt_system_prompt=str(
                 data.get("reverse_prompt_system_prompt", "")
             ).strip(),
+            enable_control_stack_v2=_as_bool(
+                data.get("enable_control_stack_v2"), True
+            ),
+            control_default_fidelity=(
+                str(data.get("control_default_fidelity") or "balanced")
+                .strip()
+                .casefold()
+                if str(data.get("control_default_fidelity") or "balanced")
+                .strip()
+                .casefold()
+                in {"strict", "balanced", "loose"}
+                else "balanced"
+            ),
+            control_default_resize_policy=(
+                str(data.get("control_default_resize_policy") or "fit")
+                .strip()
+                .casefold()
+                if str(data.get("control_default_resize_policy") or "fit")
+                .strip()
+                .casefold()
+                in {"fit", "crop", "stretch"}
+                else "fit"
+            ),
+            control_default_reference_scope=(
+                str(data.get("control_default_reference_scope") or "appearance")
+                .strip()
+                .casefold()
+                if str(data.get("control_default_reference_scope") or "appearance")
+                .strip()
+                .casefold()
+                in {"appearance", "style", "color"}
+                else "appearance"
+            ),
             max_input_image_size_mb=min(
                 100,
                 _as_int(data.get("max_input_image_size_mb"), 20, 1),
@@ -801,6 +952,10 @@ class PluginSettings:
         """Resolve the standalone RTX workflow path."""
         path = Path(self.upscale_workflow_file).expanduser()
         return path if path.is_absolute() else plugin_dir / path
+
+    def resolve_reverse_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the dedicated local reverse-analysis workflow path."""
+        return self._resolve_plugin_path(plugin_dir, self.reverse_workflow_file)
 
     @staticmethod
     def _resolve_plugin_path(plugin_dir: Path, value: str) -> Path:

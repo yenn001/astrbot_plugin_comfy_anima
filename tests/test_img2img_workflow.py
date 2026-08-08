@@ -11,6 +11,7 @@ from ..core.workflow import (
 )
 from ..core.workflow_registry import WorkflowRegistry, WorkflowRegistryError
 from ..models import GenerationOptions, LoraSelection, PluginSettings
+from ..services.control_plan import ControlChannel, ControlPlan
 
 
 class Img2ImgWorkflowTests(unittest.TestCase):
@@ -249,6 +250,100 @@ class ControlFidelityPolicyTests(unittest.TestCase):
 
         self.assertEqual(workflow["540"]["inputs"]["strength"], 0.72)
         self.assertEqual(workflow["540"]["inputs"]["end_percent"], 0.9)
+
+    def test_v2_plan_binds_independent_sources_and_channel_parameters(self) -> None:
+        workflow, _, preferred = self.builder.build_control_plan(
+            {1: "reply.png", 2: "direct.png"},
+            GenerationOptions(
+                prompt="portrait",
+                seed=1,
+                width=640,
+                height=896,
+                pipeline="base",
+            ),
+            ControlPlan(
+                channels=(
+                    ControlChannel(
+                        "pose",
+                        source_index=1,
+                        strength=0.63,
+                        start_percent=0.1,
+                        end_percent=0.7,
+                        resize_policy="fit",
+                    ),
+                    ControlChannel(
+                        "depth",
+                        source_index=2,
+                        strength=0.48,
+                        start_percent=0.2,
+                        end_percent=0.8,
+                        resize_policy="crop",
+                    ),
+                ),
+                pipeline="rtx",
+            ),
+        )
+
+        self.assertEqual(preferred, ["458"])
+        self.assertEqual(workflow["500"]["inputs"]["image"], "reply.png")
+        self.assertEqual(workflow["502"]["inputs"]["image"], "direct.png")
+        self.assertEqual(workflow["510"]["inputs"]["image"], ["501", 0])
+        self.assertEqual(workflow["520"]["inputs"]["image"], ["503", 0])
+        self.assertEqual(workflow["501"]["inputs"]["width"], 640)
+        self.assertEqual(workflow["503"]["inputs"]["height"], 896)
+        self.assertEqual(workflow["503"]["inputs"]["crop"], "center")
+        self.assertEqual(workflow["511"]["inputs"]["strength"], 0.63)
+        self.assertEqual(workflow["511"]["inputs"]["start_percent"], 0.1)
+        self.assertEqual(workflow["521"]["inputs"]["end_percent"], 0.8)
+        self.assertNotIn("530", workflow)
+        self.assertNotIn("531", workflow)
+        self.assertNotIn("540", workflow)
+
+    def test_v2_plan_prunes_unused_first_source_and_uses_plan_pipeline(self) -> None:
+        workflow, _, preferred = self.builder.build_control_plan(
+            {2: "reference.png"},
+            GenerationOptions(prompt="portrait", pipeline="base"),
+            ControlPlan(
+                channels=(ControlChannel("reference", source_index=2),),
+                pipeline="iterative",
+            ),
+        )
+
+        self.assertEqual(preferred, ["103"])
+        self.assertNotIn("500", workflow)
+        self.assertNotIn("501", workflow)
+        self.assertEqual(workflow["540"]["inputs"]["image"], ["503", 0])
+        self.assertNotIn("510", workflow)
+        self.assertNotIn("520", workflow)
+        self.assertNotIn("530", workflow)
+
+    def test_v2_plan_clones_scale_node_for_different_resize_policies(self) -> None:
+        workflow, _, _ = self.builder.build_control_plan(
+            {1: "shared.png"},
+            GenerationOptions(prompt="portrait"),
+            ControlPlan(
+                channels=(
+                    ControlChannel("pose", resize_policy="fit"),
+                    ControlChannel("depth", resize_policy="crop"),
+                )
+            ),
+        )
+
+        pose_scale = workflow["510"]["inputs"]["image"][0]
+        depth_scale = workflow["520"]["inputs"]["image"][0]
+        self.assertEqual(pose_scale, "501")
+        self.assertNotEqual(depth_scale, pose_scale)
+        self.assertEqual(workflow[depth_scale]["inputs"]["crop"], "center")
+
+    def test_v2_plan_rejects_missing_second_source(self) -> None:
+        with self.assertRaisesRegex(ValueError, "图2"):
+            self.builder.build_control_plan(
+                {1: "only.png"},
+                GenerationOptions(prompt="portrait"),
+                ControlPlan(
+                    channels=(ControlChannel("depth", source_index=2),)
+                ),
+            )
 
 
 if __name__ == "__main__":

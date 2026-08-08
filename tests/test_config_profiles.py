@@ -25,6 +25,7 @@ def _config(ip: str = "192.168.1.50") -> dict[str, Any]:
     return {
         "comfyui_url": f"http://{ip}:8188",
         "workflow_file": "workflow/anima_api.json",
+        "reverse_workflow_file": "workflow/anima_reverse_tagger_api.json",
         "workflow_dir": "workflow",
         "unet_catalog_url": f"http://{ip}:8188/object_info/UNETLoader",
         "unet_loader_node_id": "429",
@@ -97,7 +98,9 @@ class ConfigProfileServiceTests(unittest.TestCase):
         self.assertNotIn("api_token", raw_file)
         self.assertNotIn("prompt_llm_provider_id", raw_file)
 
-    def test_v1_profiles_missing_six_pipeline_fields_are_migrated_in_place(self) -> None:
+    def test_v1_profiles_missing_added_workflow_fields_are_migrated_in_place(
+        self,
+    ) -> None:
         saved = self.service.save_profile("旧版 34", _config(), activate=True)
         raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
         raw["version"] = 1
@@ -109,6 +112,7 @@ class ConfigProfileServiceTests(unittest.TestCase):
             "iterative_workflow_file",
             "inpaint_crop_workflow_file",
             "lanpaint_workflow_file",
+            "reverse_workflow_file",
         ):
             record["settings"].pop(field)
         self.storage_path.write_text(
@@ -125,6 +129,10 @@ class ConfigProfileServiceTests(unittest.TestCase):
             profiles[0]["settings"]["base_workflow_file"],
             "workflow/anima_base_api.json",
         )
+        self.assertEqual(
+            profiles[0]["settings"]["reverse_workflow_file"],
+            "workflow/anima_reverse_tagger_api.json",
+        )
         migrated = json.loads(self.storage_path.read_text(encoding="utf-8"))
         self.assertEqual(migrated["version"], PROFILE_SCHEMA_VERSION)
         self.assertEqual(
@@ -132,7 +140,24 @@ class ConfigProfileServiceTests(unittest.TestCase):
             ENVIRONMENT_FIELDS,
         )
 
-    def test_v2_profile_missing_required_field_is_still_corrupt(self) -> None:
+    def test_v2_profile_missing_reverse_workflow_is_migrated(self) -> None:
+        self.service.save_profile("v2", _config())
+        raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
+        raw["version"] = 2
+        raw["profiles"]["v2"]["settings"].pop("reverse_workflow_file")
+        self.storage_path.write_text(
+            json.dumps(raw, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        profile = self.service.get_profile("v2")
+
+        self.assertEqual(
+            profile["settings"]["reverse_workflow_file"],
+            "workflow/anima_reverse_tagger_api.json",
+        )
+
+    def test_v3_profile_missing_required_field_is_still_corrupt(self) -> None:
         self.service.save_profile("损坏档案", _config())
         raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
         raw["profiles"]["损坏档案"]["settings"].pop("comfyui_url")
@@ -144,7 +169,9 @@ class ConfigProfileServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigProfileStorageError, "comfyui_url"):
             self.service.list_profiles()
 
-    def test_import_accepts_v1_profile_with_legacy_workflow_fields_missing(self) -> None:
+    def test_import_accepts_v1_profile_with_legacy_workflow_fields_missing(
+        self,
+    ) -> None:
         settings = self.service.save_profile("source", _config())["settings"]
         for field in (
             "upscale_workflow_file",
@@ -153,6 +180,7 @@ class ConfigProfileServiceTests(unittest.TestCase):
             "iterative_workflow_file",
             "inpaint_crop_workflow_file",
             "lanpaint_workflow_file",
+            "reverse_workflow_file",
         ):
             settings.pop(field)
         payload = {

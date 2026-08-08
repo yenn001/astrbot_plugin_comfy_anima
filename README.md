@@ -1,8 +1,17 @@
 # AstrBot Comfy Anima
 
-> 当前版本：v2.0.3
+> 当前版本：v2.1.0
 
 面向 AstrBot、NapCat / OneBot v11 与 ComfyUI 的 Anima 绘图插件。它提供自然语言分镜、直接 Tags、图片反推、多人语义换角、整图改图、底图控制、RTX 放大、遮罩重绘、LoRA 管理、Danbooru 本地索引、任务中心和两套管理页面。
+
+## v2.1.0 本地反推与双图 Control Stack
+
+- 默认反推后端改为 ComfyUI 本地 `wd_tagger_mira` 工作流。`workflow` 失败会报告工作流、节点、输出或超时阶段，不会静默调用视觉 LLM；只有手动选择 `hybrid` 才允许回退。
+- `/反推` 返回经 NFKC、去重、Danbooru 括号转义和控制文本隔离后的 Tags。`/反推画图` 没有修改文字时直接把 Tags 交给 Anima，不再额外调用绘图导演。
+- Control Stack v2 支持最多两张 SHA-256 去重底图和四个唯一通道。回复图片固定为图1，当前消息附件成为图2；可写“姿势用图1，构图用图2”。来源不明确时停止，不提交 ComfyUI。
+- Pose、Depth、Lineart、Reference 各自拥有图片来源、强度、起止区间、缩放策略和 Reference 范围；未选择的输入、预处理与控制节点从 API 工作流物理删除。
+- 角色声明加入来源分层。用户明确作品与角色继续严格 exact；LLM 猜测的虚构作品、模型娘、网络拟人和原创 OC 无法 exact 时降级为创意描述，不触发外貌补写、角色 LoRA 或身份清理。
+- 普通聊天图片终端始终缓冲，避免 `<pic>` 控制文本在流式回复中泄漏；可选终端修复开关不再控制协议可见性。
 
 ## v2.0.3 日常聊天结果精简
 
@@ -57,6 +66,7 @@ LoRA 文件：black deniav1-2.safetensors
 | Anima 原图 | `workflow/anima_base_api.json` | `--pipeline base` |
 | Anima + RTX | `workflow/anima_rtx_api.json` | `--pipeline rtx` |
 | Anima + 迭代放大 | `workflow/anima_iterative_api.json` | `--pipeline iterative` |
+| 本地 Mira WD Tagger 反推 | `workflow/anima_reverse_tagger_api.json` | `/反推`、`/反推画图` |
 | 底图控制 | `workflow/anima_control_api.json` | `/底图控制` |
 | 整图 img2img | `workflow/anima_img2img_api.json` | `/改图`、无控制模式的 `/反推画图` |
 | RTX 独立放大 | `workflow/rtx_upscale_api.json` | `/放大` |
@@ -106,6 +116,7 @@ python -m pip install -r requirements.txt
 | Quick 重绘 | `InpaintCropImproved`、`InpaintStitchImproved` |
 | LanPaint | `LanPaint_KSampler`、`LanPaint_MaskBlend` |
 | 底图控制 | `AnimaLLLiteApply`、`OpenposePreprocessor`、`DepthAnythingV2Preprocessor`、`LineArtPreprocessor` |
+| 本地反推 | `wd_tagger_mira`、`ShowText|pysssss` |
 
 插件**不会自动下载或安装** ComfyUI 自定义节点、模型、LoRA 或控制权重。可把 [docs/workflows/导入Comfy工作流用下载插件用.json](docs/workflows/导入Comfy工作流用下载插件用.json) 导入 ComfyUI Manager 做基础依赖检查，再以插件管理页显示的缺失节点/模型为最终依据。
 
@@ -120,7 +131,7 @@ python -m pip install -r requirements.txt
 2. 安装 `requirements.txt`。
 3. 在 ComfyUI 中准备模型和缺失节点。
 4. 重载 AstrBot 插件。
-5. 设置 `comfyui_url`、绘图思考 Provider 和反推多模态 Provider。
+5. 设置 `comfyui_url` 和绘图思考 Provider；默认本地反推不需要视觉 Provider，只有 `vision/hybrid` 模式需要配置。
 6. 执行 `/anima ping`，再运行工作流依赖检查。
 7. 用低成本请求验收：
 
@@ -173,6 +184,18 @@ LLM 只提供创作计划、角色查询提示和候选 LoRA。插件会在本�
 
 在同一条消息发送图片，或回复一张图片后发送指令。`/改图` 是无蒙版整图重生成，不保证像素级保持；局部像素控制请使用 `/重绘` 和蒙版。
 
+默认本地反推配置：
+
+```text
+reverse_backend=workflow
+reverse_workflow_file=workflow/anima_reverse_tagger_api.json
+reverse_tagger_model=wd-convnext-tagger-v3.onnx
+reverse_general_threshold=0.55
+reverse_character_threshold=0.60
+reverse_categories=copyright,character,general
+reverse_session_method=CPU
+```
+
 ### 底图控制
 
 ```text
@@ -180,9 +203,10 @@ LLM 只提供创作计划、角色查询提示和候选 LoRA。插件会在本�
 /底图控制 构图和姿势不变 --m p d
 /底图控制 按线稿重新上色 --m l
 /底图控制 参考整体外观和配色 --m r
+/底图控制 姿势用图1，构图用图2，换成雨夜场景 --m p d --mode free
 ```
 
-`p / d / l / r` 分别代表 Pose、Depth、Lineart、Reference。Reference 不会因普通“构图不变”自动命中。
+`p / d / l / r` 分别代表 Pose、Depth、Lineart、Reference。Reference 不会因普通“构图不变”自动命中，也不承诺角色身份锁定；它只提供外观、画风或配色软影响。
 
 ## 多人语义换角
 

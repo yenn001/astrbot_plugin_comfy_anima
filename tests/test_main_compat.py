@@ -34,6 +34,8 @@ from ..services.lora_semantic import (
     semantic_source_fingerprint,
 )
 from ..services.reverse_prompt import ReversePromptResult
+from ..services.reverse_evidence import ReverseEvidence
+from ..services.reverse_workflow import ReverseWorkflowError
 
 
 class _DecoratorGroup:
@@ -423,13 +425,22 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(event.extras["enable_streaming"], False)
 
-    async def test_unrelated_chat_keeps_streaming_setting_untouched(self) -> None:
+    async def test_unrelated_chat_is_buffered_when_picture_protocol_is_enabled(self) -> None:
         plugin, _cleared = self._plugin()
         event = self._event("今天天气怎么样？")
 
         await plugin.buffer_chat_draw_protocol_response(event)
 
-        self.assertNotIn("enable_streaming", event.extras)
+        self.assertIs(event.extras["enable_streaming"], False)
+
+    async def test_disabled_terminal_repair_still_buffers_picture_protocol(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_chat_draw_terminal_guard = False
+        event = self._event("再出一遍 cos")
+
+        await plugin.buffer_chat_draw_protocol_response(event)
+
+        self.assertIs(event.extras["enable_streaming"], False)
 
     async def test_disabled_picture_trigger_never_starts_terminal_trace(self) -> None:
         plugin, _cleared = self._plugin()
@@ -2042,7 +2053,25 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "character_variant_unconfirmed")
 
-    def test_unverified_llm_character_declaration_fails_closed(self) -> None:
+    def test_director_invented_work_is_demoted_to_creative_description(self) -> None:
+        plugin, events = self._llm_character_validation_plugin()
+        prompt, _negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt="1girl, invented_person, portrait",
+                negative_prompt="",
+                character_queries=("Invented Person|Unknown Work",),
+                user_request="draw an invented person",
+                records=(),
+                source="test",
+            )
+        )
+        self.assertIn("invented_person", prompt)
+        self.assertTrue(
+            any("llm_character_advisory_unverified_kept" in event for event in events)
+        )
+
+    def test_user_explicit_unknown_work_still_fails_closed(self) -> None:
         plugin, _events = self._llm_character_validation_plugin()
         with self.assertRaises(CharacterPromptCompileError) as raised:
             asyncio.run(
@@ -2051,13 +2080,32 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     prompt="1girl, invented_person, portrait",
                     negative_prompt="",
                     character_queries=("Invented Person|Unknown Work",),
-                    user_request="画 Invented Person",
+                    user_request="draw 《Unknown Work》 character: Invented Person",
                     records=(),
                     source="test",
                 )
             )
-
         self.assertEqual(raised.exception.code, "character_resolution_unverified")
+
+    def test_unverified_bare_llm_character_declaration_is_kept_as_original(self) -> None:
+        plugin, events = self._llm_character_validation_plugin()
+        prompt, negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt="1girl, deepseek whale girl, blue hair, portrait",
+                negative_prompt="bad hands",
+                character_queries=("deepseek whale girl",),
+                user_request="deepseek personification in a bedroom",
+                records=(),
+                source="test",
+            )
+        )
+
+        self.assertIn("deepseek whale girl", prompt)
+        self.assertEqual(negative, "bad hands")
+        self.assertTrue(
+            any("llm_character_advisory_unverified_kept" in event for event in events)
+        )
 
     def test_gallery_exact_authorizes_locally_missing_unique_current_character_lora(
         self,
@@ -2387,7 +2435,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                         prompt="1girl, viola, maid, selfie",
                         negative_prompt="",
                         character_queries=("Viola|BanG Dream!",),
-                        user_request="draw Viola",
+                        user_request="draw Viola from BanG Dream!",
                         records=records,
                         source="test",
                     )
@@ -3826,7 +3874,7 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 object(),
                 self.main.GenerationOptions(
                     prompt="换成红色晚礼服，构图不变",
-                    control_modes=("pose", "depth"),
+                    control_modes=("pose", "reference"),
                 ),
             )
 
@@ -8441,6 +8489,132 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-seed-value", serialized)
         self.assertNotIn("private-character-term", serialized)
         self.assertIn("prompt_lab_candidates_ready", serialized)
+
+
+class V210ReverseAndControlIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _settings(**overrides):
+        values = {
+            "enable_reverse_prompt": True,
+            "reverse_backend": "workflow",
+            "enable_control_stack_v2": True,
+            "control_default_fidelity": "balanced",
+            "control_default_resize_policy": "fit",
+            "control_default_reference_scope": "appearance",
+            "default_generation_pipeline": "base",
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    async def test_workflow_reverse_never_calls_vision_service(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+
+        class WorkflowReverse:
+            @staticmethod
+            async def reverse(_path):
+                return ReverseEvidence.flat_tagger(
+                    r"1girl, rio_\(blue_archive\)",
+                    backend="workflow:wd_tagger_mira",
+                )
+
+        class VisionReverse:
+            @staticmethod
+            async def reverse(*_args, **_kwargs):
+                raise AssertionError("workflow backend must not call vision")
+
+        plugin._workflow_reverse = WorkflowReverse()
+        plugin._reverse_prompt = VisionReverse()
+        result, provider = await plugin._call_reverse_prompt(
+            object(), object(), Path("input.png")
+        )
+
+        self.assertEqual(provider, "workflow:wd_tagger_mira")
+        self.assertFalse(result.confidence_available)
+
+    async def test_workflow_failure_is_closed_without_vision_fallback(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+        called = 0
+
+        class WorkflowReverse:
+            @staticmethod
+            async def reverse(_path):
+                raise ReverseWorkflowError("tagger output is empty", code="empty_tags")
+
+        class VisionReverse:
+            @staticmethod
+            async def reverse(*_args, **_kwargs):
+                nonlocal called
+                called += 1
+
+        plugin._workflow_reverse = WorkflowReverse()
+        plugin._reverse_prompt = VisionReverse()
+        with self.assertRaises(self.main.ReversePromptError) as raised:
+            await plugin._call_reverse_prompt(object(), object(), Path("input.png"))
+
+        self.assertEqual(raised.exception.code, "workflow_empty_tags")
+        self.assertEqual(called, 0)
+
+    async def test_hybrid_is_the_only_mode_that_falls_back_to_vision(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings(
+            reverse_backend="hybrid",
+            enable_llm_pic_trigger=False,
+        )
+        plugin._internal_llm_events = set()
+
+        class WorkflowReverse:
+            @staticmethod
+            async def reverse(_path):
+                raise ReverseWorkflowError("tagger timed out", code="timeout")
+
+        class VisionReverse:
+            @staticmethod
+            async def reverse(*_args, **_kwargs):
+                return ReversePromptResult("1girl, solo"), "vision-provider"
+
+        plugin._workflow_reverse = WorkflowReverse()
+        plugin._reverse_prompt = VisionReverse()
+        _result, provider = await plugin._call_reverse_prompt(
+            object(), object(), Path("input.png")
+        )
+
+        self.assertEqual(provider, "vision-provider")
+
+    def test_dual_image_natural_binding_builds_independent_channels(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+        plan = plugin._make_control_plan(
+            self.main.GenerationOptions(
+                prompt="姿势用图1，构图用图2",
+                control_modes=("pose", "depth"),
+                pipeline="base",
+            ),
+            image_count=2,
+        )
+
+        self.assertEqual(
+            [(channel.mode, channel.source_index) for channel in plan.channels],
+            [("pose", 1), ("depth", 2)],
+        )
+
+    def test_dual_image_ambiguous_binding_stops_before_submission(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+        with self.assertRaisesRegex(ValueError, "未明确绑定"):
+            plugin._make_control_plan(
+                self.main.GenerationOptions(
+                    prompt="保持姿势和构图",
+                    control_modes=("pose", "depth"),
+                ),
+                image_count=2,
+            )
 
 
 if __name__ == "__main__":

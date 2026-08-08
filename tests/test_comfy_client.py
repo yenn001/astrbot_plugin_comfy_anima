@@ -34,6 +34,26 @@ class ComfyClientTests(unittest.TestCase):
         self.assertEqual(images[0].filename, "final.png")
         self.assertEqual(images[0].node_id, "285")
 
+    def test_extract_text_prefers_declared_node_and_bounds_output(self) -> None:
+        outputs = {
+            "1": {"text": "fallback"},
+            "2": {"ui": {"text": ["preferred", "tags"]}},
+        }
+
+        text = ComfyClient.extract_text(outputs, ["2", "1"], max_chars=12)
+
+        self.assertEqual(text, "preferred\nta")
+
+    def test_extract_text_rejects_non_text_output_shapes(self) -> None:
+        self.assertEqual(
+            ComfyClient.extract_text(
+                {"1": {"text": [{"unsafe": "object"}]}},
+                ["1"],
+                max_chars=100,
+            ),
+            "",
+        )
+
 
 class _ChunkedContent:
     def __init__(self, chunks: tuple[bytes, ...]) -> None:

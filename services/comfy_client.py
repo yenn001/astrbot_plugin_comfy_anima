@@ -307,6 +307,15 @@ class ComfyClient:
         self, prompt_id: str, preferred_node_ids: list[str]
     ) -> list[ImageReference]:
         """轮询历史记录直到生成完成并返回图片引用。"""
+        outputs = await self.wait_for_history(prompt_id)
+        images = self.extract_images(outputs, preferred_node_ids)
+        if images:
+            return images
+        raise ComfyClientError("任务已结束，但历史记录中没有图片输出")
+
+    async def wait_for_history(self, prompt_id: str) -> dict[str, Any]:
+        """Wait for one completed prompt and return its output map."""
+
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._settings.generation_timeout
         while loop.time() < deadline:
@@ -323,14 +332,29 @@ class ComfyClient:
                     )
                 outputs = history.get("outputs", {})
                 if isinstance(outputs, dict):
-                    images = self.extract_images(outputs, preferred_node_ids)
-                    if images:
-                        return images
-                raise ComfyClientError("任务已结束，但历史记录中没有图片输出")
+                    return outputs
+                raise ComfyClientError("任务已结束，但历史记录没有有效 outputs")
             await asyncio.sleep(self._settings.poll_interval)
         raise ComfyClientError(
             f"生成超过 {self._settings.generation_timeout} 秒，已停止等待"
         )
+
+    async def wait_for_text_output(
+        self,
+        prompt_id: str,
+        preferred_node_ids: list[str],
+        *,
+        max_chars: int = 12000,
+    ) -> str:
+        """Wait for a text-only workflow without treating it as image output."""
+
+        if not 1 <= max_chars <= 65536:
+            raise ValueError("max_chars must be between 1 and 65536")
+        outputs = await self.wait_for_history(prompt_id)
+        text = self.extract_text(outputs, preferred_node_ids, max_chars=max_chars)
+        if text:
+            return text
+        raise ComfyClientError("任务已结束，但历史记录中没有文本输出")
 
     @staticmethod
     def extract_images(
@@ -361,6 +385,45 @@ class ComfyClient:
             if result:
                 return result
         return []
+
+    @staticmethod
+    def extract_text(
+        outputs: dict[str, Any],
+        preferred_node_ids: list[str],
+        *,
+        max_chars: int,
+    ) -> str:
+        """Extract text from known ComfyUI output fields in deterministic order."""
+
+        ordered_ids = list(dict.fromkeys(str(item) for item in preferred_node_ids))
+        ordered_ids.extend(node_id for node_id in outputs if node_id not in ordered_ids)
+        for node_id in ordered_ids:
+            node_output = outputs.get(node_id)
+            if not isinstance(node_output, dict):
+                continue
+            candidates: list[Any] = []
+            for key in ("text", "strings", "result"):
+                value = node_output.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+                elif isinstance(value, list):
+                    candidates.extend(value)
+            ui = node_output.get("ui")
+            if isinstance(ui, dict):
+                for key in ("text", "strings"):
+                    value = ui.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+                    elif isinstance(value, list):
+                        candidates.extend(value)
+            pieces = [
+                str(value).strip()
+                for value in candidates
+                if isinstance(value, (str, int, float)) and str(value).strip()
+            ]
+            if pieces:
+                return "\n".join(pieces)[:max_chars]
+        return ""
 
     async def download_image(self, image: ImageReference, target_dir: Path) -> Path:
         """下载单张图片到安全的临时目录。"""

@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v2.0.3
+AstrBot Comfy Anima 插件 v2.1.0
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v2.0.3
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 2.0.3
-日期: 2026-08-06
+版本: 2.1.0
+日期: 2026-08-08
 """
 
 import asyncio
@@ -102,6 +102,7 @@ from .services.character_identity import (
     resolve_user_adjacent_character_alias,
 )
 from .services.character_prompt_compiler import (
+    CharacterIdentityClaim,
     CharacterPromptCompileError,
     CharacterPromptEvidence,
     compile_character_prompt,
@@ -112,6 +113,11 @@ from .services.control_modes import (
     extract_command_control_modes,
     extract_natural_control_modes,
     looks_like_control_request,
+)
+from .services.control_plan import (
+    ControlChannel,
+    ControlPlan,
+    ControlPlanError,
 )
 from .services.danbooru_index import (
     DanbooruIndexError,
@@ -224,8 +230,14 @@ from .services.prompt_plans import (
 from .services.plugin_page import PluginPageApi
 from .services.reverse_prompt import (
     ReversePromptError,
+    ReversePromptResult,
     ReversePromptService,
     parse_json_object_with_strategy,
+)
+from .services.reverse_workflow import (
+    ReverseWorkflowBuilder,
+    ReverseWorkflowError,
+    WorkflowReverseService,
 )
 from .services.subject_slots import (
     ObservedSubject,
@@ -397,6 +409,15 @@ WEB_UI_EDITABLE_FIELDS = (
     "enable_llm_pic_trigger",
     "enable_chat_draw_terminal_guard",
     "enable_reverse_prompt",
+    "enable_workflow_reverse",
+    "reverse_backend",
+    "reverse_workflow_file",
+    "reverse_workflow_timeout",
+    "reverse_tagger_model",
+    "reverse_general_threshold",
+    "reverse_character_threshold",
+    "reverse_categories",
+    "reverse_session_method",
     "enable_reverse_json_formatter",
     "enable_reverse_json_repair_retry",
     "reverse_prompt_provider_id",
@@ -404,6 +425,10 @@ WEB_UI_EDITABLE_FIELDS = (
     "reverse_prompt_temperature",
     "reverse_prompt_max_tokens",
     "reverse_prompt_system_prompt",
+    "enable_control_stack_v2",
+    "control_default_fidelity",
+    "control_default_resize_policy",
+    "control_default_reference_scope",
     "max_input_image_size_mb",
     "max_input_image_pixels",
     "auto_draw_system_prompt",
@@ -705,6 +730,8 @@ class ComfyAnimaPlugin(Star):
             if self.settings.enable_reverse_prompt
             else None
         )
+        self._workflow_reverse: Optional[WorkflowReverseService] = None
+        self._workflow_reverse_error = ""
         self._upscale_workflow_builder: Optional[ImageWorkflowBuilder] = None
         self._control_workflow_builder: Optional[ControlWorkflowBuilder] = None
         self._control_initialization_error = ""
@@ -901,6 +928,23 @@ class ComfyAnimaPlugin(Star):
             self._client = None
             self._initialization_error = str(exc)
             logger.error(f"[{PLUGIN_NAME}] ComfyUI 客户端初始化失败: {exc}", exc_info=True)
+
+        if self.settings.enable_workflow_reverse and self._client is not None:
+            try:
+                reverse_builder = ReverseWorkflowBuilder(
+                    self.settings.resolve_reverse_workflow_path(self.plugin_dir),
+                    self.settings,
+                )
+                self._workflow_reverse = WorkflowReverseService(
+                    self._client,
+                    reverse_builder,
+                    self.settings,
+                )
+            except (OSError, ValueError, ReverseWorkflowError) as exc:
+                self._workflow_reverse_error = str(exc)
+                logger.warning(
+                    f"[{PLUGIN_NAME}] local reverse workflow unavailable: {exc}"
+                )
 
         try:
             workflow_path = self.settings.resolve_workflow_path(self.plugin_dir)
@@ -1623,27 +1667,22 @@ class ComfyAnimaPlugin(Star):
     ) -> None:
         """Buffer ordinary Agent output so terminal controls can be validated."""
 
-        if not self._chat_draw_terminal_guard_enabled():
-            return
-        message = str(getattr(event, "message_str", "") or "")
-        if not (
-            looks_like_conversation_draw_intent(message)
-            or re.search(
-                r"\b(?:lora|danbooru|prompt\s*plan)\b|风格|方案|标签|触发词",
-                message,
-                flags=re.IGNORECASE,
-            )
-        ):
+        if not self._chat_draw_protocol_buffering_enabled():
             return
         setter = getattr(event, "set_extra", None)
         if callable(setter):
-            # AstrBot reads this before it builds ToolLoopAgentRunner.  Without
-            # full buffering, streaming chunks may expose bare tags before
-            # ``on_agent_done`` can repair or reject the terminal protocol.
+            # A response can emit ``<pic>`` even when the message intent is a
+            # short continuation such as “draw it again”. Transport controls
+            # must never rely on a lexical classifier to remain invisible.
             setter("enable_streaming", False)
 
+    def _chat_draw_protocol_buffering_enabled(self) -> bool:
+        """Return whether ordinary-chat picture controls require safe transport."""
+
+        return bool(getattr(self.settings, "enable_llm_pic_trigger", False))
+
     def _chat_draw_terminal_guard_enabled(self) -> bool:
-        """Use one switch boundary for buffering, tracing, repair and rendering."""
+        """Return whether optional terminal tracing and repair are enabled."""
 
         return bool(
             getattr(self.settings, "enable_llm_pic_trigger", False)
@@ -3681,8 +3720,8 @@ class ComfyAnimaPlugin(Star):
         supplement = self._extract_command_text(
             event.message_str, focus, command="反推"
         )
-        if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
-            yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
+        if not self._reverse_backend_ready():
+            yield event.plain_result(f"{MessageEmoji.ERROR} 当前反推后端未就绪")
             return
         access_error = self._access_error(event, supplement, check_sensitive=bool(supplement))
         if access_error:
@@ -3701,7 +3740,7 @@ class ComfyAnimaPlugin(Star):
                 self._record_image_task_phase(
                     job,
                     "input",
-                    "输入图片校验完成，准备调用多模态 Provider。",
+                    "输入图片校验完成，准备调用已选择的反推后端。",
                     "reverse_input_ready",
                     details={"bytes": image_path.stat().st_size},
                 )
@@ -3709,7 +3748,7 @@ class ComfyAnimaPlugin(Star):
                 self._record_image_task_phase(
                     job,
                     "provider",
-                    "正在调用所选多模态 Provider 提取结构化画面事实。",
+                    "正在提取规范化画面 Tags。",
                     "reverse_provider_started",
                 )
 
@@ -3731,19 +3770,26 @@ class ComfyAnimaPlugin(Star):
                         ),
                     )
 
-                async with self._provider_slot():
-                    result, provider_id = await self._call_reverse_prompt(
-                        self.context,
-                        event,
-                        image_path,
-                        supplement,
-                        reverse_progress,
-                    )
+                reverse_call = self._call_reverse_prompt(
+                    self.context,
+                    event,
+                    image_path,
+                    supplement,
+                    reverse_progress,
+                )
+                reverse_backend = str(
+                    getattr(self.settings, "reverse_backend", "vision")
+                ).casefold()
+                if reverse_backend == "workflow":
+                    result, provider_id = await reverse_call
+                else:
+                    async with self._provider_slot():
+                        result, provider_id = await reverse_call
                 job.state = "completed"
                 self._record_image_task_phase(
                     job,
                     "provider",
-                    "多模态反推完成，结构化结果已通过校验。",
+                    "反推完成，规范化结果已通过校验。",
                     "reverse_provider_completed",
                     details={"provider_id": provider_id},
                 )
@@ -3752,7 +3798,7 @@ class ComfyAnimaPlugin(Star):
                 if image_path is not None:
                     image_path.unlink(missing_ok=True)
 
-        yield event.plain_result(f"{MessageEmoji.INFO} 正在读取图片并调用多模态模型反推……")
+        yield event.plain_result(f"{MessageEmoji.INFO} 正在读取图片并调用反推后端……")
         try:
             result, provider_id, elapsed = await self._run_auxiliary_job(
                 event,
@@ -3875,13 +3921,13 @@ class ComfyAnimaPlugin(Star):
             f"[{PLUGIN_NAME}] reverse draw control modes parsed: "
             f"modes={list(control_modes)}, source={control_mode_source}"
         )
-        if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
-            yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
+        if not self._reverse_backend_ready():
+            yield event.plain_result(f"{MessageEmoji.ERROR} 当前反推后端未就绪")
             return
         if (
             not self._client
             or (not self._workflow_builder and not self._pipeline_builders)
-            or not self._director
+            or (bool(reverse_requirement) and not self._director)
             or (bool(control_modes) and not self._control_workflow_builder)
             or (
                 not control_modes
@@ -3964,52 +4010,73 @@ class ComfyAnimaPlugin(Star):
                         ),
                     )
 
-                async with self._provider_slot():
-                    reverse_result, reverse_provider = await self._timed_llm_call(
-                        job,
-                        self._call_reverse_prompt(
-                            self.context,
-                            event,
-                            image_path,
-                            reverse_requirement,
-                            reverse_progress,
-                        ),
-                    )
-                job.state = "directing"
-                self._record_image_task_phase(
-                    job,
-                    "director",
-                    "反推结果已就绪，正在由绘图导演整理 Anima 提示词。",
-                    "reverse_draw_director_started",
-                    details={"reverse_provider_id": reverse_provider},
+                reverse_call = self._call_reverse_prompt(
+                    self.context,
+                    event,
+                    image_path,
+                    reverse_requirement,
+                    reverse_progress,
                 )
-                if control_modes:
-                    director_request = reverse_result.control_generation_request(
-                        reverse_requirement,
-                        control_modes,
-                        parsed_options.semantic_redraw_mode or "balanced",
+                reverse_backend = str(
+                    getattr(self.settings, "reverse_backend", "vision")
+                ).casefold()
+                if reverse_backend == "workflow":
+                    reverse_result, reverse_provider = await reverse_call
+                else:
+                    async with self._provider_slot():
+                        reverse_result, reverse_provider = await self._timed_llm_call(
+                            job, reverse_call
+                        )
+                if not reverse_requirement:
+                    instruction = PictureInstruction(
+                        reverse_result.positive_tags,
+                        "",
+                        parsed_options.pipeline,
                     )
-                elif parsed_options.semantic_redraw_mode:
-                    director_request = reverse_result.semantic_redraw_request(
-                        reverse_requirement,
-                        parsed_options.semantic_redraw_mode,
+                    director_provider = ""
+                    self._record_image_task_phase(
+                        job,
+                        "director",
+                        "未提供修改要求，规范化 Tags 已直接进入 Anima。",
+                        "reverse_draw_direct_passthrough",
+                        details={"reverse_backend": reverse_provider},
                     )
                 else:
-                    director_request = reverse_result.drawing_request(
-                        reverse_requirement
+                    job.state = "directing"
+                    self._record_image_task_phase(
+                        job,
+                        "director",
+                        "反推结果已就绪，正在由绘图导演整理 Anima 提示词。",
+                        "reverse_draw_director_started",
+                        details={"reverse_provider_id": reverse_provider},
                     )
-                instruction, director_provider = await self._timed_llm_call(
-                    job,
-                    self._generate_directed_instruction(
-                        event,
-                        director_request,
-                        task_kind=(
-                            TASK_CONTROL_DRAW
-                            if control_modes
-                            else TASK_REVERSE_DRAW
+                    if control_modes:
+                        director_request = reverse_result.control_generation_request(
+                            reverse_requirement,
+                            control_modes,
+                            parsed_options.semantic_redraw_mode or "balanced",
+                        )
+                    elif parsed_options.semantic_redraw_mode:
+                        director_request = reverse_result.semantic_redraw_request(
+                            reverse_requirement,
+                            parsed_options.semantic_redraw_mode,
+                        )
+                    else:
+                        director_request = reverse_result.drawing_request(
+                            reverse_requirement
+                        )
+                    instruction, director_provider = await self._timed_llm_call(
+                        job,
+                        self._generate_directed_instruction(
+                            event,
+                            director_request,
+                            task_kind=(
+                                TASK_CONTROL_DRAW
+                                if control_modes
+                                else TASK_REVERSE_DRAW
+                            ),
                         ),
-                    ),
-                )
+                    )
                 final_prompt = instruction.prompt
                 directed_negative = instruction.negative_prompt
                 final_access_error = self._access_error(event, final_prompt)
@@ -4320,8 +4387,8 @@ class ComfyAnimaPlugin(Star):
         if mode not in {"preserve", "balanced", "free"}:
             yield event.plain_result(f"{MessageEmoji.ERROR} 未知整图重绘模式: {mode}")
             return
-        if not self.settings.enable_reverse_prompt or self._reverse_prompt is None:
-            yield event.plain_result(f"{MessageEmoji.ERROR} 在线反推功能未启用")
+        if not self._reverse_backend_ready():
+            yield event.plain_result(f"{MessageEmoji.ERROR} 当前反推后端未就绪")
             return
         if (
             not self._client
@@ -6485,6 +6552,39 @@ QQ快捷指令:
         return name.strip(), work.strip() if separator else ""
 
     @staticmethod
+    def _character_identity_claim(
+        name: str,
+        work: str,
+        user_request: str,
+    ) -> CharacterIdentityClaim:
+        """Keep director guesses advisory unless the user made an exact claim."""
+
+        request = unicodedata.normalize("NFKC", str(user_request or "")).casefold()
+        strip_pattern = r"[\s_\-:：,，。.!！?？()（）《》「」『』]+"
+        compact = re.sub(strip_pattern, "", request)
+        name_key = re.sub(strip_pattern, "", name.casefold())
+        work_key = re.sub(strip_pattern, "", work.casefold())
+        explicit_cue = bool(
+            re.search(
+                r"(?:目标角色|角色(?:名)?\s*[:：]|把.+?(?:换成|替换为)|"
+                r"《[^》]+》|(?:来自|出自|from)\s*[^,，。]+)",
+                request,
+                flags=re.IGNORECASE,
+            )
+        )
+        strict = bool(
+            work
+            and explicit_cue
+            and ((name_key and name_key in compact) or (work_key and work_key in compact))
+        )
+        return CharacterIdentityClaim(
+            name=name,
+            work=work,
+            source="user_exact" if strict else "director_candidate",
+            strict=strict,
+        )
+
+    @staticmethod
     def _split_declared_character_aliases(value: str) -> tuple[str, tuple[str, ...]]:
         """Split a bounded adjacent ASCII alias embedded in ``characters``."""
 
@@ -7057,10 +7157,16 @@ QQ快捷指令:
                 prompt_copyright_terms.append((term, canonical))
 
         resolution_inputs: list[tuple[str, str, str, tuple[str, ...]]] = []
+        claims_by_raw: dict[str, CharacterIdentityClaim] = {}
         for raw in declared_queries:
             name, work = self._split_character_query_hint(raw)
             name, declared_aliases = self._split_declared_character_aliases(name)
             if name:
+                claims_by_raw[raw] = self._character_identity_claim(
+                    name,
+                    work,
+                    user_request,
+                )
                 resolution_inputs.append((raw, name, work, declared_aliases))
         declared_keys = {
             (normalize_tag(name), normalize_tag(work))
@@ -7416,6 +7522,25 @@ QQ快捷指令:
                     details={"candidate_count": resolution.candidate_count},
                 )
             if not resolution.verified:
+                claim = claims_by_raw.get(raw)
+                if claim is not None and not claim.strict:
+                    # ``characters`` is a drawing-director discovery hint. A
+                    # bare unknown name can be an original character or an
+                    # internet personification, not a failed real identity.
+                    self._record_image_task_phase(
+                        job,
+                        "character_validation",
+                        "LLM 角色候选无法 exact 确认；已按原创/拟人描述保留，不加载角色 LoRA。",
+                        "llm_character_advisory_unverified_kept",
+                        level="WARNING",
+                        details={
+                            "query_length": len(name),
+                            "claim_source": "creative_fallback",
+                            "discarded_work_hint": bool(explicit_work),
+                            "source": source or "unknown",
+                        },
+                    )
+                    continue
                 raise CharacterPromptCompileError(
                     f"无法通过本地 Danbooru 或当前唯一角色 LoRA + Gallery exact 确认角色“{name}”",
                     code="character_resolution_unverified",
@@ -7560,6 +7685,15 @@ QQ快捷指令:
                 "dropped_relation_count": len(compilation.dropped_relation_terms),
                 "override_categories": list(compilation.override_categories),
                 "appearance_sources": list(compilation.appearance_sources),
+                "identity_outcomes": [
+                    (
+                        "lora_bound"
+                        if normalize_tag(canonical)
+                        in job.llm_external_character_authorities
+                        else "exact"
+                    )
+                    for canonical in compilation.canonical_tags
+                ],
             },
         )
         return await finish_with_revision_guard(
@@ -8920,12 +9054,9 @@ QQ快捷指令:
                 positive_prompt = request.tags.strip()
                 negative_prompt = request.negative_prompt.strip(" ,")
                 if not positive_prompt:
-                    if (
-                        not self.settings.enable_reverse_prompt
-                        or self._reverse_prompt is None
-                    ):
+                    if not self._reverse_backend_ready():
                         raise CharacterSwapError(
-                            "图片语义换角需要先启用在线反推功能",
+                            "图片语义换角需要先启用可用的反推后端",
                             code="reverse_prompt_disabled",
                         )
                     job.state = "reading_image"
@@ -10234,6 +10365,39 @@ QQ快捷指令:
             counts.pop(event_key, None)
         internal_events.discard(event_key)
 
+    def _reverse_backend_ready(self) -> bool:
+        """Return whether the explicitly selected reverse backend can run."""
+
+        if not bool(getattr(self.settings, "enable_reverse_prompt", True)):
+            return False
+        backend = str(getattr(self.settings, "reverse_backend", "vision")).casefold()
+        if backend == "workflow":
+            return getattr(self, "_workflow_reverse", None) is not None
+        if backend == "hybrid":
+            return (
+                getattr(self, "_workflow_reverse", None) is not None
+                or getattr(self, "_reverse_prompt", None) is not None
+            )
+        return getattr(self, "_reverse_prompt", None) is not None
+
+    @staticmethod
+    def _flat_tags_require_spatial_binding(tags: str) -> bool:
+        """Detect flat Tagger output that cannot identify one unique subject."""
+
+        normalized = str(tags or "").casefold().replace("\\(", "(")
+        terms = {
+            term.strip().replace(" ", "_")
+            for term in normalized.split(",")
+            if term.strip()
+        }
+        if "1girl" in terms and "1boy" in terms:
+            return True
+        return any(
+            re.fullmatch(r"(?:[2-9]|[1-9]\d+)(?:girls|boys|others)", term)
+            or term in {"multiple_girls", "multiple_boys", "group", "crowd"}
+            for term in terms
+        )
+
     async def _call_reverse_prompt(
         self,
         context: Any,
@@ -10243,10 +10407,55 @@ QQ快捷指令:
         progress: Any = None,
         profile: str = "full",
     ) -> tuple[Any, str]:
-        """Run the complete reverse call and repair window as internal LLM work."""
+        """Dispatch reverse inference without silent backend substitution."""
+
+        backend = str(getattr(self.settings, "reverse_backend", "vision")).casefold()
+        if backend in {"workflow", "hybrid"}:
+            if self._workflow_reverse is not None:
+                try:
+                    evidence = await self._workflow_reverse.reverse(image_path)
+                    if profile == "swap" and self._flat_tags_require_spatial_binding(
+                        evidence.flat_tags
+                    ):
+                        raise ReversePromptError(
+                            "本地 Tagger 检测到多人或混合性别，但不能绑定人物位置；请明确切换 vision 后端后再换角",
+                            code="workflow_spatial_binding_unavailable",
+                        )
+                    if progress is not None:
+                        progress(
+                            "本地 Mira WD Tagger 已返回可用 Tags。",
+                            "workflow_reverse_ready",
+                            {"backend": evidence.source_backend},
+                        )
+                    return (
+                        ReversePromptResult(
+                            positive_tags=evidence.flat_tags,
+                            confidence=0.0,
+                            confidence_available=False,
+                        ),
+                        evidence.source_backend,
+                    )
+                except ReversePromptError:
+                    raise
+                except ReverseWorkflowError as exc:
+                    if backend == "workflow":
+                        raise ReversePromptError(
+                            exc.user_message,
+                            code=f"workflow_{exc.code}",
+                        ) from exc
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] workflow reverse failed; explicit hybrid fallback: "
+                        f"code={exc.code}"
+                    )
+            elif backend == "workflow":
+                raise ReversePromptError(
+                    "本地反推工作流未就绪: "
+                    + (self._workflow_reverse_error or "功能未启用或依赖缺失"),
+                    code="workflow_reverse_unavailable",
+                )
 
         if self._reverse_prompt is None:
-            raise ReversePromptError("在线反推功能未启用", code="reverse_disabled")
+            raise ReversePromptError("视觉反推功能未启用", code="reverse_disabled")
         async with self._internal_llm_request_scope(event):
             return await self._reverse_prompt.reverse(
                 context,
@@ -11623,6 +11832,18 @@ QQ快捷指令:
         )
         pipeline_rows.append(
             {
+                "id": "reverse_workflow",
+                "role": "analysis",
+                "ready": self._workflow_reverse is not None,
+                "default": settings.reverse_backend == "workflow",
+                "profile_id": "anima_reverse_tagger",
+                "display_name": "本地 Mira WD Tagger 反推",
+                "error": self._workflow_reverse_error,
+                "model": settings.reverse_tagger_model,
+            }
+        )
+        pipeline_rows.append(
+            {
                 "id": "control",
                 "role": "control_generation",
                 "ready": self._control_workflow_builder is not None,
@@ -11748,6 +11969,29 @@ QQ快捷指令:
                 "enable_natural_draw": settings.enable_natural_draw,
                 "enable_llm_pic_trigger": settings.enable_llm_pic_trigger,
                 "enable_reverse_prompt": settings.enable_reverse_prompt,
+                "enable_workflow_reverse": settings.enable_workflow_reverse,
+                "reverse_backend": settings.reverse_backend,
+                "reverse_workflow_file": settings.reverse_workflow_file,
+                "reverse_workflow_timeout": settings.reverse_workflow_timeout,
+                "reverse_tagger_model": settings.reverse_tagger_model,
+                "reverse_general_threshold": (
+                    settings.reverse_general_threshold
+                ),
+                "reverse_character_threshold": (
+                    settings.reverse_character_threshold
+                ),
+                "reverse_categories": ",".join(
+                    settings.reverse_categories
+                ),
+                "reverse_session_method": settings.reverse_session_method,
+                "enable_control_stack_v2": settings.enable_control_stack_v2,
+                "control_default_fidelity": settings.control_default_fidelity,
+                "control_default_resize_policy": (
+                    settings.control_default_resize_policy
+                ),
+                "control_default_reference_scope": (
+                    settings.control_default_reference_scope
+                ),
                 "enable_reverse_json_formatter": (
                     settings.enable_reverse_json_formatter
                 ),
@@ -17012,20 +17256,121 @@ QQ快捷指令:
             if source is not None:
                 source.unlink(missing_ok=True)
 
+    def _make_control_plan(
+        self,
+        options: GenerationOptions,
+        *,
+        image_count: int,
+    ) -> ControlPlan:
+        """Build one deterministic legacy-or-dual-image control plan."""
+
+        if image_count not in {1, 2}:
+            raise ControlPlanError("底图控制需要一张或两张不同图片")
+        prompt = str(options.prompt or "")
+        aliases = {
+            "pose": ("pose", "姿势", "动作"),
+            "depth": ("depth", "深度", "构图", "空间"),
+            "lineart": ("lineart", "线稿", "轮廓", "上色"),
+            "reference": ("reference", "参考", "画风", "风格", "配色"),
+        }
+        source_by_mode: dict[str, int] = {}
+        for mode in options.control_modes:
+            for alias in aliases[mode]:
+                escaped = re.escape(alias)
+                patterns = (
+                    rf"{escaped}\s*(?:使用|用|来自|取自|采用)?\s*(?:第\s*)?([12])\s*(?:张)?\s*图",
+                    rf"{escaped}\s*(?:使用|用|来自|取自|采用)?\s*图\s*([12])",
+                    rf"(?:第\s*)?([12])\s*(?:张)?\s*图\s*(?:用于|用作|作为|控制)?\s*{escaped}",
+                    rf"图\s*([12])\s*(?:用于|用作|作为|控制)?\s*{escaped}",
+                )
+                matches = {
+                    int(match.group(1))
+                    for pattern in patterns
+                    for match in re.finditer(pattern, prompt, flags=re.IGNORECASE)
+                }
+                if len(matches) > 1:
+                    raise ControlPlanError(f"{mode} 同时绑定了图1和图2")
+                if matches:
+                    source_by_mode[mode] = next(iter(matches))
+                    break
+
+        if image_count == 2:
+            missing = [mode for mode in options.control_modes if mode not in source_by_mode]
+            if missing:
+                raise ControlPlanError(
+                    "检测到两张底图，但以下通道未明确绑定来源："
+                    + ", ".join(missing)
+                    + "。请写成“姿势用图1，构图用图2”；当前仅生成计划，不提交 ComfyUI"
+                )
+        else:
+            source_by_mode = {mode: 1 for mode in options.control_modes}
+
+        fidelity = str(
+            getattr(self.settings, "control_default_fidelity", "balanced")
+        ).casefold()
+        if re.search(r"严格|高保真|强约束|strict", prompt, flags=re.IGNORECASE):
+            fidelity = "strict"
+        elif re.search(r"宽松|弱约束|loose", prompt, flags=re.IGNORECASE):
+            fidelity = "loose"
+        content_mode = str(options.semantic_redraw_mode or "balanced").casefold()
+        pipeline = self._resolve_generation_pipeline(options)
+        channels = []
+        resize_policy = str(
+            getattr(self.settings, "control_default_resize_policy", "fit")
+        ).casefold()
+        for mode in options.control_modes:
+            reference_scope = str(
+                getattr(
+                    self.settings,
+                    "control_default_reference_scope",
+                    "appearance",
+                )
+            ).casefold()
+            if mode == "reference":
+                if re.search(r"配色|色彩|color", prompt, flags=re.IGNORECASE):
+                    reference_scope = "color"
+                elif re.search(r"画风|风格|style", prompt, flags=re.IGNORECASE):
+                    reference_scope = "style"
+            channels.append(
+                ControlChannel(
+                    mode,
+                    source_index=source_by_mode.get(mode, 1),
+                    resize_policy=resize_policy,
+                    reference_scope=reference_scope,
+                )
+            )
+        return ControlPlan(
+            channels=tuple(channels),
+            fidelity=fidelity,
+            content_mode=content_mode,
+            pipeline=pipeline,
+        )
+
     async def _execute_control_job(
         self,
         job: GenerationJob,
         event: AstrMessageEvent,
         options: GenerationOptions,
     ) -> tuple[list[Path], int, str, str, Optional[str]]:
-        """Upload one source image, preserve its aspect ratio, then generate."""
+        """Upload up to two sources once and execute one deterministic control plan."""
 
         assert self._client is not None
-        source: Optional[Path] = None
-        upload_task: Optional[asyncio.Task[Any]] = None
+        sources: list[Path] = []
+        upload_tasks: list[asyncio.Task[Any]] = []
         try:
             job.state = "reading_image"
-            source = await self._image_input.collect_one(event)
+            collect_two = (
+                getattr(self._image_input, "collect_up_to_two", None)
+                if bool(getattr(self.settings, "enable_control_stack_v2", True))
+                else None
+            )
+            sources = (
+                await collect_two(event)
+                if callable(collect_two)
+                else [await self._image_input.collect_one(event)]
+            )
+            plan = self._make_control_plan(options, image_count=len(sources))
+            source = sources[0]
 
             def source_size() -> tuple[int, int]:
                 assert source is not None
@@ -17051,6 +17396,10 @@ QQ快捷指令:
                     "target_width": width,
                     "target_height": height,
                     "control_modes": list(options.control_modes),
+                    "image_count": len(sources),
+                    "channel_sources": {
+                        channel.mode: channel.source_index for channel in plan.channels
+                    },
                 },
             )
             use_llm = (
@@ -17062,17 +17411,24 @@ QQ快捷指令:
                 options,
                 width=width,
                 height=height,
+                pipeline=plan.pipeline,
                 suppress_default_style=(
                     options.suppress_default_style or not bool(options.lora_preset)
                 ),
             )
             if self._parallel_preflight_enabled():
-                upload_task = asyncio.create_task(self._client.upload_image(source))
-            if (
+                upload_tasks = [
+                    asyncio.create_task(self._client.upload_image(path))
+                    for path in sources
+                ]
+            structure_only = set(options.control_modes).issubset({"pose", "depth"})
+            should_reverse = (
                 use_llm
-                and self.settings.enable_reverse_prompt
-                and self._reverse_prompt is not None
-            ):
+                and self._reverse_backend_ready()
+                and plan.content_mode in {"preserve", "balanced"}
+                and not structure_only
+            )
+            if should_reverse:
                 job.state = "reverse_prompting"
                 self._record_image_task_phase(
                     job,
@@ -17100,20 +17456,26 @@ QQ快捷指令:
                         ),
                     )
 
-                async with self._provider_slot():
-                    reverse_result, reverse_provider = await self._timed_llm_call(
-                        job,
-                        self._call_reverse_prompt(
-                            self.context,
-                            event,
-                            source,
-                            (
-                                "Analyze the source exactly as shown for image control. "
-                                "Do not apply the requested future change during analysis."
-                            ),
-                            control_reverse_progress,
-                        ),
-                    )
+                reverse_call = self._call_reverse_prompt(
+                    self.context,
+                    event,
+                    source,
+                    (
+                        "Analyze the source exactly as shown for image control. "
+                        "Do not apply the requested future change during analysis."
+                    ),
+                    control_reverse_progress,
+                )
+                reverse_backend = str(
+                    getattr(self.settings, "reverse_backend", "vision")
+                ).casefold()
+                if reverse_backend == "workflow":
+                    reverse_result, reverse_provider = await reverse_call
+                else:
+                    async with self._provider_slot():
+                        reverse_result, reverse_provider = await self._timed_llm_call(
+                            job, reverse_call
+                        )
                 effective_options = replace(
                     effective_options,
                     prompt=reverse_result.control_generation_request(
@@ -17130,29 +17492,52 @@ QQ快捷指令:
                     details={"reverse_provider_id": reverse_provider},
                 )
             job.state = "uploading"
-            uploaded = (
-                await upload_task
-                if upload_task is not None
-                else await self._client.upload_image(source)
+            uploaded_items = (
+                list(await asyncio.gather(*upload_tasks))
+                if upload_tasks
+                else [await self._client.upload_image(path) for path in sources]
             )
+            image_names = {
+                index: uploaded.workflow_value
+                for index, uploaded in enumerate(uploaded_items, start=1)
+            }
             self._record_image_task_phase(
                 job,
                 "upload",
                 "底图已上传，准备刷新 LoRA 并构建控制生成工作流。",
                 "control_image_uploaded",
-                details={"control_modes": list(options.control_modes)},
+                details={
+                    "control_modes": list(options.control_modes),
+                    "image_count": len(image_names),
+                    "channel_sources": {
+                        channel.mode: channel.source_index for channel in plan.channels
+                    },
+                },
             )
-            return await self._execute_job(
-                job,
-                effective_options,
-                event,
-                control_image_name=uploaded.workflow_value,
-            )
+            try:
+                return await self._execute_job(
+                    job,
+                    effective_options,
+                    event,
+                    control_image_names=image_names,
+                    control_plan=plan,
+                )
+            except TypeError as exc:
+                if len(image_names) != 1 or "control_image_names" not in str(exc):
+                    raise
+                return await self._execute_job(
+                    job,
+                    effective_options,
+                    event,
+                    control_image_name=image_names[1],
+                )
         finally:
-            if upload_task is not None and not upload_task.done():
-                upload_task.cancel()
-                await asyncio.gather(upload_task, return_exceptions=True)
-            if source is not None:
+            pending = [task for task in upload_tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for source in sources:
                 source.unlink(missing_ok=True)
 
     async def _prepare_inpaint_options(
@@ -17497,6 +17882,8 @@ QQ快捷指令:
         event: AstrMessageEvent,
         *,
         control_image_name: str = "",
+        control_image_names: Optional[Mapping[int, str]] = None,
+        control_plan: Optional[ControlPlan] = None,
         img2img_image_name: str = "",
     ) -> tuple[list[Path], int, str, str, Optional[str]]:
         """占用并发槽，提交任务、等待结果并下载图片。"""
@@ -17504,7 +17891,13 @@ QQ快捷指令:
         pipeline_builders = getattr(self, "_pipeline_builders", {})
         if self._workflow_builder is None and not pipeline_builders:
             raise WorkflowError("没有可用的 Anima 生成工作流")
-        if control_image_name and img2img_image_name:
+        normalized_control_names = dict(control_image_names or {})
+        if control_image_name:
+            existing = normalized_control_names.get(1)
+            if existing and existing != control_image_name:
+                raise WorkflowError("底图控制图1文件绑定冲突")
+            normalized_control_names[1] = control_image_name
+        if normalized_control_names and img2img_image_name:
             raise WorkflowError("control and img2img conditioning cannot be combined")
         started_at = time.monotonic()
         image_paths = GeneratedImagePaths()
@@ -18058,7 +18451,7 @@ QQ快捷指令:
                 builder = pipeline_builders.get(requested_pipeline)
                 active_pipeline = requested_pipeline
                 if options.control_modes:
-                    if not control_image_name:
+                    if not normalized_control_names:
                         raise WorkflowError("底图控制任务缺少已上传的参考图片")
                     builder = self._control_workflow_builder
                     active_pipeline = f"control:{requested_pipeline}"
@@ -18096,9 +18489,20 @@ QQ快捷指令:
                 )
                 if options.control_modes:
                     assert isinstance(builder, ControlWorkflowBuilder)
-                    workflow, seed, preferred_nodes = builder.build_control(
-                        control_image_name,
+                    effective_control_plan = control_plan or ControlPlan.from_modes(
+                        options.control_modes,
+                        content_mode=(options.semantic_redraw_mode or "balanced"),
+                        pipeline=requested_pipeline,
+                    )
+                    if effective_control_plan.pipeline != requested_pipeline:
+                        effective_control_plan = replace(
+                            effective_control_plan,
+                            pipeline=requested_pipeline,
+                        )
+                    workflow, seed, preferred_nodes = builder.build_control_plan(
+                        normalized_control_names,
                         effective_options,
+                        effective_control_plan,
                     )
                     self._record_image_task_phase(
                         job,
@@ -18107,6 +18511,10 @@ QQ快捷指令:
                         "control_workflow_ready",
                         details={
                             "control_modes": list(options.control_modes),
+                            "channel_sources": {
+                                channel.mode: channel.source_index
+                                for channel in effective_control_plan.channels
+                            },
                             "pipeline": requested_pipeline,
                             "output_nodes": preferred_nodes,
                         },

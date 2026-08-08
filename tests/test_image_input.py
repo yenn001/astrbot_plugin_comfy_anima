@@ -113,6 +113,55 @@ class IncomingImageServiceTests(unittest.IsolatedAsyncioTestCase):
                     _Event([_ImageComponent(str(self.source))])
                 )
 
+    async def test_collect_many_orders_reply_before_direct_attachment(self) -> None:
+        direct_source = self.root / "direct.png"
+        Image.new("RGB", (32, 24), "blue").save(direct_source)
+        reply = _ReplyComponent([_ImageComponent(str(self.source))])
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            results = await self.service.collect_many(
+                _Event([_ImageComponent(str(direct_source)), reply])
+            )
+
+        self.assertEqual(len(results), 2)
+        with Image.open(results[0]) as first, Image.open(results[1]) as second:
+            self.assertEqual(first.getpixel((0, 0)), (255, 165, 0))
+            self.assertEqual(second.getpixel((0, 0)), (0, 0, 255))
+
+    async def test_collect_many_sha_deduplicates_reply_and_direct_copy(self) -> None:
+        reply = _ReplyComponent([_ImageComponent(str(self.source))])
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            results = await self.service.collect_up_to_two(
+                _Event([reply, _ImageComponent(str(self.source))])
+            )
+
+        self.assertEqual(len(results), 1)
+
+    async def test_collect_many_rejects_more_than_two_direct_images(self) -> None:
+        second = self.root / "second.png"
+        third = self.root / "third.png"
+        Image.new("RGB", (32, 24), "blue").save(second)
+        Image.new("RGB", (32, 24), "green").save(third)
+        with patch(
+            "astrbot_plugin_comfy_anima.services.image_input.Comp",
+            self.components,
+        ):
+            with self.assertRaisesRegex(IncomingImageError, "最多"):
+                await self.service.collect_many(
+                    _Event(
+                        [
+                            _ImageComponent(str(self.source)),
+                            _ImageComponent(str(second)),
+                            _ImageComponent(str(third)),
+                        ]
+                    )
+                )
+
     async def test_pixel_limit_is_enforced_after_image_verification(self) -> None:
         service = IncomingImageService(
             PluginSettings.from_mapping({"max_input_image_pixels": 1_000_000}),

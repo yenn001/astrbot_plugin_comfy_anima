@@ -1,13 +1,13 @@
 """
-AstrBot Comfy Anima 插件 v1.9.21
+AstrBot Comfy Anima 插件 v2.1.0
 
 功能描述：
 - 加载和修改 ComfyUI API 工作流
 - 解析绘图指令中的可选参数
 
 作者: Yen
-版本: 1.9.21
-日期: 2026-08-03
+版本: 2.1.0
+日期: 2026-08-08
 """
 
 import copy
@@ -15,10 +15,11 @@ import json
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ..constants import MAX_CFG, MAX_IMAGE_SIDE, MAX_SEED, MAX_STEPS, MIN_IMAGE_SIDE
 from ..models import GenerationOptions, PluginSettings
+from ..services.control_plan import ControlChannel, ControlPlan
 from .command_aliases import (
     CONTEXT_CONTROL_DRAW,
     CONTEXT_GENERATION,
@@ -794,6 +795,8 @@ class ControlWorkflowBuilder(WorkflowBuilder):
     """Build one Anima LLLite image-controlled generation workflow."""
 
     _CONTROL_ORDER = ("pose", "depth", "lineart", "reference")
+    _FIDELITY_FACTORS = {"strict": 1.1, "balanced": 1.0, "loose": 0.75}
+    _RESIZE_CROP = {"fit": "disabled", "crop": "center", "stretch": "disabled"}
 
     def __init__(self, workflow_path: Path, settings: PluginSettings):
         super().__init__(workflow_path, settings)
@@ -806,16 +809,12 @@ class ControlWorkflowBuilder(WorkflowBuilder):
         ):
             raise WorkflowError("当前工作流不是完整的 Anima 底图控制工作流")
         required_nodes = {
-            profile.input_image.node_id,
             profile.control_model_target.node_id,
         }
-        control_image_node_id = str(
-            profile.defaults.get("control_image_node_id")
-            or profile.input_image.node_id
-        ).strip()
-        if not control_image_node_id:
-            raise WorkflowError("底图控制工作流缺少控制图输出节点")
-        required_nodes.add(control_image_node_id)
+        self._control_sources = self._load_control_sources()
+        for input_node_id, scale_node_id in self._control_sources.values():
+            required_nodes.add(input_node_id)
+            required_nodes.add(scale_node_id)
         for binding in profile.controls.values():
             required_nodes.add(binding.apply_node_id)
             if binding.preprocessor_node_id:
@@ -823,6 +822,38 @@ class ControlWorkflowBuilder(WorkflowBuilder):
         missing = sorted(node_id for node_id in required_nodes if node_id not in self._template)
         if missing:
             raise WorkflowError("底图控制工作流缺少节点: " + ", ".join(missing))
+
+    def _load_control_sources(self) -> dict[int, tuple[str, str]]:
+        """Load up to two input/scale node pairs from manifest defaults."""
+
+        profile = self.profile
+        source = profile.input_image
+        assert source is not None
+        raw_sources = profile.defaults.get("control_image_sources")
+        result: dict[int, tuple[str, str]] = {}
+        if isinstance(raw_sources, Mapping):
+            for raw_index, raw_binding in raw_sources.items():
+                try:
+                    index = int(str(raw_index).strip())
+                except ValueError as exc:
+                    raise WorkflowError("底图控制来源编号必须是 1 或 2") from exc
+                if index not in {1, 2} or not isinstance(raw_binding, Mapping):
+                    raise WorkflowError("底图控制来源必须是图1或图2的节点映射")
+                input_node_id = str(raw_binding.get("input_node_id") or "").strip()
+                scale_node_id = str(raw_binding.get("scale_node_id") or "").strip()
+                if not input_node_id or not scale_node_id:
+                    raise WorkflowError(f"底图控制图{index}缺少输入或缩放节点")
+                result[index] = (input_node_id, scale_node_id)
+        if not result:
+            scale_node_id = str(
+                profile.defaults.get("control_image_node_id") or source.node_id
+            ).strip()
+            if not scale_node_id:
+                raise WorkflowError("底图控制工作流缺少控制图输出节点")
+            result[1] = (source.node_id, scale_node_id)
+        if 1 not in result:
+            raise WorkflowError("底图控制工作流必须声明图1来源")
+        return result
 
     @staticmethod
     def _mode_strength(default_strength: float, mode_count: int) -> float:
@@ -836,6 +867,8 @@ class ControlWorkflowBuilder(WorkflowBuilder):
         image_name: str,
         options: GenerationOptions,
     ) -> tuple[dict[str, Any], int, list[str]]:
+        """Build the legacy one-image request through a v2 control plan."""
+
         modes = tuple(
             mode
             for mode in self._CONTROL_ORDER
@@ -847,29 +880,160 @@ class ControlWorkflowBuilder(WorkflowBuilder):
         if unknown:
             raise WorkflowError("未知底图控制模式: " + ", ".join(unknown))
 
+        pipeline = str(
+            options.pipeline
+            or getattr(self._settings, "default_generation_pipeline", "rtx")
+            or "rtx"
+        ).strip().casefold()
+        if pipeline not in {"base", "rtx", "iterative"}:
+            raise WorkflowError(f"底图控制不支持生成管线: {pipeline}")
+        content_mode = str(options.semantic_redraw_mode or "balanced").casefold()
+        if content_mode not in {"preserve", "balanced", "free"}:
+            content_mode = "balanced"
+        plan = ControlPlan.from_modes(
+            modes,
+            content_mode=content_mode,
+            pipeline=pipeline,
+        )
+        return self.build_control_plan({1: image_name}, options, plan)
+
+    @staticmethod
+    def _fresh_node_id(workflow: Mapping[str, Any]) -> str:
+        numeric = [int(node_id) for node_id in workflow if str(node_id).isdigit()]
+        candidate = max(numeric, default=0) + 1
+        while str(candidate) in workflow:
+            candidate += 1
+        return str(candidate)
+
+    @classmethod
+    def _configure_scale_node(
+        cls,
+        workflow: dict[str, Any],
+        node_id: str,
+        input_node_id: str,
+        *,
+        width: int,
+        height: int,
+        resize_policy: str,
+    ) -> None:
+        node = workflow.get(node_id)
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            raise WorkflowError(f"底图控制缩放节点无效: {node_id}")
+        inputs["image"] = [input_node_id, 0]
+        if "width" in inputs:
+            inputs["width"] = width
+        if "height" in inputs:
+            inputs["height"] = height
+        if "crop" in inputs:
+            inputs["crop"] = cls._RESIZE_CROP[resize_policy]
+
+    @classmethod
+    def _channel_strength(
+        cls,
+        channel: ControlChannel,
+        default_strength: float,
+        mode_count: int,
+        fidelity: str,
+    ) -> float:
+        if channel.strength is not None:
+            return channel.strength
+        strength = cls._mode_strength(default_strength, mode_count)
+        strength *= cls._FIDELITY_FACTORS[fidelity]
+        return round(max(0.0, min(10.0, strength)), 4)
+
+    def build_control_plan(
+        self,
+        image_names: Mapping[int | str, str],
+        options: GenerationOptions,
+        plan: ControlPlan,
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        """Build a bounded dual-source, independently tuned control stack."""
+
+        if not isinstance(plan, ControlPlan):
+            raise WorkflowError("底图控制计划无效")
+        if not isinstance(image_names, Mapping):
+            raise WorkflowError("底图控制图片映射无效")
+        normalized_names: dict[int, str] = {}
+        for raw_index, raw_name in image_names.items():
+            try:
+                index = int(str(raw_index).strip())
+            except ValueError as exc:
+                raise WorkflowError("底图控制图片编号必须是 1 或 2") from exc
+            if index not in self._control_sources:
+                raise WorkflowError(f"底图控制工作流未声明图{index}来源")
+            name = str(raw_name or "").strip()
+            if not name:
+                raise WorkflowError(f"底图控制图{index}文件名为空")
+            if index in normalized_names and normalized_names[index] != name:
+                raise WorkflowError(f"底图控制图{index}绑定冲突")
+            normalized_names[index] = name
+
+        channel_by_mode = {channel.mode: channel for channel in plan.channels}
+        modes = tuple(mode for mode in self._CONTROL_ORDER if mode in channel_by_mode)
+        required_sources = {channel.source_index for channel in plan.channels}
+        missing_sources = sorted(required_sources - set(normalized_names))
+        if missing_sources:
+            raise WorkflowError(
+                "底图控制缺少图片来源: "
+                + ", ".join(f"图{index}" for index in missing_sources)
+            )
+
         workflow, seed, preferred_nodes = super().build(options)
         profile = self.profile
-        source = profile.input_image
         target = profile.control_model_target
+        source = profile.input_image
         assert source is not None and target is not None
-        self._set_input(workflow, source.node_id, source.input_name, image_name)
-        control_image_node_id = str(
-            profile.defaults.get("control_image_node_id") or source.node_id
-        ).strip()
-        control_image_node = workflow.get(control_image_node_id)
-        control_image_inputs = (
-            control_image_node.get("inputs")
-            if isinstance(control_image_node, dict)
-            else None
-        )
         width = options.width or self._settings.default_width
         height = options.height or self._settings.default_height
-        if isinstance(control_image_inputs, dict):
-            if "width" in control_image_inputs:
-                control_image_inputs["width"] = width
-            if "height" in control_image_inputs:
-                control_image_inputs["height"] = height
-        control_image_link: list[Any] = [control_image_node_id, 0]
+
+        for index, (input_node_id, scale_node_id) in self._control_sources.items():
+            if index not in required_sources:
+                workflow.pop(input_node_id, None)
+                workflow.pop(scale_node_id, None)
+                continue
+            input_name = source.input_name if index == 1 else "image"
+            self._set_input(
+                workflow,
+                input_node_id,
+                input_name,
+                normalized_names[index],
+            )
+
+        scale_links: dict[tuple[int, str], list[Any]] = {}
+
+        def image_link(channel: ControlChannel) -> list[Any]:
+            key = (channel.source_index, channel.resize_policy)
+            existing = scale_links.get(key)
+            if existing is not None:
+                return existing
+            input_node_id, base_scale_node_id = self._control_sources[
+                channel.source_index
+            ]
+            source_has_scale = any(
+                source_index == channel.source_index
+                for source_index, _ in scale_links
+            )
+            scale_node_id = base_scale_node_id
+            if source_has_scale:
+                base_node = workflow.get(base_scale_node_id)
+                if not isinstance(base_node, dict):
+                    raise WorkflowError(
+                        f"底图控制缩放节点无效: {base_scale_node_id}"
+                    )
+                scale_node_id = self._fresh_node_id(workflow)
+                workflow[scale_node_id] = copy.deepcopy(base_node)
+            self._configure_scale_node(
+                workflow,
+                scale_node_id,
+                input_node_id,
+                width=width,
+                height=height,
+                resize_policy=channel.resize_policy,
+            )
+            link: list[Any] = [scale_node_id, 0]
+            scale_links[key] = link
+            return link
 
         base_model: list[Any]
         if not profile.lora_node_id:
@@ -884,13 +1048,14 @@ class ControlWorkflowBuilder(WorkflowBuilder):
                 if binding.preprocessor_node_id:
                     workflow.pop(binding.preprocessor_node_id, None)
                 continue
-            image_link: list[Any] = control_image_link
+            channel = channel_by_mode[mode]
+            selected_image_link = image_link(channel)
             if binding.preprocessor_node_id:
                 self._set_input(
                     workflow,
                     binding.preprocessor_node_id,
                     binding.preprocessor_image_input,
-                    control_image_link,
+                    selected_image_link,
                 )
                 preprocessor = workflow.get(binding.preprocessor_node_id)
                 preprocessor_inputs = (
@@ -904,7 +1069,7 @@ class ControlWorkflowBuilder(WorkflowBuilder):
                         2048,
                         max(512, int(round(requested_resolution / 64) * 64)),
                     )
-                image_link = [binding.preprocessor_node_id, 0]
+                selected_image_link = [binding.preprocessor_node_id, 0]
             self._set_input(
                 workflow,
                 binding.apply_node_id,
@@ -915,37 +1080,42 @@ class ControlWorkflowBuilder(WorkflowBuilder):
                 workflow,
                 binding.apply_node_id,
                 binding.image_input,
-                image_link,
+                selected_image_link,
             )
             self._set_input(
                 workflow,
                 binding.apply_node_id,
                 binding.strength_input,
-                self._mode_strength(binding.default_strength, len(modes)),
+                self._channel_strength(
+                    channel,
+                    binding.default_strength,
+                    len(modes),
+                    plan.fidelity,
+                ),
             )
             apply_node = workflow.get(binding.apply_node_id)
             apply_inputs = (
                 apply_node.get("inputs") if isinstance(apply_node, dict) else None
             )
             if isinstance(apply_inputs, dict):
-                if (
-                    binding.default_start_percent is not None
-                    and binding.start_input in apply_inputs
-                ):
-                    apply_inputs[binding.start_input] = binding.default_start_percent
-                if (
-                    binding.default_end_percent is not None
-                    and binding.end_input in apply_inputs
-                ):
-                    apply_inputs[binding.end_input] = binding.default_end_percent
+                start_percent = (
+                    channel.start_percent
+                    if channel.start_percent is not None
+                    else binding.default_start_percent
+                )
+                end_percent = (
+                    channel.end_percent
+                    if channel.end_percent is not None
+                    else binding.default_end_percent
+                )
+                if start_percent is not None and binding.start_input in apply_inputs:
+                    apply_inputs[binding.start_input] = start_percent
+                if end_percent is not None and binding.end_input in apply_inputs:
+                    apply_inputs[binding.end_input] = end_percent
             previous_model = [binding.apply_node_id, 0]
 
         self._set_input(workflow, target.node_id, target.input_name, previous_model)
-        pipeline = str(
-            options.pipeline
-            or getattr(self._settings, "default_generation_pipeline", "rtx")
-            or "rtx"
-        ).strip().casefold()
+        pipeline = plan.pipeline
         if pipeline == "base":
             for node_id in ("100", "101", "102", "103", "458", "552"):
                 workflow.pop(node_id, None)

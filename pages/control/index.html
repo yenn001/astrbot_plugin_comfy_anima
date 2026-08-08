@@ -282,9 +282,25 @@
                 <label><span>自动更新周期（小时）</span><input name="danbooru_auto_update_interval_hours" type="number" min="24" max="2160" step="1"></label>
                 <p class="span-4 muted">身份优先模式会全量抓取 Character、Copyright 与 Artist，并按帖子数阈值筛选 General / Meta；五类全量模式耗时和磁盘占用更高。生成任务使用单并发、ID 游标、断点恢复和原子切换；服务器无法直连时请配置无凭据 HTTP 代理或可信局域网镜像。</p>
                 <label class="span-4"><span>System Prompt</span><textarea name="auto_draw_system_prompt" rows="9" placeholder="留空使用插件内置导演提示词"></textarea></label>
-                <div class="span-4 section-divider"><span>在线图片反推</span></div>
+                <div class="span-4 section-divider"><span>图片反推后端</span></div>
                 <label class="toggle"><input name="enable_reverse_prompt" type="checkbox"><span>启用 /反推 与 /反推画图</span></label>
-                <label class="toggle"><input name="enable_reverse_json_formatter" type="checkbox"><span>启用本地 JSON 格式整理器</span></label>
+                  <label class="toggle"><input name="enable_workflow_reverse" type="checkbox"><span>启用本地 Mira WD Tagger 工作流</span></label>
+                <label><span>默认后端</span><select name="reverse_backend"><option value="workflow">本地工作流</option><option value="vision">视觉模型</option><option value="hybrid">显式混合回退</option></select></label>
+                <label class="span-2"><span>反推工作流</span><input name="reverse_workflow_file"></label>
+                <label><span>Tagger 模型</span><input name="reverse_tagger_model"></label>
+                <label><span>工作流超时（秒）</span><input name="reverse_workflow_timeout" type="number" min="10" max="300"></label>
+                  <label><span>General 阈值</span><input name="reverse_general_threshold" type="number" min="0.05" max="1" step="0.01"></label>
+                  <label><span>Character 阈值</span><input name="reverse_character_threshold" type="number" min="0.05" max="1" step="0.01"></label>
+                  <label><span>输出分类</span><input name="reverse_categories" placeholder="copyright,character,general"></label>
+                  <label><span>推理会话</span><select name="reverse_session_method"><option value="CPU">CPU</option><option value="GPU">GPU</option><option value="GPU Release">GPU Release</option></select></label>
+                  <p class="span-4 muted">本地工作流只返回扁平 Tags，不提供 OCR、人物位置或多人属性绑定；workflow 失败不会静默调用视觉模型，只有 hybrid 允许显式回退。</p>
+                  <div class="span-4 section-divider"><span>Anima Control Stack v2</span></div>
+                  <label class="toggle"><input name="enable_control_stack_v2" type="checkbox"><span>启用双图独立控制通道</span></label>
+                  <label><span>默认保真</span><select name="control_default_fidelity"><option value="strict">Strict 强约束</option><option value="balanced">Balanced 平衡</option><option value="loose">Loose 弱约束</option></select></label>
+                  <label><span>默认缩放</span><select name="control_default_resize_policy"><option value="fit">Fit 适配</option><option value="crop">Crop 居中裁切</option><option value="stretch">Stretch 拉伸</option></select></label>
+                  <label><span>Reference 范围</span><select name="control_default_reference_scope"><option value="appearance">外观</option><option value="style">画风</option><option value="color">配色</option></select></label>
+                  <p class="span-4 muted">回复图片固定为图1，当前消息附件按顺序成为图2。双图请求必须明确写出“姿势用图1，构图用图2”。Reference 是外观、画风或配色软影响，不是身份锁定。</p>
+                  <label class="toggle"><input name="enable_reverse_json_formatter" type="checkbox"><span>启用本地 JSON 格式整理器</span></label>
                 <label class="toggle"><input name="enable_reverse_json_repair_retry" type="checkbox"><span>格式校验失败时重做一次</span></label>
                 <p class="span-4 muted">整理器只在本地兼容代码围栏、说明文字、尾逗号和单引号字典，不会调用额外模型；关闭后仅接受一个完整的严格 JSON 对象。安全隔离与字段校验始终开启。</p>
                 <label><span>反推超时（秒）</span><input name="reverse_prompt_timeout" type="number" min="10" max="300"></label>
