@@ -1,6 +1,8 @@
 """Comfy Anima 插件服务模块。"""
 
 from .comfy_client import ComfyClient, ComfyClientError
+from .drawing_orchestrator import DrawingOrchestrator
+from .drawing_state_machine import DuplicateSubmissionError
 from .image_input import IncomingImageError, IncomingImageService
 from .lora_catalog import LoraCatalogError, LoraCatalogService
 from .lora_downloader import LoraDownloadError, LoraDownloadService
@@ -12,6 +14,8 @@ from .unet_catalog import UnetCatalogError, UnetCatalogService, UnetModelEntry
 __all__ = [
     "ComfyClient",
     "ComfyClientError",
+    "DrawingOrchestrator",
+    "DuplicateSubmissionError",
     "IncomingImageError",
     "IncomingImageService",
     "LoraCatalogError",

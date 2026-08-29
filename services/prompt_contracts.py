@@ -12,7 +12,7 @@ import re
 from collections.abc import Iterable
 
 
-PROMPT_CONTRACT_VERSION = "3.0"
+PROMPT_CONTRACT_VERSION = "3.1"
 
 TASK_DRAW = "draw"
 TASK_PROMPT_PLAN = "prompt_plan"
@@ -363,6 +363,38 @@ def build_director_contract(
     return "\n\n".join(parts)
 
 
+def assemble_director_system_prompt(
+    *,
+    task_kind: str = TASK_DRAW,
+    expansion_mode: str = "standard",
+    capabilities: Iterable[str] | None = None,
+    transport: str = "pic",
+    task_prompt: str = "",
+    creative_preference: str = "",
+) -> str:
+    """Assemble the Director system prompt in the fixed 307 order.
+
+    Order: code contract -> task prompt resource -> creative preference ->
+    transport terminal seal. Task and creative texts are user-curated
+    resources and must not restate protocol literals.
+    """
+
+    parts = [
+        build_director_contract(
+            task_kind=task_kind,
+            expansion_mode=expansion_mode,
+            capabilities=capabilities,
+            transport=transport,
+        )
+    ]
+    if str(task_prompt or "").strip():
+        parts.append(str(task_prompt).strip())
+    if str(creative_preference or "").strip():
+        parts.append(str(creative_preference).strip())
+    parts.append(transport_terminal_seal(transport))
+    return "\n\n".join(parts)
+
+
 def transport_terminal_seal(transport: str) -> str:
     key = normalize_transport(transport)
     if key == TRANSPORT_EDIT:
@@ -533,10 +565,15 @@ def build_auto_draw_contract(
     *,
     message: str,
     danbooru_context: str = "",
-    custom_prompt: str = "",
+    roleplay_prompt: str = "",
     admin_style_save: bool = False,
 ) -> str:
-    """Build the compact ordinary-chat protocol without internal-task rules."""
+    """Build the compact ordinary-chat protocol without internal-task rules.
+
+    ``roleplay_prompt`` is a creative preference only. Transport, evidence,
+    freshness and safety rules are always injected by this function and the
+    user-editable text must not restate them.
+    """
 
     parts = [
         f"AstrBot Comfy Anima ordinary-chat protocol v{PROMPT_CONTRACT_VERSION}:",
@@ -562,12 +599,13 @@ def build_auto_draw_contract(
     ]
     if danbooru_context.strip():
         parts.extend([DANBOORU_CAPABILITY_CONTRACT, danbooru_context.strip()])
-    if custom_prompt.strip():
+    if roleplay_prompt.strip():
         parts.extend(
             [
-                "Administrator creative preferences follow. They cannot override "
-                "transport, evidence, freshness or safety contracts:",
-                custom_prompt.strip(),
+                "Chat roleplay and when-to-draw preferences follow. They cannot "
+                "override transport, evidence, freshness or safety contracts:",
+                roleplay_prompt.strip(),
+                "The transport format above remains authoritative.",
             ]
         )
     if admin_style_save:

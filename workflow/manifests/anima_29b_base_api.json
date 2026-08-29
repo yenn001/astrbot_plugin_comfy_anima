@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "profile_id": "anima_29b_base",
+  "display_name": "Anima 2.9B base",
+  "workflow_file": "anima_29b_base_api.json",
+  "task_type": "text_to_image",
+  "bindings": {
+    "positive_prompt": {
+      "node_id": "11",
+      "input": "text"
+    },
+    "negative_prompt": {
+      "node_id": "12",
+      "input": "text"
+    },
+    "unet": {
+      "node_id": "44",
+      "input": "unet_name"
+    },
+    "lora": {
+      "node_id": "462"
+    },
+    "seed": [
+      {
+        "node_id": "19",
+        "input": "seed"
+      }
+    ],
+    "resolution": {
+      "node_id": "28",
+      "width_input": "width",
+      "height_input": "height"
+    },
+    "samplers": [
+      {
+        "node_id": "19",
+        "steps_input": "steps",
+        "cfg_input": "cfg",
+        "denoise_input": "denoise"
+      }
+    ],
+    "clip": {
+      "node_id": "45",
+      "input": "clip_name"
+    },
+    "vae": {
+      "node_id": "15",
+      "input": "vae_name"
+    }
+  },
+  "output_variants": {
+    "base": {
+      "preferred_node_ids": [
+        "88"
+      ],
+      "prune_node_ids": []
+    }
+  },
+  "default_output_variant": "base",
+  "defaults": {
+    "pipeline": "base",
+    "width": 832,
+    "height": 1216,
+    "steps": 8,
+    "cfg": 5.0,
+    "denoise": 1.0
+  },
+  "model_contract": {
+    "model_family": "anima_29b_40l",
+    "unet": "Anima-2.9B-preview-v1.safetensors",
+    "clip": "qwen_3_06b_base.safetensors",
+    "vae": "qwen_image_vae.safetensors",
+    "lora_patch_required": true,
+    "lora_patch_node_type": "ComfyUI-Anima-2.9B",
+    "lora_patch_contract_id": "anima29b-runtime-patch:detect-unet-blocks-28-to-40@2de99f23e31ccf75d1a0f3d04c16ac5cfcd320e6",
+    "verification_status": "verified",
+    "verification_receipt": "2026-08-25 .88 ComfyUI patch startup + 2.9B role-LoRA prompt 93054b75-ad53-444d-bf63-7ad18709eeb2 + family receipt 2cd54c2f-a2bf-4fce-8ed5-e7d7162dcfb1"
+  }
+}

@@ -20,6 +20,7 @@ import os
 import tempfile
 import threading
 import unicodedata
+import re
 from collections.abc import Callable, Mapping, MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,8 +43,8 @@ from ..constants import (
 
 
 PROFILE_SCHEMA = "astrbot-comfy-anima-environment-profile"
-PROFILE_SCHEMA_VERSION = 3
-LEGACY_PROFILE_SCHEMA_VERSIONS = frozenset({1, 2})
+PROFILE_SCHEMA_VERSION = 5
+LEGACY_PROFILE_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 MAX_PROFILE_NAME_LENGTH = 64
 MAX_TEXT_FIELD_LENGTH = 2048
 MAX_NODE_LIST_ITEMS = 32
@@ -59,14 +60,28 @@ ENVIRONMENT_FIELD_DEFAULTS: dict[str, Any] = {
     "iterative_workflow_file": "workflow/anima_iterative_api.json",
     "inpaint_crop_workflow_file": "workflow/anima_inpaint_crop_api.json",
     "lanpaint_workflow_file": "workflow/anima_lanpaint_api.json",
+    "control_workflow_file": "workflow/anima_control_api.json",
+    "img2img_workflow_file": "workflow/anima_img2img_api.json",
     "reverse_workflow_file": "workflow/anima_reverse_tagger_api.json",
+    "default_generation_pipeline": "rtx",
+    "model_profile_id": "anima_legacy",
+    "model_family": "anima_legacy_28l",
     "workflow_dir": "workflow",
     "unet_catalog_url": "",
     "unet_loader_node_id": "429",
     "unet_model_input_name": "unet_name",
     "unet_model_name": "",
+    "unet_model_root": "",
+    "clip_model_name": "qwen_3_06b_base.safetensors",
+    "clip_model_root": "",
+    "vae_model_name": "qwen_image_vae.safetensors",
+    "vae_model_root": "",
+    "lora_patch_required": False,
+    "lora_patch_node_type": "",
+    "lora_patch_contract_id": "",
     "lora_catalog_url": "",
     "lora_manager_url": "",
+    "lora_model_root": "",
     "lora_loader_node_id": "462",
     "prompt_node_id": DEFAULT_PROMPT_NODE_ID,
     "negative_node_id": DEFAULT_NEGATIVE_NODE_ID,
@@ -91,10 +106,29 @@ _V1_ADDED_WORKFLOW_FIELDS = frozenset(
         "iterative_workflow_file",
         "inpaint_crop_workflow_file",
         "lanpaint_workflow_file",
+        "control_workflow_file",
+        "img2img_workflow_file",
         "reverse_workflow_file",
     }
 )
 _V2_ADDED_WORKFLOW_FIELDS = frozenset({"reverse_workflow_file"})
+_V3_ADDED_PROFILE_FIELDS = frozenset(
+    {
+        "control_workflow_file",
+        "img2img_workflow_file",
+        "default_generation_pipeline",
+        "model_profile_id",
+        "model_family",
+        "clip_model_name",
+        "vae_model_name",
+        "lora_patch_required",
+        "lora_patch_node_type",
+        "lora_patch_contract_id",
+    }
+)
+_V4_ADDED_ASSET_ROOT_FIELDS = frozenset(
+    {"unet_model_root", "clip_model_root", "vae_model_root", "lora_model_root"}
+)
 
 _URL_FIELDS = frozenset(
     {
@@ -114,9 +148,18 @@ _PATH_FIELDS = frozenset(
         "iterative_workflow_file",
         "inpaint_crop_workflow_file",
         "lanpaint_workflow_file",
+        "control_workflow_file",
+        "img2img_workflow_file",
         "reverse_workflow_file",
         "workflow_dir",
+        "unet_model_root",
+        "clip_model_root",
+        "vae_model_root",
+        "lora_model_root",
     }
+)
+_OPTIONAL_PATH_FIELDS = frozenset(
+    {"unet_model_root", "clip_model_root", "vae_model_root", "lora_model_root"}
 )
 _NODE_FIELDS = frozenset(
     {
@@ -130,7 +173,20 @@ _NODE_FIELDS = frozenset(
         "upscale_output_node_id",
     }
 )
-_FREE_TEXT_FIELDS = frozenset({"unet_model_input_name", "unet_model_name"})
+_FREE_TEXT_FIELDS = frozenset(
+    {
+        "unet_model_input_name",
+        "unet_model_name",
+        "clip_model_name",
+        "vae_model_name",
+        "model_profile_id",
+        "model_family",
+        "lora_patch_node_type",
+        "lora_patch_contract_id",
+    }
+)
+_BOOL_FIELDS = frozenset({"lora_patch_required"})
+_PIPELINE_FIELDS = frozenset({"default_generation_pipeline"})
 _NODE_LIST_FIELDS = frozenset({"sampler_node_ids", "output_node_ids"})
 _IMAGE_SIDE_FIELDS = frozenset({"default_width", "default_height"})
 _UNSAFE_PROFILE_NAME_CHARS = frozenset('<>:"/\\|?*')
@@ -217,6 +273,16 @@ def _validate_text(value: Any, field: str, *, allow_empty: bool) -> str:
     return normalized
 
 
+def _validate_asset_root(value: Any, field: str) -> str:
+    normalized = _validate_text(value, field, allow_empty=True).replace("\\", "/")
+    if not normalized.strip("/"):
+        return ""
+    path = Path(normalized)
+    if path.is_absolute() or re.match(r"^[A-Za-z]:", normalized) or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ConfigProfileValidationError(f"{field} 必须是 models 下的安全相对目录")
+    return "/".join(path.parts)
+
+
 def _validate_url(value: Any, field: str) -> str:
     normalized = _validate_text(
         value,
@@ -291,15 +357,33 @@ def validate_environment_settings(
         if field in _URL_FIELDS:
             normalized[field] = _validate_url(value, field)
         elif field in _PATH_FIELDS:
-            normalized[field] = _validate_text(value, field, allow_empty=False)
+            if field in _OPTIONAL_PATH_FIELDS:
+                normalized[field] = _validate_asset_root(value, field)
+            else:
+                normalized[field] = _validate_text(value, field, allow_empty=False)
         elif field in _NODE_FIELDS:
             normalized[field] = _validate_text(value, field, allow_empty=False)
         elif field in _FREE_TEXT_FIELDS:
             normalized[field] = _validate_text(
                 value,
                 field,
-                allow_empty=field == "unet_model_name",
+                allow_empty=field
+                in {
+                    "unet_model_name",
+                    "lora_patch_node_type",
+                    "lora_patch_contract_id",
+                },
             )
+        elif field in _BOOL_FIELDS:
+            if not isinstance(value, bool):
+                raise ConfigProfileValidationError(f"{field} must be boolean")
+            normalized[field] = value
+        elif field in _PIPELINE_FIELDS:
+            normalized[field] = _validate_text(value, field, allow_empty=False).lower()
+            if normalized[field] not in {"base", "rtx", "iterative"}:
+                raise ConfigProfileValidationError(
+                    "default_generation_pipeline must be base, rtx or iterative"
+                )
         elif field in _NODE_LIST_FIELDS:
             normalized[field] = _validate_node_list(value, field)
         elif field in _IMAGE_SIDE_FIELDS:
@@ -340,9 +424,12 @@ def _validate_stored_environment_settings(
         raise ConfigProfileValidationError("version 不受支持")
     partial = validate_environment_settings(settings, require_all=False)
     missing = ENVIRONMENT_FIELDS - set(partial)
-    allowed_missing = (
-        _V1_ADDED_WORKFLOW_FIELDS if schema_version == 1 else _V2_ADDED_WORKFLOW_FIELDS
-    )
+    allowed_missing = {
+        1: _V1_ADDED_WORKFLOW_FIELDS | _V3_ADDED_PROFILE_FIELDS | _V4_ADDED_ASSET_ROOT_FIELDS,
+        2: _V2_ADDED_WORKFLOW_FIELDS | _V3_ADDED_PROFILE_FIELDS | _V4_ADDED_ASSET_ROOT_FIELDS,
+        3: _V3_ADDED_PROFILE_FIELDS | _V4_ADDED_ASSET_ROOT_FIELDS,
+        4: _V4_ADDED_ASSET_ROOT_FIELDS,
+    }[schema_version]
     unsupported_missing = missing - allowed_missing
     if unsupported_missing:
         names = ", ".join(sorted(unsupported_missing))

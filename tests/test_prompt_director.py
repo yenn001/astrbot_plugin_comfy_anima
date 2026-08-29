@@ -18,6 +18,16 @@ from ..services.prompt_contracts import CAPABILITY_DANBOORU
 class PictureResponseParserTests(unittest.TestCase):
     """普通 LLM 回复应正确拆分正文与绘图任务。"""
 
+    def test_pipeline_aliases_for_model_synonyms(self) -> None:
+        """模型输出的常见管线同义词应归一化，未知值仍拒绝。"""
+
+        for raw in ("draw", "txt2img", "text2img", "文生图", "生图", "生成",
+                    "standard", "normal"):
+            self.assertEqual(PromptDirector._normalize_pipeline(raw), "base", raw)
+        self.assertEqual(PromptDirector._normalize_pipeline("高清放大"), "rtx")
+        with self.assertRaises(PromptDirectorError):
+            PromptDirector._normalize_pipeline("unknown_pipeline")
+
     def test_extracts_multiple_prompts_in_source_order(self) -> None:
         """多个 pic 标签应按出现顺序提取并规范化。"""
         output = (
@@ -341,18 +351,17 @@ class PictureResponseParserTests(unittest.TestCase):
 
     def test_builtin_reference_covers_plugin_contract(self) -> None:
         reference = (
-            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+            Path(__file__).resolve().parents[1] / "prompts" / "director_creative_default.txt"
         )
         director = PromptDirector(reference, PluginSettings.from_mapping({}))
         system_prompt = director._system_prompt(capabilities=())
 
-        self.assertIn("Prompt contract version: 3.0", system_prompt)
+        self.assertIn("Prompt contract version: 3.1", system_prompt)
         self.assertIn('Return exactly one `<pic prompt="...">`', system_prompt)
         self.assertIn("not authoritative for Danbooru identity", system_prompt)
-        self.assertIn("飞鸟马时 (toki)", system_prompt)
-        self.assertIn("gold embroidery catching the rim light", system_prompt)
-        self.assertIn("14 至 32", system_prompt)
-        self.assertIn("Ultra", system_prompt)
+        self.assertIn("角色连续性优先于堆砌信息", system_prompt)
+        self.assertIn("景别决定细节", system_prompt)
+        self.assertIn("不叠加互相竞争的时间与光源", system_prompt)
         self.assertIn("Terminal seal", system_prompt)
         self.assertNotIn("list_anima_loras", system_prompt)
         self.assertNotIn("search_anima_danbooru_tags", system_prompt)
@@ -360,7 +369,7 @@ class PictureResponseParserTests(unittest.TestCase):
 
     def test_system_prompt_exposes_dynamic_bounded_danbooru_status(self) -> None:
         reference = (
-            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+            Path(__file__).resolve().parents[1] / "prompts" / "director_creative_default.txt"
         )
         status = {
             "ready": True,
@@ -396,12 +405,12 @@ class PictureResponseParserTests(unittest.TestCase):
 
     def test_custom_prompt_keeps_runtime_constraints(self) -> None:
         reference = (
-            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+            Path(__file__).resolve().parents[1] / "prompts" / "director_creative_default.txt"
         )
         director = PromptDirector(
             reference,
             PluginSettings.from_mapping(
-                {"auto_draw_system_prompt": "请使用温柔的杂志插画口吻。"}
+                {"director_creative_preference": "请使用温柔的杂志插画口吻。"}
             ),
         )
 
@@ -430,7 +439,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         **overrides: object,
     ) -> PromptDirector:
         reference = (
-            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+            Path(__file__).resolve().parents[1] / "prompts" / "director_creative_default.txt"
         )
         settings = PluginSettings.from_mapping(
             {
@@ -454,7 +463,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     "tools_call_args": {
                         "positive_tags": positive,
                         "negative_tags": "",
-                        "pipeline": "",
+                        "pipeline": "base",
                     },
                 },
             ),
@@ -465,7 +474,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     "completion_text": (
                         '{"positive_tags":"'
                         + positive
-                        + '","negative_tags":"","pipeline":""}'
+                        + '","negative_tags":"","pipeline":"base"}'
                     )
                 },
             ),
@@ -514,7 +523,7 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     instruction.diagnostics.provider_id,
                     "test-provider",
                 )
-                self.assertEqual(instruction.diagnostics.pipeline, "")
+                self.assertIn(instruction.diagnostics.pipeline, {"", "base"})
                 stored = store.get(instruction.diagnostic_id)
                 self.assertIsNotNone(stored)
                 assert stored is not None
@@ -879,6 +888,75 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Do not call any tool again", context.repair_kwargs["prompt"])
         self.assertIn(r"viola_\(bang_dream!\)", instruction.prompt)
         self.assertEqual(instruction.character_queries, ("Viola|BanG Dream!",))
+
+    async def test_invalid_lookup_terminal_accepts_fenced_json_repair(self) -> None:
+        director = self._director()
+
+        class Context:
+            lookup_calls = 0
+            repair_calls = 0
+
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                self.lookup_calls += 1
+                return type("Response", (), {"completion_text": "lookup done"})()
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.repair_calls += 1
+                payload = json.dumps(
+                    {
+                        "positive_tags": "1girl, maid, selfie. A maid selfie.",
+                        "negative_tags": "bad hands",
+                        "pipeline": "base",
+                    }
+                )
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": f"```json\n{payload}\n```"},
+                )()
+
+        context = Context()
+        instruction, _provider_id = await director.generate_instruction(
+            context,
+            object(),
+            "女仆自拍",
+            tools=object(),
+        )
+
+        self.assertEqual(context.lookup_calls, 1)
+        self.assertEqual(context.repair_calls, 1)
+        self.assertIn("1girl", instruction.prompt)
+
+    async def test_invalid_lookup_terminal_accepts_embedded_json_repair(self) -> None:
+        director = self._director()
+
+        class Context:
+            async def tool_loop_agent(self, **_kwargs: object) -> object:
+                return type("Response", (), {"completion_text": "lookup done"})()
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                payload = json.dumps(
+                    {
+                        "positive_tags": "1girl, stairs, uniform. A staircase scene.",
+                        "negative_tags": "",
+                        "pipeline": "base",
+                    }
+                )
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": f"ok, plan ready\n{payload}\nthank you"},
+                )()
+
+        instruction, _provider_id = await director.generate_instruction(
+            Context(),
+            object(),
+            "画一张楼梯间的图",
+            tools=object(),
+        )
+
+        self.assertIn("stairs", instruction.prompt)
+        self.assertEqual(instruction.pipeline, "base")
 
     async def test_invalid_lookup_terminal_rejects_prose_repair_with_shape_only_detail(
         self,
@@ -1333,7 +1411,7 @@ class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _director() -> PromptDirector:
         reference = (
-            Path(__file__).resolve().parents[1] / "prompts" / "director_reference.txt"
+            Path(__file__).resolve().parents[1] / "prompts" / "director_creative_default.txt"
         )
         return PromptDirector(
             reference,

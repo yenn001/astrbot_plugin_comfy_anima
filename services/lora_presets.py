@@ -155,6 +155,31 @@ def normalize_preset_aliases(value: Any) -> tuple[str, ...]:
     return tuple(aliases)
 
 
+def normalize_preset_tags(value: Any, *, limit: int = 200) -> tuple[str, ...]:
+    """Normalize user-managed positive/negative prompt tags."""
+    if isinstance(value, str):
+        raw_items = re.split(r"[\r\n,，;；]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = []
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        tag = str(raw or "").strip()
+        if not tag:
+            continue
+        if len(tag) > 200:
+            raise LoraPresetError("单个提示词 Tag 不能超过 200 个字符")
+        key = unicodedata.normalize("NFKC", tag).casefold()
+        if key not in seen:
+            seen.add(key)
+            tags.append(tag)
+    if len(tags) > limit:
+        raise LoraPresetError(f"单个提示词池最多允许 {limit} 个 Tag")
+    return tuple(tags)
+
+
 def _preset_name_aliases(
     value: str,
     explicit_aliases: Iterable[str] = (),
@@ -199,6 +224,26 @@ class LoraPreset:
     aliases: tuple[str, ...] = ()
     note: str = ""
     enabled: bool = True
+    character_canonical: str = ""
+    work_canonical: str = ""
+    identity_anchor: str = ""
+    required_trigger_terms: tuple[str, ...] = ()
+    positive_tags: tuple[str, ...] = ()
+    negative_tags: tuple[str, ...] = ()
+    variant_id: str = "default"
+    contract_enabled: bool = False
+
+    @property
+    def is_character_preset(self) -> bool:
+        return self.category == PRESET_CATEGORY_CHARACTER
+
+    @property
+    def required_prompt_terms(self) -> tuple[str, ...]:
+        return tuple(
+            value
+            for value in (self.identity_anchor, *self.required_trigger_terms)
+            if str(value).strip()
+        )
 
     @property
     def lora_tags(self) -> str:
@@ -326,6 +371,20 @@ class LoraPresetRegistry:
             if not isinstance(item, dict):
                 continue
             try:
+                raw_character = item.get("character")
+                character_mapping = raw_character if isinstance(raw_character, dict) else {}
+                contract_enabled = any(
+                    key in item
+                    for key in (
+                        "character_canonical",
+                        "work_canonical",
+                        "identity_anchor",
+                        "required_trigger_terms",
+                        "positive_tags",
+                        "negative_tags",
+                        "variant_id",
+                    )
+                )
                 template_key = str(item.get("__template_key") or "").strip()
                 category = TEMPLATE_CATEGORIES.get(template_key)
                 if category is None:
@@ -346,6 +405,27 @@ class LoraPresetRegistry:
                     aliases=normalize_preset_aliases(item.get("aliases", [])),
                     note=str(item.get("note") or "").strip(),
                     enabled=bool(item.get("enabled", True)),
+                    character_canonical=str(
+                        item.get("character_canonical")
+                        or character_mapping.get("canonical")
+                        or ""
+                    ).strip(),
+                    work_canonical=str(
+                        item.get("work_canonical")
+                        or character_mapping.get("work")
+                        or ""
+                    ).strip(),
+                    identity_anchor=str(item.get("identity_anchor") or "").strip(),
+                    required_trigger_terms=normalize_preset_tags(
+                        item.get("required_trigger_terms")
+                        or item.get("required_triggers")
+                        or ()
+                    ),
+                    positive_tags=normalize_preset_tags(item.get("positive_tags") or ()),
+                    negative_tags=normalize_preset_tags(item.get("negative_tags") or ()),
+                    variant_id=str(item.get("variant_id") or "default").strip()
+                    or "default",
+                    contract_enabled=contract_enabled,
                 )
                 self._upsert(preset)
             except (LoraPresetError, TypeError, ValueError):
@@ -428,12 +508,26 @@ class LoraPresetRegistry:
 
     def find_mentioned_style(self, text: str) -> Optional[LoraPreset]:
         """识别完整风格名或唯一别名；任何歧义都拒绝自动选择。"""
+        return self.find_mentioned_preset(text, categories=(PRESET_CATEGORY_ARTIST_STYLE,))
+
+    def find_mentioned_preset(
+        self,
+        text: str,
+        *,
+        categories: Iterable[str] = PRESET_CATEGORIES,
+    ) -> Optional[LoraPreset]:
+        """识别用户/Bot 提到的预设名称、别名、角色 canonical 或作品。"""
         source = str(text or "")
         if not source:
             return None
 
         source_key = _preset_lookup_key(source)
-        styles = self.list_presets(category=PRESET_CATEGORY_ARTIST_STYLE)
+        allowed = set(categories)
+        styles = tuple(
+            preset
+            for preset in self.list_presets()
+            if preset.category in allowed
+        )
 
         numeric_request = re.search(
             r"(?:用|使用|采用|套用|按|切换(?:到|为)?)?\s*"
@@ -470,6 +564,22 @@ class LoraPresetRegistry:
                 if len(_preset_lookup_key(preset.name)) == longest
             ]
             return strongest[0] if len(strongest) == 1 else None
+
+        identity_matches: list[LoraPreset] = []
+        for preset in styles:
+            identity_values = (
+                preset.character_canonical,
+                preset.work_canonical,
+                *preset.aliases,
+            )
+            if any(
+                value
+                and _lookup_key_mentioned(source_key, _preset_lookup_key(value))
+                for value in identity_values
+            ):
+                identity_matches.append(preset)
+        if len(identity_matches) == 1:
+            return identity_matches[0]
 
         aliases: dict[str, list[tuple[str, LoraPreset]]] = {}
         for preset in styles:
@@ -521,6 +631,14 @@ class LoraPresetRegistry:
         note: str = "",
         enabled: bool = True,
         identifier: str = "",
+        character_canonical: str = "",
+        work_canonical: str = "",
+        identity_anchor: str = "",
+        required_trigger_terms: Any = (),
+        positive_tags: Any = (),
+        negative_tags: Any = (),
+        variant_id: str = "default",
+        enforce_character_contract: bool = False,
     ) -> LoraPreset:
         normalized_category = normalize_category(category)
         normalized_name = self._normalize_name(name, normalized_category)
@@ -537,6 +655,20 @@ class LoraPresetRegistry:
         normalized_note = str(note or "").strip()
         if len(normalized_note) > 500:
             raise LoraPresetError("组合备注不能超过 500 个字符")
+        normalized_character = str(character_canonical or "").strip()
+        normalized_work = str(work_canonical or "").strip()
+        normalized_identity_anchor = str(identity_anchor or "").strip()
+        normalized_required_terms = normalize_preset_tags(required_trigger_terms)
+        normalized_positive_tags = normalize_preset_tags(positive_tags)
+        normalized_negative_tags = normalize_preset_tags(negative_tags)
+        normalized_variant_id = str(variant_id or "default").strip() or "default"
+        if len(normalized_variant_id) > 80:
+            raise LoraPresetError("预设变体标识不能超过 80 个字符")
+        if enforce_character_contract and normalized_category == PRESET_CATEGORY_CHARACTER:
+            if not normalized_identity_anchor:
+                raise LoraPresetError("角色预设必须填写身份锚点")
+            if not normalized_required_terms:
+                raise LoraPresetError("角色预设必须填写必需触发词")
         preset = LoraPreset(
             name=normalized_name,
             category=normalized_category,
@@ -546,6 +678,17 @@ class LoraPresetRegistry:
             aliases=normalized_aliases,
             note=normalized_note,
             enabled=enabled,
+            character_canonical=normalized_character,
+            work_canonical=normalized_work,
+            identity_anchor=normalized_identity_anchor,
+            required_trigger_terms=normalized_required_terms,
+            positive_tags=normalized_positive_tags,
+            negative_tags=normalized_negative_tags,
+            variant_id=normalized_variant_id,
+            contract_enabled=(
+                enforce_character_contract
+                and normalized_category == PRESET_CATEGORY_CHARACTER
+            ),
         )
         if str(identifier or "").strip():
             current = self.resolve(identifier, enabled_only=False)
@@ -614,6 +757,13 @@ class LoraPresetRegistry:
                 "aliases": list(preset.aliases),
                 "note": preset.note,
                 "enabled": preset.enabled,
+                "character_canonical": preset.character_canonical,
+                "work_canonical": preset.work_canonical,
+                "identity_anchor": preset.identity_anchor,
+                "required_trigger_terms": list(preset.required_trigger_terms),
+                "positive_tags": list(preset.positive_tags),
+                "negative_tags": list(preset.negative_tags),
+                "variant_id": preset.variant_id,
             }
             for preset in self._presets
         ]
@@ -644,7 +794,7 @@ class LoraPresetRegistry:
         if not presets:
             return "No matching saved LoRA presets were found."
         lines = [
-            "Saved LoRA presets. Artist/style presets are complete base style stacks; copy every exact tag in order. Query character LoRAs separately and append them after the style stack."
+            "Saved LoRA presets. Select an exact preset by name or character/work identity. Character preset identity anchors and required triggers are authoritative; after a character preset match, do not append Danbooru character identity tags."
         ]
         global_indices = {
             id(preset): index for index, preset in enumerate(self._presets, 1)
@@ -657,6 +807,23 @@ class LoraPresetRegistry:
                 line += " | disabled"
             if preset.trigger_words:
                 line += f" | triggers: {preset.trigger_words}"
+            if preset.character_canonical:
+                line += f" | character: {preset.character_canonical}"
+            if preset.work_canonical:
+                line += f" | work: {preset.work_canonical}"
+            if preset.identity_anchor:
+                line += f" | identity_anchor: {preset.identity_anchor}"
+            if preset.required_trigger_terms:
+                line += (
+                    " | required_triggers: "
+                    + ", ".join(preset.required_trigger_terms)
+                )
+            if preset.positive_tags:
+                line += " | positive_tags: " + ", ".join(preset.positive_tags)
+            if preset.negative_tags:
+                line += " | negative_tags: " + ", ".join(preset.negative_tags)
+            if preset.variant_id != "default":
+                line += f" | variant: {preset.variant_id}"
             if preset.aliases:
                 line += f" | aliases: {', '.join(preset.aliases)}"
             if detail and preset.description:

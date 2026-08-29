@@ -558,12 +558,22 @@ def build_lora_trigger_plan(
         if record is None:
             skipped.append(f"{selection.name}: no fresh metadata record")
             continue
+        role = effective_roles.get(key) or str(record.category or "").casefold()
         triggers = _metadata_trigger_terms(record)
         if not triggers:
+            if role == PRESET_CATEGORY_CHARACTER or role == "character":
+                forced_triggers = resolved_character_triggers.get(key, ())
+                if forced_triggers:
+                    for trigger in forced_triggers:
+                        append_trigger(trigger, selection.name)
+                else:
+                    skipped.append(
+                        f"{selection.name}: no reliable character identity trigger"
+                    )
+                continue
             skipped.append(f"{selection.name}: no metadata trigger words")
             continue
 
-        role = effective_roles.get(key) or str(record.category or "").casefold()
         if role == PRESET_CATEGORY_ARTIST_STYLE or role in FUNCTIONAL_LORA_CATEGORIES:
             for trigger in triggers:
                 append_trigger(trigger, selection.name)

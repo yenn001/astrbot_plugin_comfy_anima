@@ -358,6 +358,23 @@ class ConfigProfileServiceTests(unittest.TestCase):
 
         self.assertEqual(self.storage_path.read_text("utf-8"), "{not-json")
 
+    def test_asset_roots_are_safe_relative_paths(self) -> None:
+        config = _config()
+        config.update(
+            unet_model_root="2.9Bunet",
+            clip_model_root="2.9Bclip",
+            vae_model_root="2.9Bvae",
+            lora_model_root="2.9BLora",
+        )
+        saved = self.service.save_profile("2.9B", config)
+        self.assertEqual(saved["settings"]["lora_model_root"], "2.9BLora")
+        for field in ("unet_model_root", "clip_model_root", "vae_model_root", "lora_model_root"):
+            bad = dict(config)
+            bad[field] = "../escape"
+            with self.subTest(field=field):
+                with self.assertRaises(ConfigProfileValidationError):
+                    self.service.save_profile("bad-" + field, bad)
+
 
 if __name__ == "__main__":
     unittest.main()

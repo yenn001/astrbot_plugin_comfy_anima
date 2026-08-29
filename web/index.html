@@ -69,6 +69,7 @@
               </select>
             </label>
             <span id="service-state" class="status-pill" role="status">连接中</span>
+            <span class="secondary" aria-disabled="true" title="2.4.0 暂缓 2.9B 可执行路径">2.9B 控制台已暂缓</span>
             <button id="reload-data" class="secondary">刷新当前页</button>
           </div>
         </header>
@@ -155,6 +156,13 @@
               </div>
             </div>
             <p id="profile-status" class="muted live-line" role="status"></p>
+            <dl id="profile-capability-grid" class="profile-capability-grid" aria-live="polite">
+              <div><dt>MODEL FAMILY</dt><dd data-profile-field="model-family">—</dd></div>
+              <div><dt>LORA POLICY</dt><dd data-profile-field="lora-policy">—</dd></div>
+              <div><dt>PATCH CONTRACT</dt><dd data-profile-field="patch-contract">—</dd></div>
+              <div><dt>WORKFLOW FAMILY</dt><dd data-profile-field="workflow-family">—</dd></div>
+            </dl>
+            <p id="profile-capability-note" class="muted live-line" role="status"></p>
           </article>
 
           <form id="settings-form" class="stack large-gap">
@@ -250,6 +258,15 @@
                   <small id="reverse-provider-note" class="muted">明确为纯文本的模型不可选；视觉能力未知的旧模型仍可选择。</small>
                 </div>
                 <label><span>Temperature</span><input name="prompt_llm_temperature" type="number" min="0" max="2" step="0.05"></label>
+                <div class="span-2 provider-field">
+                  <label for="intent-router-select"><span>普通聊天意图判断模型</span></label>
+                  <div class="provider-picker"><select id="intent-router-select" name="intent_router_model"><option value="">未配置，资产查询后禁止自动提交</option></select></div>
+                  <input id="intent-router-manual" placeholder="手动填写独立 Intent Router Provider ID" hidden>
+                  <small id="intent-router-note" class="muted">必须与绘图导演模型、图片反推模型不同；用于资产工具完成后的单次意图判断。</small>
+                </div>
+                <label><span>意图判断超时（秒）</span><input name="intent_router_timeout" type="number" min="3" max="120" step="1"></label>
+                <label><span>意图判断 Temperature</span><input name="intent_router_temperature" type="number" min="0" max="1" step="0.05"></label>
+                <label><span>普通聊天模式</span><select name="interaction_mode"><option value="smart">Smart：独立模型判断</option><option value="strict">Strict：命令/确认后提交</option></select></label>
                 <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
                 <label><span>换角分类总超时（秒）</span><input name="character_swap_timeout" type="number" min="30" max="600" step="1"></label>
                 <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
@@ -481,6 +498,15 @@
                   <button class="filter-tab" data-archive-state="failed" type="button" aria-pressed="false">失败 <span id="archive-filter-count-failed">0</span></button>
                   <button class="filter-tab" data-archive-state="unarchived" type="button" aria-pressed="false">未建档 <span id="archive-filter-count-unarchived">0</span></button>
                 </div>
+                <p class="eyebrow archive-state-label">MODEL FAMILY FILTER</p>
+                <div id="lora-family-filters" class="filter-tabs family-filter-tabs" role="group" aria-label="LoRA 模型族筛选">
+                  <button class="filter-tab active" data-family-filter="active" type="button" aria-pressed="true"><span id="lora-family-filter-active-label">当前预设可用</span> <span id="family-filter-count-active">0</span></button>
+                  <button class="filter-tab" data-family-filter="all" type="button" aria-pressed="false">全部 <span id="family-filter-count-all">0</span></button>
+                  <button class="filter-tab" data-family-filter="anima_legacy_28l" type="button" aria-pressed="false">Legacy 28-layer <span id="family-filter-count-legacy">0</span></button>
+                  <button class="filter-tab" data-family-filter="anima_29b_40l" type="button" aria-pressed="false">2.9B 40-layer <span id="family-filter-count-29b">0</span></button>
+                  <button class="filter-tab" data-family-filter="unknown" type="button" aria-pressed="false">未声明 <span id="family-filter-count-unknown">0</span></button>
+                </div>
+                <p id="lora-family-filter-note" class="muted family-filter-note">当前预设模型族读取中…</p>
               </div>
               <div class="selection-tools">
                 <span id="lora-selection-count" class="ticket-tag">已选 0</span>
@@ -545,6 +571,17 @@
               <div id="lora-detail-content" class="lora-detail-grid"></div>
               <form id="lora-semantic-form" class="lora-review-form stack">
                 <input name="name" type="hidden">
+                <fieldset class="prompt-check-fieldset lora-family-fieldset" aria-describedby="lora-compatibility-help">
+                  <legend>MODEL FAMILY CONTRACT</legend>
+                  <div class="form-grid compact-grid">
+                    <label><span>LoRA 模型族兼容模式</span><select name="compatibility_mode" aria-describedby="lora-compatibility-help"><option value="unknown">未确认（2.9B 禁用）</option><option value="legacy_only">仅 Legacy 28-layer</option><option value="native_29b">原生 2.9B 40-layer</option><option value="legacy_projection">Legacy LoRA + 已验证 2.9B 投影</option></select></label>
+                    <div class="family-check-grid">
+                      <label class="check-row"><input type="checkbox" name="compatible_model_families" value="anima_legacy_28l"><span>Legacy Anima · 28-layer</span></label>
+                      <label class="check-row"><input type="checkbox" name="compatible_model_families" value="anima_29b_40l"><span>Anima 2.9B · 40-layer</span></label>
+                    </div>
+                  </div>
+                  <p id="lora-compatibility-help" class="field-help">未确认资产会在 2.9B 预设下拒绝提交；跨族使用必须选择“Legacy LoRA + 已验证 2.9B 投影”，并且运行时 patch receipt 必须有效。</p>
+                </fieldset>
                 <div class="card-head"><div><p class="eyebrow">HUMAN REVIEW</p><h3>人工语义审核</h3></div><span class="ticket-tag">MANUAL WINS</span></div>
                 <div class="form-grid compact-grid">
                   <label><span>分类</span><select name="category"><option value="character">角色</option><option value="artist_style">画师 / 风格</option><option value="speed_sampling">加速 / 采样</option><option value="quality_enhancement">画质增强</option><option value="detail_restoration">细节修复</option><option value="composition_pose">构图 / 姿势</option><option value="lighting_color">光影 / 色彩</option><option value="background_environment">背景 / 环境</option><option value="clothing_concept">服装 / 概念</option><option value="mixed">混合</option><option value="unclassified">未分类 / 待确认</option></select></label>
@@ -575,6 +612,15 @@
                 <label><span>备注</span><textarea name="note" rows="2" placeholder="只用于管理和检索说明，不直接写进提示词"></textarea></label>
                 <label><span>LoRA 串（每行 name=weight）</span><textarea name="loras" rows="9" placeholder="anima-highres-aesthetic-boost=0.5&#10;black deniav1-2=1.0" required></textarea></label>
                 <label><span>手动补充触发词</span><textarea name="trigger_words" rows="3" placeholder="可留空；生成前仍会强刷 Manager 并合并最新元数据触发词"></textarea></label>
+                <div class="form-grid compact-grid">
+                  <label><span>角色 canonical</span><input name="character_canonical" placeholder="denia_(作品)"></label>
+                  <label><span>作品字段</span><input name="work_canonical" placeholder="作品 canonical"></label>
+                </div>
+                <label><span>身份锚点（角色预设必填）</span><textarea name="identity_anchor" rows="2" placeholder="用户可控的角色身份锚点"></textarea></label>
+                <label><span>必需触发词（角色预设必填，每行或逗号分隔）</span><textarea name="required_trigger_terms" rows="2" placeholder="denia&#10;denia trigger"></textarea></label>
+                <label><span>正面提示词 Tag 池</span><textarea name="positive_tags" rows="3" placeholder="可选 Tag，每行或逗号分隔"></textarea></label>
+                <label><span>负面提示词 Tag 池</span><textarea name="negative_tags" rows="3" placeholder="排除 Tag，每行或逗号分隔"></textarea></label>
+                <label><span>变体标识</span><input name="variant_id" value="default" placeholder="default / school / swimsuit"></label>
                 <label><span>说明</span><textarea name="description" rows="3"></textarea></label>
                 <label class="toggle"><input name="enabled" type="checkbox" checked><span>启用此组合</span></label>
                 <div class="inline-actions"><button id="preset-save" class="primary" type="submit">强制刷新并保存</button><button id="preset-cancel-edit" class="ghost" type="button" hidden>取消编辑</button></div>

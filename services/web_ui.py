@@ -50,6 +50,11 @@ ASSET_CONTENT_TYPES = {
     "theme.js": "application/javascript",
     "login.js": "application/javascript",
 }
+ANIMA_29B_ASSET_CONTENT_TYPES = {
+    "index.html": "text/html",
+    "app.css": "text/css",
+    "app.js": "application/javascript",
+}
 
 
 class WebUiError(RuntimeError):
@@ -66,6 +71,8 @@ class WebUiController(Protocol):
     async def web_ui_bootstrap(self) -> dict[str, Any]: ...
 
     async def web_ui_save_settings(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_save_29b_settings(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def web_ui_list_providers(self) -> dict[str, Any]: ...
 
@@ -263,12 +270,22 @@ class WebUiService:
         app.add_routes(
             [
                 web.get("/", self._index),
+                web.get("/anima-29b", self._anima_29b_disabled_index),
+                web.get("/anima-29b/", self._anima_29b_disabled_index),
                 web.get("/login", self._login_page),
                 web.get("/favicon.ico", self._favicon),
                 web.get("/assets/{name}", self._asset),
+                web.get(
+                    "/anima-29b/assets/{name}",
+                    self._anima_29b_disabled_asset,
+                ),
                 web.post("/api/login", self._login),
                 web.post("/api/logout", self._logout),
                 web.get("/api/bootstrap", self._bootstrap),
+                web.put(
+                    "/api/anima-29b/settings",
+                    self._save_29b_disabled_settings,
+                ),
                 web.get("/api/providers", self._list_providers),
                 web.put("/api/settings", self._save_settings),
                 web.get("/api/prompt/status", self._prompt_status),
@@ -465,6 +482,10 @@ class WebUiService:
         for filename in ("index.html", "login.html", *ASSET_CONTENT_TYPES):
             if not (asset_dir / filename).is_file():
                 raise WebUiError(f"Web UI asset is missing: {filename}")
+        anima_29b_dir = asset_dir / "anima_29b"
+        for filename in ANIMA_29B_ASSET_CONTENT_TYPES:
+            if not (anima_29b_dir / filename).is_file():
+                raise WebUiError(f"2.9B Web UI asset is missing: {filename}")
 
     @web.middleware
     async def _security_headers(
@@ -532,6 +553,52 @@ class WebUiService:
 
     async def _index(self, _request: web.Request) -> web.FileResponse:
         return web.FileResponse(self._asset_path("index.html"))
+
+    def _anima_29b_asset_path(self, filename: str) -> Path:
+        return self._plugin_dir / "web" / "anima_29b" / filename
+
+    async def _anima_29b_disabled_index(
+        self, _request: web.Request
+    ) -> web.Response:
+        """Return the deferred-scope page; no 2.9B console is served."""
+
+        page = (
+            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            "<title>Comfy Anima · 2.9B 控制台已暂缓</title></head><body>"
+            "<h1>Anima 2.9B 控制台已暂缓</h1>"
+            "<p>2.4.0 Deferred Scope：所有 2.9B 可执行路径均已禁用。</p>"
+            "<a href=\"/\">返回 Legacy 控制台</a></body></html>"
+        )
+        return web.Response(text=page, content_type="text/html")
+
+    async def _anima_29b_disabled_asset(
+        self, _request: web.Request
+    ) -> web.Response:
+        raise web.HTTPNotFound()
+
+    async def _save_29b_disabled_settings(
+        self, _request: web.Request
+    ) -> web.Response:
+        return web.json_response(
+            {"ok": False, "error": "2.9B settings are deferred in 2.4.0"},
+            status=423,
+        )
+
+    async def _anima_29b_index(self, _request: web.Request) -> web.FileResponse:
+        return web.FileResponse(self._anima_29b_asset_path("index.html"))
+
+    async def _anima_29b_asset(self, request: web.Request) -> web.StreamResponse:
+        filename = request.match_info["name"]
+        content_type = ANIMA_29B_ASSET_CONTENT_TYPES.get(filename)
+        if content_type is None:
+            raise web.HTTPNotFound()
+        path = self._anima_29b_asset_path(filename)
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(
+            path,
+            headers={"Content-Type": f"{content_type}; charset=utf-8"},
+        )
 
     async def _login_page(self, request: web.Request) -> web.StreamResponse:
         if self._read_session(request) is not None:
@@ -623,6 +690,12 @@ class WebUiService:
             return await self._controller.web_ui_save_settings(payload)
 
         return await self._controller_response(save())
+
+    async def _save_29b_settings(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_save_29b_settings(payload)
+        )
 
     async def _list_providers(self, _request: web.Request) -> web.Response:
         return await self._controller_response(self._controller.web_ui_list_providers())

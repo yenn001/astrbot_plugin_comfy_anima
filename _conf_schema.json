@@ -83,12 +83,57 @@
     "type": "string",
     "default": "workflow/anima_lanpaint_api.json"
   },
+  "control_workflow_file": {
+    "description": "底图控制工作流",
+    "type": "string",
+    "default": "workflow/anima_control_api.json"
+  },
+  "img2img_workflow_file": {
+    "description": "Anima img2img 工作流",
+    "type": "string",
+    "default": "workflow/anima_img2img_api.json"
+  },
   "default_generation_pipeline": {
     "description": "默认 Anima 生成管线",
     "type": "string",
     "options": ["base", "rtx", "iterative"],
     "hint": "base 仅原图；rtx 默认执行 RTX 放大；iterative 使用迭代采样放大",
     "default": "rtx"
+  },
+  "model_profile_id": {
+    "description": "当前模型 Profile ID",
+    "type": "string",
+    "default": "anima_legacy"
+  },
+  "model_family": {
+    "description": "当前模型族",
+    "type": "string",
+    "default": "anima_legacy_28l"
+  },
+  "clip_model_name": {
+    "description": "当前 Anima CLIP 模型",
+    "type": "string",
+    "default": "qwen_3_06b_base.safetensors"
+  },
+  "vae_model_name": {
+    "description": "当前 Anima VAE 模型",
+    "type": "string",
+    "default": "qwen_image_vae.safetensors"
+  },
+  "lora_patch_required": {
+    "description": "当前模型是否要求旧版 LoRA 兼容补丁",
+    "type": "bool",
+    "default": false
+  },
+  "lora_patch_node_type": {
+    "description": "LoRA 兼容补丁节点类型",
+    "type": "string",
+    "default": ""
+  },
+  "lora_patch_contract_id": {
+    "description": "LoRA 兼容补丁合约标识",
+    "type": "string",
+    "default": ""
   },
   "iterative_scale": {
     "description": "迭代放大目标倍率",
@@ -161,11 +206,35 @@
     "hint": "由 /模型切换 自动保存；留空时使用当前工作流档案声明的 UNET 节点内置模型",
     "default": ""
   },
+  "unet_model_root": {
+    "description": "UNET 模型目录分支",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/unet 的安全目录；2.9B 建议填写 2.9Bunet",
+    "default": ""
+  },
+  "clip_model_root": {
+    "description": "CLIP 模型目录分支",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/text_encoders 的安全目录；2.9B 建议填写 2.9Bclip",
+    "default": ""
+  },
+  "vae_model_root": {
+    "description": "VAE 模型目录分支",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/vae 的安全目录；2.9B 建议填写 2.9Bvae",
+    "default": ""
+  },
   "enable_natural_draw": {
     "description": "启用自然语言绘图",
     "type": "bool",
     "hint": "识别“帮我画一个……”等普通 QQ 消息，并使用所选模型规划提示词",
     "default": true
+  },
+  "director_primary": {
+    "description": "Director Primary（沉浸式）",
+    "type": "bool",
+    "hint": "显式绘图走 Director 主链路；普通聊天在交付工具隔离下允许角色台词 + <pic> 终端渲染（先聊后图），失败时保留台词并附加提示",
+    "default": false
   },
   "enable_llm_pic_trigger": {
     "description": "启用 LLM 回复中的 pic 标签触发",
@@ -332,9 +401,26 @@
     "_special": "select_provider"
   },
   "auto_draw_system_prompt": {
-    "description": "绘图 System Prompt",
+    "description": "绘图 System Prompt（deprecated，仅作回滚源）",
     "type": "text",
-    "hint": "留空使用插件内置分镜导演；自定义内容会叠加在插件运行时约束之后。需要出图时必须保留合法 <pic prompt=\"英文 tags\">；明确角色需增加 characters=\"角色名|作品名\"，换装等场景可选 negative=\"英文 tags\"。不得要求普通聊天自行启用 --llm c/--llmcc/--lcc 专用文字换角模式",
+    "hint": "307 起不再复制或使用此字段；旧内容只读保留供回滚。新的主 LLM 台词气质与 Director 创作偏好分别由下面两个字段控制，协议与工具规则由插件代码维护。",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "_deprecated": true
+  },
+  "chat_roleplay_draw_prompt": {
+    "description": "主 LLM 聊天出图提示词",
+    "type": "text",
+    "hint": "只负责何时主动出图与角色台词气质；不得包含 <pic>、JSON、工具调用步骤等协议内容（协议由插件代码统一注入）",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
+  "director_creative_preference": {
+    "description": "绘图导演创作偏好",
+    "type": "text",
+    "hint": "只负责画风、标签写法与镜头偏好；不得包含 <pic>、JSON、工具调用步骤等协议内容（协议由插件代码统一注入）",
     "default": "",
     "editor_mode": true,
     "editor_language": "markdown"
@@ -382,6 +468,26 @@
     "type": "int",
     "default": 1
   },
+  "conversation_draw_cooldown_seconds": {
+    "description": "会话出图冷却秒数",
+    "type": "float",
+    "default": 8.0
+  },
+  "follow_up_draw_priority": {
+    "description": "follow-up 出图优先级",
+    "type": "string",
+    "default": "after_delivery"
+  },
+  "intent_router_probe_plan": {
+    "description": "意图路由使用 probe plan",
+    "type": "bool",
+    "default": true
+  },
+  "show_command_progress": {
+    "description": "显示命令进度提示",
+    "type": "bool",
+    "default": true
+  },
   "director_reference_file": {
     "description": "内置分镜参考文件",
     "type": "string",
@@ -409,6 +515,12 @@
     "description": "LoRA Manager 地址",
     "type": "string",
     "hint": "留空自动使用 comfyui_url/api/lm/loras；也可填写 http://IP:8188/loras 或完整 API 地址",
+    "default": ""
+  },
+  "lora_model_root": {
+    "description": "LoRA 模型目录分支",
+    "type": "string",
+    "hint": "2.9B 建议填写 2.9BLora；Legacy 留空或使用原 lora 根目录",
     "default": ""
   },
   "lora_manager_scan_on_refresh": {
@@ -856,6 +968,60 @@
     "type": "bool",
     "hint": "普通绘图不再无条件进入 LoRA 工具循环；明确角色、未知风格或 LoRA 请求才查询资产",
     "default": true
+  },
+  "intent_router_model": {
+    "description": "独立普通聊天意图判断模型",
+    "type": "string",
+    "hint": "必须与绘图导演模型和图片反推模型分开配置；为空时不启用语义路由",
+    "default": ""
+  },
+  "intent_router_timeout": {
+    "description": "意图判断模型超时（秒）",
+    "type": "int",
+    "hint": "仅用于资产工具完成后的单次轻量判断",
+    "min": 3,
+    "max": 120,
+    "default": 20
+  },
+  "intent_router_temperature": {
+    "description": "意图判断模型温度",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "default": 0
+  },
+  "intent_router_min_confidence": {
+    "description": "意图判断最低置信度",
+    "type": "float",
+    "hint": "低于该置信度时改为询问用户，不直接提交 ComfyUI",
+    "min": 0,
+    "max": 1,
+    "default": 0.7
+  },
+  "enable_session_recipe_continuity": {
+    "description": "允许会话续接复用上次绘图配方",
+    "type": "bool",
+    "hint": "关闭后“再拍一张/现在发给我”不会再自动复用上次设置",
+    "default": true
+  },
+  "invalidate_session_recipe_on_update": {
+    "description": "插件更新后自动清空旧会话配方",
+    "type": "bool",
+    "hint": "版本变化时在 initialize 阶段清空，防止旧预设/LoRA 配置被续接",
+    "default": true
+  },
+  "enable_preset_manifest_gate": {
+    "description": "提交前强制校验预设清单",
+    "type": "bool",
+    "hint": "角色预设、LoRA 栈或负面池与预期不一致时停止提交；仅供诊断时临时关闭",
+    "default": true
+  },
+  "interaction_mode": {
+    "description": "普通聊天交互模式",
+    "type": "string",
+    "options": ["smart", "strict"],
+    "hint": "smart 使用独立意图模型；strict 只接受命令、按钮或一次性确认",
+    "default": "smart"
   },
   "structured_director_mode": {
     "description": "绘图导演结构化输出模式",

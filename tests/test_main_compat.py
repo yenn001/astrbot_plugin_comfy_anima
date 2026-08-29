@@ -9,7 +9,7 @@ import tempfile
 import time
 import types
 import unittest
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -24,7 +24,7 @@ from ..services.danbooru_index import (
     TagLookup,
     normalize_tag,
 )
-from ..services.lora_catalog import LoraRecord
+from ..services.lora_catalog import LoraRecord as _CatalogLoraRecord
 from ..services.lora_semantic import (
     LoraIdentityBinding,
     LoraSemanticIndex,
@@ -36,6 +36,12 @@ from ..services.lora_semantic import (
 from ..services.reverse_prompt import ReversePromptResult
 from ..services.reverse_evidence import ReverseEvidence
 from ..services.reverse_workflow import ReverseWorkflowError
+
+
+@dataclass(frozen=True)
+class LoraRecord(_CatalogLoraRecord):
+    compatible_model_families: tuple[str, ...] = ("anima_legacy_28l",)
+    compatibility_mode: str = "legacy_only"
 
 
 class _DecoratorGroup:
@@ -75,6 +81,7 @@ class _FilterStub:
     on_using_llm_tool = _passthrough
     on_llm_tool_respond = _passthrough
     on_agent_done = _passthrough
+    after_message_sent = _passthrough
 
 
 class _Star:
@@ -199,6 +206,27 @@ class MainCompatibilityTests(unittest.TestCase):
                     source,
                     rf'"{field}":\s*(?:\(\s*)?settings\.{field}',
                 )
+
+    def test_decorating_hook_is_render_not_intermediate_cleaner(self) -> None:
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        render_index = source.index("    async def render_llm_picture_tags")
+        render_previous = source[:render_index].splitlines()[-1].strip()
+        self.assertEqual(
+            render_previous,
+            "@filter.on_decorating_result(priority=20)",
+        )
+        helper_index = source.index(
+            "    def _clean_intermediate_chat_draw_controls"
+        )
+        helper_previous = source[:helper_index].splitlines()[-1].strip()
+        self.assertNotEqual(
+            helper_previous,
+            "@filter.on_decorating_result(priority=20)",
+        )
+        self.assertIn(
+            "self._clean_intermediate_chat_draw_controls(event, result)",
+            source,
+        )
 
     def test_director_output_tool_is_request_local_not_globally_registered(self) -> None:
         source = Path(self.main.__file__).read_text(encoding="utf-8")
@@ -503,7 +531,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         plugin._repair_chat_draw_terminal.assert_awaited_once()
         self.assertIn("<pic", response.completion_text)
 
-    async def test_decorating_order_repairs_no_tool_draw_intent(self) -> None:
+    async def test_intermediate_decoration_never_repairs_draw_intent(self) -> None:
         plugin, _cleared = self._plugin()
         event = self._event("再出一遍 cos 吧")
         plugin._ensure_chat_draw_terminal_trace(event, intent=True)
@@ -513,10 +541,13 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin.render_llm_picture_tags(event)
 
-        plugin._repair_chat_draw_terminal.assert_awaited_once()
-        self.assertIn("ComfyUI", result.chain[-1].text)
-        self.assertNotIn("<pic", result.chain[-1].text)
-        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertEqual(result.chain[0].text, "行，马上穿给你看。")
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertFalse(trace["repair_attempted"])
+        self.assertFalse(trace["blocked"])
 
     async def test_no_tool_negated_request_cannot_submit_picture(self) -> None:
         plugin, _cleared = self._plugin()
@@ -550,6 +581,194 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         plugin._repair_chat_draw_terminal.assert_not_awaited()
         self.assertNotIn("<pic", response.completion_text)
         self.assertIn("ComfyUI", response.completion_text)
+
+    async def test_follow_up_never_downgrades_active_drawing_trace(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        event = self._event("画一张达妮娅自拍")
+        trace = plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+        trace["terminal_state"] = "draw_new"
+
+        class ToolSet:
+            def __init__(self) -> None:
+                self.removed: list[str] = []
+
+            def remove_tool(self, name: str) -> None:
+                self.removed.append(name)
+
+            def get_tool(self, _name: str) -> None:
+                return None
+
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        tool_set = ToolSet()
+        request = types.SimpleNamespace(
+            prompt=(
+                "[SYSTEM NOTICE] User sent follow-up messages while tool "
+                "execution was in progress. Prioritize these follow-up "
+                "instructions in your next actions.\n1. 检查一下日志看看怎么回事"
+            ),
+            system_prompt="base",
+            func_tool=tool_set,
+        )
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertEqual(trace["terminal_state"], "draw_new")
+        self.assertEqual(request.system_prompt, "base")
+        self.assertIsNone(request.func_tool)
+        self.assertEqual(tool_set.removed, [])
+
+    async def test_director_primary_visual_intent_injects_immersive_contract(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.director_primary = True
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._auto_draw_system_prompt = ""
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+        event = self._event("画一张达妮娅自拍")
+        request = types.SimpleNamespace(system_prompt="base")
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertTrue(request.system_prompt.startswith("base"))
+        self.assertGreater(len(request.system_prompt), len("base"))
+
+        response = self._response('<pic prompt="must not run">')
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("ComfyUI", response.completion_text)
+
+    async def test_director_primary_decorator_strips_pic_without_submit(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.director_primary = True
+        plugin._access_error = lambda *_args, **_kwargs: None
+        event = self._event("普通聊天")
+        trace = plugin._ensure_chat_draw_terminal_trace(event, intent=False)
+        trace["blocked"] = True
+        trace["blocked_message"] = (
+            f"{self.main.MessageEmoji.INFO} Director Primary 已启用，本次未提交绘图"
+        )
+        result = types.SimpleNamespace(chain=[_Plain('<pic prompt="leak">')])
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        plain_texts = [
+            component.text
+            for component in result.chain
+            if isinstance(component, _Plain)
+        ]
+        self.assertTrue(all("<pic" not in text for text in plain_texts))
+
+    async def test_active_drawing_session_isolates_follow_up_requests(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        event = self._event("画一张达妮娅自拍")
+        event.unified_msg_origin = "Bot:FriendMessage:719397082"
+        plugin._get_drawing_orchestrator().begin_umo_drawing(
+            event.unified_msg_origin
+        )
+
+        class ToolSet:
+            def __init__(self) -> None:
+                self.removed: list[str] = []
+
+            def remove_tool(self, name: str) -> None:
+                self.removed.append(name)
+
+            def get_tool(self, _name: str) -> None:
+                return None
+
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        tool_set = ToolSet()
+        request = types.SimpleNamespace(
+            prompt="follow-up notice",
+            system_prompt="base",
+            func_tool=tool_set,
+        )
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        self.assertIsNone(request.func_tool)
+        self.assertEqual(tool_set.removed, [])
+        self.assertEqual(request.system_prompt, "base")
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+    async def test_director_primary_isolates_even_without_active_drawing_session(
+        self,
+    ) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.director_primary = True
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._auto_draw_system_prompt = ""
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+
+        class ToolSet:
+            def __init__(self) -> None:
+                self.removed: list[str] = []
+
+            def remove_tool(self, name: str) -> None:
+                self.removed.append(name)
+
+            def get_tool(self, _name: str) -> None:
+                return None
+
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        tool_set = ToolSet()
+        event = self._event("画一套jk制服")
+        request = types.SimpleNamespace(
+            prompt="画一套jk制服",
+            system_prompt="base",
+            func_tool=tool_set,
+        )
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        self.assertIsNone(request.func_tool)
+        self.assertEqual(tool_set.removed, [])
+        self.assertGreater(len(request.system_prompt), len("base"))
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
 
     async def test_disabled_picture_trigger_never_starts_terminal_trace(self) -> None:
         plugin, _cleared = self._plugin()
@@ -831,7 +1050,89 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(plugin._chat_draw_terminal_trace(event))
         self.assertEqual(cleared, [])
 
-    def test_decorating_fallback_blocks_failed_asset_lookup(self) -> None:
+    async def test_intermediate_pic_with_pending_tool_is_sanitized_not_rendered(
+        self,
+    ) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("照片发给我看看")
+        plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+        plugin._run_job = AsyncMock(side_effect=AssertionError("must not submit"))
+        result = types.SimpleNamespace(
+            chain=[_Plain('照片这就来 <pic prompt="1girl, portrait">')]
+        )
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn("照片这就来", result.chain[0].text)
+        self.assertNotIn("<pic", result.chain[0].text)
+        plugin._run_job.assert_not_awaited()
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertFalse(trace["blocked"])
+        self.assertFalse(trace["repair_attempted"])
+
+    async def test_final_pic_renders_after_on_agent_done_clears_trace(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.show_chat_generation_details = False
+        plugin.settings.max_auto_images_per_reply = 1
+        plugin.settings.enable_prompt_composer_v2 = False
+        event = self._event("照片发给我看看")
+        plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+
+        response = self._response('<pic prompt="1girl, portrait">')
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+
+        async def run_job(event_, options):
+            self.assertEqual(options.prompt, "1girl, portrait")
+            return [Path("generated.png")], 123, options.prompt, "", "base"
+
+        plugin._run_job = run_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<pic prompt="1girl, portrait">')]
+        )
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn(("image", "generated.png"), result.chain)
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+    async def test_terminal_run_keeps_clean_text_and_never_resubmits(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.show_chat_generation_details = False
+        event = self._event("照片发给我看看")
+        orchestrator = plugin._get_drawing_orchestrator()
+        state = orchestrator.begin_submission(event)
+        orchestrator.mark_running(event, state.run_id)
+        orchestrator.mark_completed(event, state.run_id)
+        orchestrator.mark_delivered(event, state.run_id)
+        plugin._run_job = AsyncMock(side_effect=AssertionError("must not submit"))
+        result = types.SimpleNamespace(
+            chain=[_Plain('照片这就来 <pic prompt="1girl, portrait">')]
+        )
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn("照片这就来", result.chain[0].text)
+        self.assertNotIn("<pic", result.chain[0].text)
+        plugin._run_job.assert_not_awaited()
+
+    async def test_failed_asset_lookup_keeps_intermediate_roleplay_and_trace(self) -> None:
         plugin, cleared = self._plugin()
         event = self._event("用 LoRA 画飞鸟马时")
         plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
@@ -843,9 +1144,65 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         result = types.SimpleNamespace(chain=[_Plain("画好了，1girl, toki")])
         event.get_result = lambda: result
 
-        asyncio.run(plugin.render_llm_picture_tags(event))
+        await plugin.render_llm_picture_tags(event)
 
-        self.assertIn("未提交 ComfyUI", result.chain[-1].text)
+        self.assertEqual(result.chain[0].text, "画好了，1girl, toki")
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["blocked"])
+        self.assertFalse(trace["repair_attempted"])
+        self.assertEqual(cleared, [])
+
+        response = self._response("画好了，1girl, toki")
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+        self.assertIn("绘图资产查询失败", response.completion_text)
+        self.assertIn("未提交 ComfyUI", response.completion_text)
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+        self.assertEqual(cleared, [id(event)])
+
+    async def test_failed_decoration_sticky_seal_blocks_later_pic_submission(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=False,
+        )
+        plugin._run_job = AsyncMock(side_effect=AssertionError("blocked request submitted"))
+
+        first_result = types.SimpleNamespace(chain=[_Plain("资产查询失败")])
+        event.get_result = lambda: first_result
+        await plugin.render_llm_picture_tags(event)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["blocked"])
+
+        second_result = types.SimpleNamespace(
+            chain=[_Plain("照片这就来 <pic prompt=\"1girl, portrait\">")]
+        )
+        event.get_result = lambda: second_result
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn("照片这就来", second_result.chain[0].text)
+        self.assertNotIn("<pic", second_result.chain[0].text)
+        plugin._run_job.assert_not_awaited()
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["blocked"])
+
+        response = self._response('<pic prompt="1girl, portrait">')
+        await plugin.enforce_chat_draw_terminal(event, self._run_context(), response)
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("未提交 ComfyUI", response.completion_text)
         self.assertIsNone(plugin._chat_draw_terminal_trace(event))
         self.assertEqual(cleared, [id(event)])
 
@@ -1798,6 +2155,10 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(detector("帮我画一个雨夜里的猫娘"))
         self.assertTrue(detector("帮我画一个戴帽子的女孩"))
         self.assertTrue(detector("生成一张赛博朋克城市图片"))
+        self.assertTrue(detector("画一套jk情趣制服给我看看"))
+        self.assertTrue(detector("想看你的自拍"))
+        self.assertTrue(detector("画一张你在干嘛的图"))
+        self.assertFalse(detector("我想看你在干嘛"))
         self.assertFalse(detector("帮我写一个 Python 列表"))
 
     def test_image_operation_intent_routing_understands_colloquial_requests(self) -> None:
@@ -2300,7 +2661,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                     strict_keys=frozenset({key}),
                 )
             )
-            self.assertEqual(bound_overrides, {})
+            self.assertEqual(bound_overrides, {key: ("viola",)})
             english_job = self.main.GenerationJob("user", "draw", 0.0)
             english_prompt, _ = asyncio.run(
                 plugin._compile_llm_character_prompt(
@@ -2345,7 +2706,15 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
             {"viola_(bang_dream!)": key},
         )
         self.assertEqual(kept, (selection,))
-        self.assertEqual(overrides, {key: "viola"})
+        self.assertEqual(overrides, {})
+        trigger_plan = self.main.build_lora_trigger_plan(
+            prompt=prompt,
+            negative_prompt=negative,
+            selections=kept,
+            records_by_name={key: record},
+            bound_character_activation_terms=bound_overrides,
+        )
+        self.assertIn("viola", trigger_plan.prompt)
         self.assertEqual(filtered, ())
         self.assertIn(r"viola_\(bang_dream!\)", english_prompt)
         self.assertEqual(
@@ -4379,7 +4748,7 @@ class PerUserImageQueueTests(unittest.IsolatedAsyncioTestCase):
         return plugin
 
     async def test_second_image_task_is_persisted_and_runs_fifo(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
             plugin = self._plugin(store)
             first_started = asyncio.Event()
@@ -4443,12 +4812,12 @@ class PerUserImageQueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plugin._queued_jobs, {})
             self.assertEqual(
                 {item["status"] for item in store.recent_tasks(limit=10)},
-                {"succeeded"},
+                {"partial"},
             )
             store.close()
 
     async def test_normal_generation_uses_the_same_queue(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
             plugin = self._plugin(store)
             first_started = asyncio.Event()
@@ -5632,6 +6001,8 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "styles/base.safetensors",
                 category="quality_enhancement",
                 trigger_words=("masterpiece", "very aesthetic"),
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
             ),
             self.catalog_module.LoraRecord(
                 "characters/denia.safetensors",
@@ -5639,6 +6010,8 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 trigger_words=("denia_wuwa", "black coat", "silver hair"),
                 character_name="Denia",
                 aliases=("denia", "达妮娅"),
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
             ),
         )
 
@@ -5741,6 +6114,125 @@ class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(captured[0].negative_prompt, "black coat")
         self.assertNotIn("silver hair", prompt)
+
+    async def test_character_preset_identity_is_expected_not_unexpected(self) -> None:
+        """A contract-enabled character preset must not trip the final gate."""
+
+        records = (
+            self.catalog_module.LoraRecord(
+                "characters/denia.safetensors",
+                category="character",
+                trigger_words=(),
+                character_name="Denia",
+                aliases=("denia", "达妮娅"),
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
+            ),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+                _self.refreshes = 0
+
+            async def refresh_for_operation(_self):
+                _self.refreshes += 1
+                _self._cache = records
+                _self._cache_expires_at = float("inf")
+                return records
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return records
+
+        captured = []
+
+        class Builder:
+            @staticmethod
+            def build(options):
+                captured.append(options)
+                return {"workflow": True}, 123, ["out"]
+
+        class Client:
+            @staticmethod
+            async def submit(workflow):
+                self.assertEqual(workflow, {"workflow": True})
+                return "prompt-id"
+
+            @staticmethod
+            async def wait_for_images(prompt_id, preferred):
+                self.assertEqual((prompt_id, preferred), ("prompt-id", ["out"]))
+                return (object(),)
+
+            @staticmethod
+            async def download_image(_reference, job_dir):
+                return job_dir / "result.png"
+
+            @staticmethod
+            async def gpu_name():
+                return "Test GPU"
+
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "denia_(wuthering_waves)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = self.main.PluginSettings.from_mapping(
+                {
+                    "enable_prompt_llm": False,
+                    "default_style_preset": "",
+                    "strict_lora_validation": True,
+                    "max_dynamic_loras": 3,
+                    "max_total_dynamic_loras": 12,
+                    "max_prompt_length": 4000,
+                }
+            )
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._client = Client()
+            plugin._workflow_builder = Builder()
+            plugin._lora_catalog = Catalog()
+            plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+            preset = plugin._lora_presets.save(
+                name="达妮娅",
+                category=self.main.PRESET_CATEGORY_CHARACTER,
+                selections=(LoraSelection("characters/denia", 0.8),),
+                identity_anchor=r"denia \(wuthering waves\)",
+                required_trigger_terms=("wuthering waves",),
+                enforce_character_contract=True,
+            )
+            plugin._danbooru_index = index
+            plugin._temp_dir = Path(tempfile.mkdtemp())
+            plugin._access_error = lambda _event, _text: None
+            job = self.main.GenerationJob("u", "preview", 0.0)
+            options = self.main.GenerationOptions(
+                prompt=(
+                    r"1girl, denia \(wuthering waves\), "
+                    "<lora:characters/denia:0.8>"
+                ),
+                lora_preset=preset.name,
+                validate_llm_characters=True,
+            )
+
+            paths, seed, prompt, _, _ = await plugin._execute_job(
+                job,
+                options,
+                object(),
+            )
+
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(len(paths), 1)
+        self.assertIn(r"denia \(wuthering waves\)", prompt)
 
     async def test_character_swap_rejects_target_changed_after_planning(self) -> None:
         current = self.catalog_module.LoraRecord(
@@ -8727,6 +9219,59 @@ class V210ReverseAndControlIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 image_count=2,
             )
+
+
+class TwoNineBDefaultStyleIsolationTests(unittest.TestCase):
+    """A 2.9B profile must not inherit the persisted Legacy style preset."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _plugin(model_family: str):
+        plugin = object.__new__(TwoNineBDefaultStyleIsolationTests.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            model_family=model_family,
+            default_style_preset="风格001",
+        )
+
+        class Registry:
+            @staticmethod
+            def match_style_selections(_parsed):
+                return ()
+
+            @staticmethod
+            def resolve(identifier):
+                category = "artist_style" if identifier == "风格001" else "character"
+                return types.SimpleNamespace(
+                    name=identifier,
+                    category=category,
+                    selections=(),
+                )
+
+        plugin._lora_presets = Registry()
+        return plugin
+
+    def test_29b_omits_default_style_without_mutating_setting(self) -> None:
+        plugin = self._plugin("anima_29b_40l")
+        presets, replace_stack = plugin._resolve_job_presets("", ())
+        self.assertEqual(presets, ())
+        self.assertFalse(replace_stack)
+        self.assertEqual(plugin.settings.default_style_preset, "风格001")
+
+    def test_29b_character_preset_does_not_auto_add_legacy_style(self) -> None:
+        plugin = self._plugin("anima_29b_40l")
+        presets, replace_stack = plugin._resolve_job_presets("角色001", ())
+        self.assertEqual([preset.name for preset in presets], ["角色001"])
+        self.assertFalse(replace_stack)
+
+    def test_legacy_still_uses_default_style(self) -> None:
+        plugin = self._plugin("anima_legacy_28l")
+        presets, replace_stack = plugin._resolve_job_presets("", ())
+        self.assertEqual([preset.name for preset in presets], ["风格001"])
+        self.assertTrue(replace_stack)
 
 
 if __name__ == "__main__":

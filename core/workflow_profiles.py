@@ -72,6 +72,8 @@ class WorkflowProfile:
     prompt: InputBinding | None = None
     negative: InputBinding | None = None
     unet: InputBinding | None = None
+    clip: InputBinding | None = None
+    vae: InputBinding | None = None
     lora_node_id: str = ""
     seed_bindings: tuple[InputBinding, ...] = ()
     resolution: ResolutionBinding | None = None
@@ -84,6 +86,7 @@ class WorkflowProfile:
     output_variants: Mapping[str, OutputVariant] = field(default_factory=dict)
     default_output_variant: str = "base"
     defaults: Mapping[str, Any] = field(default_factory=dict)
+    model_contract: Mapping[str, Any] = field(default_factory=dict)
     source: str = "legacy"
 
     @property
@@ -109,6 +112,8 @@ class WorkflowProfile:
                 settings.unet_loader_node_id,
                 settings.unet_model_input_name,
             ),
+            clip=None,
+            vae=None,
             lora_node_id=settings.lora_loader_node_id,
             seed_bindings=tuple(seeds),
             resolution=ResolutionBinding(settings.resolution_node_id),
@@ -367,6 +372,9 @@ def load_workflow_profile(
     defaults = payload.get("defaults")
     if not isinstance(defaults, Mapping):
         defaults = {}
+    model_contract = payload.get("model_contract")
+    if not isinstance(model_contract, Mapping):
+        model_contract = {}
     return WorkflowProfile(
         profile_id=_clean_id(payload.get("profile_id"), "profile_id"),
         display_name=str(payload.get("display_name") or workflow_path.stem).strip()[:128],
@@ -383,6 +391,8 @@ def load_workflow_profile(
         ),
         negative=_binding(bindings.get("negative_prompt"), "negative_prompt"),
         unet=_binding(bindings.get("unet"), "unet"),
+        clip=_binding(bindings.get("clip"), "clip"),
+        vae=_binding(bindings.get("vae"), "vae"),
         lora_node_id=_clean_id(
             (bindings.get("lora") or {}).get("node_id")
             if isinstance(bindings.get("lora"), Mapping)
@@ -412,6 +422,7 @@ def load_workflow_profile(
             "default_output_variant",
         ),
         defaults=dict(defaults),
+        model_contract=dict(model_contract),
         source=str(manifest_path),
     )
 

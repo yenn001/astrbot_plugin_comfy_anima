@@ -2,6 +2,134 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.0] - 2026-08-30
+
+### 2.1.307 调用链收敛线正式发布
+
+- 以 2.4.0 发布已验证的 Legacy 单图调用链收敛实现；运行时兼容基线保持 v2.1.1。
+- 保留 PromptCatalog、确定性 IntentPlan、资产探针、主体身份门禁、Manifest 合并和请求级 ToolSet 隔离。
+- 2.9B 可执行路径继续 Deferred；交付回执在当前 aiocqhttp 运行时诚实降级为 UNKNOWN。
+
+## [2.1.307] - 2026-08-28
+
+### Immersive + Prompt Refactor Stage 1
+
+- 新增 PromptCatalog：版本化提示词资源唯一确定性解析，重复/缺头 loud 失败。
+- 拆分配置：chat_roleplay_draw_prompt / director_creative_preference；
+  旧 auto_draw_system_prompt 仅作回滚源，不再复制使用。
+- 协议收口 v3.1：任务提示词与传输协议分离，Director 拼接顺序固定。
+- 资产探针三态化：probe_evidence_ok / probe_miss / probe_fatal，
+  MISS 不封存绘图终态。
+- 照片请求路由拆分：director_primary 下 photo-only 不再进入 natural draw。
+- 确定性 IntentPlan 与只读 ToolSet 裁剪。
+- ResponseEnvelope / BundleLedger / DeliveryReceipt：挂载归属硬校验，
+  无 message_id 不得标 SENT。
+- 身份绑定确定性解析：多 canonical 失败关闭。
+- 双 Manifest 合并：预设权威覆盖、配方独有槽保留、不静默丢弃保存权重。
+
+## [2.1.306] - 2026-08-27
+
+### 调用链收敛重构 Stage 1
+
+- 新增 `services/drawing_state_machine.py`：每个 event 一个 drawing run，严格
+  queued → submitting → running → completed → delivery，终态不可重开，
+  queued/submitting/running 可取消。
+- 新增 `services/drawing_orchestrator.py`：事件级唯一提交闸门（同一 event 第二次
+  提交抛 `DuplicateSubmissionError`）、幂等 run_id 分配、终态后旧 hook 只读。
+- `_create_image_task_record` 改为把 orchestrator 分配的 run_id 直接写入
+  `task_runs`，任务库、交付与诊断共享同一 run_id。
+- 活动 agent run 期间到达的绘图消息（AstrBot `FOLLOW_UP_NOTICE`）在
+  `on_llm_request` 阶段识别并提升为受控绘图轮次，不再裸奔进角色扮演回复。
+- 绘图轮次请求阶段额外移除 shell/python/file/grep 等高权限工具；执行阶段对
+  越权工具调用 fail-closed 并请求停止事件。
+- 普通聊天多 `<pic>` 回复在 Stage 1 只允许第一次提交，后续 prompt 明确拒绝并
+  给出提示（待 Stage 2 多 bundle 支持）。
+
+### 上线期间发现并处理的问题
+
+- **角色预设身份终检误杀**：contract-enabled 角色预设未建立 expected 身份基线，
+  预设自己的 `denia_(wuthering_waves)` 被判为“未授权额外 Character”。
+  处理：预设分支先调用 `_verified_prompt_character_canonicals` 建立基线，
+  拒绝信息附带具体身份名。
+- **Director JSON 修复解析过严**：模型返回 Markdown 围栏或带短尾的 JSON 时被拒。
+  处理：`_strict_json_object` 增加围栏/嵌入对象候选解析，仍走严格字段白名单。
+- **`pipeline="txt2img"/"draw"` 未知管线**：模型用同义词表达 base 管线导致提交前拒绝。
+  处理：`_normalize_pipeline` 增加 `txt2img/text2img/文生图/draw/生图/生成/standard/normal → base`，
+  未知值仍拒绝。
+- **follow-up 期间 `<pic>` 协议泄漏**：模型抢用 `send_message_to_user` 把协议文本当消息发出。
+  处理：Director Primary 下所有 LLM 请求构造阶段移除竞争交付与宿主执行工具；
+  会话标记改用引用计数，嵌套 begin/end 不清除外层会话。
+- **“画一套/想看…”类意图漏识别**：自然绘图与意图分类只认“张/个/幅”。
+  处理：补 `套/组` 量词与 `想看/我要看/给我看 + 照片/图/自拍/样子`；
+  “在干嘛/在做什么/日志/怎么回事”保持 debug 优先，避免把查岗当画图。
+- **中间工具轮回复刷“绘图终止协议修复未完成”**（2026-08-28 01:19–01:22 生产日志）：
+  模型在同一条回复里先返回 `<pic>` 又继续调用 `astr_kb_search` 等工具时，
+  装饰阶段把中间结果当成终态：提前渲染了图片并把 terminal trace 留在
+  `repair_attempted` 状态；之后每一轮工具循环都被替换成
+  “❌ 绘图终止协议修复未完成”，最长刷了约 3 分钟。
+  处理：带 trace 的 `on_decorating_result` 一律只做中间态清洗
+  （移除 `<pic>/<edit>/<think>`，保留角色台词），不再修复、提交或封存；
+  最终回复由 `on_agent_done` 终态守卫消费后才允许渲染。图片成功交付后立即
+  清空 trace；事件已有终态 run 时只保留清洗后的台词、绝不再次提交；
+  Director Primary 下同回复重复提交也不再向用户显示 Stage 1 错误文本。
+
+### Stage 2 Director Primary（沉浸式）
+
+- 新增 `director_primary` 配置：显式绘图走 Director 主链路；
+  普通聊天在工具隔离下恢复角色台词 + `<pic>` 终端渲染（先聊后图）。
+- 工具循环中间轮只清洗控制标签、保留台词；只有 `on_agent_done` 消费后的
+  最终回复才执行修复与出图，避免中间装饰阶段提前出图或刷错误文本。
+- 终态修复失败时保留角色台词，只附加失败提示，不再吞掉整条回复。
+
+## [2.1.305] - 2026-08-27
+
+### LLM 工具调用边界状态机
+
+- 新增确定性意图分类器：debug_only > 续接 > draw_new > edit_last_image > query_only > clarify。
+- 新增会话绘图配方：成功交付后持久化；插件更新首载清空旧配方，同版本重载保留，预设/LoRA/模型族变化即时失效。
+- 新增 PresetManifest 提交前不变量：负面池、LoRA 栈、模型族、身份锚与预期不一致时停止提交。
+- 新增 `<pic>` 终端确定性解码：单次 HTML 转义、全角括号与零宽字符归一化、LoRA 属性白名单。
+- Intent Router 增加 debug 优先级提示与 0.7 置信度门槛，低于阈值降级 clarify。
+- 动态任务上下文改走 `req.extra_user_content_parts`，system prompt 只保留稳定规则。
+- `metadata.yaml` 补齐 `display_name`、`short_desc`、`astrbot_version`、`support_platforms` 与配置项国际化。
+
+## [2.1.303] - 2026-08-27
+
+### 图片交付工具隔离
+
+- 普通聊天绘图请求按请求隔离 `send_message_to_user` 等竞争交付工具，避免 Agent 在终止校验前发送裸 `<pic>` 或虚假成功文本。
+- 隔离无法验证时 fail-closed，并保留 LoRA/资产查询工具链。
+
+## [2.1.302] - 2026-08-27
+
+### Intent Router WebUI
+
+- Added visible independent intent-router model controls to both WebUI settings surfaces, including manual Provider ID, timeout, temperature and Smart/Strict mode.
+
+## [2.1.301] - 2026-08-27
+
+### Independent intent routing and handoff
+
+- Added a separately configured `intent_router_model` that classifies ordinary-chat drawing intent after asset lookup without submission authority.
+- Added `smart`/`strict` interaction settings and explicit failed-handoff feedback while preserving Legacy/2.9B isolation and the terminal seal.
+
+## [2.1.300] - 2026-08-26
+
+### Legacy 角色 XXX 预设组合
+
+- 扩展“风格与角色串”全局预设，支持角色 canonical、作品、身份锚点、必需触发词、变体和正/负 Tag 池。
+- 同一 Legacy LoRA 可被多个角色预设独立复用；LoRA Manager 元数据提供触发词和 Tag 参考，不静默覆盖用户配置。
+- Bot/LLM 可按角色预设名、canonical 或作品字段选择预设；命中后禁用 Danbooru 角色身份替换、重叠和追加。
+- 身份锚点或必需触发词为空时，保存和 ComfyUI 提交均被阻断。
+
+## [2.1.2] - 2026-08-26
+
+### Bot/LLM 绘图交接状态封存
+
+- 修复中间装饰阶段失败后清空 terminal trace，导致后续旧的 LLM `<pic>` 响应绕过阻断并继续提交 ComfyUI 的问题。
+- 失败终止现在在同一事件内保持 sticky seal，直到最终 Agent 响应被消费；后续响应只返回同一阻断结果，不再产生图片。
+- 保持 LoRA、模型族隔离和 fail-closed 校验不变。
+
 ## [2.1.1] - 2026-08-08
 
 ### 普通聊天图片终止协议修复

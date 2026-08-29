@@ -113,6 +113,13 @@ class UnetCatalogService:
         except json.JSONDecodeError as exc:
             raise UnetCatalogError("ComfyUI 返回了无效的 UNET 清单 JSON") from exc
         names = self.parse_payload(payload)
+        root = str(getattr(self._settings, "unet_model_root", "") or "").replace("\\", "/").strip("/").casefold()
+        if root:
+            names = tuple(
+                name for name in names
+                if (parts := tuple(part for part in name.replace("\\", "/").strip("/").casefold().split("/") if part))
+                and (root in parts or name.casefold().startswith(root + "/"))
+            )
         if not names:
             raise UnetCatalogError("ComfyUI 的 UNET 模型目录中没有可用文件")
         return tuple(

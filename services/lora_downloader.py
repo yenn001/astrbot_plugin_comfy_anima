@@ -451,7 +451,7 @@ class LoraDownloadService:
             payload={
                 "model_id": model_id,
                 "model_version_id": version_id,
-                "model_root": "",
+                "model_root": str(getattr(self._settings, "lora_model_root", "") or ""),
                 "relative_path": "",
                 "use_default_paths": True,
                 "download_id": download_id,

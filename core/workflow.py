@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..constants import MAX_CFG, MAX_IMAGE_SIDE, MAX_SEED, MAX_STEPS, MIN_IMAGE_SIDE
-from ..models import GenerationOptions, PluginSettings
+from ..models import GenerationOptions, LoraSelection, PluginSettings
 from ..services.control_plan import ControlChannel, ControlPlan
 from .command_aliases import (
     CONTEXT_CONTROL_DRAW,
@@ -307,6 +307,14 @@ class WorkflowBuilder:
             self._profile = load_workflow_profile(workflow_path, settings)
         except WorkflowProfileError as exc:
             raise WorkflowError(f"工作流档案无效: {exc}") from exc
+        if (
+            self._profile.model_contract.get("verification_status") == "unsupported"
+            and self._profile.model_contract.get("activation_required") is False
+        ):
+            note = self._profile.model_contract.get(
+                "verification_note", "workflow is unavailable"
+            )
+            raise WorkflowError(str(note))
         self._validate_required_nodes()
 
     @property
@@ -408,6 +416,55 @@ class WorkflowBuilder:
             raise WorkflowError(f"无法设置节点 {node_id}，节点不存在或格式错误")
         node["inputs"][input_name] = value
 
+    def _apply_model_assets(self, workflow: dict[str, Any]) -> None:
+        """Apply the active profile's UNET, CLIP and VAE values."""
+        profile = self._profile
+        bindings = (
+            (profile.unet, self._settings.resolve_asset_name("unet")),
+            (profile.clip, self._settings.resolve_asset_name("clip")),
+            (profile.vae, self._settings.resolve_asset_name("vae")),
+        )
+        for binding, value in bindings:
+            if binding is not None and value:
+                WorkflowBuilder._set_input(workflow, binding.node_id, binding.input_name, value)
+        for class_type, input_name, value, binding in (
+            ("CLIPLoader", "clip_name", self._settings.resolve_asset_name("clip"), profile.clip),
+            ("VAELoader", "vae_name", self._settings.resolve_asset_name("vae"), profile.vae),
+        ):
+            if not value or binding is not None:
+                continue
+            for node_id, node in workflow.items():
+                if isinstance(node, dict) and node.get("class_type") == class_type:
+                    WorkflowBuilder._set_input(workflow, node_id, input_name, value)
+                    break
+
+    def _ensure_lora_patch_contract(self) -> None:
+        """Fail closed until the active workflow's patch contract is verified."""
+        if not getattr(self._settings, "lora_patch_required", False):
+            return
+        contract_status = str(
+            self._profile.model_contract.get("verification_status") or "needs_review"
+        ).strip().lower()
+        configured_contract = str(
+            getattr(self._settings, "lora_patch_contract_id", "") or ""
+        ).strip()
+        if contract_status != "verified" or configured_contract.endswith(":unverified"):
+            raise WorkflowError(
+                "2.9B LoRA patch contract is not verified; legacy LoRA submission is blocked"
+            )
+
+    def _scope_loras(self, selections: tuple[LoraSelection, ...]) -> tuple[LoraSelection, ...]:
+        root = str(getattr(self._settings, "lora_model_root", "") or "").replace("\\", "/").strip("/")
+        if not root:
+            return selections
+        scoped: list[LoraSelection] = []
+        for selection in selections:
+            name = str(selection.name or "").replace("\\", "/").strip("/")
+            if name and name.casefold() != root.casefold() and not name.casefold().startswith(root.casefold() + "/"):
+                name = f"{root}/{name}"
+            scoped.append(LoraSelection(name=name, strength=selection.strength))
+        return tuple(scoped)
+
     def build(
         self, options: GenerationOptions
     ) -> tuple[dict[str, Any], int, list[str]]:
@@ -421,9 +478,11 @@ class WorkflowBuilder:
         """
         workflow = copy.deepcopy(self._template)
         seed = options.seed if options.seed is not None else secrets.randbelow(MAX_SEED)
+        self._apply_model_assets(workflow)
 
         unet_binding = self._profile.unet
-        if self._settings.unet_model_name and unet_binding is not None:
+        unet_name = self._settings.resolve_asset_name("unet")
+        if unet_name and unet_binding is not None:
             unet_node = workflow.get(unet_binding.node_id)
             unet_inputs = (
                 unet_node.get("inputs") if isinstance(unet_node, dict) else None
@@ -434,7 +493,7 @@ class WorkflowBuilder:
                     f"工作流缺少 UNET 节点 {unet_binding.node_id} "
                     f"或输入 {input_name}"
                 )
-            unet_inputs[input_name] = self._settings.unet_model_name
+            unet_inputs[input_name] = unet_name
 
         prompt_binding = self._profile.prompt
         assert prompt_binding is not None
@@ -442,12 +501,13 @@ class WorkflowBuilder:
         prompt_input_name = self._resolve_input_name(prompt_inputs, prompt_binding)
         prompt_inputs[prompt_input_name] = options.prompt.strip()
         if options.dynamic_loras or options.lora_injection_mode == "replace":
+            self._ensure_lora_patch_contract()
             if not self._profile.lora_node_id:
                 raise WorkflowError("当前工作流档案没有动态 LoRA 节点")
             inject_loras(
                 workflow,
                 self._profile.lora_node_id,
-                options.dynamic_loras,
+                WorkflowBuilder._scope_loras(self, options.dynamic_loras),
                 mode=(options.lora_injection_mode or self._settings.dynamic_lora_mode),
             )
         if options.negative_prompt:
@@ -610,7 +670,7 @@ class Img2ImgWorkflowBuilder(WorkflowBuilder):
     def __init__(self, workflow_path: Path, settings: PluginSettings):
         super().__init__(workflow_path, settings)
         profile = self.profile
-        if profile.profile_id != "anima_img2img" or profile.input_image is None:
+        if profile.profile_id not in {"anima_img2img", "anima_29b_img2img"} or profile.input_image is None:
             raise WorkflowError("current workflow is not the bundled Anima img2img workflow")
         if profile.task_type != "img2img":
             raise WorkflowError("Anima img2img manifest must declare task_type img2img")
@@ -1190,6 +1250,7 @@ class InpaintWorkflowBuilder:
     ) -> tuple[dict[str, Any], int, list[str]]:
         workflow = copy.deepcopy(self._template)
         seed = options.seed if options.seed is not None else secrets.randbelow(MAX_SEED)
+        WorkflowBuilder._apply_model_assets(self, workflow)
 
         input_binding = self._profile.input_image
         mask_binding = self._profile.mask_image
@@ -1208,13 +1269,14 @@ class InpaintWorkflowBuilder:
         )
 
         unet_binding = self._profile.unet
-        if self._settings.unet_model_name and unet_binding is not None:
+        unet_name = self._settings.resolve_asset_name("unet")
+        if unet_name and unet_binding is not None:
             WorkflowBuilder._set_input(
                 workflow,
                 unet_binding.node_id,
                 unet_binding.input_name,
-                self._settings.unet_model_name,
-            )
+                unet_name,
+        )
 
         prompt_binding = self._profile.prompt
         assert prompt_binding is not None
@@ -1225,12 +1287,13 @@ class InpaintWorkflowBuilder:
             options.prompt.strip(),
         )
         if options.dynamic_loras:
+            WorkflowBuilder._ensure_lora_patch_contract(self)
             if not self._profile.lora_node_id:
                 raise WorkflowError("当前重绘工作流没有动态 LoRA 节点")
             inject_loras(
                 workflow,
                 self._profile.lora_node_id,
-                options.dynamic_loras,
+                WorkflowBuilder._scope_loras(self, options.dynamic_loras),
                 mode=(
                     options.lora_injection_mode
                     or self._settings.dynamic_lora_mode

@@ -1,23 +1,23 @@
 """
-AstrBot Comfy Anima 插件 v2.1.1
+AstrBot Comfy Anima 插件 v2.4.0
 
 功能描述：
 - 定义插件常量与默认节点映射
 - 集中维护版本及指令信息
 
 作者: Yen
-版本: 2.1.1
-日期: 2026-08-08
+版本: 2.4.0
+日期: 2026-08-30
 """
 
 from typing import Final
 
 
 PLUGIN_NAME: Final[str] = "astrbot_plugin_comfy_anima"
-PLUGIN_VERSION: Final[str] = "2.1.1"
+PLUGIN_VERSION: Final[str] = "2.4.0"
 
 DEFAULT_WORKFLOW_FILE: Final[str] = "workflow/anima_v2_api.json"
-DEFAULT_DIRECTOR_REFERENCE_FILE: Final[str] = "prompts/director_reference.txt"
+DEFAULT_DIRECTOR_REFERENCE_FILE: Final[str] = "prompts/director_creative_default.txt"
 DEFAULT_PROMPT_NODE_ID: Final[str] = "210"
 DEFAULT_NEGATIVE_NODE_ID: Final[str] = "13"
 DEFAULT_PRIMARY_SEED_NODE_ID: Final[str] = "8"

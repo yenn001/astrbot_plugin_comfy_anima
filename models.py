@@ -180,6 +180,20 @@ def _as_group_levels(value: Any) -> dict[str, str]:
     return result
 
 
+def migrate_legacy_auto_draw_prompt(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a config copy with the 307 prompt fields present.
+
+    The legacy ``auto_draw_system_prompt`` value is deliberately NOT copied:
+    it stays available as a rollback source only. Empty new fields make the
+    runtime fall back to the curated 307 prompt resources.
+    """
+
+    migrated = dict(config)
+    migrated.setdefault("chat_roleplay_draw_prompt", "")
+    migrated.setdefault("director_creative_preference", "")
+    return migrated
+
+
 @dataclass(frozen=True)
 class PluginSettings:
     """插件运行配置。"""
@@ -199,7 +213,19 @@ class PluginSettings:
     iterative_workflow_file: str = "workflow/anima_iterative_api.json"
     inpaint_crop_workflow_file: str = "workflow/anima_inpaint_crop_api.json"
     lanpaint_workflow_file: str = "workflow/anima_lanpaint_api.json"
+    control_workflow_file: str = "workflow/anima_control_api.json"
+    img2img_workflow_file: str = "workflow/anima_img2img_api.json"
     default_generation_pipeline: str = "rtx"
+    model_profile_id: str = "anima_legacy"
+    model_family: str = "anima_legacy_28l"
+    unet_model_root: str = ""
+    clip_model_name: str = "qwen_3_06b_base.safetensors"
+    clip_model_root: str = ""
+    vae_model_name: str = "qwen_image_vae.safetensors"
+    vae_model_root: str = ""
+    lora_patch_required: bool = False
+    lora_patch_node_type: str = ""
+    lora_patch_contract_id: str = ""
     enable_prompt_llm: bool = True
     prompt_llm_provider_id: str = ""
     prompt_llm_timeout: int = 120
@@ -211,10 +237,20 @@ class PluginSettings:
     director_reference_file: str = DEFAULT_DIRECTOR_REFERENCE_FILE
     director_extra_instruction: str = ""
     enable_natural_draw: bool = True
+    director_primary: bool = False
     enable_llm_pic_trigger: bool = True
     enable_chat_draw_terminal_guard: bool = True
+    # Deprecated rollback source only. 307 resolves
+    # chat_roleplay_draw_prompt / director_creative_preference instead and
+    # never copies this field into the new fields.
     auto_draw_system_prompt: str = ""
+    chat_roleplay_draw_prompt: str = ""
+    director_creative_preference: str = ""
     max_auto_images_per_reply: int = 1
+    conversation_draw_cooldown_seconds: float = 8.0
+    follow_up_draw_priority: str = "after_delivery"
+    intent_router_probe_plan: bool = True
+    show_command_progress: bool = True
     enable_reverse_prompt: bool = True
     enable_workflow_reverse: bool = True
     reverse_backend: str = "workflow"
@@ -262,6 +298,7 @@ class PluginSettings:
     lora_catalog_url: str = ""
     enable_lora_manager: bool = True
     lora_manager_url: str = ""
+    lora_model_root: str = ""
     lora_manager_scan_on_refresh: bool = True
     lora_manager_scan_interval: int = 60
     lora_manager_scan_timeout: int = 180
@@ -301,6 +338,14 @@ class PluginSettings:
     enable_parallel_preflight: bool = True
     provider_max_concurrent_jobs: int = 4
     enable_local_intent_router: bool = True
+    intent_router_model: str = ""
+    intent_router_timeout: int = 20
+    intent_router_temperature: float = 0.0
+    intent_router_min_confidence: float = 0.7
+    enable_session_recipe_continuity: bool = True
+    invalidate_session_recipe_on_update: bool = True
+    enable_preset_manifest_gate: bool = True
+    interaction_mode: str = "smart"
     structured_director_mode: str = "auto"
     enable_prompt_composer_v2: bool = True
     adaptive_negative_mode: str = "conservative"
@@ -439,6 +484,14 @@ class PluginSettings:
                 data.get("lanpaint_workflow_file", "workflow/anima_lanpaint_api.json")
             ).strip()
             or "workflow/anima_lanpaint_api.json",
+            control_workflow_file=str(
+                data.get("control_workflow_file", "workflow/anima_control_api.json")
+            ).strip()
+            or "workflow/anima_control_api.json",
+            img2img_workflow_file=str(
+                data.get("img2img_workflow_file", "workflow/anima_img2img_api.json")
+            ).strip()
+            or "workflow/anima_img2img_api.json",
             default_generation_pipeline=(
                 str(data.get("default_generation_pipeline")).strip().lower()
                 if str(data.get("default_generation_pipeline", "")).strip().lower()
@@ -447,6 +500,30 @@ class PluginSettings:
                     "rtx" if _as_bool(data.get("enable_upscale"), True) else "base"
                 )
             ),
+            model_profile_id=(
+                str(data.get("model_profile_id", "anima_legacy")).strip()
+                or "anima_legacy"
+            ),
+            model_family=(
+                str(data.get("model_family", "anima_legacy_28l")).strip()
+                or "anima_legacy_28l"
+            ),
+            unet_model_root=str(data.get("unet_model_root", "")).strip().strip("/\\"),
+            clip_model_name=(
+                str(data.get("clip_model_name", "qwen_3_06b_base.safetensors")).strip()
+                or "qwen_3_06b_base.safetensors"
+            ),
+            clip_model_root=str(data.get("clip_model_root", "")).strip().strip("/\\"),
+            vae_model_name=(
+                str(data.get("vae_model_name", "qwen_image_vae.safetensors")).strip()
+                or "qwen_image_vae.safetensors"
+            ),
+            vae_model_root=str(data.get("vae_model_root", "")).strip().strip("/\\"),
+            lora_patch_required=_as_bool(data.get("lora_patch_required"), False),
+            lora_patch_node_type=str(data.get("lora_patch_node_type", "")).strip(),
+            lora_patch_contract_id=str(
+                data.get("lora_patch_contract_id", "")
+            ).strip(),
             enable_prompt_llm=_as_bool(data.get("enable_prompt_llm"), True),
             prompt_llm_provider_id=str(data.get("prompt_llm_provider_id", "")).strip(),
             prompt_llm_timeout=_as_int(data.get("prompt_llm_timeout"), 120, 10),
@@ -458,13 +535,23 @@ class PluginSettings:
             prompt_llm_max_tokens=_as_int(data.get("prompt_llm_max_tokens"), 1000, 128),
             prompt_llm_fallback=_as_bool(data.get("prompt_llm_fallback"), True),
             show_llm_prompt=_as_bool(data.get("show_llm_prompt"), False),
-            director_reference_file=str(
-                data.get("director_reference_file", DEFAULT_DIRECTOR_REFERENCE_FILE)
-            ).strip(),
+            director_reference_file=(
+                DEFAULT_DIRECTOR_REFERENCE_FILE
+                if str(
+                    data.get(
+                        "director_reference_file", DEFAULT_DIRECTOR_REFERENCE_FILE
+                    )
+                ).strip()
+                == "prompts/director_reference.txt"
+                else str(
+                    data.get("director_reference_file", DEFAULT_DIRECTOR_REFERENCE_FILE)
+                ).strip()
+            ),
             director_extra_instruction=str(
                 data.get("director_extra_instruction", "")
             ).strip(),
             enable_natural_draw=_as_bool(data.get("enable_natural_draw"), True),
+            director_primary=_as_bool(data.get("director_primary"), False),
             enable_llm_pic_trigger=pic_trigger_enabled,
             # The terminal guard is a transport-safety invariant, not an
             # independently disableable feature. Disable ordinary-chat image
@@ -473,8 +560,27 @@ class PluginSettings:
             auto_draw_system_prompt=str(
                 data.get("auto_draw_system_prompt", "")
             ).strip(),
+            chat_roleplay_draw_prompt=str(
+                data.get("chat_roleplay_draw_prompt", "")
+            ).strip(),
+            director_creative_preference=str(
+                data.get("director_creative_preference", "")
+            ).strip(),
             max_auto_images_per_reply=_as_int(
                 data.get("max_auto_images_per_reply"), 1, 1
+            ),
+            conversation_draw_cooldown_seconds=max(
+                0.0,
+                float(data.get("conversation_draw_cooldown_seconds", 8.0) or 8.0),
+            ),
+            follow_up_draw_priority=str(
+                data.get("follow_up_draw_priority", "after_delivery")
+            ).strip(),
+            intent_router_probe_plan=_as_bool(
+                data.get("intent_router_probe_plan"), True
+            ),
+            show_command_progress=_as_bool(
+                data.get("show_command_progress"), True
             ),
             enable_reverse_prompt=_as_bool(data.get("enable_reverse_prompt"), True),
             enable_workflow_reverse=_as_bool(
@@ -630,6 +736,7 @@ class PluginSettings:
             lora_catalog_url=str(data.get("lora_catalog_url", "")).strip(),
             enable_lora_manager=_as_bool(data.get("enable_lora_manager"), True),
             lora_manager_url=str(data.get("lora_manager_url", "")).strip(),
+            lora_model_root=str(data.get("lora_model_root", "")).strip().strip("/\\"),
             lora_manager_scan_on_refresh=_as_bool(
                 data.get("lora_manager_scan_on_refresh"), True
             ),
@@ -721,6 +828,34 @@ class PluginSettings:
             ),
             enable_local_intent_router=_as_bool(
                 data.get("enable_local_intent_router"), True
+            ),
+            intent_router_model=str(data.get("intent_router_model", "")).strip(),
+            intent_router_timeout=min(
+                120,
+                _as_int(data.get("intent_router_timeout"), 20, 3),
+            ),
+            intent_router_temperature=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_router_temperature"), 0.0)),
+            ),
+            intent_router_min_confidence=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_router_min_confidence"), 0.7)),
+            ),
+            enable_session_recipe_continuity=_as_bool(
+                data.get("enable_session_recipe_continuity"), True
+            ),
+            invalidate_session_recipe_on_update=_as_bool(
+                data.get("invalidate_session_recipe_on_update"), True
+            ),
+            enable_preset_manifest_gate=_as_bool(
+                data.get("enable_preset_manifest_gate"), True
+            ),
+            interaction_mode=(
+                str(data.get("interaction_mode", "smart")).strip().lower()
+                if str(data.get("interaction_mode", "smart")).strip().lower()
+                in {"smart", "strict"}
+                else "smart"
             ),
             structured_director_mode=(
                 str(data.get("structured_director_mode", "auto")).strip().lower()
@@ -949,6 +1084,18 @@ class PluginSettings:
         path = Path(self.workflow_file).expanduser()
         return path if path.is_absolute() else plugin_dir / path
 
+    def resolve_asset_name(self, kind: str) -> str:
+        """Return a ComfyUI model name scoped to the active asset branch."""
+        field = {"unet": "unet_model_name", "clip": "clip_model_name", "vae": "vae_model_name"}.get(kind)
+        root_field = {"unet": "unet_model_root", "clip": "clip_model_root", "vae": "vae_model_root"}.get(kind)
+        if field is None or root_field is None:
+            raise ValueError(f"unknown asset kind: {kind}")
+        name = str(getattr(self, field, "") or "").replace("\\", "/").strip("/")
+        root = str(getattr(self, root_field, "") or "").replace("\\", "/").strip("/")
+        if root and name and name.casefold() != root.casefold() and not name.casefold().startswith(root.casefold() + "/"):
+            return f"{root}/{name}"
+        return name
+
     def resolve_upscale_workflow_path(self, plugin_dir: Path) -> Path:
         """Resolve the standalone RTX workflow path."""
         path = Path(self.upscale_workflow_file).expanduser()
@@ -991,6 +1138,14 @@ class PluginSettings:
         if value is None:
             raise ValueError("未知重绘模式")
         return self._resolve_plugin_path(plugin_dir, value)
+
+    def resolve_control_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the control-generation workflow for the active profile."""
+        return self._resolve_plugin_path(plugin_dir, self.control_workflow_file)
+
+    def resolve_img2img_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the img2img workflow for the active profile."""
+        return self._resolve_plugin_path(plugin_dir, self.img2img_workflow_file)
 
     def resolve_director_reference_path(self, plugin_dir: Path) -> Path:
         """解析并返回分镜导演参考提示词路径。"""
@@ -1050,6 +1205,7 @@ class GenerationOptions:
     llm_character_queries: tuple[str, ...] = ()
     llm_character_user_request: str = ""
     llm_prompt_source: str = ""
+    preset_manifest: Any = None
 
 
 @dataclass(frozen=True)

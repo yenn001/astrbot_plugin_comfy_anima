@@ -1,6 +1,26 @@
 {
   "metadata": {
-    "display_name": "Comfy Anima"
+    "display_name": "Comfy Anima",
+    "short_desc": "Anima ComfyUI drawing and asset management plugin",
+    "desc": "Anima ComfyUI drawing, editing, control-net, LoRA visual management, layered prompt assets, and Prompt Lab."
+  },
+  "config": {
+    "intent_router_min_confidence": {
+      "description": "Minimum intent router confidence",
+      "hint": "Below this threshold the bot asks the user instead of submitting to ComfyUI"
+    },
+    "enable_session_recipe_continuity": {
+      "description": "Allow continuation to reuse the last picture recipe",
+      "hint": "When disabled, \"send me another one\" no longer reuses the previous settings"
+    },
+    "invalidate_session_recipe_on_update": {
+      "description": "Clear old session recipes after a plugin update",
+      "hint": "Cleared during initialize when the version changes, preventing stale preset/LoRA reuse"
+    },
+    "enable_preset_manifest_gate": {
+      "description": "Enforce the preset manifest before submission",
+      "hint": "Stops submission when the character preset, LoRA stack, or negative pool diverges; disable only for diagnostics"
+    }
   },
   "pages": {
     "control": {

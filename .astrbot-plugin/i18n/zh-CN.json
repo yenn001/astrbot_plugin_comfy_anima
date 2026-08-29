@@ -1,6 +1,26 @@
 {
   "metadata": {
-    "display_name": "Comfy Anima"
+    "display_name": "Comfy Anima",
+    "short_desc": "Anima 专用 ComfyUI 绘图与资产管理插件",
+    "desc": "Anima 专用 ComfyUI 绘图、改图、底图控制、LoRA 视觉管理、分层提示词资产与 Prompt Lab。"
+  },
+  "config": {
+    "intent_router_min_confidence": {
+      "description": "意图判断最低置信度",
+      "hint": "低于该置信度时改为询问用户，不直接提交 ComfyUI"
+    },
+    "enable_session_recipe_continuity": {
+      "description": "允许会话续接复用上次绘图配方",
+      "hint": "关闭后“再拍一张/现在发给我”不会再自动复用上次设置"
+    },
+    "invalidate_session_recipe_on_update": {
+      "description": "插件更新后自动清空旧会话配方",
+      "hint": "版本变化时在 initialize 阶段清空，防止旧预设/LoRA 配置被续接"
+    },
+    "enable_preset_manifest_gate": {
+      "description": "提交前强制校验预设清单",
+      "hint": "角色预设、LoRA 栈或负面池与预期不一致时停止提交；仅供诊断时临时关闭"
+    }
   },
   "pages": {
     "control": {

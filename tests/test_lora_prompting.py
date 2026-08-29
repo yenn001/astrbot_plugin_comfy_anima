@@ -548,5 +548,26 @@ class RuntimeLoraTriggerTests(unittest.TestCase):
         )
 
 
+    def test_bound_activation_is_applied_when_manager_metadata_has_no_trigger(self) -> None:
+        plan = build_lora_trigger_plan(
+            prompt="masterpiece",
+            negative_prompt="",
+            selections=(LoraSelection("characters/denia", 0.8),),
+            records_by_name={
+                "characters/denia": LoraRecord(
+                    "characters/denia",
+                    category="character",
+                    character_name="denia (wuthering waves)",
+                    trigger_words=(),
+                )
+            },
+            bound_character_activation_terms={
+                "characters/denia": ("denia (wuthering waves)",)
+            },
+        )
+        self.assertIn("denia", plan.prompt)
+        self.assertIn("wuthering waves", plan.prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

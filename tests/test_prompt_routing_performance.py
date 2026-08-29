@@ -37,7 +37,7 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
         plugin._director = PromptDirector(
             Path(__file__).resolve().parents[1]
             / "prompts"
-            / "director_reference.txt",
+            / "director_creative_default.txt",
             settings,
         )
         plugin._director_error = ""
@@ -46,7 +46,13 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
         plugin._lora_presets = LoraPresetRegistry([], max_loras=12)
         plugin._semantic_index = types.SimpleNamespace(entries={})
         plugin._find_requested_style_preset = lambda _text: ""
-        plugin._get_director_output_tool_set = lambda: None
+        plugin._registered_llm_tool_names = lambda: (
+            "list_anima_loras",
+            "list_anima_lora_presets",
+            "list_anima_prompt_plans",
+            "search_anima_danbooru_tags",
+        )
+        plugin._get_director_output_tool_set = lambda: object()
         plugin._get_lora_tool_set = lambda: object()
         plugin._get_danbooru_tool_set = lambda: object()
         return plugin
@@ -84,7 +90,17 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
 
             async def llm_generate(self, **_kwargs: object) -> object:
                 self.llm_calls += 1
-                raise AssertionError("explicit LoRA intent should use tool loop")
+                import json
+
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(
+                        {
+                            "positive_tags": "1girl, portrait, <lora:characters/denia:0.8>",
+                            "negative_tags": "",
+                            "pipeline": "base",
+                        }
+                    )
+                )
 
             async def tool_loop_agent(self, **_kwargs: object) -> object:
                 self.tool_calls += 1
@@ -103,7 +119,7 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("<lora:characters/denia:0.8>", instruction.prompt)
-        self.assertEqual(context.llm_calls, 0)
+        self.assertEqual(context.llm_calls, 1)
         self.assertEqual(context.tool_calls, 1)
 
     async def test_known_danbooru_identity_uses_lookup_tool_without_lora(self) -> None:
@@ -113,7 +129,20 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
 
             async def llm_generate(self, **_kwargs: object) -> object:
                 self.llm_calls += 1
-                raise AssertionError("known identity lookup should use the tool loop")
+                import json
+
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(
+                        {
+                            "positive_tags": (
+                                "1girl, roxy_migurdia, blue hair, portrait. "
+                                "Roxy faces the viewer in a quiet portrait."
+                            ),
+                            "negative_tags": "",
+                            "pipeline": "base",
+                        }
+                    )
+                )
 
             async def tool_loop_agent(self, **_kwargs: object) -> object:
                 self.tool_calls += 1
@@ -148,7 +177,7 @@ class PromptRoutingPerformanceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("roxy_migurdia", instruction.prompt)
-        self.assertEqual(context.llm_calls, 0)
+        self.assertEqual(context.llm_calls, 1)
         self.assertEqual(context.tool_calls, 1)
 
     async def test_provider_failure_prose_never_becomes_prompt(self) -> None:

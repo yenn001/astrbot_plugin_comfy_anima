@@ -262,7 +262,17 @@ class LoraIdentityBinding:
     activation_terms: tuple[str, ...] = ()
     source: str = "manual"
     verified_revision: str = ""
+    verified_source_revision: str = ""
     verified_at: str = ""
+    variant_id: str = "default"
+    variant_display_name: str = ""
+    variant_aliases: tuple[str, ...] = ()
+    stable_identity_tags: tuple[str, ...] = ()
+    default_appearance_tags: tuple[str, ...] = ()
+    optional_component_tags: tuple[str, ...] = ()
+    default_for_character: bool = True
+    compatible_model_families: tuple[str, ...] = ()
+    compatibility_mode: str = "unknown"
 
     def __post_init__(self) -> None:
         character = _clean_text(self.character_canonical)
@@ -279,7 +289,44 @@ class LoraIdentityBinding:
             tuple(dict.fromkeys(_clean_text(item) for item in self.activation_terms if _clean_text(item)))[:24],
         )
         object.__setattr__(self, "verified_revision", _clean_text(self.verified_revision))
+        object.__setattr__(
+            self,
+            "verified_source_revision",
+            _clean_text(self.verified_source_revision),
+        )
         object.__setattr__(self, "verified_at", _clean_text(self.verified_at))
+        variant_id = _clean_text(self.variant_id) or "default"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", variant_id):
+            raise LoraSemanticError("LoRA identity variant_id is invalid")
+        object.__setattr__(self, "variant_id", variant_id)
+        object.__setattr__(self, "variant_display_name", _clean_text(self.variant_display_name))
+        for field_name in (
+            "variant_aliases",
+            "stable_identity_tags",
+            "default_appearance_tags",
+            "optional_component_tags",
+        ):
+            values = tuple(
+                dict.fromkeys(
+                    _clean_text(item)
+                    for item in getattr(self, field_name)
+                    if _clean_text(item)
+                )
+            )[:48]
+            object.__setattr__(self, field_name, values)
+        object.__setattr__(self, "default_for_character", bool(self.default_for_character))
+        families = tuple(
+            dict.fromkeys(
+                _clean_text(item).casefold()
+                for item in self.compatible_model_families
+                if _clean_text(item)
+            )
+        )[:8]
+        mode = _clean_text(self.compatibility_mode).casefold() or "unknown"
+        if mode not in {"unknown", "legacy_only", "native_29b", "legacy_projection"}:
+            raise LoraSemanticError("LoRA identity compatibility_mode is invalid")
+        object.__setattr__(self, "compatible_model_families", families)
+        object.__setattr__(self, "compatibility_mode", mode)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -288,7 +335,17 @@ class LoraIdentityBinding:
             "activation_terms": list(self.activation_terms),
             "source": self.source,
             "verified_revision": self.verified_revision,
+            "verified_source_revision": self.verified_source_revision,
             "verified_at": self.verified_at,
+            "variant_id": self.variant_id,
+            "variant_display_name": self.variant_display_name,
+            "variant_aliases": list(self.variant_aliases),
+            "stable_identity_tags": list(self.stable_identity_tags),
+            "default_appearance_tags": list(self.default_appearance_tags),
+            "optional_component_tags": list(self.optional_component_tags),
+            "default_for_character": self.default_for_character,
+            "compatible_model_families": list(self.compatible_model_families),
+            "compatibility_mode": self.compatibility_mode,
         }
 
     @classmethod
@@ -296,13 +353,35 @@ class LoraIdentityBinding:
         activation_terms = payload.get("activation_terms", ())
         if not isinstance(activation_terms, (list, tuple)):
             raise LoraSemanticError("LoRA identity activation_terms must be an array")
+        def values(name: str) -> tuple[str, ...]:
+            raw = payload.get(name, ())
+            if isinstance(raw, str):
+                raw = (raw,)
+            if not isinstance(raw, (list, tuple)):
+                raise LoraSemanticError(f"LoRA identity {name} must be an array")
+            return tuple(str(item) for item in raw)
         return cls(
             character_canonical=str(payload.get("character_canonical") or ""),
             copyright_canonical=str(payload.get("copyright_canonical") or ""),
             activation_terms=tuple(str(item) for item in activation_terms),
             source=str(payload.get("source") or "manual"),
             verified_revision=str(payload.get("verified_revision") or ""),
+            verified_source_revision=str(
+                payload.get("verified_source_revision") or ""
+            ),
             verified_at=str(payload.get("verified_at") or ""),
+            variant_id=str(payload.get("variant_id") or "default"),
+            variant_display_name=str(payload.get("variant_display_name") or ""),
+            variant_aliases=values("variant_aliases"),
+            stable_identity_tags=values("stable_identity_tags"),
+            default_appearance_tags=values("default_appearance_tags"),
+            optional_component_tags=values("optional_component_tags"),
+            default_for_character=bool(payload.get("default_for_character", True)),
+            compatible_model_families=tuple(
+                str(item) for item in payload.get("compatible_model_families", ())
+                if str(item).strip()
+            ) if isinstance(payload.get("compatible_model_families", ()), (list, tuple, set)) else (),
+            compatibility_mode=str(payload.get("compatibility_mode") or "unknown"),
         )
 
 
@@ -321,6 +400,9 @@ class SemanticEntry:
     artist_style_names: tuple[SemanticFact, ...] = ()
     aliases: tuple[SemanticFact, ...] = ()
     identity_bindings: tuple[LoraIdentityBinding, ...] = ()
+    # Explicit model-family declaration; unknown remains fail-closed on 2.9B.
+    compatible_model_families: tuple[str, ...] = ()
+    compatibility_mode: str = "unknown"
     analysis_summary: str = ""
     analysis_confidence: float = 0.0
     source_fingerprint: str = ""
@@ -350,6 +432,18 @@ class SemanticEntry:
         )
         object.__setattr__(self, "updated_at", _clean_text(self.updated_at))
         object.__setattr__(self, "error", _clean_text(self.error))
+        families = tuple(
+            dict.fromkeys(
+                _clean_text(item).casefold()
+                for item in self.compatible_model_families
+                if _clean_text(item)
+            )
+        )[:8]
+        mode = _clean_text(self.compatibility_mode).casefold() or "unknown"
+        if mode not in {"unknown", "legacy_only", "native_29b", "legacy_projection"}:
+            raise LoraSemanticError("LoRA compatibility_mode is invalid")
+        object.__setattr__(self, "compatible_model_families", families)
+        object.__setattr__(self, "compatibility_mode", mode)
         object.__setattr__(
             self,
             "analysis_summary",
@@ -423,6 +517,8 @@ class SemanticEntry:
             "identity_bindings": [
                 binding.to_dict() for binding in self.identity_bindings
             ],
+            "compatible_model_families": list(self.compatible_model_families),
+            "compatibility_mode": self.compatibility_mode,
             "analysis_summary": self.analysis_summary,
             "analysis_confidence": self.analysis_confidence,
             "source_fingerprint": self.source_fingerprint,
@@ -466,6 +562,14 @@ class SemanticEntry:
                 for item in raw_bindings
                 if isinstance(item, Mapping)
             ),
+            compatible_model_families=tuple(
+                str(item)
+                for item in payload.get("compatible_model_families", ())
+                if str(item).strip()
+            )
+            if isinstance(payload.get("compatible_model_families", ()), (list, tuple, set))
+            else (),
+            compatibility_mode=str(payload.get("compatibility_mode") or "unknown"),
             **parsed_fields,
         )
 
@@ -777,6 +881,14 @@ class LoraSemanticIndex:
             ),
             aliases=aliases,
             character_name=" / ".join(character_names) or record.character_name,
+            compatible_model_families=(
+                entry.compatible_model_families or record.compatible_model_families
+            ),
+            compatibility_mode=(
+                entry.compatibility_mode
+                if entry.compatibility_mode != "unknown"
+                else record.compatibility_mode
+            ),
             source_work="；".join(works) or record.source_work,
         )
 

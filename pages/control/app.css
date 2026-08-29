@@ -498,6 +498,10 @@ button.inverse:hover:not(:disabled) { background: #57483b; box-shadow: 5px 5px 0
 
 .profile-station { border-left: 10px solid var(--orange); }
 .profile-controls { display: grid; grid-template-columns: minmax(220px, 0.7fr) minmax(260px, 1fr) auto; gap: 14px; align-items: end; }
+.profile-capability-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 16px 0 0; }
+.profile-capability-grid > div { min-width: 0; padding: 11px 12px; border: 1px solid var(--line-soft); background: color-mix(in srgb, var(--paper-high) 82%, var(--orange)); }
+.profile-capability-grid dt { color: var(--muted); font: 700 9px/1.3 var(--font-mono); letter-spacing: .08em; }
+.profile-capability-grid dd { margin: 6px 0 0; color: var(--ink); font: 700 12px/1.35 var(--font-mono); overflow-wrap: anywhere; }
 .profile-buttons { display: flex; flex-wrap: wrap; gap: 9px; }
 
 .lora-tool-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 22px; align-items: start; }
@@ -565,6 +569,9 @@ button.inverse:hover:not(:disabled) { background: #57483b; box-shadow: 5px 5px 0
 .chip.bad { color: var(--danger); background: #f5ddd1; border-color: var(--danger); }
 .chip.neutral { background: #e5dfd3; }
 .chip.metadata { color: var(--archive-metadata-fg); background: var(--archive-metadata-bg); border-color: var(--archive-metadata-border); }
+.lora-family-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.lora-family-badges .chip { padding: 4px 6px; font-size: 9px; }
+.lora-family-badges .family-chip { color: #17435d; background: #d6eaf4; border-color: #5d9bb8; }
 
 .catalog-card { padding: 0; overflow: hidden; }
 .catalog-toolbar {
@@ -648,6 +655,12 @@ td.multiline { white-space: pre-line; line-height: 1.55; }
 .lora-detail-block dd { min-width: 0; margin: 0; overflow-wrap: anywhere; line-height: 1.55; }
 .lora-detail-block pre { max-height: 280px; margin: 0; padding: 10px; overflow: auto; color: var(--ink); background: var(--sand-light); border-left: 4px solid var(--orange); white-space: pre-wrap; font: 12px/1.55 var(--font-mono); }
 .lora-review-form { padding: 20px; background: var(--ink); color: var(--paper); border: 3px solid var(--orange); box-shadow: 7px 7px 0 var(--orange); }
+.lora-family-fieldset { margin: 0 0 8px; border-color: var(--orange); }
+.lora-family-fieldset legend { color: var(--orange); }
+.family-check-grid { display: grid; gap: 8px; align-content: center; }
+.check-row { display: flex; align-items: center; gap: 8px; font: 700 12px var(--font-mono); }
+.check-row input { accent-color: var(--orange); }
+.field-help { margin: 8px 0 0; color: #d8ccbd; font-size: 12px; line-height: 1.5; }
 .lora-review-form .card-head { margin: 0; }
 .lora-review-form label > span { color: #d8ccbd; }
 .lora-review-form textarea,
@@ -727,6 +740,9 @@ td.multiline { white-space: pre-line; line-height: 1.55; }
 .digestion-status-notes { display: flex; flex-wrap: wrap; gap: 8px 20px; color: #cfc1ae; font: 10px var(--font-mono); }
 .digestion-status-notes b { color: var(--orange-light); }
 .archive-state-label { margin: 18px 0 7px; }
+.family-filter-tabs { margin-bottom: 4px; }
+.family-filter-tabs .filter-tab.active { background: var(--orange-light); }
+.family-filter-note { max-width: 760px; margin: 7px 0 0; font-size: 11px; }
 .archive-state-tabs .filter-tab.active { background: var(--sand); }
 .chip.warning { color: #71370b; background: #f2b45f; border-color: #9b4a11; }
 .archive-state-chip { margin-bottom: 7px; font-size: 11px; }
@@ -1475,6 +1491,7 @@ html[data-theme="night"] .prompt-result-section pre { background: #171411; }
   label.span-3, label.span-4 { grid-column: span 2; }
   .archive-metrics { grid-template-columns: repeat(3, 1fr); }
   .profile-controls { grid-template-columns: 1fr 1fr; }
+  .profile-capability-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .profile-buttons { grid-column: span 2; }
   .catalog-toolbar { align-items: flex-start; flex-direction: column; }
   .selection-tools { justify-content: flex-start; }
@@ -1547,6 +1564,7 @@ html[data-theme="night"] .prompt-result-section pre { background: #171411; }
   .metric-card { grid-column: span 12; min-height: 132px; }
   .metric-card:nth-child(even) { margin-left: 11px; }
   .form-grid, .compact-grid, .profile-controls { grid-template-columns: 1fr; }
+  .profile-capability-grid { grid-template-columns: 1fr; }
   .workflow-sampler-head { align-items: flex-start; flex-direction: column; }
   .workflow-selector-row { grid-template-columns: 1fr; align-items: stretch; }
   .workflow-selector-row .compact-actions { flex-wrap: wrap; }

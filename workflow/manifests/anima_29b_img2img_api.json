@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "profile_id": "anima_29b_img2img",
+  "display_name": "Anima 2.9B img2img",
+  "workflow_file": "anima_29b_img2img_api.json",
+  "task_type": "img2img",
+  "bindings": {
+    "positive_prompt": {
+      "node_id": "11",
+      "input": "text"
+    },
+    "negative_prompt": {
+      "node_id": "12",
+      "input": "text"
+    },
+    "unet": {
+      "node_id": "44",
+      "input": "unet_name"
+    },
+    "lora": {
+      "node_id": "462"
+    },
+    "seed": [
+      {
+        "node_id": "19",
+        "input": "seed"
+      },
+      {
+        "node_id": "100",
+        "input": "seed"
+      }
+    ],
+    "resolution": {
+      "node_id": "501",
+      "width_input": "width",
+      "height_input": "height"
+    },
+    "samplers": [
+      {
+        "node_id": "19",
+        "steps_input": "steps",
+        "cfg_input": "cfg",
+        "denoise_input": "denoise"
+      },
+      {
+        "node_id": "100",
+        "steps_input": "steps",
+        "cfg_input": "cfg",
+        "denoise_input": "denoise"
+      }
+    ],
+    "input_image": {
+      "node_id": "500",
+      "input": "image"
+    },
+    "upscale": {
+      "node_id": "552",
+      "scale_input": "resize_type.scale",
+      "quality_input": "quality"
+    },
+    "clip": {
+      "node_id": "45",
+      "input": "clip_name"
+    },
+    "vae": {
+      "node_id": "15",
+      "input": "vae_name"
+    }
+  },
+  "output_variants": {
+    "base": {
+      "preferred_node_ids": [
+        "88"
+      ],
+      "prune_node_ids": []
+    },
+    "rtx": {
+      "preferred_node_ids": [
+        "458"
+      ],
+      "prune_node_ids": []
+    },
+    "iterative": {
+      "preferred_node_ids": [
+        "103"
+      ],
+      "prune_node_ids": []
+    }
+  },
+  "default_output_variant": "base",
+  "defaults": {
+    "mode": "img2img",
+    "pipeline": "base",
+    "width": 832,
+    "height": 1216,
+    "steps": 8,
+    "cfg": 5.0,
+    "denoise": 0.55,
+    "rtx_scale": 2.0,
+    "rtx_quality": "ULTRA",
+    "iterative_scale": 1.5,
+    "iterative_steps": 3,
+    "iterative_denoise": 0.35
+  },
+  "model_contract": {
+    "model_family": "anima_29b_40l",
+    "unet": "Anima-2.9B-preview-v1.safetensors",
+    "clip": "qwen_3_06b_base.safetensors",
+    "vae": "qwen_image_vae.safetensors",
+    "lora_patch_required": true,
+    "lora_patch_node_type": "ComfyUI-Anima-2.9B",
+    "lora_patch_contract_id": "anima29b-runtime-patch:detect-unet-blocks-28-to-40@2de99f23e31ccf75d1a0f3d04c16ac5cfcd320e6",
+    "verification_status": "verified",
+    "verification_receipt": "2026-08-25 .88 family receipt 4e7375bc-4826-4bb3-8a49-3610c1426e02"
+  }
+}

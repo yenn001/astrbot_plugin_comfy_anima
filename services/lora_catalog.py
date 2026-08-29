@@ -184,6 +184,10 @@ class LoraRecord:
     source_work: str = ""
     from_civitai: bool = False
     source_fingerprint: str = ""
+    # Empty means unknown and is rejected by the 2.9B profile rather than
+    # silently sharing a Legacy asset.
+    compatible_model_families: tuple[str, ...] = ()
+    compatibility_mode: str = "unknown"
 
 
 class _DirectoryLinkParser(HTMLParser):
@@ -237,6 +241,29 @@ class LoraCatalogService:
         self._record_overlay: Optional[
             Callable[[tuple[LoraRecord, ...]], tuple[LoraRecord, ...]]
         ] = None
+
+    def _filter_model_root(self, records: tuple[LoraRecord, ...]) -> tuple[LoraRecord, ...]:
+        """Keep only LoRAs inside the active ComfyUI models/loras branch."""
+        root = str(getattr(self._settings, "lora_model_root", "") or "").replace("\\", "/").strip("/").casefold()
+        if not root:
+            return records
+        filtered: list[LoraRecord] = []
+        for record in records:
+            candidates = (
+                str(record.file_path or ""),
+                str(record.folder or ""),
+                str(record.name or ""),
+            )
+            matched = False
+            for raw in candidates:
+                path = raw.replace("\\", "/").strip("/").casefold()
+                parts = tuple(part for part in path.split("/") if part)
+                if root in parts or path == root or path.startswith(root + "/"):
+                    matched = True
+                    break
+            if matched:
+                filtered.append(record)
+        return tuple(filtered)
 
     def set_record_overlay(
         self,
@@ -383,11 +410,19 @@ class LoraCatalogService:
                     detail,
                 )
 
+            records = self._filter_model_root(records)
+            if not records:
+                root = str(getattr(self._settings, "lora_model_root", "") or "")
+                raise LoraCatalogError(
+                    f"当前 LoRA 分支 {root or '(默认)'} 中没有可用文件，已拒绝跨目录回退"
+                )
+
             if manager_records and records:
                 records = self._merge_catalogs(records, manager_records)
                 self._last_source = "LoRA Manager + ComfyUI object_info"
             else:
                 self._last_source = "ComfyUI object_info / custom catalog"
+            records = self._filter_model_root(records)
             if not records:
                 raise LoraCatalogError("局域网清单中没有找到 LoRA 文件")
             records = self._apply_alias_rules(records)

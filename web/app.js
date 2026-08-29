@@ -7,6 +7,7 @@ let toastTimer = null;
 let loraItems = [];
 let loraFilter = "all";
 let loraArchiveFilter = "all";
+let loraFamilyFilter = "active";
 let loraArchiveStatus = null;
 let archiveRunInFlight = false;
 let profileItems = [];
@@ -53,6 +54,7 @@ let loraGalleryPage = 1;
 let loraGalleryPages = 1;
 let loraGalleryFingerprint = "";
 let loraPreviewObserver = null;
+let activeModelFamily = "anima_legacy_28l";
 const taskLatestEvents = new Map();
 const volatilePreferences = new Map();
 const volatileSessionPreferences = new Map();
@@ -97,6 +99,18 @@ const loraCategoryLabels = {
   mixed: "混合",
   unclassified: "未分类",
   unknown: "未分类",
+};
+
+const loraFamilyLabels = {
+  anima_legacy_28l: "Legacy · 28-layer",
+  anima_29b_40l: "2.9B · 40-layer",
+};
+
+const loraCompatibilityLabels = {
+  unknown: "未声明",
+  legacy_only: "仅 Legacy",
+  native_29b: "原生 2.9B",
+  legacy_projection: "Legacy 投影",
 };
 
 const filterCountIds = {
@@ -186,6 +200,8 @@ const numberFields = new Set([
   "prompt_llm_temperature",
   "prompt_llm_max_tokens",
   "character_swap_timeout",
+  "intent_router_timeout",
+  "intent_router_temperature",
   "reverse_prompt_timeout",
   "reverse_prompt_temperature",
   "reverse_prompt_max_tokens",
@@ -520,6 +536,62 @@ function valueList(value) {
   return [];
 }
 
+function loraCompatibilityMode(item) {
+  return String(
+    item?.compatibility_mode
+      || item?.archive_entry?.compatibility_mode
+      || item?.archive?.compatibility_mode
+      || "unknown",
+  ).trim().toLocaleLowerCase() || "unknown";
+}
+
+function loraCompatibleFamilies(item) {
+  return new Set(valueList(
+    item?.compatible_model_families
+      || item?.archive_entry?.compatible_model_families
+      || item?.archive?.compatible_model_families,
+  ).map((value) => value.trim().toLocaleLowerCase()).filter(Boolean));
+}
+
+function isLoraCompatibleWithActiveProfile(item) {
+  const families = loraCompatibleFamilies(item);
+  const mode = loraCompatibilityMode(item);
+  if (activeModelFamily === "anima_29b_40l") {
+    return (mode === "native_29b" && families.has("anima_29b_40l"))
+      || (mode === "legacy_projection" && families.has("anima_legacy_28l"));
+  }
+  // Legacy keeps its historical permissive catalog behavior, while an
+  // explicitly 2.9B-only asset remains hidden from the active list.
+  return !(mode === "native_29b" && !families.has("anima_legacy_28l"))
+    && !(families.has("anima_29b_40l") && !families.has("anima_legacy_28l"));
+}
+
+function loraMatchesFamilyFilter(item) {
+  if (loraFamilyFilter === "all") return true;
+  if (loraFamilyFilter === "active") return isLoraCompatibleWithActiveProfile(item);
+  const families = loraCompatibleFamilies(item);
+  if (loraFamilyFilter === "unknown") return !families.size;
+  return families.has(loraFamilyFilter);
+}
+
+function loraFamilyBadge(item) {
+  const families = loraCompatibleFamilies(item);
+  const mode = loraCompatibilityMode(item);
+  const cell = document.createElement("div");
+  cell.className = "lora-family-badges";
+  if (!families.size) {
+    cell.append(chip("模型族未声明", "bad"));
+  } else {
+    for (const family of families) {
+      if (loraFamilyLabels[family]) cell.append(chip(loraFamilyLabels[family], "family-chip"));
+    }
+    if (loraCompatibilityLabels[mode]) {
+      cell.append(chip(loraCompatibilityLabels[mode], mode === "unknown" ? "bad" : "neutral"));
+    }
+  }
+  return cell;
+}
+
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -564,6 +636,7 @@ function loraArchiveCell(item) {
       : `归档于 ${parsed.toLocaleString("zh-CN", {hour12: false})}`;
     cell.append(time);
   }
+  cell.append(loraFamilyBadge(item));
   return cell;
 }
 
@@ -652,6 +725,10 @@ async function loadBootstrap() {
   const data = await api("/api/bootstrap");
   csrfToken = data.csrf_token;
   bootstrapData = data;
+  activeModelFamily = data.settings?.model_family === "anima_29b_40l"
+    || data.settings?.model_profile_id === "anima_29b"
+    ? "anima_29b_40l"
+    : "anima_legacy_28l";
   document.querySelector("#service-state").textContent = "在线";
   document.querySelector("#service-state").classList.add("online");
   document.querySelector("#version-label").textContent = `v${data.version}`;
@@ -670,8 +747,9 @@ async function loadBootstrap() {
     `${data.settings.default_width} × ${data.settings.default_height}`;
   populateSettings(data.settings);
   renderWorkflowSamplers(data.workflow_runtime || {}, data.settings || {});
+  updateLoraFamilyFilterUI();
   await Promise.all([
-    loadProviders(data.settings.prompt_llm_provider_id),
+    loadProviders({prompt: data.settings.prompt_llm_provider_id, intent: data.settings.intent_router_model}),
     loadConfigProfiles({quiet: true}),
     loadWorkflows({quiet: true}),
   ]);
@@ -999,6 +1077,10 @@ async function loadProviders(selectedOverride = null) {
       note: "#reverse-provider-note", empty: "自动复用导演/当前会话模型", selected: "selected_reverse", vision: true,
     },
     {
+      key: "intent", group: "chat", select: "#intent-router-select", manual: "#intent-router-manual",
+      note: "#intent-router-note", empty: "未配置独立意图模型（查询后禁止自动提交）", selected: "selected_intent_router",
+    },
+    {
       key: "embedding", group: "embedding", select: "#embedding-provider-select", manual: "#embedding-provider-manual",
       note: "#embedding-provider-note", empty: "停用向量召回", selected: "selected_embedding",
     },
@@ -1099,6 +1181,7 @@ function collectSettings(form) {
     const providerManual = {
       prompt_llm_provider_id: "#provider-manual",
       reverse_prompt_provider_id: "#reverse-provider-manual",
+      intent_router_model: "#intent-router-manual",
       lora_embedding_provider_id: "#embedding-provider-manual",
       lora_rerank_provider_id: "#rerank-provider-manual",
     };
@@ -1159,6 +1242,48 @@ async function saveSettings(event) {
   }
 }
 
+function renderProfileCapabilities(profile) {
+  const fields = {
+    "model-family": "—",
+    "lora-policy": "—",
+    "patch-contract": "—",
+    "workflow-family": "—",
+  };
+  const settings = profile?.settings || {};
+  const is29b = settings.model_profile_id === "anima_29b";
+  fields["model-family"] = is29b ? "Anima 2.9B · 40-layer" : "Anima Legacy · 28-layer";
+  fields["lora-policy"] = is29b
+    ? "native 2.9B / verified Legacy projection"
+    : "Legacy 28-layer direct";
+  fields["patch-contract"] = is29b
+    ? (settings.lora_patch_required ? "required · receipt-gated" : "invalid profile")
+    : "not required";
+  fields["workflow-family"] = "base · RTX · iterative · inpaint · control · img2img";
+  const note = document.querySelector("#profile-capability-note");
+  if (note) {
+    note.textContent = is29b
+      ? "2.9B Control is currently fail-closed: the runtime has no 40-layer-compatible AnimaLLLite control bundle. Other verified families remain selectable."
+      : "Legacy control uses the original 28-layer control assets.";
+  }
+  for (const [name, value] of Object.entries(fields)) {
+    const node = document.querySelector(`[data-profile-field="${name}"]`);
+    if (node) node.textContent = value;
+  }
+}
+
+function updateLoraFamilyFilterUI() {
+  const note = document.querySelector("#lora-family-filter-note");
+  if (note) {
+    note.textContent = activeModelFamily === "anima_29b_40l"
+      ? "当前预设：Anima 2.9B · 40-layer。列表仅把原生 2.9B 与已声明的 Legacy 投影列为可用；patch receipt 仍由提交门禁最终复核。"
+      : "当前预设：Anima Legacy · 28-layer。2.9B-only 资产会隐藏；未声明资产仍保留，但不会被误标为 2.9B 可用。";
+  }
+  const label = document.querySelector("#lora-family-filter-active-label");
+  if (label) label.textContent = activeModelFamily === "anima_29b_40l" ? "当前 2.9B 可用" : "当前 Legacy 可用";
+  updateFamilyFilterCounts();
+  renderLoraTable();
+}
+
 function renderConfigProfiles(activeProfile = "") {
   const select = document.querySelector("#config-profile-select");
   const badge = document.querySelector("#profile-active-badge");
@@ -1177,6 +1302,10 @@ function renderConfigProfiles(activeProfile = "") {
   const resolvedActive = activeProfile || profileItems.find((item) => item.active)?.name || "";
   select.value = profileItems.some((item) => item.name === previous) ? previous : resolvedActive;
   badge.textContent = resolvedActive ? `当前 · ${resolvedActive}` : "未激活档案";
+  renderProfileCapabilities(
+    profileItems.find((item) => item.name === select.value) ||
+    profileItems.find((item) => item.active),
+  );
 }
 
 async function loadConfigProfiles({quiet = false} = {}) {
@@ -1354,6 +1483,7 @@ function visibleLoras() {
   return loraItems.filter((item) => (
     (loraFilter === "all" || normalizeCategory(item.category) === loraFilter)
     && (loraArchiveFilter === "all" || normalizeArchiveState(item) === loraArchiveFilter)
+    && loraMatchesFamilyFilter(item)
   ));
 }
 
@@ -1388,6 +1518,33 @@ function updateFilterCounts() {
   }
   for (const [state, id] of Object.entries(archiveFilterCountIds)) {
     document.querySelector(`#${id}`).textContent = archiveCounts[state] || 0;
+  }
+  updateFamilyFilterCounts();
+}
+
+function updateFamilyFilterCounts() {
+  const counts = {all: 0, active: 0, anima_legacy_28l: 0, anima_29b_40l: 0, unknown: 0};
+  for (const item of loraItems) {
+    const category = normalizeCategory(item.category);
+    const state = normalizeArchiveState(item);
+    if (loraFilter !== "all" && category !== loraFilter) continue;
+    if (loraArchiveFilter !== "all" && state !== loraArchiveFilter) continue;
+    counts.all += 1;
+    if (isLoraCompatibleWithActiveProfile(item)) counts.active += 1;
+    const families = loraCompatibleFamilies(item);
+    if (!families.size) counts.unknown += 1;
+    if (families.has("anima_legacy_28l")) counts.anima_legacy_28l += 1;
+    if (families.has("anima_29b_40l")) counts.anima_29b_40l += 1;
+  }
+  for (const [key, id] of Object.entries({
+    all: "family-filter-count-all",
+    active: "family-filter-count-active",
+    anima_legacy_28l: "family-filter-count-legacy",
+    anima_29b_40l: "family-filter-count-29b",
+    unknown: "family-filter-count-unknown",
+  })) {
+    const node = document.querySelector(`#${id}`);
+    if (node) node.textContent = counts[key] || 0;
   }
 }
 
@@ -1474,6 +1631,9 @@ function fillLoraReviewForm(detail) {
   const form = document.querySelector("#lora-semantic-form");
   const semantic = detail.semantic || {};
   form.elements.name.value = detail.name;
+  form.elements.compatibility_mode.value = semantic.compatibility_mode || detail.compatibility_mode || "unknown";
+  const familySet = new Set(valueList(semantic.compatible_model_families || detail.compatible_model_families));
+  for (const checkbox of form.querySelectorAll("input[name=compatible_model_families]")) checkbox.checked = familySet.has(checkbox.value);
   form.elements.category.value = semantic.category || detail.category || "unclassified";
   form.elements.character_names.value = valueList(semantic.character_names || detail.character_name).join("\n");
   form.elements.source_works.value = valueList(semantic.source_works || detail.source_work).join("\n");
@@ -1545,6 +1705,9 @@ async function saveLoraSemantic(event) {
   const button = document.querySelector("#lora-semantic-save");
   const payload = Object.fromEntries(new FormData(form).entries());
   payload.semantic_schema_version = 3;
+  payload.compatible_model_families = Array.from(form.querySelectorAll("input[name=compatible_model_families]:checked"), (input) => input.value);
+  const compatibilityError = validateLoraCompatibility(payload.compatibility_mode, payload.compatible_model_families);
+  if (compatibilityError) { showToast(compatibilityError, true); return; }
   payload.identity_bindings = String(payload.identity_bindings || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
     const [characterCanonical = "", copyrightCanonical = "", activationText = ""] = line.split("|").map((part) => part.trim());
     return {
@@ -1566,6 +1729,16 @@ async function saveLoraSemantic(event) {
   } finally {
     setBusy(button, false);
   }
+}
+
+function validateLoraCompatibility(mode, families) {
+  const declared = new Set(families || []);
+  if (mode === "unknown") return declared.size ? "已声明模型族，请同时选择具体兼容模式" : "";
+  if (!declared.size) return "请选择至少一个兼容模型族";
+  if (mode === "legacy_only" && !declared.has("anima_legacy_28l")) return "Legacy-only 必须声明 Legacy 28-layer";
+  if (mode === "native_29b" && !declared.has("anima_29b_40l")) return "native-2.9B 必须声明 Anima 2.9B 40-layer";
+  if (mode === "legacy_projection" && !declared.has("anima_legacy_28l")) return "legacy-projection 必须声明来源 Legacy 28-layer";
+  return "";
 }
 
 function renderLoraTable() {
@@ -2020,12 +2193,20 @@ async function loadPresets() {
         `Manager 最新：${(item.manager_trigger_words || []).join(", ") || "（无）"}`,
         `最终有效：${(item.effective_trigger_words || []).join(", ") || "（无）"}`,
       ];
+      const identityLines = [
+        item.character_canonical ? `角色：${item.character_canonical}` : "",
+        item.work_canonical ? `作品：${item.work_canonical}` : "",
+        item.identity_anchor ? `锚点：${item.identity_anchor}` : "",
+        item.required_trigger_terms?.length ? `必需：${item.required_trigger_terms.join(", ")}` : "",
+        item.positive_tags?.length ? `正面：${item.positive_tags.join(", ")}` : "",
+        item.negative_tags?.length ? `负面：${item.negative_tags.join(", ")}` : "",
+      ].filter(Boolean);
       row.append(
         textCell([item.name, aliases.length ? `简称：${aliases.join(" / ")}` : ""].filter(Boolean).join("\n"), "multiline"),
         textCell(item.category_label),
         textCell((item.loras || []).join("\n"), "multiline"),
         textCell(triggerLines.join("\n"), "multiline"),
-        textCell([item.note, item.description].filter(Boolean).join("\n") || "—", "multiline"),
+        textCell([...identityLines, item.note, item.description].filter(Boolean).join("\n") || "—", "multiline"),
         statusCell,
         action,
       );
@@ -2058,6 +2239,13 @@ function editPreset(item) {
   form.elements.namedItem("note").value = item.note || "";
   form.elements.namedItem("loras").value = (item.loras || []).join("\n");
   form.elements.namedItem("trigger_words").value = item.trigger_words || "";
+  form.elements.namedItem("character_canonical").value = item.character_canonical || "";
+  form.elements.namedItem("work_canonical").value = item.work_canonical || "";
+  form.elements.namedItem("identity_anchor").value = item.identity_anchor || "";
+  form.elements.namedItem("required_trigger_terms").value = (item.required_trigger_terms || []).join("\n");
+  form.elements.namedItem("positive_tags").value = (item.positive_tags || []).join("\n");
+  form.elements.namedItem("negative_tags").value = (item.negative_tags || []).join("\n");
+  form.elements.namedItem("variant_id").value = item.variant_id || "default";
   form.elements.namedItem("description").value = item.description || "";
   form.elements.namedItem("enabled").checked = item.enabled !== false;
   document.querySelector("#preset-editor-title").textContent = `编辑：${item.name}`;
@@ -2078,11 +2266,23 @@ async function savePreset(event) {
     category: values.get("category"),
     loras: String(values.get("loras") || "").split("\n").map((item) => item.trim()).filter(Boolean),
     trigger_words: values.get("trigger_words"),
+    character_canonical: values.get("character_canonical"),
+    work_canonical: values.get("work_canonical"),
+    identity_anchor: values.get("identity_anchor"),
+    required_trigger_terms: String(values.get("required_trigger_terms") || "").split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean),
+    positive_tags: String(values.get("positive_tags") || "").split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean),
+    negative_tags: String(values.get("negative_tags") || "").split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean),
+    variant_id: values.get("variant_id") || "default",
     description: values.get("description"),
     aliases: values.get("aliases"),
     note: values.get("note"),
     enabled: form.elements.namedItem("enabled").checked,
   };
+  if (payload.category === "character" && (!String(payload.identity_anchor || "").trim() || !payload.required_trigger_terms.length)) {
+    showToast("角色预设必须填写身份锚点和必需触发词", true);
+    setBusy(button, false);
+    return;
+  }
   try {
     const data = await api("/api/presets", {method: "POST", body: JSON.stringify(payload)});
     showToast(data.message);
@@ -4547,6 +4747,7 @@ document.querySelector("#provider-refresh").addEventListener("click", () => {
   for (const [key, selectId, manualId] of [
     ["prompt", "#provider-select", "#provider-manual"],
     ["reverse", "#reverse-provider-select", "#reverse-provider-manual"],
+    ["intent", "#intent-router-select", "#intent-router-manual"],
     ["embedding", "#embedding-provider-select", "#embedding-provider-manual"],
     ["rerank", "#rerank-provider-select", "#rerank-provider-manual"],
   ]) {
@@ -4560,6 +4761,7 @@ document.querySelector("#provider-refresh").addEventListener("click", () => {
 for (const [selectId, manualId] of [
   ["#provider-select", "#provider-manual"],
   ["#reverse-provider-select", "#reverse-provider-manual"],
+  ["#intent-router-select", "#intent-router-manual"],
   ["#embedding-provider-select", "#embedding-provider-manual"],
   ["#rerank-provider-select", "#rerank-provider-manual"],
 ]) {
@@ -4625,6 +4827,17 @@ document.querySelector("#lora-archive-state-filters").addEventListener("click", 
   if (!button) return;
   loraArchiveFilter = button.dataset.archiveState;
   for (const item of document.querySelectorAll("#lora-archive-state-filters .filter-tab")) {
+    const active = item === button;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-pressed", String(active));
+  }
+  renderLoraTable();
+});
+document.querySelector("#lora-family-filters").addEventListener("click", (event) => {
+  const button = event.target.closest(".filter-tab");
+  if (!button) return;
+  loraFamilyFilter = button.dataset.familyFilter || "active";
+  for (const item of document.querySelectorAll("#lora-family-filters .filter-tab")) {
     const active = item === button;
     item.classList.toggle("active", active);
     item.setAttribute("aria-pressed", String(active));

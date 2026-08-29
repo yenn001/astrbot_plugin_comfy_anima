@@ -475,6 +475,27 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
                 self.assertIn(f'value="{category}">{label}</option>', self.html)
                 self.assertIn(f'{category}: "{label}"', self.javascript)
 
+    def test_lora_catalog_exposes_model_family_filter_and_active_gate_hint(self) -> None:
+        for family_filter in (
+            "active",
+            "all",
+            "anima_legacy_28l",
+            "anima_29b_40l",
+            "unknown",
+        ):
+            self.assertIn(f'data-family-filter="{family_filter}"', self.html)
+        for identifier in (
+            "lora-family-filter-note",
+            "family-filter-count-active",
+            "family-filter-count-legacy",
+            "family-filter-count-29b",
+            "family-filter-count-unknown",
+        ):
+            self.assertIn(f'id="{identifier}"', self.html)
+        self.assertIn("isLoraCompatibleWithActiveProfile", self.javascript)
+        self.assertIn("loraMatchesFamilyFilter", self.javascript)
+        self.assertIn("patch receipt 仍由提交门禁最终复核", self.javascript)
+
     def test_workflow_sampler_panel_reads_templates_and_saves_override(self) -> None:
         for identifier in (
             "workflow-profile-id",
@@ -603,8 +624,29 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             (plugin_root / "web" / "app.css").read_bytes(),
             (plugin_root / "pages" / "control" / "app.css").read_bytes(),
         )
+
+    def test_anima_29b_page_is_deferred(self) -> None:
+        plugin_root = Path(__file__).resolve().parents[1]
+        page_root = plugin_root / "web" / "anima_29b"
+        html = (page_root / "index.html").read_text(encoding="utf-8")
+        self.assertIn("2.9B 控制台已暂缓", html)
+        self.assertIn("Deferred Scope", html)
+        self.assertNotIn("启用 Anima 2.9B", html)
+        self.assertNotIn("2.9B RUNTIME SETTINGS", html)
     def test_preset_editor_supports_alias_note_edit_and_trigger_provenance(self) -> None:
-        for field in ("identifier", "aliases", "note", "trigger_words"):
+        for field in (
+            "identifier",
+            "aliases",
+            "note",
+            "trigger_words",
+            "character_canonical",
+            "work_canonical",
+            "identity_anchor",
+            "required_trigger_terms",
+            "positive_tags",
+            "negative_tags",
+            "variant_id",
+        ):
             self.assertIn(f'name="{field}"', self.html)
         for identifier in (
             "preset-editor-title",
@@ -620,6 +662,10 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             'identifier: values.get("identifier")',
             'aliases: values.get("aliases")',
             'note: values.get("note")',
+            'required_trigger_terms:',
+            'positive_tags:',
+            'negative_tags:',
+            'character_canonical: values.get("character_canonical")',
         ):
             self.assertIn(marker, self.javascript)
 
@@ -777,6 +823,18 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(saved.status, 200)
         self.assertEqual(self.controller.saved_settings, {"default_width": 1024})
+
+    async def test_29b_page_is_deferred_and_assets_disabled(self) -> None:
+        anonymous = await self.client.get("/anima-29b/", allow_redirects=False)
+        self.assertEqual(anonymous.status, 302)
+        await self._login()
+        page = await self.client.get("/anima-29b/")
+        self.assertEqual(page.status, 200)
+        text = await page.text()
+        self.assertIn("2.9B 控制台已暂缓", text)
+        self.assertNotIn("启用 Anima 2.9B", text)
+        script = await self.client.get("/anima-29b/assets/app.js")
+        self.assertEqual(script.status, 404)
 
     async def test_v170_routes_reuse_authentication_csrf_and_no_store(self) -> None:
         anonymous = await self.client.get("/api/prompt-assets/status")

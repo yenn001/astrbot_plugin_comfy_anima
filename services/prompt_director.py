@@ -36,6 +36,11 @@ from .prompt_contracts import (
     normalize_task_kind,
     transport_terminal_seal,
 )
+from .prompt_catalog import strip_prompt_header
+from .director_output_schema import (
+    DirectorOutputSchemaError,
+    validate_emit_anima_plan,
+)
 from .provider_response import response_error_code, response_text
 from .structured_provider import (
     StructuredProviderError,
@@ -117,8 +122,41 @@ _PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+def _json_object_candidates(value: str) -> tuple[str, ...]:
+    """Return bounded candidate JSON texts for a repair/structured response.
+
+    Director repairs ask for ``only JSON``, but providers occasionally wrap the
+    object in Markdown fences or append a short conversational tail. Accepting
+    those envelopes here is safe because every parsed object still passes the
+    strict field whitelist in ``_picture_instruction_from_payload``.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    candidates: list[str] = [text]
+    if text.startswith("```"):
+        fenced = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text, count=1)
+        fenced = re.sub(r"\s*```\s*$", "", fenced)
+        fenced = fenced.strip()
+        if fenced and fenced != text:
+            candidates.append(fenced)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        embedded = text[start : end + 1].strip()
+        if embedded and embedded != text:
+            candidates.append(embedded)
+    return tuple(dict.fromkeys(candidates))
+
+
 def _strict_json_object(value: str) -> dict[str, Any]:
-    """Parse one finite JSON object while rejecting duplicate keys."""
+    """Parse one finite JSON object while rejecting duplicate keys.
+
+    Fenced or embedded objects from terminal repair responses are recovered
+    through ``_json_object_candidates`` before being held to the same strict
+    object rules.
+    """
 
     def reject_constant(token: str) -> Any:
         raise ValueError(f"invalid JSON constant: {token}")
@@ -131,14 +169,21 @@ def _strict_json_object(value: str) -> dict[str, Any]:
             result[key] = item
         return result
 
-    parsed = json.loads(
-        str(value or "").strip(),
-        object_pairs_hook=unique_pairs,
-        parse_constant=reject_constant,
-    )
-    if not isinstance(parsed, dict):
-        raise ValueError("JSON root must be an object")
-    return parsed
+    last_error: ValueError | None = None
+    for candidate in _json_object_candidates(value):
+        try:
+            parsed = json.loads(
+                candidate,
+                object_pairs_hook=unique_pairs,
+                parse_constant=reject_constant,
+            )
+        except (TypeError, ValueError) as exc:
+            last_error = exc if isinstance(exc, ValueError) else ValueError(str(exc))
+            continue
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON root must be an object")
+        return parsed
+    raise last_error or ValueError("JSON root must be an object")
 
 
 def _has_structured_call_surface(response: Any) -> bool:
@@ -250,11 +295,19 @@ class PromptDirector:
         settings: PluginSettings,
         composer: PromptComposer | None = None,
         danbooru_status_provider: Callable[[], Mapping[str, Any]] | None = None,
+        verified_lora_names_provider: Callable[[], tuple[str, ...]] | None = None,
+        verified_character_canonicals_provider: Callable[[], tuple[str, ...]] | None = None,
     ):
         self._settings = settings
         self._reference = self._load_reference(reference_path)
         self._composer = composer
         self._danbooru_status_provider = danbooru_status_provider
+        self._verified_lora_names_provider = (
+            verified_lora_names_provider or (lambda: ())
+        )
+        self._verified_character_canonicals_provider = (
+            verified_character_canonicals_provider or (lambda: ())
+        )
 
     def compose_picture_instruction(
         self,
@@ -328,7 +381,8 @@ class PromptDirector:
         if path.stat().st_size > 1024 * 1024:
             raise PromptDirectorError("分镜参考文件超过 1MB")
         try:
-            return path.read_text(encoding="utf-8").strip()
+            text = path.read_text(encoding="utf-8")
+            return strip_prompt_header(text).strip()
         except OSError as exc:
             raise PromptDirectorError(
                 "无法读取分镜参考文件", f"读取 {path} 失败: {exc}"
@@ -368,12 +422,12 @@ class PromptDirector:
                 parts.append(danbooru_context)
         if (
             normalized_task_kind in creative_preference_tasks
-            and self._settings.auto_draw_system_prompt
+            and self._settings.director_creative_preference
         ):
             parts.extend(
                 [
                     "以下是管理员创作偏好；不得覆盖上面的传输、证据、实时资产和安全约束：",
-                    self._settings.auto_draw_system_prompt,
+                    self._settings.director_creative_preference,
                 ]
             )
         elif normalized_task_kind in creative_preference_tasks:
@@ -498,6 +552,108 @@ class PromptDirector:
             runtime_capabilities=runtime_capabilities,
         )
         return instruction.prompt, provider_id, instruction.negative_prompt
+
+    async def generate_instruction_probe_then_structured(
+        self,
+        context: Any,
+        event: Any,
+        scene_text: str,
+        tools: Any,
+        output_tools: Any,
+        lookup_tool_call_timeout: int | None = None,
+        expansion_mode: str = "standard",
+        task_kind: str = TASK_DRAW,
+        runtime_capabilities: tuple[str, ...] = (),
+        compose_result: bool = True,
+    ) -> tuple[PictureInstruction, str]:
+        """Run probe lookups first, then generate a structured instruction.
+
+        The probe response is treated as evidence text only; it is never
+        parsed as the terminal. The second stage runs without lookup tools and
+        must return the plugin's structured output.
+        """
+
+        provider_id = await self._resolve_provider_id(context, event)
+        normalized_task_kind = normalize_task_kind(task_kind)
+        normalized_capabilities = normalize_capabilities(runtime_capabilities)
+        if not hasattr(context, "tool_loop_agent"):
+            raise PromptDirectorError(
+                "当前 AstrBot 不支持本地资产查询工具，已停止本次绘图",
+                fatal=True,
+            )
+        tool_call_timeout = max(
+            1,
+            int(
+                lookup_tool_call_timeout
+                if lookup_tool_call_timeout is not None
+                else self._lora_tool_call_timeout()
+            ),
+        )
+        request_timeout = self._lora_agent_timeout(tool_call_timeout)
+        probe_prompt = (
+            build_director_user_prompt(
+                scene_text,
+                task_kind=normalized_task_kind,
+                expansion_mode=expansion_mode,
+                transport="pic",
+            )
+            + "\n\nThis is the probe stage only. Perform the required local asset "
+            "lookups and stop. Do not produce the final picture instruction here."
+        )
+        probe_system_prompt = self._system_prompt(
+            task_kind=normalized_task_kind,
+            expansion_mode=expansion_mode,
+            capabilities=normalized_capabilities,
+            transport="pic",
+        )
+        try:
+            probe_response = await asyncio.wait_for(
+                context.tool_loop_agent(
+                    event=event,
+                    chat_provider_id=provider_id,
+                    prompt=probe_prompt,
+                    system_prompt=probe_system_prompt,
+                    tools=tools,
+                    max_steps=self._settings.lora_tool_max_steps,
+                    tool_call_timeout=tool_call_timeout,
+                ),
+                timeout=request_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise PromptDirectorError(
+                "本地资产查询或 LLM 分镜超时，已停止本次绘图",
+                (
+                    f"provider={provider_id}, "
+                    f"tool_call_timeout={tool_call_timeout}, "
+                    f"agent_timeout={request_timeout}"
+                ),
+                fatal=True,
+            ) from exc
+        except Exception as exc:
+            raise PromptDirectorError(
+                "本地资产查询工具调用失败，已停止本次绘图",
+                f"provider={provider_id}, error={exc}",
+                fatal=True,
+            ) from exc
+
+        evidence = str(response_text(probe_response) or "").strip()
+        evidence = evidence[:12000]
+        generate_scene = (
+            str(scene_text or "").strip()
+            + "\n\n<verified_asset_evidence>\n"
+            + (evidence or "no tool evidence returned")
+        )
+        return await self.generate_instruction(
+            context,
+            event,
+            generate_scene,
+            tools=None,
+            output_tools=output_tools,
+            expansion_mode=expansion_mode,
+            task_kind=normalized_task_kind,
+            runtime_capabilities=(),
+            compose_result=compose_result,
+        )
 
     async def generate_instruction(
         self,
@@ -711,7 +867,13 @@ class PromptDirector:
                         fatal=True,
                     )
                 if terminal_repair_response:
-                    instruction = self._extract_terminal_repair_instruction(response)
+                    instruction = self._extract_terminal_repair_instruction(
+                        response,
+                        allowed_lora_names=self._verified_lora_names_provider(),
+                        allowed_character_canonicals=(
+                            self._verified_character_canonicals_provider()
+                        ),
+                    )
                     if compose_result:
                         instruction = self.compose_picture_instruction(
                             instruction,
@@ -752,6 +914,21 @@ class PromptDirector:
                                 fatal=True,
                             ) from json_exc
                     if payload is not None:
+                        if transport in {"function", "json"}:
+                            try:
+                                validate_emit_anima_plan(
+                                    payload,
+                                    allowed_lora_names=self._verified_lora_names_provider(),
+                                    allowed_character_canonicals=(
+                                        self._verified_character_canonicals_provider()
+                                    ),
+                                )
+                            except DirectorOutputSchemaError as schema_exc:
+                                raise PromptDirectorError(
+                                    "结构化分镜不符合内置 schema",
+                                    f"director_schema_violation: {schema_exc}",
+                                    fatal=True,
+                                ) from schema_exc
                         instruction = self._picture_instruction_from_payload(payload)
                         if compose_result:
                             instruction = self.compose_picture_instruction(
@@ -1156,6 +1333,9 @@ class PromptDirector:
             "negative",
             "pipeline",
             "characters",
+            "lora_stack",
+            "preset",
+            "identity_binding",
         }
         if any(key not in allowed_fields for key in payload):
             raise PromptDirectorError(
@@ -1200,8 +1380,13 @@ class PromptDirector:
         )
 
     @staticmethod
-    def _extract_terminal_repair_instruction(response: Any) -> PictureInstruction:
-        """Accept one strict repair envelope without reopening lookup authority."""
+    def _extract_terminal_repair_instruction(
+        response: Any,
+        *,
+        allowed_lora_names: tuple[str, ...] = (),
+        allowed_character_canonicals: tuple[str, ...] = (),
+    ) -> PictureInstruction:
+        """Accept one strict repair envelope with the same built-in schema."""
 
         diagnostics = PromptDirector._terminal_repair_diagnostics(response)
         if _has_structured_call_surface(response):
@@ -1211,10 +1396,19 @@ class PromptDirector:
                     expected_tool_name="emit_anima_plan_v1",
                     allow_json_fallback=False,
                 )
+                validate_emit_anima_plan(
+                    structured.arguments,
+                    allowed_lora_names=allowed_lora_names,
+                    allowed_character_canonicals=allowed_character_canonicals,
+                )
                 return PromptDirector._picture_instruction_from_payload(
                     structured.arguments
                 )
-            except (PromptDirectorError, StructuredProviderError) as exc:
+            except (
+                PromptDirectorError,
+                StructuredProviderError,
+                DirectorOutputSchemaError,
+            ) as exc:
                 raise PromptDirectorError(
                     "绘图模型终端修复返回了无效结构化结果",
                     f"invalid_terminal_repair_structured:{diagnostics}",
@@ -1235,11 +1429,24 @@ class PromptDirector:
             pass
         try:
             payload = _strict_json_object(visible)
+            validate_emit_anima_plan(
+                payload,
+                allowed_lora_names=allowed_lora_names,
+                allowed_character_canonicals=allowed_character_canonicals,
+            )
             return PromptDirector._picture_instruction_from_payload(payload)
         except (PromptDirectorError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            root_cause = (
+                str(getattr(exc, "user_message", "") or getattr(exc, "detail", "") or "")
+            )
+            detail = (
+                f"invalid_terminal_repair:{root_cause};{diagnostics}"
+                if root_cause
+                else f"invalid_terminal_repair:{diagnostics}"
+            )
             raise PromptDirectorError(
                 "绘图模型终端修复没有返回唯一合法的 JSON 或 <pic> 分镜",
-                f"invalid_terminal_repair:{diagnostics}",
+                detail,
                 fatal=True,
             ) from exc
 
@@ -1591,6 +1798,14 @@ class PromptDirector:
             "base": "base",
             "原图": "base",
             "不放大": "base",
+            "txt2img": "base",
+            "text2img": "base",
+            "文生图": "base",
+            "draw": "base",
+            "生图": "base",
+            "生成": "base",
+            "standard": "base",
+            "normal": "base",
             "rtx": "rtx",
             "高清放大": "rtx",
             "iterative": "iterative",

@@ -114,6 +114,75 @@ class LoraPresetRegistryTests(unittest.TestCase):
         self.assertEqual(second.presets[0].note, "日常角色版本")
         self.assertFalse(second.presets[1].enabled)
 
+    def test_character_contract_requires_identity_and_required_terms(self) -> None:
+        registry = LoraPresetRegistry([])
+        with self.assertRaisesRegex(LoraPresetError, "身份锚点"):
+            registry.save(
+                name="角色合同",
+                category="character",
+                selections=_selection("characters/denia"),
+                enforce_character_contract=True,
+            )
+        with self.assertRaisesRegex(LoraPresetError, "必需触发词"):
+            registry.save(
+                name="角色合同",
+                category="character",
+                selections=_selection("characters/denia"),
+                identity_anchor="denia identity",
+                enforce_character_contract=True,
+            )
+
+    def test_character_fields_round_trip_and_lora_reuse_are_independent(self) -> None:
+        registry = LoraPresetRegistry([])
+        first = registry.save(
+            name="达妮娅默认",
+            category="character",
+            selections=_selection("characters/shared"),
+            character_canonical="denia_(work)",
+            work_canonical="work",
+            identity_anchor="denia identity",
+            required_trigger_terms=["denia trigger"],
+            positive_tags=["silver hair", "black tights"],
+            negative_tags=["bad anatomy"],
+            variant_id="default",
+            enforce_character_contract=True,
+        )
+        second = registry.save(
+            name="达妮娅自拍",
+            category="character",
+            selections=_selection("characters/shared", 0.65),
+            character_canonical="denia_(work)",
+            work_canonical="work",
+            identity_anchor="denia selfie",
+            required_trigger_terms=["denia selfie trigger"],
+            positive_tags=["selfie"],
+            negative_tags=["text"],
+            variant_id="selfie",
+            enforce_character_contract=True,
+        )
+
+        self.assertEqual(first.selections[0].name, second.selections[0].name)
+        self.assertNotEqual(first.identity_anchor, second.identity_anchor)
+        restored = LoraPresetRegistry(registry.to_config())
+        self.assertTrue(restored.presets[0].contract_enabled)
+        self.assertEqual(restored.presets[1].variant_id, "selfie")
+
+    def test_character_canonical_can_select_global_preset(self) -> None:
+        registry = LoraPresetRegistry([])
+        registry.save(
+            name="达妮娅",
+            category="character",
+            selections=_selection("characters/denia"),
+            character_canonical="denia_(work)",
+            work_canonical="work",
+            identity_anchor="denia identity",
+            required_trigger_terms=["denia trigger"],
+            enforce_character_contract=True,
+        )
+        selected = registry.find_mentioned_preset("请给我达妮娅的自拍")
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.name, "达妮娅")
+
     def test_list_filters_by_category_keyword_and_enabled_state(self) -> None:
         registry = LoraPresetRegistry([])
         registry.save(
@@ -582,7 +651,11 @@ class _RecordingLoraCatalog:
     async def resolve_selections_with_records(self, selections, *, strict):
         resolved = await self.resolve_selections(selections, strict=strict)
         records = {
-            selection.name.casefold(): LoraRecord(selection.name)
+            selection.name.casefold(): LoraRecord(
+                selection.name,
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
+            )
             for selection in resolved
         }
         return resolved, records
