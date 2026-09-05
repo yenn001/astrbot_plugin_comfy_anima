@@ -268,6 +268,7 @@ const booleanFields = new Set([
   "admin_ignore_whitelist",
   "admin_ignore_blocklist",
   "enable_web_ui",
+  "enable_time_context",
 ]);
 
 function pluginPageBridge() {

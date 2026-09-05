@@ -22,6 +22,7 @@ import tempfile
 from uuid import uuid4
 import threading
 import time
+from datetime import datetime
 import types
 import unicodedata
 from collections import OrderedDict, deque
@@ -640,6 +641,7 @@ WEB_UI_EDITABLE_FIELDS = (
     "admin_ignore_whitelist",
     "admin_ignore_blocklist",
     "enable_web_ui",
+    "enable_time_context",
     "web_ui_host",
     "web_ui_port",
     "web_ui_username",
@@ -4442,6 +4444,9 @@ class ComfyAnimaPlugin(Star):
                 negative_prompt = instruction.negative_prompt
                 pipeline = instruction.pipeline
                 character_queries = getattr(instruction, "character_queries", ())
+                prompt = self._sync_time_context(
+                    prompt, user_request=str(event.message_str or "")
+                )
             access_error = self._access_error(event, prompt)
             if access_error:
                 new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {access_error}"))
@@ -12875,6 +12880,7 @@ QQ快捷指令:
             yield event.plain_result(f"{MessageEmoji.DRAW} {notice}")
         subject = self._requested_subject_hint(prompt)
         prompt, _ = await self._translate_direct_draw_chinese(event, prompt)
+        prompt = self._sync_time_context(prompt, user_request=prompt)
         try:
             character_preset = self._subject_character_preset(subject)
             if character_preset is not None:
@@ -14988,6 +14994,7 @@ QQ快捷指令:
                     settings.lora_visual_thumbnail_size
                 ),
                 "character_swap_timeout": settings.character_swap_timeout,
+                "enable_time_context": settings.enable_time_context,
                 "enable_chat_draw_terminal_guard": (
                     settings.enable_chat_draw_terminal_guard
                 ),
@@ -21327,6 +21334,83 @@ QQ快捷指令:
                 await asyncio.gather(*pending, return_exceptions=True)
             for source in sources:
                 source.unlink(missing_ok=True)
+
+    _TIME_OF_DAY_TAGS: tuple[tuple[int, str], ...] = (
+        (5, "morning"),
+        (9, "day"),
+        (16, "sunset"),
+        (19, "night"),
+    )
+    _EXPLICIT_TIME_TAGS: frozenset[str] = frozenset(
+        {
+            "morning",
+            "day",
+            "sunset",
+            "night",
+            "evening",
+            "noon",
+            "dawn",
+            "sunrise",
+            "midnight",
+            "golden hour",
+        }
+    )
+    _EXPLICIT_TIME_WORDS = re.compile(
+        r"早上|早晨|中午|下午|傍晚|晚上|夜里|深夜|白天|"
+        r"(?:morning|noon|day|evening|night|sunset|sunrise|midnight)",
+        flags=re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _time_of_day_tag(now: Any) -> str:
+        """Map one wall-clock time to a Danbooru lighting tag."""
+
+        hour = int(getattr(now, "hour", 12))
+        for start, tag in reversed(ComfyAnimaPlugin._TIME_OF_DAY_TAGS):
+            if hour >= start:
+                return tag
+        return "night"
+
+    def _sync_time_context(self, prompt: str, user_request: str = "") -> str:
+        """Append the current time-of-day lighting tag when none exists.
+
+        Skipped when the user (or the prompt) already specifies a time of
+        day, when the feature is disabled, or on non-txt2img paths.
+        """
+
+        if not bool(getattr(self.settings, "enable_time_context", True)):
+            return prompt
+        if self._EXPLICIT_TIME_TAGS.intersection(
+            tag.strip().casefold()
+            for tag in re.split(r"[,，]", str(prompt or ""))
+        ):
+            return prompt
+        request_text = f"{user_request} {prompt}"
+        if self._EXPLICIT_TIME_WORDS.search(request_text):
+            return prompt
+        try:
+            timezone_name = str(
+                getattr(getattr(self, "context", None), "config", {}).get(
+                    "timezone", ""
+                )
+                or ""
+            ).strip()
+        except Exception:
+            timezone_name = ""
+        try:
+            if timezone_name:
+                from zoneinfo import ZoneInfo
+
+                now = datetime.now(ZoneInfo(timezone_name))
+            else:
+                now = datetime.now().astimezone()
+        except Exception:
+            now = datetime.now().astimezone()
+        tag = self._time_of_day_tag(now)
+        if not tag:
+            return prompt
+        base = str(prompt or "").strip().rstrip(",")
+        return f"{base}, {tag}" if base else tag
 
     def _resolve_target_family(
         self, options: Optional[GenerationOptions] = None

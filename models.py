@@ -267,6 +267,7 @@ class PluginSettings:
     comfyui_url: str = "http://127.0.0.1:8188"
     api_token: str = ""
     enable_web_ui: bool = False
+    enable_time_context: bool = True
     web_ui_host: str = "0.0.0.0"
     web_ui_port: int = 6198
     web_ui_username: str = "admin"
@@ -536,6 +537,7 @@ class PluginSettings:
             comfyui_url=str(data.get("comfyui_url", cls.comfyui_url)).strip(),
             api_token=str(data.get("api_token", "")).strip(),
             enable_web_ui=_as_bool(data.get("enable_web_ui"), False),
+        enable_time_context=_as_bool(data.get("enable_time_context"), True),
             web_ui_host=(str(data.get("web_ui_host", "0.0.0.0")).strip() or "0.0.0.0"),
             web_ui_port=min(
                 65535,

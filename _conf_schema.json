@@ -1668,5 +1668,11 @@
     "min": 0,
     "max": 20,
     "default": 5
+  },
+  "enable_time_context": {
+    "description": "生图同步现实时间",
+    "type": "bool",
+    "hint": "开启后按当前时段自动补充 morning/day/sunset/night 光影标签；提示词已写明时间或用户指定时间时不覆盖",
+    "default": true
   }
 }
