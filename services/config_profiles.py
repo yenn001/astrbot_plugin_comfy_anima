@@ -593,6 +593,76 @@ class ConfigProfileService:
             persist_updates=persist_updates,
         )
 
+    async def activate_profile_async(
+        self,
+        name: Any,
+        config: MutableMapping[str, Any],
+        *,
+        persist_updates: Any | None = None,
+    ) -> dict[str, Any]:
+        """Async variant of :meth:`activate_profile` for event-loop persistence."""
+        if not isinstance(config, MutableMapping):
+            raise ConfigProfileValidationError(
+                "切换配置档案需要可修改的 AstrBot 插件配置"
+            )
+        normalized_name = normalize_profile_name(name)
+        with self._lock:
+            state = self._read_state()
+            profile_id, record = self._find_profile(state, normalized_name)
+            updates = validate_environment_settings(record["settings"])
+            previous_settings = extract_environment_settings(config)
+            previous_raw = {
+                key: (key in config, _copy(config.get(key)))
+                for key in ENVIRONMENT_FIELDS
+            }
+            previous_active = state["active_profile"]
+
+            await self._apply_updates_async(config, updates, persist_updates)
+            state["active_profile"] = profile_id
+            try:
+                self._write_state(state)
+            except Exception as store_exc:
+                try:
+                    if persist_updates is None:
+                        for key, (existed, value) in previous_raw.items():
+                            if existed:
+                                config[key] = value
+                            else:
+                                config.pop(key, None)
+                        save_config = getattr(config, "save_config", None)
+                        if callable(save_config):
+                            save_config()
+                    else:
+                        await self._apply_updates_async(
+                            config,
+                            previous_settings,
+                            persist_updates,
+                        )
+                except Exception as rollback_exc:
+                    raise ConfigProfileApplyError(
+                        "配置已应用，但活动档案状态保存失败，且配置回滚失败："
+                        f"{rollback_exc}"
+                    ) from store_exc
+                state["active_profile"] = previous_active
+                raise ConfigProfileApplyError(
+                    "活动档案状态保存失败，配置修改已回滚"
+                ) from store_exc
+            return self._public_profile(record, True)
+
+    async def switch_profile_async(
+        self,
+        name: Any,
+        config: MutableMapping[str, Any],
+        *,
+        persist_updates: Any | None = None,
+    ) -> dict[str, Any]:
+        """Alias with user-facing terminology for :meth:`activate_profile_async`."""
+        return await self.activate_profile_async(
+            name,
+            config,
+            persist_updates=persist_updates,
+        )
+
     def export_profile(self, name: Any) -> dict[str, Any]:
         """Return a portable profile envelope containing no plugin secrets."""
 
@@ -661,6 +731,44 @@ class ConfigProfileService:
         if persist_updates is not None:
             try:
                 result = persist_updates(payload)
+            except Exception as exc:
+                raise ConfigProfileApplyError(f"配置档案保存失败：{exc}") from exc
+            if result is False:
+                raise ConfigProfileApplyError("配置档案保存失败，修改未生效")
+            return
+
+        previous = {
+            key: (key in config, _copy(config.get(key)))
+            for key in payload
+        }
+        try:
+            config.update(payload)
+            save_config = getattr(config, "save_config", None)
+            if callable(save_config):
+                save_config()
+        except Exception as exc:
+            for key, (existed, value) in previous.items():
+                try:
+                    if existed:
+                        config[key] = value
+                    else:
+                        config.pop(key, None)
+                except Exception:
+                    pass
+            raise ConfigProfileApplyError(
+                f"配置档案保存失败，修改已回滚：{exc}"
+            ) from exc
+
+    async def _apply_updates_async(
+        self,
+        config: MutableMapping[str, Any],
+        updates: Mapping[str, Any],
+        persist_updates: Any | None,
+    ) -> None:
+        payload = _copy(dict(updates))
+        if persist_updates is not None:
+            try:
+                result = await persist_updates(payload)
             except Exception as exc:
                 raise ConfigProfileApplyError(f"配置档案保存失败：{exc}") from exc
             if result is False:

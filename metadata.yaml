@@ -2,7 +2,7 @@ name: astrbot_plugin_comfy_anima
 display_name: Comfy Anima
 short_desc: Anima 专用 ComfyUI 绘图与资产管理插件
 desc: Anima 专用 ComfyUI 绘图、改图、底图控制、LoRA 视觉管理、分层提示词资产与 Prompt Lab
-version: 2.4.0
+version: 2.4.1
 author: Yen
 repo: "https://github.com/yenn001/astrbot_plugin_comfy_anima"
 astrbot_version: ">=4.13.1"

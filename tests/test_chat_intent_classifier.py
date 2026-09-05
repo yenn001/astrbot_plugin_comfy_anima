@@ -38,6 +38,46 @@ class ChatIntentClassifierTests(unittest.TestCase):
         self.assertEqual(decision.intent, INTENT_DRAW_NEW)
         self.assertTrue(decision.visual_delivery)
 
+    def test_draw_out_for_me_phrase_is_draw(self) -> None:
+        decision = classify_chat_intent(
+            "想看你穿什么样的，画出来给我看"
+        )
+        self.assertEqual(decision.intent, INTENT_DRAW_NEW)
+        self.assertTrue(decision.visual_delivery)
+
+    def test_combined_delivery_phrase_is_draw_new(self) -> None:
+        decision = classify_chat_intent("娅娅早上好呀，检查穿着了！（画出来）")
+        self.assertEqual(decision.intent, INTENT_DRAW_NEW)
+        self.assertTrue(decision.visual_delivery)
+        self.assertEqual(decision.confidence, 1.0)
+
+    def test_negated_delivery_phrase_clarifies(self) -> None:
+        decision = classify_chat_intent("不要画出来了")
+        self.assertEqual(decision.intent, INTENT_CLARIFY)
+        self.assertFalse(decision.visual_delivery)
+
+    def test_postponed_delivery_phrase_clarifies(self) -> None:
+        decision = classify_chat_intent("明天再画出来给我看")
+        self.assertEqual(decision.intent, INTENT_CLARIFY)
+        self.assertFalse(decision.visual_delivery)
+
+    def test_rejected_delivery_phrase_clarifies(self) -> None:
+        decision = classify_chat_intent("拒绝画出来")
+        self.assertEqual(decision.intent, INTENT_CLARIFY)
+
+    def test_role_preset_plus_visual_action_is_draw_new(self) -> None:
+        decision = classify_chat_intent("角色预设，达妮娅在厨房做饭的样子")
+        self.assertEqual(decision.intent, INTENT_DRAW_NEW)
+        self.assertTrue(decision.visual_delivery)
+        self.assertEqual(decision.confidence, 0.9)
+
+    def test_visual_task_intent_can_be_disabled(self) -> None:
+        decision = classify_chat_intent(
+            "角色预设，达妮娅在厨房做饭的样子",
+            enable_visual_task_intent=False,
+        )
+        self.assertEqual(decision.intent, INTENT_CLARIFY)
+
     def test_continuation_with_recipe(self) -> None:
         decision = classify_chat_intent("再拍一张", has_recipe=True)
         self.assertEqual(decision.intent, INTENT_DRAW_NEW)

@@ -6,6 +6,7 @@ from ..services.preset_manifest import (
     PresetManifest,
     PresetManifestError,
     assert_manifests_equal,
+    assert_preset_invariants,
 )
 
 
@@ -24,6 +25,17 @@ def _manifest(negative: tuple[str, ...]) -> PresetManifest:
 
 
 class PresetManifestTests(unittest.TestCase):
+    def test_runtime_family_filename_matches_family_neutral_preset_name(self) -> None:
+        expected = PresetManifest.build(
+            lora_entries=[{"name": "anima-000040", "weight": 0.9}]
+        )
+        actual = PresetManifest.build(
+            lora_entries=[
+                {"name": "29B/anima-000040_29b.safetensors", "weight": 0.9}
+            ]
+        )
+        self.assertEqual(expected.lora_keys(), actual.lora_keys())
+        assert_preset_invariants(expected, actual)
     def test_stable_hash(self) -> None:
         first = _manifest(("lowres", "bad anatomy"))
         second = _manifest(("lowres", "bad anatomy"))

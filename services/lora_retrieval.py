@@ -68,6 +68,42 @@ def _provider_signature(provider: Any, configured_id: str, kind: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _provider_declared_dimension(provider: Any) -> Optional[int]:
+    """Read a provider's declared vector dimension when one is exposed."""
+    for attr in ("get_dim", "dimension", "vector_dimension", "embedding_dimension"):
+        value = getattr(provider, attr, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                continue
+        if isinstance(value, int) and value > 0:
+            return value
+    try:
+        meta = provider.meta()
+    except Exception:
+        meta = None
+    if meta is not None:
+        for attr in ("dimension", "vector_dimension", "embedding_dimension"):
+            value = getattr(meta, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            if isinstance(value, int) and value > 0:
+                return value
+    model = str(
+        getattr(meta, "model", "")
+        or getattr(provider, "provider_config", {}).get("embedding_model")
+        or getattr(provider, "provider_config", {}).get("model")
+        or ""
+    )
+    if "bge-m3" in model.casefold():
+        return 1024
+    return None
+
+
 class LoraHybridSearchService:
     """Embedding recall and rerank without weakening exact live-file validation."""
 
@@ -125,6 +161,11 @@ class LoraHybridSearchService:
             clean_query,
         )
         lexical = tuple(record for _score, record in lexical_ranked)
+        if self._short_lexical_query(clean_query):
+            self.last_diagnostics["mode"] = "lexical"
+            self.last_diagnostics["rerank_skipped"] = "short_query"
+            self.last_diagnostics["embedding_skipped"] = "short_query"
+            return self._stable_union(exact, lexical)[:effective_limit]
         if not bool(getattr(self._settings, "enable_lora_hybrid_search", False)):
             return self._stable_union(exact, lexical)[:effective_limit]
 
@@ -210,7 +251,7 @@ class LoraHybridSearchService:
                 getattr(self._settings, "lora_rerank_provider_id", "") or ""
             ).strip()
             rerank_provider = self._find_rerank_provider()
-            if rerank_provider is not None and order:
+            if rerank_provider is not None and order and len(clean_query) >= 12:
                 budget = min(20, len(order))
                 pool = order[:budget]
                 try:
@@ -225,6 +266,8 @@ class LoraHybridSearchService:
                 except Exception as exc:
                     diagnostics["rerank_status"] = "unavailable"
                     diagnostics["rerank_error"] = type(exc).__name__
+            elif rerank_provider is not None and order:
+                diagnostics["rerank_status"] = "skipped_short_query"
             elif rerank_id:
                 diagnostics["rerank_status"] = "configured_but_unavailable"
             return tuple(order[:effective_limit])
@@ -271,7 +314,7 @@ class LoraHybridSearchService:
             embedding_ranked,
         )
         rerank_provider = self._find_rerank_provider()
-        if rerank_provider is not None and candidates:
+        if rerank_provider is not None and candidates and len(query) >= 12:
             pinned_keys = {self._record_key(record) for record in exact}
             pinned = tuple(
                 record for record in candidates if self._record_key(record) in pinned_keys
@@ -296,10 +339,18 @@ class LoraHybridSearchService:
                     self.last_diagnostics["rerank_fallback"] = type(exc).__name__
                     self.last_diagnostics["fallback_code"] = "rerank_unavailable"
             candidates = self._stable_union(pinned, remainder)
+        elif rerank_provider is not None and candidates:
+            self.last_diagnostics["rerank_skipped"] = "short_query"
 
         self.last_diagnostics["mode"] = "hybrid"
         self.last_diagnostics["candidate_count"] = len(candidates)
         return candidates[:limit]
+
+    @staticmethod
+    def _short_lexical_query(query: str) -> bool:
+        """Return whether a query should stay in deterministic lexical mode."""
+        clean_query = str(query or "").strip()
+        return len(clean_query) <= 8 and " " not in clean_query
 
     @staticmethod
     def _category_filtered_records(
@@ -458,6 +509,18 @@ class LoraHybridSearchService:
             dimensions = {len(vector) for vector in finalized}
             if len(dimensions) != 1:
                 raise ValueError("embedding_dimension")
+            actual_dimension = next(iter(dimensions), 0)
+            self.last_diagnostics["embedding_dimension"] = actual_dimension
+            declared_dimension = _provider_declared_dimension(provider)
+            if declared_dimension and actual_dimension != declared_dimension:
+                self.last_diagnostics["embedding_dimension_mismatch"] = True
+                self.last_diagnostics["expected_embedding_dimension"] = declared_dimension
+                logger.warning(
+                    "LoRA embedding provider returned %d dims while declared "
+                    "dimension is %d; continuing with actual vectors",
+                    actual_dimension,
+                    declared_dimension,
+                )
             self._save_cache(
                 {
                     "schema": _CACHE_SCHEMA,
@@ -601,10 +664,14 @@ class LoraHybridSearchService:
             }:
                 basename_matches.append(record)
                 continue
-            aliases = (
-                record.character_name,
-                record.source_work,
-                *record.aliases,
+            aliases = tuple(
+                value
+                for value in (
+                    *re.split(r"[/|;；]+", record.character_name or ""),
+                    *re.split(r"[/|;；]+", record.source_work or ""),
+                    *record.aliases,
+                )
+                if str(value).strip()
             )
             if identity_query and any(
                 _normalized_identity(value) == identity_query

@@ -7,6 +7,7 @@ from ..services.response_envelope import (
     BundleLedger,
     BundleOwnershipError,
     BundleState,
+    DeliveryReceipt,
     ReceiptState,
     ResponseBundle,
 )
@@ -106,10 +107,10 @@ class ResponseEnvelopeTests(unittest.TestCase):
         ledger.ensure_envelope(allocate_run_id=lambda: "run-1")
         bundle = ledger.new_bundle(BundleKind.IMAGE, bundle_run_id="comfy-run")
         receipt = ledger.mark_send_attempt(bundle.bundle_id)
-        self.assertEqual(receipt.state, ReceiptState.UNKNOWN.value)
+        self.assertEqual(receipt.status, ReceiptState.UNKNOWN)
         self.assertFalse(receipt.has_verified_send)
         receipt = ledger.mark_send_attempt(bundle.bundle_id, message_id="msg-123")
-        self.assertEqual(receipt.state, ReceiptState.SENT.value)
+        self.assertEqual(receipt.status, ReceiptState.SENT)
         self.assertTrue(receipt.has_verified_send)
 
     def test_failed_send_attempt_is_recorded(self) -> None:
@@ -120,10 +121,33 @@ class ResponseEnvelopeTests(unittest.TestCase):
         receipt = ledger.mark_send_attempt(
             bundle.bundle_id, error="adapter exploded"
         )
-        self.assertEqual(receipt.state, ReceiptState.FAILED.value)
+        self.assertEqual(receipt.status, ReceiptState.FAILED)
         self.assertEqual(receipt.attempt_count, 1)
         self.assertEqual(receipt.last_error, "adapter exploded")
 
+    def test_delivery_receipt_is_frozen_and_single_status(self) -> None:
+        receipt = DeliveryReceipt(bundle_id="b1")
+        self.assertFalse(hasattr(receipt, "state"))
+        self.assertEqual(receipt.status, ReceiptState.UNKNOWN)
+        with self.assertRaises(AttributeError):
+            receipt.status = ReceiptState.SENT
+
+    def test_unknown_is_not_verified_send(self) -> None:
+        receipt = DeliveryReceipt(bundle_id="b1")
+        self.assertFalse(receipt.has_verified_send)
+
+    def test_send_transition_uses_replace_and_keeps_previous_receipt(self) -> None:
+        event = _Event()
+        ledger = BundleLedger.for_event(event)
+        ledger.ensure_envelope(allocate_run_id=lambda: "run-1")
+        bundle = ledger.new_bundle(BundleKind.IMAGE, bundle_run_id="comfy-run")
+        first = ledger.mark_send_attempt(bundle.bundle_id)
+        second = ledger.mark_send_attempt(bundle.bundle_id, message_id="msg-123")
+        self.assertIsNot(first, second)
+        self.assertEqual(first.status, ReceiptState.UNKNOWN)
+        self.assertEqual(first.attempt_count, 1)
+        self.assertEqual(second.status, ReceiptState.SENT)
+        self.assertEqual(second.attempt_count, 2)
 
     def test_multiple_bundles_share_parent_run_id(self) -> None:
         event = _Event()
@@ -147,12 +171,12 @@ class ResponseEnvelopeTests(unittest.TestCase):
         bundle = ledger.new_bundle(BundleKind.IMAGE, bundle_run_id="run-1")
         ledger.mark_send_attempt(bundle.bundle_id)
         receipt = ledger.mark_send_attempt(bundle.bundle_id, message_id="msg-9")
-        receipt.attach_output(
+        receipt = receipt.attach_output(
             run_id="run-1",
             output_path="/out/a.png",
             output_sha256="abc123",
         )
-        self.assertEqual(receipt.status, ReceiptState.SENT.value)
+        self.assertEqual(receipt.status, ReceiptState.SENT)
         self.assertEqual(receipt.run_id, "run-1")
         self.assertEqual(receipt.output_path, "/out/a.png")
         self.assertEqual(receipt.output_sha256, "abc123")

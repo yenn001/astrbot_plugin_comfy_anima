@@ -13,6 +13,7 @@ AstrBot Comfy Anima 插件 v2.0.0
 import asyncio
 import html
 import json
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -89,6 +90,15 @@ _CONTROL_ATTR_RE = re.compile(
     flags=re.DOTALL,
 )
 
+# Provider/skill runtimes occasionally leak internal control prose into the
+# user-facing completion.  These markers are never valid picture content.
+_INTERNAL_LEAK_RE = re.compile(
+    r"<\s*skill\b[^>]*>.*?<\s*/\s*skill\s*>|"
+    r"^\s*wait,\s*i\s*shouldn't.*$|"
+    r"^\s*(?:tool_calls?|function_call|arguments)\s*:\s*\{.*$",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
 _PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "all_models_failed",
@@ -120,6 +130,143 @@ _PROVIDER_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"^\s*traceback\s*\(", flags=re.IGNORECASE),
     ),
 )
+
+FINAL_PROMPT_SOFT_CAP_TOKENS = 800
+FINAL_PROMPT_HARD_CAP_TOKENS = 1200
+_ENGLISH_WORDS_PER_TOKEN = 0.75
+_PER_PERSON_WORD_BUDGETS: dict[int, int] = {1: 150, 2: 90, 3: 70}
+_PER_PERSON_WORD_HARD_MULTIPLIER = 2.0
+
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-_'’][A-Za-z0-9]+)*")
+_PERSON_COUNT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d+)\s*(?:girls?|boys?|people|persons?)(?![A-Za-z0-9_])",
+    flags=re.IGNORECASE,
+)
+_HAIR_COLOR_RE = re.compile(
+    r"(?:\b(?:white|black|brown|blonde|blond|blue|pink|red|green|purple|"
+    r"silver|gray|grey|golden|orange|auburn|teal|lavender|platinum|cyan|"
+    r"violet|dark|light)\s+hair\b)"
+    r"|(?:\bhair\s+(?:is|was|colored?|colour(?:ed)?)\s+(?:white|black|brown|"
+    r"blonde|blond|blue|pink|red|green|purple|silver|gray|grey|golden|orange|"
+    r"auburn|teal|lavender|platinum|cyan|violet|dark|light)\b)",
+    flags=re.IGNORECASE,
+)
+_HAIRSTYLE_LENGTH_RE = re.compile(
+    r"(?:\b(?:long|short|medium)\s+(?:\w+\s+){0,2}hair\b)"
+    r"|(?:ponytail|twintails|twin tails|pigtails|bob cut|braid|curly hair|"
+    r"straight hair|wavy hair|hair bun|hair down|hair up|side tail|mohawk|"
+    r"buzz cut|undercut|hair tied|topknot)",
+    flags=re.IGNORECASE,
+)
+_BANGS_RE = re.compile(r"\bbangs\b|\bfringe\b", flags=re.IGNORECASE)
+_EYE_COLOR_RE = re.compile(
+    r"(?:\b(?:white|black|brown|blue|pink|red|green|purple|silver|gray|grey|"
+    r"golden|orange|amber|teal|lavender|violet|cyan|hazel|heterochromia)\s+"
+    r"eyes?\b)",
+    flags=re.IGNORECASE,
+)
+_FACE_SHAPE_RE = re.compile(
+    r"(?:\b(?:oval|round|heart-shaped|heart shaped|square|angular|delicate|"
+    r"baby|soft|sharp|long|narrow)\s+face\b)"
+    r"|(?:face shape|jawline|jaw|chin|cheekbones)",
+    flags=re.IGNORECASE,
+)
+_SKIN_BODY_RE = re.compile(
+    r"(?:\b(?:fair|pale|light|dark|tanned|tan|olive|porcelain|ivory|brown|"
+    r"black|white)\s+skin\b)"
+    r"|(?:complexion|body type|figure|petite|slim|slender|tall|athletic|"
+    r"curvy|skinny|muscular)",
+    flags=re.IGNORECASE,
+)
+
+_DNA_ANCHORS = (
+    ("hair color", _HAIR_COLOR_RE),
+    ("hairstyle+length", _HAIRSTYLE_LENGTH_RE),
+    ("bangs", _BANGS_RE),
+    ("eye color", _EYE_COLOR_RE),
+    ("face shape", _FACE_SHAPE_RE),
+    ("skin/body", _SKIN_BODY_RE),
+)
+
+
+def _english_word_count(prompt: str) -> int:
+    """Count word-like tokens in an English prompt."""
+    return len(_WORD_TOKEN_RE.findall(str(prompt or "")))
+
+
+def estimate_prompt_tokens(prompt: str) -> int:
+    """Estimate tokens from English words using 1 token ~= 0.75 words."""
+    return math.ceil(_english_word_count(prompt) / _ENGLISH_WORDS_PER_TOKEN)
+
+
+def estimate_person_count(prompt: str) -> int:
+    """Infer the largest explicit Danbooru person count; default to one."""
+    counts = [
+        int(match.group(1))
+        for match in _PERSON_COUNT_RE.finditer(str(prompt or ""))
+        if int(match.group(1)) > 0
+    ]
+    return max(counts) if counts else 1
+
+
+def dna_coverage(prompt: str) -> tuple[str, ...]:
+    """Return DNA anchors missing from a prompt.
+
+    This is a lightweight evidence check, not a substitute for character
+    authority. Missing anchors are advisory warnings, never hard failures.
+    """
+    text = re.sub(r"\s+", " ", str(prompt or ""))
+    return tuple(
+        anchor
+        for anchor, pattern in _DNA_ANCHORS
+        if pattern.search(text) is None
+    )
+
+
+def validate_final_prompt(
+    prompt: str,
+    *,
+    person_count: int | None = None,
+) -> tuple[str, ...]:
+    """Validate final positive prompt budgets; return advisory warnings.
+
+    Raises:
+        PromptDirectorError: when the prompt exceeds the 1200-token hard cap,
+            or a per-person word count is clearly beyond its hard multiplier.
+    """
+    word_count = _english_word_count(prompt)
+    token_estimate = estimate_prompt_tokens(prompt)
+    if token_estimate > FINAL_PROMPT_HARD_CAP_TOKENS:
+        raise PromptDirectorError(
+            "最终提示词超过 1200 token 硬上限，已停止",
+            f"final_prompt_hard_cap:{token_estimate}>{FINAL_PROMPT_HARD_CAP_TOKENS}",
+            fatal=True,
+        )
+    warnings: list[str] = []
+    if token_estimate >= FINAL_PROMPT_SOFT_CAP_TOKENS:
+        warnings.append(
+            f"final_prompt_soft_cap:{token_estimate}>={FINAL_PROMPT_SOFT_CAP_TOKENS}"
+        )
+    count = (
+        person_count
+        if person_count and person_count > 0
+        else estimate_person_count(prompt)
+    )
+    budget = _PER_PERSON_WORD_BUDGETS.get(count, _PER_PERSON_WORD_BUDGETS[3])
+    per_person_estimate = math.ceil(word_count / count)
+    hard_word_limit = math.ceil(budget * _PER_PERSON_WORD_HARD_MULTIPLIER)
+    if per_person_estimate > hard_word_limit:
+        raise PromptDirectorError(
+            "角色人均提示词字数明显超过预算，已停止",
+            f"per_person_word_budget_hard:{per_person_estimate}>{hard_word_limit}",
+            fatal=True,
+        )
+    if per_person_estimate > budget:
+        warnings.append(
+            f"per_person_word_budget:{per_person_estimate}>{budget}"
+        )
+    warnings.extend(f"dna_missing:{anchor}" for anchor in dna_coverage(prompt))
+    return tuple(warnings)
 
 
 def _json_object_candidates(value: str) -> tuple[str, ...]:
@@ -275,6 +422,7 @@ class PictureInstruction:
     character_queries: tuple[str, ...] = ()
     diagnostic_id: str = ""
     diagnostics: PromptDiagnostics | None = None
+    quality_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -316,10 +464,25 @@ class PromptDirector:
         provider_id: str = "",
         source: str = "director",
     ) -> PictureInstruction:
-        """Apply the optional local composer exactly once to a picture plan."""
+        """Compose a picture plan once and validate final prompt quality budgets."""
 
-        if self._composer is None or instruction.diagnostic_id:
+        if instruction.diagnostic_id:
             return instruction
+        person_count = len(instruction.character_queries) or None
+        if self._composer is None:
+            quality_warnings = validate_final_prompt(
+                instruction.prompt,
+                person_count=person_count,
+            )
+            if not quality_warnings:
+                return instruction
+            return PictureInstruction(
+                prompt=instruction.prompt,
+                negative_prompt=instruction.negative_prompt,
+                pipeline=instruction.pipeline,
+                character_queries=instruction.character_queries,
+                quality_warnings=quality_warnings,
+            )
         try:
             composed = self._composer.compose(
                 instruction.prompt,
@@ -334,6 +497,10 @@ class PromptDirector:
                 "prompt_composition_failed",
                 fatal=True,
             ) from exc
+        quality_warnings = validate_final_prompt(
+            composed.positive_prompt,
+            person_count=person_count,
+        )
         return PictureInstruction(
             prompt=composed.positive_prompt,
             negative_prompt=composed.negative_prompt,
@@ -341,6 +508,7 @@ class PromptDirector:
             character_queries=instruction.character_queries,
             diagnostic_id=composed.diagnostic_id,
             diagnostics=composed.diagnostics,
+            quality_warnings=quality_warnings,
         )
 
     def compose_edit_instruction(
@@ -553,6 +721,34 @@ class PromptDirector:
         )
         return instruction.prompt, provider_id, instruction.negative_prompt
 
+    @staticmethod
+    def _require_appearance_anchors(
+        instruction: PictureInstruction,
+        anchors: tuple[str, ...],
+    ) -> None:
+        """Require every verified character appearance anchor in the plan.
+
+        A bound character carries profile anchors (e.g. ``pink hair``); when
+        the model invents other hair/eye colors instead, the wrong color wins
+        over the LoRA and the face drifts. Missing anchors raise a non-fatal
+        error so the existing repair loop re-asks with an explicit directive.
+        """
+
+        if not anchors:
+            return
+        prompt_text = str(instruction.prompt or "").casefold()
+        missing = tuple(
+            anchor
+            for anchor in anchors
+            if str(anchor or "").strip()
+            and str(anchor).strip().casefold() not in prompt_text
+        )
+        if missing:
+            raise PromptDirectorError(
+                "【绘图导演思考模型】绘图模型没有写入已验证角色外貌锚点",
+                "character_appearance_anchors_missing:" + ",".join(missing),
+            )
+
     async def generate_instruction_probe_then_structured(
         self,
         context: Any,
@@ -565,6 +761,7 @@ class PromptDirector:
         task_kind: str = TASK_DRAW,
         runtime_capabilities: tuple[str, ...] = (),
         compose_result: bool = True,
+        required_appearance_anchors: tuple[str, ...] = (),
     ) -> tuple[PictureInstruction, str]:
         """Run probe lookups first, then generate a structured instruction.
 
@@ -621,7 +818,7 @@ class PromptDirector:
             )
         except asyncio.TimeoutError as exc:
             raise PromptDirectorError(
-                "本地资产查询或 LLM 分镜超时，已停止本次绘图",
+                f"【绘图导演思考模型】本地资产查询或 LLM 分镜超时 (Provider: {provider_id})",
                 (
                     f"provider={provider_id}, "
                     f"tool_call_timeout={tool_call_timeout}, "
@@ -631,7 +828,7 @@ class PromptDirector:
             ) from exc
         except Exception as exc:
             raise PromptDirectorError(
-                "本地资产查询工具调用失败，已停止本次绘图",
+                f"【绘图导演思考模型】本地资产查询工具调用失败 (Provider: {provider_id})",
                 f"provider={provider_id}, error={exc}",
                 fatal=True,
             ) from exc
@@ -653,6 +850,7 @@ class PromptDirector:
             task_kind=normalized_task_kind,
             runtime_capabilities=(),
             compose_result=compose_result,
+            required_appearance_anchors=required_appearance_anchors,
         )
 
     async def generate_instruction(
@@ -667,6 +865,7 @@ class PromptDirector:
         task_kind: str = TASK_DRAW,
         runtime_capabilities: tuple[str, ...] = (),
         compose_result: bool = True,
+        required_appearance_anchors: tuple[str, ...] = (),
     ) -> tuple[PictureInstruction, str]:
         """Generate one validated picture instruction including its pipeline."""
 
@@ -833,7 +1032,7 @@ class PromptDirector:
         except asyncio.TimeoutError as exc:
             if uses_lookup_tools:
                 raise PromptDirectorError(
-                    "本地资产查询或 LLM 分镜超时，已停止本次绘图",
+                    f"【绘图导演思考模型】本地资产查询或 LLM 分镜超时 (Provider: {provider_id})",
                     (
                         f"provider={provider_id}, "
                         f"tool_call_timeout={tool_call_timeout}, "
@@ -841,18 +1040,22 @@ class PromptDirector:
                     ),
                     fatal=True,
                 ) from exc
-            raise PromptDirectorError("LLM 分镜超时") from exc
+            raise PromptDirectorError(
+                f"【绘图导演思考模型】LLM 分镜超时 "
+                f"(Provider: {provider_id}，超时 {self._settings.prompt_llm_timeout}s)"
+            ) from exc
         except PromptDirectorError:
             raise
         except Exception as exc:
             if uses_lookup_tools:
                 raise PromptDirectorError(
-                    "本地资产查询工具调用失败，已停止本次绘图",
+                    f"【绘图导演思考模型】本地资产查询工具调用失败，已停止本次绘图 (Provider: {provider_id})",
                     f"provider={provider_id}, error={exc}",
                     fatal=True,
                 ) from exc
             raise PromptDirectorError(
-                "LLM 分镜调用失败", f"provider={provider_id}, error={exc}"
+                f"【绘图导演思考模型】LLM 分镜调用失败 (Provider: {provider_id})，原因: {exc}",
+                f"provider={provider_id}, error={exc}",
             ) from exc
 
         first_error: PromptDirectorError | None = None
@@ -862,7 +1065,7 @@ class PromptDirector:
                 provider_error = response_error_code(response)
                 if provider_error:
                     raise PromptDirectorError(
-                        "绘图 Provider 没有返回可用结果",
+                        f"【绘图导演思考模型】绘图 Provider 没有返回可用结果 (Provider: {provider_id})",
                         provider_error,
                         fatal=True,
                     )
@@ -879,6 +1082,10 @@ class PromptDirector:
                             instruction,
                             provider_id=provider_id,
                         )
+                    self._require_appearance_anchors(
+                        instruction,
+                        required_appearance_anchors,
+                    )
                     return instruction, provider_id
                 if transport in {"function", "json"}:
                     payload: Any = None
@@ -897,7 +1104,7 @@ class PromptDirector:
                                 or _has_structured_call_surface(response)
                             ):
                                 raise PromptDirectorError(
-                                    "绘图模型没有返回合法的结构化 Function Call",
+                                    f"【绘图导演思考模型】绘图模型没有返回合法的结构化 Function Call (Provider: {provider_id})",
                                     structured_exc.code,
                                     fatal=True,
                                 ) from structured_exc
@@ -909,7 +1116,7 @@ class PromptDirector:
                             payload = _strict_json_object(str(visible or ""))
                         except (TypeError, ValueError, json.JSONDecodeError) as json_exc:
                             raise PromptDirectorError(
-                                "绘图模型没有返回合法的结构化 JSON",
+                                f"【绘图导演思考模型】绘图模型没有返回合法的结构化 JSON (Provider: {provider_id})",
                                 "invalid_director_json",
                                 fatal=True,
                             ) from json_exc
@@ -925,7 +1132,7 @@ class PromptDirector:
                                 )
                             except DirectorOutputSchemaError as schema_exc:
                                 raise PromptDirectorError(
-                                    "结构化分镜不符合内置 schema",
+                                    f"【绘图导演思考模型】结构化分镜不符合内置 schema (Provider: {provider_id})",
                                     f"director_schema_violation: {schema_exc}",
                                     fatal=True,
                                 ) from schema_exc
@@ -935,11 +1142,15 @@ class PromptDirector:
                                 instruction,
                                 provider_id=provider_id,
                             )
+                        self._require_appearance_anchors(
+                            instruction,
+                            required_appearance_anchors,
+                        )
                         return instruction, provider_id
                 completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
                     raise PromptDirectorError(
-                        "绘图模型没有返回有效提示词",
+                        f"【绘图导演思考模型】绘图模型没有返回有效提示词 (Provider: {provider_id})",
                         "empty_completion",
                         fatal=True,
                     )
@@ -952,6 +1163,10 @@ class PromptDirector:
                         instruction,
                         provider_id=provider_id,
                     )
+                self._require_appearance_anchors(
+                    instruction,
+                    required_appearance_anchors,
+                )
                 return instruction, provider_id
             except PromptDirectorError as exc:
                 if exc.detail in {
@@ -966,11 +1181,12 @@ class PromptDirector:
                     detail = exc.detail or exc.user_message
                     if first_error is not None and not detail:
                         detail = first_error.detail or first_error.user_message
+                    err_suffix = f" (原因: {detail})" if detail else ""
                     raise PromptDirectorError(
                         (
-                            "本地资产工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI"
+                            f"【绘图导演思考模型】本地资产工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI (Provider: {provider_id}){err_suffix}"
                             if uses_lookup_tools
-                            else "绘图模型连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI"
+                            else f"【绘图导演思考模型】连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI (Provider: {provider_id}){err_suffix}"
                         ),
                         detail,
                         fatal=True,
@@ -978,7 +1194,7 @@ class PromptDirector:
                 first_error = exc
                 if uses_lookup_tools and not hasattr(context, "llm_generate"):
                     raise PromptDirectorError(
-                        "本地资产工具分镜结果无效，且当前 AstrBot 不支持无工具终端修复",
+                        f"【绘图导演思考模型】本地资产工具分镜结果无效，且当前 AstrBot 不支持无工具终端修复 (Provider: {provider_id})",
                         exc.detail or exc.user_message,
                         fatal=True,
                     ) from exc
@@ -987,14 +1203,31 @@ class PromptDirector:
                     and output_tools is not None
                     and structured_mode == "auto"
                 )
+                anchor_directive = ""
+                if str(exc.detail or "").startswith(
+                    "character_appearance_anchors_missing:"
+                ):
+                    anchor_list = ", ".join(
+                        str(anchor).strip()
+                        for anchor in required_appearance_anchors
+                        if str(anchor).strip()
+                    )
+                    anchor_directive = (
+                        " Also, these verified character appearance anchors "
+                        "MUST appear verbatim as positive tags: "
+                        f"{anchor_list}. Do not invent or change hair/eye "
+                        "colors; keep the verified appearance anchors."
+                    )
                 repair_prompt = (
                     user_prompt
+                    + anchor_directive
                     + "\n\nThe local asset lookup is complete. Return exactly one JSON "
                     "object with positive_tags, negative_tags, pipeline and optional "
                     "characters fields. Do not call any tool again. Do not return "
                     "explanation, Markdown, XML, an error message or plain text."
                     if uses_lookup_tools
                     else (pic_user_prompt if auto_protocol_fallback else user_prompt)
+                    + anchor_directive
                     + (
                         "\n\nYour previous response was invalid. Return exactly one "
                         '<pic prompt="English Anima tags. One concise scene sentence." '
@@ -1028,7 +1261,7 @@ class PromptDirector:
                     terminal_repair_response = uses_lookup_tools
                 except asyncio.TimeoutError as retry_exc:
                     raise PromptDirectorError(
-                        "绘图模型修复重试超时，已停止且不会提交 ComfyUI",
+                        f"【绘图导演思考模型】绘图模型修复重试超时 (Provider: {provider_id})",
                         "repair_timeout",
                         fatal=True,
                     ) from retry_exc
@@ -1036,7 +1269,7 @@ class PromptDirector:
                     raise
                 except Exception as retry_exc:
                     raise PromptDirectorError(
-                        "绘图模型修复重试失败，已停止且不会提交 ComfyUI",
+                        f"【绘图导演思考模型】绘图模型修复重试失败 (Provider: {provider_id})",
                         f"provider={provider_id}, error_type={type(retry_exc).__name__}",
                         fatal=True,
                     ) from retry_exc
@@ -1133,12 +1366,15 @@ class PromptDirector:
         try:
             response = await invoke(user_prompt)
         except asyncio.TimeoutError as exc:
-            raise PromptDirectorError("LLM 重绘规划超时", fatal=tools is not None) from exc
+            raise PromptDirectorError(
+                f"【绘图导演思考模型】LLM 重绘规划超时 (Provider: {provider_id})",
+                fatal=tools is not None,
+            ) from exc
         except PromptDirectorError:
             raise
         except Exception as exc:
             raise PromptDirectorError(
-                "LLM 重绘规划失败",
+                f"【绘图导演思考模型】LLM 重绘规划失败 (Provider: {provider_id})",
                 f"provider={provider_id}, error={exc}",
                 fatal=tools is not None,
             ) from exc
@@ -1147,14 +1383,14 @@ class PromptDirector:
                 provider_error = response_error_code(response)
                 if provider_error:
                     raise PromptDirectorError(
-                        "重绘 Provider 没有返回可用结果",
+                        f"【绘图导演思考模型】重绘 Provider 没有返回可用结果 (Provider: {provider_id})",
                         provider_error,
                         fatal=True,
                     )
                 completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
                     raise PromptDirectorError(
-                        "LLM 没有返回有效重绘提示词",
+                        f"【绘图导演思考模型】LLM 没有返回有效重绘提示词 (Provider: {provider_id})",
                         "empty_edit_completion",
                         fatal=True,
                     )
@@ -1179,8 +1415,10 @@ class PromptDirector:
                 }:
                     raise
                 if attempt == 1:
+                    detail = exc.detail or exc.user_message
+                    err_suffix = f" (原因: {detail})" if detail else ""
                     raise PromptDirectorError(
-                        "重绘模型连续两次没有返回可用的 <edit> 提示词，已停止且不会提交 ComfyUI",
+                        f"【绘图导演思考模型】重绘连续两次没有返回可用的 <edit> 提示词，已停止且不会提交 ComfyUI (Provider: {provider_id}){err_suffix}",
                         exc.detail or exc.user_message,
                         fatal=True,
                     ) from exc
@@ -1195,13 +1433,13 @@ class PromptDirector:
                     response = await invoke(repair_prompt)
                 except asyncio.TimeoutError as retry_exc:
                     raise PromptDirectorError(
-                        "重绘模型修复重试超时，已停止且不会提交 ComfyUI",
+                        f"【绘图导演思考模型】重绘模型修复重试超时 (Provider: {provider_id})",
                         "edit_repair_timeout",
                         fatal=True,
                     ) from retry_exc
                 except Exception as retry_exc:
                     raise PromptDirectorError(
-                        "重绘模型修复重试失败，已停止且不会提交 ComfyUI",
+                        f"【绘图导演思考模型】重绘模型修复重试失败 (Provider: {provider_id})",
                         (
                             f"provider={provider_id}, "
                             f"error_type={type(retry_exc).__name__}"
@@ -1227,7 +1465,9 @@ class PromptDirector:
         meta = provider.meta() if hasattr(provider, "meta") else None
         provider_id = getattr(meta, "id", "") if meta else ""
         if not provider_id:
-            raise PromptDirectorError("未选择 LLM，当前会话也没有可用模型")
+            raise PromptDirectorError(
+                "【绘图导演思考模型】未选择 LLM，当前会话也没有可用模型"
+            )
         return str(provider_id)
 
     async def resolve_provider_id(self, context: Any, event: Any) -> str:
@@ -1248,7 +1488,9 @@ class PromptDirector:
             except TypeError:
                 provider = context.get_using_provider()
         if provider is None or not hasattr(provider, "text_chat"):
-            raise PromptDirectorError("找不到可用的 LLM Provider")
+            raise PromptDirectorError(
+                "【绘图导演思考模型】找不到可用的 LLM Provider"
+            )
         return provider
 
     @staticmethod
@@ -1410,7 +1652,7 @@ class PromptDirector:
                 DirectorOutputSchemaError,
             ) as exc:
                 raise PromptDirectorError(
-                    "绘图模型终端修复返回了无效结构化结果",
+                    "【绘图导演思考模型】绘图模型终端修复返回了无效结构化结果",
                     f"invalid_terminal_repair_structured:{diagnostics}",
                     fatal=True,
                 ) from exc
@@ -1445,7 +1687,7 @@ class PromptDirector:
                 else f"invalid_terminal_repair:{diagnostics}"
             )
             raise PromptDirectorError(
-                "绘图模型终端修复没有返回唯一合法的 JSON 或 <pic> 分镜",
+                "【绘图导演思考模型】绘图模型终端修复没有返回唯一合法的 JSON 或 <pic> 分镜",
                 detail,
                 fatal=True,
             ) from exc
@@ -1744,6 +1986,7 @@ class PromptDirector:
         """移除 LLM 控制标签和隐藏思考，同时保留可发送给用户的正文。"""
         marker = "\x00"
         text = PromptDirector._remove_think_content(model_output, marker)
+        text = _INTERNAL_LEAK_RE.sub(marker, text)
         text = _PIC_TAG_RE.sub(marker, text)
         text = _ANY_PIC_TAG_RE.sub(marker, text)
         text = _EDIT_TAG_RE.sub(marker, text)

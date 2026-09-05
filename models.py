@@ -59,6 +59,14 @@ def _as_float(value: Any, default: float, minimum: float = 0.0) -> float:
         return default
 
 
+def _normalize_enum(value: str, allowed: tuple[str, ...], default: str) -> str:
+    """将配置枚举值规范化到允许集合。"""
+    normalized = str(value or "").strip().casefold()
+    if normalized in allowed:
+        return normalized
+    return default
+
+
 def _as_string_list(value: Any, default: list[str]) -> list[str]:
     """将列表或逗号分隔字符串转换为字符串列表。"""
     if isinstance(value, list):
@@ -191,6 +199,64 @@ def migrate_legacy_auto_draw_prompt(config: Mapping[str, Any]) -> dict[str, Any]
     migrated = dict(config)
     migrated.setdefault("chat_roleplay_draw_prompt", "")
     migrated.setdefault("director_creative_preference", "")
+    return migrated
+
+
+def migrate_legacy_consolidated_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate legacy natural-draw flags into the consolidated fields.
+
+    Runs once and stamps ``config_migration_version=2``. After migration,
+    runtime code must not read the legacy fields.
+    """
+    import time as _time
+
+    migrated = dict(config)
+    try:
+        migration_version = int(migrated.get("config_migration_version") or 0)
+    except (TypeError, ValueError):
+        # Policy: non-integer migration version is treated as 0, so the
+        # migration runs once and stamps a valid version=2.
+        migration_version = 0
+    if migration_version >= 2:
+        if not str(migrated.get("config_migrated_utc") or "").strip():
+            migrated["config_migrated_utc"] = _time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
+            )
+        return migrated
+    if "natural_draw_mode" not in migrated:
+        legacy_enabled = migrated.get("enable_natural_draw")
+        pic_trigger_enabled = migrated.get("enable_llm_pic_trigger")
+        if legacy_enabled is False:
+            migrated["natural_draw_mode"] = "off"
+        elif legacy_enabled is True and pic_trigger_enabled is False:
+            migrated["natural_draw_mode"] = "photo_only"
+        else:
+            migrated["natural_draw_mode"] = "full"
+    if "scene_extraction" not in migrated and "enable_scene_extraction" in migrated:
+        migrated["scene_extraction"] = migrated["enable_scene_extraction"]
+    if (
+        "chinese_prompt_translation" not in migrated
+        and "enable_chinese_prompt_translation" in migrated
+    ):
+        migrated["chinese_prompt_translation"] = migrated[
+            "enable_chinese_prompt_translation"
+        ]
+    migrated.setdefault("character_purity_mode", "smart")
+    if str(migrated.get("intent_judge_backend", "")).strip().casefold() in {
+        "",
+        "rule",
+    }:
+        migrated["intent_judge_backend"] = "auto"
+    if str(migrated.get("intent_router_gate_mode", "")).strip().casefold() in {
+        "",
+        "off",
+    }:
+        migrated["intent_router_gate_mode"] = "on"
+    migrated["config_migration_version"] = 2
+    if not str(migrated.get("config_migrated_utc") or "").strip():
+        migrated["config_migrated_utc"] = _time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
+        )
     return migrated
 
 
@@ -342,12 +408,41 @@ class PluginSettings:
     intent_router_timeout: int = 20
     intent_router_temperature: float = 0.0
     intent_router_min_confidence: float = 0.7
+    intent_judge_backend: str = "auto"
+    intent_judge_embedding_provider_id: str = ""
+    intent_judge_rerank_provider_id: str = ""
+    intent_judge_online_provider_id: str = ""
+    intent_judge_positive_anchors: list[str] = field(default_factory=list)
+    intent_judge_negative_anchors: list[str] = field(default_factory=list)
+    intent_judge_local_embedding_threshold: float = 0.10
+    intent_judge_local_rerank_threshold: float = 0.05
+    intent_judge_auto_confidence_floor: float = 0.70
+    intent_judge_online_timeout: float = 10.0
+    intent_judge_online_temperature: float = 0.0
+    intent_judge_fallback: str = "no_draw"
+    draw_pipeline_mode: str = "auto"
+    intent_router_gate_mode: str = "on"
+    enable_visual_task_intent: bool = True
+    enable_user_picture_preferences: bool = False
+    user_picture_preferences_ttl: int = 0
+    router_timeout_before_agent: float = 0.0
+    enable_scene_extraction: bool = True
+    scene_extraction_model: str = ""
+    scene_context_window: int = 8
+    scene_extraction_max_memories: int = 5
+    natural_draw_mode: str = "full"
+    character_purity_mode: str = "smart"
+    scene_extraction: bool = True
+    chinese_prompt_translation: bool = True
+    config_migration_version: int = 2
+    config_migrated_utc: str = ""
     enable_session_recipe_continuity: bool = True
     invalidate_session_recipe_on_update: bool = True
     enable_preset_manifest_gate: bool = True
     interaction_mode: str = "smart"
     structured_director_mode: str = "auto"
     enable_prompt_composer_v2: bool = True
+    enable_chinese_prompt_translation: bool = True
     adaptive_negative_mode: str = "conservative"
     enable_prompt_diagnostics: bool = True
     prompt_diagnostics_include_content: bool = False
@@ -381,11 +476,13 @@ class PluginSettings:
     max_preset_loras: int = 12
     max_total_dynamic_loras: int = 12
     default_style_preset: str = "风格001"
-    auto_reload_after_style_save: bool = True
+    auto_reload_after_style_save: bool = False
     lora_presets: list[dict[str, Any]] = field(default_factory=_default_lora_presets)
     strict_lora_validation: bool = True
     prompt_node_id: str = DEFAULT_PROMPT_NODE_ID
     negative_node_id: str = DEFAULT_NEGATIVE_NODE_ID
+    workflow_positive_node_overrides: list[str] = field(default_factory=list)
+    workflow_negative_node_overrides: list[str] = field(default_factory=list)
     primary_seed_node_id: str = DEFAULT_PRIMARY_SEED_NODE_ID
     secondary_seed_node_id: str = DEFAULT_SECONDARY_SEED_NODE_ID
     resolution_node_id: str = DEFAULT_RESOLUTION_NODE_ID
@@ -432,7 +529,9 @@ class PluginSettings:
             经过类型清洗的插件配置。
         """
         data = config or {}
-        pic_trigger_enabled = _as_bool(data.get("enable_llm_pic_trigger"), True)
+        natural_mode_value = str(
+            data.get("natural_draw_mode", "full")
+        ).strip().casefold()
         return cls(
             comfyui_url=str(data.get("comfyui_url", cls.comfyui_url)).strip(),
             api_token=str(data.get("api_token", "")).strip(),
@@ -538,9 +637,7 @@ class PluginSettings:
             director_reference_file=(
                 DEFAULT_DIRECTOR_REFERENCE_FILE
                 if str(
-                    data.get(
-                        "director_reference_file", DEFAULT_DIRECTOR_REFERENCE_FILE
-                    )
+                    data.get("director_reference_file", "")
                 ).strip()
                 == "prompts/director_reference.txt"
                 else str(
@@ -550,13 +647,12 @@ class PluginSettings:
             director_extra_instruction=str(
                 data.get("director_extra_instruction", "")
             ).strip(),
-            enable_natural_draw=_as_bool(data.get("enable_natural_draw"), True),
-            director_primary=_as_bool(data.get("director_primary"), False),
-            enable_llm_pic_trigger=pic_trigger_enabled,
-            # The terminal guard is a transport-safety invariant, not an
-            # independently disableable feature. Disable ordinary-chat image
-            # controls through enable_llm_pic_trigger instead.
-            enable_chat_draw_terminal_guard=pic_trigger_enabled,
+            enable_natural_draw=True,
+            director_primary=False,
+            enable_llm_pic_trigger=True,
+            # The terminal guard follows the consolidated natural-draw mode,
+            # never the legacy pic trigger flag.
+            enable_chat_draw_terminal_guard=natural_mode_value != "off",
             auto_draw_system_prompt=str(
                 data.get("auto_draw_system_prompt", "")
             ).strip(),
@@ -569,9 +665,9 @@ class PluginSettings:
             max_auto_images_per_reply=_as_int(
                 data.get("max_auto_images_per_reply"), 1, 1
             ),
-            conversation_draw_cooldown_seconds=max(
-                0.0,
-                float(data.get("conversation_draw_cooldown_seconds", 8.0) or 8.0),
+            conversation_draw_cooldown_seconds=_as_float(
+                data.get("conversation_draw_cooldown_seconds"),
+                8.0,
             ),
             follow_up_draw_priority=str(
                 data.get("follow_up_draw_priority", "after_delivery")
@@ -842,6 +938,111 @@ class PluginSettings:
                 1.0,
                 max(0.0, _as_float(data.get("intent_router_min_confidence"), 0.7)),
             ),
+            intent_judge_backend=str(
+                data.get("intent_judge_backend", "auto")
+            ).strip().casefold(),
+            intent_judge_embedding_provider_id=str(
+                data.get("intent_judge_embedding_provider_id", "")
+            ).strip(),
+            intent_judge_rerank_provider_id=str(
+                data.get("intent_judge_rerank_provider_id", "")
+            ).strip(),
+            intent_judge_online_provider_id=str(
+                data.get("intent_judge_online_provider_id", "")
+            ).strip(),
+            intent_judge_positive_anchors=_as_string_list(
+                data.get("intent_judge_positive_anchors"), []
+            ),
+            intent_judge_negative_anchors=_as_string_list(
+                data.get("intent_judge_negative_anchors"), []
+            ),
+            intent_judge_local_embedding_threshold=min(
+                1.0,
+                max(-1.0, _as_float(data.get("intent_judge_local_embedding_threshold"), 0.10)),
+            ),
+            intent_judge_local_rerank_threshold=min(
+                1.0,
+                max(-1.0, _as_float(data.get("intent_judge_local_rerank_threshold"), 0.05)),
+            ),
+            intent_judge_auto_confidence_floor=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_judge_auto_confidence_floor"), 0.70)),
+            ),
+            intent_judge_online_timeout=min(
+                120.0,
+                max(1.0, _as_float(data.get("intent_judge_online_timeout"), 10.0)),
+            ),
+            intent_judge_online_temperature=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_judge_online_temperature"), 0.0)),
+            ),
+            intent_judge_fallback=str(
+                data.get("intent_judge_fallback", "no_draw")
+            ).strip().casefold(),
+            draw_pipeline_mode=(
+                str(data.get("draw_pipeline_mode", "auto")).strip().casefold()
+                if str(data.get("draw_pipeline_mode", "auto")).strip().casefold()
+                in {"auto", "base", "rtx", "iterative", "legacy"}
+                else "auto"
+            ),
+            intent_router_gate_mode=(
+                str(data.get("intent_router_gate_mode", "on")).strip().casefold()
+                if str(data.get("intent_router_gate_mode", "on")).strip().casefold()
+                in {"off", "on"}
+                else "on"
+            ),
+            enable_visual_task_intent=_as_bool(
+                data.get("enable_visual_task_intent"), True
+            ),
+            enable_user_picture_preferences=_as_bool(
+                data.get("enable_user_picture_preferences"), False
+            ),
+            user_picture_preferences_ttl=max(
+                0,
+                _as_int(data.get("user_picture_preferences_ttl"), 0, 0),
+            ),
+            router_timeout_before_agent=min(
+                120.0,
+                max(0.0, _as_float(data.get("router_timeout_before_agent"), 0.0)),
+            ),
+            enable_scene_extraction=True,
+            scene_extraction_model=str(
+                data.get("scene_extraction_model", "")
+            ).strip(),
+            scene_context_window=min(
+                32,
+                _as_int(data.get("scene_context_window"), 8, 1),
+            ),
+            scene_extraction_max_memories=min(
+                20,
+                _as_int(data.get("scene_extraction_max_memories"), 5, 0),
+            ),
+            natural_draw_mode=_normalize_enum(
+                str(data.get("natural_draw_mode", "full")).strip().casefold(),
+                ("off", "photo_only", "full"),
+                "full",
+            ),
+            character_purity_mode=_normalize_enum(
+                str(
+                    data.get("character_purity_mode", "smart")
+                ).strip().casefold(),
+                ("smart", "strict", "off"),
+                "smart",
+            ),
+            scene_extraction=_as_bool(
+                data.get("scene_extraction"),
+                True,
+            ),
+            chinese_prompt_translation=_as_bool(
+                data.get("chinese_prompt_translation"),
+                True,
+            ),
+            config_migration_version=_as_int(
+                data.get("config_migration_version"), 2, 0
+            ),
+            config_migrated_utc=str(
+                data.get("config_migrated_utc", "") or ""
+            ).strip(),
             enable_session_recipe_continuity=_as_bool(
                 data.get("enable_session_recipe_continuity"), True
             ),
@@ -866,6 +1067,7 @@ class PluginSettings:
             enable_prompt_composer_v2=_as_bool(
                 data.get("enable_prompt_composer_v2"), True
             ),
+            enable_chinese_prompt_translation=True,
             adaptive_negative_mode=(
                 str(data.get("adaptive_negative_mode", "conservative"))
                 .strip()
@@ -994,7 +1196,7 @@ class PluginSettings:
                 data.get("default_style_preset", "风格001")
             ).strip(),
             auto_reload_after_style_save=_as_bool(
-                data.get("auto_reload_after_style_save"), True
+                data.get("auto_reload_after_style_save"), False
             ),
             lora_presets=_as_mapping_list(
                 data.get("lora_presets", _default_lora_presets())
@@ -1006,6 +1208,12 @@ class PluginSettings:
             negative_node_id=str(
                 data.get("negative_node_id", DEFAULT_NEGATIVE_NODE_ID)
             ).strip(),
+            workflow_positive_node_overrides=_as_string_list(
+                data.get("workflow_positive_node_overrides"), []
+            ),
+            workflow_negative_node_overrides=_as_string_list(
+                data.get("workflow_negative_node_overrides"), []
+            ),
             primary_seed_node_id=str(
                 data.get("primary_seed_node_id", DEFAULT_PRIMARY_SEED_NODE_ID)
             ).strip(),
@@ -1249,6 +1457,7 @@ class GeneratedImagePaths(list[Path]):
         self.llm_call_count: int = 0
         self.comfy_elapsed_seconds: float = 0.0
         self.gpu_name: str = "未知 GPU"
+        self.output_sha256s: dict[str, str] = {}
 
 
 @dataclass

@@ -49,11 +49,11 @@ class PreviewControlTests(unittest.TestCase):
 class WebUiStatusTests(unittest.TestCase):
     def test_status_payload_is_json_safe(self) -> None:
         payload = build_webui_status(
-            target_version="2.4.0",
+            target_version="2.1.307",
             prompt_catalog=("director_draw",),
             prompt_contract_version="3.1",
         )
-        self.assertEqual(payload["target_version"], "2.4.0")
+        self.assertEqual(payload["target_version"], "2.1.307")
         self.assertIsInstance(payload["prompt_catalog"], list)
         self.assertEqual(payload["runtime_probe_phase"], "pre-stage1")
         self.assertEqual(payload["delivery_receipt_mode"], "unknown")

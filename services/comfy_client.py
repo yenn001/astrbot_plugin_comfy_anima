@@ -43,17 +43,21 @@ class ComfyClient:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("comfyui_url 必须是有效的 http/https 地址")
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
         self._client_id = str(uuid.uuid4())
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """延迟创建并复用 HTTP 会话。"""
-        if self._session is None or self._session.closed:
-            headers = {}
-            if self._settings.api_token:
-                headers["Authorization"] = f"Bearer {self._settings.api_token}"
-            timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
-            self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
-        return self._session
+        """Create and reuse one HTTP session under an asyncio lock."""
+        if self._session is not None and not self._session.closed:
+            return self._session
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                headers = {}
+                if self._settings.api_token:
+                    headers["Authorization"] = f"Bearer {self._settings.api_token}"
+                timeout = aiohttp.ClientTimeout(total=self._settings.request_timeout)
+                self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
+            return self._session
 
     async def _request_json(
         self, method: str, path: str, json_body: Optional[dict[str, Any]] = None
@@ -425,8 +429,12 @@ class ComfyClient:
                 return "\n".join(pieces)[:max_chars]
         return ""
 
-    async def download_image(self, image: ImageReference, target_dir: Path) -> Path:
-        """下载单张图片到安全的临时目录。"""
+    async def _download_image_impl(
+        self,
+        image: ImageReference,
+        target_dir: Path,
+    ) -> tuple[Path, str]:
+        """Download one image and return ``(path, sha256)`` computed in-stream."""
         session = await self._get_session()
         target_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(image.filename).suffix.lower()
@@ -440,6 +448,7 @@ class ComfyClient:
         }
         limit = self._settings.max_image_size_mb * 1024 * 1024
         downloaded = 0
+        digest = hashlib.sha256()
         try:
             async with session.get(f"{self._base_url}/view", params=params) as response:
                 if response.status >= 400:
@@ -452,6 +461,7 @@ class ComfyClient:
                         downloaded += len(chunk)
                         if downloaded > limit:
                             raise ComfyClientError("生成图片超过插件允许的大小")
+                        digest.update(chunk)
                         file.write(chunk)
         except (aiohttp.ClientError, OSError) as exc:
             target.unlink(missing_ok=True)
@@ -459,7 +469,20 @@ class ComfyClient:
         except Exception:
             target.unlink(missing_ok=True)
             raise
-        return target
+        return target, digest.hexdigest()
+
+    async def download_image(self, image: ImageReference, target_dir: Path) -> Path:
+        """下载单张图片到安全的临时目录。"""
+        path, _ = await self._download_image_impl(image, target_dir)
+        return path
+
+    async def download_image_with_sha(
+        self,
+        image: ImageReference,
+        target_dir: Path,
+    ) -> tuple[Path, str]:
+        """下载图片并同时返回文件 sha256，避免后续为回执再次读取文件。"""
+        return await self._download_image_impl(image, target_dir)
 
     async def cancel(self, prompt_id: str) -> None:
         """从队列移除任务；按配置决定是否中断当前全局任务。"""
@@ -471,6 +494,9 @@ class ComfyClient:
             return
 
     async def close(self) -> None:
-        """关闭 HTTP 会话。"""
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
+        """关闭 HTTP 会话并丢弃引用，避免关闭后的会话被复用。"""
+        async with self._session_lock:
+            session = self._session
+            self._session = None
+        if session is not None and not session.closed:
+            await session.close()

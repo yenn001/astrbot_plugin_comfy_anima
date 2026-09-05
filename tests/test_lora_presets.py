@@ -253,6 +253,34 @@ class LoraPresetRegistryTests(unittest.TestCase):
         self.assertIn("- 2. 风格1", filtered)
         self.assertIs(registry.resolve("2"), style)
 
+    def test_compact_format_truncates_lora_tags_and_hides_detail(self) -> None:
+        registry = LoraPresetRegistry([], max_loras=12)
+        selections = tuple(
+            LoraSelection(f"styles/ink{i}", 0.8) for i in range(10)
+        )
+        registry.save(
+            name="大风格",
+            category="style",
+            selections=selections,
+            trigger_words="warm light",
+            description="portrait lighting",
+            positive_tags=["portrait"],
+            negative_tags=["bad anatomy"],
+        )
+
+        compact = registry.format_for_llm(category="style")
+        detail = registry.format_for_llm(category="style", detail=True)
+
+        self.assertIn("… +2 more", compact)
+        self.assertNotIn("triggers:", compact)
+        self.assertNotIn("positive_tags:", compact)
+        self.assertNotIn("negative_tags:", compact)
+        self.assertNotIn("portrait lighting", compact)
+        self.assertIn("triggers: warm light", detail)
+        self.assertIn("positive_tags: portrait", detail)
+        self.assertIn("negative_tags: bad anatomy", detail)
+        self.assertIn("portrait lighting", detail)
+
     def test_natural_language_style_mention_uses_exact_saved_name(self) -> None:
         registry = LoraPresetRegistry([])
         shorter = registry.save(
@@ -1011,7 +1039,7 @@ class ExecuteJobPresetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plugin._client.submitted_workflow)
 
 
-class ConfigPersistenceTests(unittest.TestCase):
+class ConfigPersistenceTests(unittest.IsolatedAsyncioTestCase):
     """验证配置保存失败时不留下内存脏数据。"""
 
     @classmethod
@@ -1019,7 +1047,7 @@ class ConfigPersistenceTests(unittest.TestCase):
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
-    def test_persist_config_restores_previous_value_when_save_fails(self) -> None:
+    async def test_persist_config_restores_previous_value_when_save_fails(self) -> None:
         class FailingConfig(dict):
             def __init__(self, path: Path):
                 super().__init__(lora_presets=[{"name": "old"}])
@@ -1033,21 +1061,21 @@ class ConfigPersistenceTests(unittest.TestCase):
             plugin = object.__new__(self.main.ComfyAnimaPlugin)
             plugin.config = config
 
-            result = plugin._persist_config("lora_presets", [{"name": "new"}])
+            result = await plugin._persist_config("lora_presets", [{"name": "new"}])
 
         self.assertFalse(result)
         self.assertEqual(config["lora_presets"], [{"name": "old"}])
 
-    def test_persist_config_without_writer_fails_instead_of_claiming_success(self) -> None:
+    async def test_persist_config_without_writer_fails_instead_of_claiming_success(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.config = {"lora_presets": [{"name": "old"}]}
 
-        result = plugin._persist_config("lora_presets", [{"name": "new"}])
+        result = await plugin._persist_config("lora_presets", [{"name": "new"}])
 
         self.assertFalse(result)
         self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
 
-    def test_persist_config_without_config_path_rejects_noop_writer(self) -> None:
+    async def test_persist_config_without_config_path_rejects_noop_writer(self) -> None:
         class NoPathNoOpConfig(dict):
             def save_config(self):
                 return None
@@ -1055,12 +1083,12 @@ class ConfigPersistenceTests(unittest.TestCase):
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
         plugin.config = NoPathNoOpConfig(lora_presets=[{"name": "old"}])
 
-        result = plugin._persist_config("lora_presets", [{"name": "new"}])
+        result = await plugin._persist_config("lora_presets", [{"name": "new"}])
 
         self.assertFalse(result)
         self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
 
-    def test_persist_config_rejects_writer_that_does_not_update_disk(self) -> None:
+    async def test_persist_config_rejects_writer_that_does_not_update_disk(self) -> None:
         class NoOpConfig(dict):
             def __init__(self, path: Path):
                 super().__init__(lora_presets=[{"name": "old"}])
@@ -1078,7 +1106,7 @@ class ConfigPersistenceTests(unittest.TestCase):
             plugin = object.__new__(self.main.ComfyAnimaPlugin)
             plugin.config = NoOpConfig(path)
 
-            result = plugin._persist_config(
+            result = await plugin._persist_config(
                 "lora_presets",
                 [{"name": "new"}],
             )
@@ -1086,7 +1114,7 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(plugin.config["lora_presets"], [{"name": "old"}])
 
-    def test_verify_failure_compensates_disk_back_to_previous_value(self) -> None:
+    async def test_verify_failure_compensates_disk_back_to_previous_value(self) -> None:
         class Config(dict):
             def __init__(self, path: Path):
                 super().__init__(lora_presets=[{"name": "old"}])
@@ -1105,7 +1133,7 @@ class ConfigPersistenceTests(unittest.TestCase):
             plugin.config = Config(path)
             plugin._verify_persisted_config = lambda _updates: False
 
-            result = plugin._persist_config(
+            result = await plugin._persist_config(
                 "lora_presets",
                 [{"name": "new"}],
             )

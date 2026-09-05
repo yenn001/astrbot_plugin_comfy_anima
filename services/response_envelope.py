@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable
 
@@ -43,13 +43,12 @@ class BundleOwnershipError(RuntimeError):
     """Raised when a bundle is mounted onto a different envelope."""
 
 
-@dataclass
+@dataclass(frozen=True)
 class DeliveryReceipt:
     """Per-bundle delivery receipt; message_id is authoritative evidence."""
 
     bundle_id: str
-    status: str = ReceiptState.UNKNOWN.value
-    state: str = ReceiptState.UNKNOWN.value
+    status: ReceiptState = ReceiptState.UNKNOWN
     message_id: str = ""
     platform: str = ""
     sent_at: float = 0.0
@@ -60,8 +59,13 @@ class DeliveryReceipt:
     output_sha256: str = ""
 
     @property
+    def status_text(self) -> str:
+        """Return the status as its wire/string value for old consumers."""
+        return self.status.value
+
+    @property
     def has_verified_send(self) -> bool:
-        return self.status == ReceiptState.SENT.value and bool(self.message_id)
+        return self.status == ReceiptState.SENT and bool(self.message_id)
 
     def attach_output(
         self,
@@ -69,10 +73,13 @@ class DeliveryReceipt:
         run_id: str,
         output_path: str,
         output_sha256: str,
-    ) -> None:
-        self.run_id = str(run_id)
-        self.output_path = str(output_path)
-        self.output_sha256 = str(output_sha256)
+    ) -> "DeliveryReceipt":
+        return replace(
+            self,
+            run_id=str(run_id),
+            output_path=str(output_path),
+            output_sha256=str(output_sha256),
+        )
 
 
 @dataclass
@@ -251,7 +258,7 @@ class BundleLedger:
                 )
             if bundle.receipt is None:
                 bundle.receipt = DeliveryReceipt(bundle_id=bundle_id)
-            bundle.receipt.attach_output(
+            bundle.receipt = bundle.receipt.attach_output(
                 run_id=bundle.bundle_run_id,
                 output_path=output_path,
                 output_sha256=output_sha256,
@@ -279,22 +286,30 @@ class BundleLedger:
             if bundle.receipt is None:
                 bundle.receipt = DeliveryReceipt(bundle_id=bundle_id)
             receipt = bundle.receipt
-            receipt.attempt_count += 1
-            receipt.platform = platform or receipt.platform
+            next_status = receipt.status
+            next_message_id = receipt.message_id
+            next_sent_at = receipt.sent_at
+            next_last_error = receipt.last_error
             if error:
-                receipt.last_error = str(error)[:500]
-                receipt.status = ReceiptState.FAILED.value
-                receipt.state = ReceiptState.FAILED.value
+                next_status = ReceiptState.FAILED
+                next_last_error = str(error)[:500]
             elif str(message_id or "").strip():
-                receipt.message_id = str(message_id).strip()
-                receipt.status = ReceiptState.SENT.value
-                receipt.state = ReceiptState.SENT.value
-                receipt.sent_at = time.time()
+                next_status = ReceiptState.SENT
+                next_message_id = str(message_id).strip()
+                next_sent_at = time.time()
             else:
-                receipt.status = ReceiptState.UNKNOWN.value
-                receipt.state = ReceiptState.UNKNOWN.value
+                next_status = ReceiptState.UNKNOWN
+            bundle.receipt = replace(
+                receipt,
+                attempt_count=receipt.attempt_count + 1,
+                platform=platform or receipt.platform,
+                last_error=next_last_error,
+                status=next_status,
+                message_id=next_message_id,
+                sent_at=next_sent_at,
+            )
             self._write(envelope)
-            return receipt
+            return bundle.receipt
         raise BundleOwnershipError("unknown bundle_id")
 
     def terminal(self) -> bool:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -161,6 +161,78 @@ def _binding(raw: Any, label: str, *, required: bool = False) -> InputBinding | 
     )
 
 
+def _workflow_node_overrides(values: Any) -> dict[str, str]:
+    """Parse ``workflow_stem=node_id`` override lines into a mapping."""
+    result: dict[str, str] = {}
+    if values in (None, ""):
+        return result
+    if isinstance(values, str):
+        values = values.split(",")
+    if not isinstance(values, (list, tuple)):
+        raise WorkflowProfileError("workflow node overrides must be a list")
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "=" in text:
+            key, value = text.split("=", 1)
+        elif ":" in text:
+            key, value = text.split(":", 1)
+        else:
+            raise WorkflowProfileError(
+                f"workflow node override must look like workflow_stem=node_id: {text!r}"
+            )
+        stem = _clean_id(key, "workflow node override stem").removesuffix(".json")
+        node_id = _clean_id(value, "workflow node override node_id")
+        result[stem] = node_id
+    return result
+
+
+def _apply_prompt_overrides(
+    profile: WorkflowProfile,
+    workflow_path: Path,
+    settings: PluginSettings,
+) -> WorkflowProfile:
+    """Apply user-configurable positive/negative node id overrides."""
+    stem = workflow_path.stem
+    positive_map = _workflow_node_overrides(
+        getattr(settings, "workflow_positive_node_overrides", ())
+    )
+    negative_map = _workflow_node_overrides(
+        getattr(settings, "workflow_negative_node_overrides", ())
+    )
+    prompt = profile.prompt
+    negative = profile.negative
+    if (prompt is not None and stem in positive_map) or (
+        negative is not None and stem in negative_map
+    ):
+        if not workflow_path.is_file():
+            raise WorkflowProfileError(
+                f"cannot validate workflow node overrides: {workflow_path} missing"
+            )
+        workflow_nodes = json.loads(
+            workflow_path.read_text(encoding="utf-8")
+        )
+        for label, node_id in (
+            ("positive", positive_map.get(stem, "")),
+            ("negative", negative_map.get(stem, "")),
+        ):
+            if not node_id:
+                continue
+            if node_id not in workflow_nodes:
+                raise WorkflowProfileError(
+                    f"{workflow_path.stem} {label} node override {node_id} "
+                    "does not exist in the workflow"
+                )
+    if prompt is not None and stem in positive_map:
+        prompt = InputBinding(positive_map[stem], prompt.input_name)
+    if negative is not None and stem in negative_map:
+        negative = InputBinding(negative_map[stem], negative.input_name)
+    if prompt is not profile.prompt or negative is not profile.negative:
+        return replace(profile, prompt=prompt, negative=negative)
+    return profile
+
+
 def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
     if value in (None, ""):
         return ()
@@ -177,7 +249,11 @@ def load_workflow_profile(
 
     manifest_path = workflow_path.parent / "manifests" / f"{workflow_path.stem}.json"
     if not manifest_path.is_file():
-        return WorkflowProfile.from_settings(settings)
+        return _apply_prompt_overrides(
+            WorkflowProfile.from_settings(settings),
+            workflow_path,
+            settings,
+        )
     if manifest_path.stat().st_size > 256 * 1024:
         raise WorkflowProfileError("workflow manifest exceeds 256KB")
     try:
@@ -375,7 +451,7 @@ def load_workflow_profile(
     model_contract = payload.get("model_contract")
     if not isinstance(model_contract, Mapping):
         model_contract = {}
-    return WorkflowProfile(
+    profile = WorkflowProfile(
         profile_id=_clean_id(payload.get("profile_id"), "profile_id"),
         display_name=str(payload.get("display_name") or workflow_path.stem).strip()[:128],
         task_type=task_type,
@@ -425,6 +501,7 @@ def load_workflow_profile(
         model_contract=dict(model_contract),
         source=str(manifest_path),
     )
+    return _apply_prompt_overrides(profile, workflow_path, settings)
 
 
 __all__ = [

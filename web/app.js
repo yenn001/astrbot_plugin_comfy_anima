@@ -21,6 +21,9 @@ let consoleLoading = false;
 let consolePaused = false;
 let consoleClearMarker = null;
 let consoleStreamId = "";
+let consoleLastFilterSignature = "";
+let consoleRenderedFirstId = null;
+let consoleRenderedLastId = null;
 let taskItems = [];
 let selectedTaskId = "";
 let selectedTask = null;
@@ -56,6 +59,7 @@ let loraGalleryFingerprint = "";
 let loraPreviewObserver = null;
 let activeModelFamily = "anima_legacy_28l";
 const taskLatestEvents = new Map();
+const taskLatestPhases = new Map();
 const volatilePreferences = new Map();
 const volatileSessionPreferences = new Map();
 
@@ -216,6 +220,8 @@ const numberFields = new Set([
   "lora_embedding_top_k",
   "lora_rerank_top_n",
   "lora_retrieval_timeout",
+  "lora_cache_ttl",
+  "lora_snapshot_max_age",
   "sampler_steps_override",
   "web_ui_port",
   "web_ui_session_ttl",
@@ -237,10 +243,10 @@ const booleanFields = new Set([
   "send_generation_notice",
   "show_chat_generation_details",
   "enable_prompt_llm",
-  "enable_natural_draw",
-  "enable_llm_pic_trigger",
   "enable_chat_draw_terminal_guard",
   "enable_prompt_composer_v2",
+  "scene_extraction",
+  "chinese_prompt_translation",
   "enable_prompt_diagnostics",
   "prompt_diagnostics_include_content",
   "danbooru_api_include_aliases",
@@ -253,6 +259,8 @@ const booleanFields = new Set([
   "enable_lora_tool",
   "enable_lora_download",
   "enable_lora_hybrid_search",
+  "enable_task_lora_snapshot",
+  "auto_reload_after_style_save",
   "strict_lora_validation",
   "global_lock",
   "whitelist_only",
@@ -749,7 +757,13 @@ async function loadBootstrap() {
   renderWorkflowSamplers(data.workflow_runtime || {}, data.settings || {});
   updateLoraFamilyFilterUI();
   await Promise.all([
-    loadProviders({prompt: data.settings.prompt_llm_provider_id, intent: data.settings.intent_router_model}),
+    loadProviders({
+      prompt: data.settings.prompt_llm_provider_id,
+      intent: data.settings.intent_router_model,
+      judgeEmbedding: data.settings.intent_judge_embedding_provider_id,
+      judgeRerank: data.settings.intent_judge_rerank_provider_id,
+      judgeOnline: data.settings.intent_judge_online_provider_id,
+    }),
     loadConfigProfiles({quiet: true}),
     loadWorkflows({quiet: true}),
   ]);
@@ -1088,6 +1102,18 @@ async function loadProviders(selectedOverride = null) {
       key: "rerank", group: "rerank", select: "#rerank-provider-select", manual: "#rerank-provider-manual",
       note: "#rerank-provider-note", empty: "停用精排", selected: "selected_rerank",
     },
+    {
+      key: "judgeEmbedding", group: "embedding", select: "#intent-judge-embedding-select", manual: "#intent-judge-embedding-manual",
+      note: "#intent-judge-embedding-note", empty: "未配置意图判断 Embedding", selected: "selected_judge_embedding",
+    },
+    {
+      key: "judgeRerank", group: "rerank", select: "#intent-judge-rerank-select", manual: "#intent-judge-rerank-manual",
+      note: "#intent-judge-rerank-note", empty: "未配置意图判断 Rerank", selected: "selected_judge_rerank",
+    },
+    {
+      key: "judgeOnline", group: "chat", select: "#intent-judge-online-select", manual: "#intent-judge-online-manual",
+      note: "#intent-judge-online-note", empty: "未配置意图判断在线模型", selected: "selected_judge_online",
+    },
   ];
   for (const control of controls) {
     document.querySelector(control.note).textContent = "正在读取 AstrBot 已保存模型…";
@@ -1231,6 +1257,10 @@ async function saveSettings(event) {
       body: JSON.stringify(collectSettings(form)),
     });
     document.querySelector("#settings-note").textContent = data.message;
+    if (data.normalized?.length) {
+      document.querySelector("#settings-note").textContent +=
+        ` 已规范化：${data.normalized.join("、")}`;
+    }
     showToast(data.message);
     if (data.reload_scheduled) {
       await reloadAfterPluginChange();
@@ -2134,6 +2164,37 @@ async function runLoraArchive(mode, {names = null, button = null, automatic = fa
   }
 }
 
+async function batchMark29bLoras(button) {
+  const selected = Array.from(selectedLoras);
+  const autoDetect = selected.length === 0;
+  const message = autoDetect
+    ? "确定自动扫描并标记库中所有带 29b / 40l / 29B 子目录的 LoRA 为【原生 2.9B 40-layer】吗？"
+    : `确定将所选的 ${selected.length} 个 LoRA 批量标记为【原生 2.9B 40-layer】吗？`;
+
+  if (!(await confirmAction(message, {title: "一键标记 2.9B 模型族", confirmLabel: "开始标记"}))) {
+    return;
+  }
+
+  setBusy(button, true, "标记中…");
+  try {
+    const data = await api("/api/loras/batch-family", {
+      method: "POST",
+      body: JSON.stringify({
+        names: selected,
+        auto_detect_29b: autoDetect,
+        compatibility_mode: "native_29b",
+        compatible_model_families: ["anima_29b_40l"],
+      }),
+    });
+    showToast(data.message || `已成功标记 ${data.updated_count || 0} 项。`);
+    await searchLoras(null);
+  } catch (error) {
+    showToast(`批量标记失败: ${error.message}`, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function downloadLora(event) {
   event.preventDefault();
   const button = event.currentTarget.querySelector("button");
@@ -2493,8 +2554,10 @@ function taskProgress(task) {
 }
 
 function latestTaskPhase(task) {
-  const event = taskLatestEvents.get(task.run_id);
-  if (event?.phase) return String(event.phase).replaceAll("_", " ");
+  const phase = task.latest_phase
+    || taskLatestPhases.get(task.run_id)
+    || taskLatestEvents.get(task.run_id)?.phase;
+  if (phase) return String(phase).replaceAll("_", " ");
   if (task.status === "queued") return "等待执行";
   if (task.status === "running") return "正在运行";
   return taskStatusLabel(task.status);
@@ -2516,7 +2579,7 @@ function stopTaskPolling() {
 
 function scheduleTaskPoll(delay = 1800) {
   stopTaskPolling();
-  if (currentPanel !== "tasks") return;
+  if (currentPanel !== "tasks" || document.hidden) return;
   taskPollTimer = setTimeout(() => loadTasks({quiet: true}), delay);
 }
 
@@ -2571,17 +2634,12 @@ function renderTaskList() {
   updateTaskMetrics();
 }
 
-async function hydrateActiveTaskPhases() {
-  const active = taskItems.filter((task) => activeTaskStatuses.has(task.status)).slice(0, 8);
-  await Promise.all(active.map(async (task) => {
-    try {
-      const data = await api(`/api/tasks/${encodeURIComponent(task.run_id)}/events?after=0&limit=2000`);
-      const latest = (data.entries || []).at(-1);
-      if (latest) taskLatestEvents.set(task.run_id, latest);
-    } catch (_error) {
-      // The task list remains useful even if a single event stream was pruned.
-    }
-  }));
+function hydrateActiveTaskPhases() {
+  for (const task of taskItems) {
+    const phase = task.latest_phase || "";
+    const previous = taskLatestPhases.get(task.run_id);
+    if (phase && phase !== previous) taskLatestPhases.set(task.run_id, phase);
+  }
 }
 
 async function loadTasks({quiet = false, preferredRunId = ""} = {}) {
@@ -2597,7 +2655,7 @@ async function loadTasks({quiet = false, preferredRunId = ""} = {}) {
     if (status) params.set("status", status);
     const data = await api(`/api/tasks?${params}`);
     taskItems = data.items || [];
-    await hydrateActiveTaskPhases();
+    hydrateActiveTaskPhases();
     if (preferredRunId) selectedTaskId = preferredRunId;
     if (!selectedTaskId && taskItems.length) {
       selectedTaskId = (taskItems.find((task) => activeTaskStatuses.has(task.status)) || taskItems[0]).run_id;
@@ -2751,10 +2809,20 @@ async function loadTaskDetail(runId, {reset = false} = {}) {
     ]);
     if (selectedTaskId !== runId) return;
     selectedTask = task;
-    const known = new Set(taskEvents.map((event) => event.seq));
-    const incoming = (eventData.entries || []).filter((event) => !known.has(event.seq));
-    taskEvents.push(...incoming);
-    taskEvents.sort((left, right) => left.seq - right.seq);
+    const rawIncoming = eventData.entries || [];
+    const known = rawIncoming.length
+      ? new Set(taskEvents.map((event) => event.seq))
+      : null;
+    const incoming = rawIncoming.length
+      ? rawIncoming.filter((event) => (
+        event.seq > taskEventCursor && !known.has(event.seq)
+      ))
+      : [];
+    if (incoming.length) {
+      taskEvents.push(...incoming);
+      taskEvents.sort((left, right) => left.seq - right.seq);
+      if (taskEvents.length > 2000) taskEvents = taskEvents.slice(-2000);
+    }
     taskEventCursor = Number(eventData.cursor || taskEventCursor);
     const latest = taskEvents.at(-1);
     if (latest) taskLatestEvents.set(runId, latest);
@@ -2825,7 +2893,7 @@ function stopConsolePolling() {
 
 function scheduleConsolePoll(delay = 1200) {
   stopConsolePolling();
-  if (currentPanel !== "console" || consolePaused) return;
+  if (currentPanel !== "console" || consolePaused || document.hidden) return;
   consolePollTimer = setTimeout(() => loadConsoleLogs({quiet: true}), delay);
 }
 
@@ -2857,41 +2925,78 @@ function filteredConsoleEntries() {
   });
 }
 
-function renderConsoleLogs({follow = false} = {}) {
+function consoleFilterSignature() {
+  const query = document.querySelector("#console-query").value.trim().toLocaleLowerCase();
+  const level = document.querySelector("#console-level-filter").value;
+  const category = document.querySelector("#console-category-filter").value;
+  return `${query}\u0000${level}\u0000${category}`;
+}
+
+function createConsoleEntryNode(entry) {
+  const item = document.createElement("li");
+  item.className = `console-entry level-${String(entry.level || "INFO").toLowerCase()}`;
+
+  const rail = document.createElement("div");
+  rail.className = "console-entry-rail";
+  const time = document.createElement("time");
+  time.dateTime = entry.time || "";
+  time.textContent = consoleLogTime(entry);
+  const level = document.createElement("span");
+  level.className = "console-level";
+  level.textContent = entry.level || "INFO";
+  const category = document.createElement("span");
+  category.className = "console-category";
+  category.textContent = consoleCategoryLabels[entry.category] || "插件";
+  rail.append(time, level, category);
+
+  const body = document.createElement("div");
+  body.className = "console-entry-body";
+  const source = document.createElement("span");
+  source.className = "console-source";
+  source.textContent = `${entry.source || "plugin"}:${entry.line || 0}`;
+  const message = document.createElement("pre");
+  message.textContent = entry.message || "";
+  body.append(source, message);
+  item.append(rail, body);
+  return item;
+}
+
+function renderConsoleLogs({follow = false, append = false} = {}) {
   const list = document.querySelector("#console-list");
   const empty = document.querySelector("#console-empty");
   const viewport = document.querySelector("#console-viewport");
   const visible = filteredConsoleEntries();
-  const fragment = document.createDocumentFragment();
-  for (const entry of visible) {
-    const item = document.createElement("li");
-    item.className = `console-entry level-${String(entry.level || "INFO").toLowerCase()}`;
-
-    const rail = document.createElement("div");
-    rail.className = "console-entry-rail";
-    const time = document.createElement("time");
-    time.dateTime = entry.time || "";
-    time.textContent = consoleLogTime(entry);
-    const level = document.createElement("span");
-    level.className = "console-level";
-    level.textContent = entry.level || "INFO";
-    const category = document.createElement("span");
-    category.className = "console-category";
-    category.textContent = consoleCategoryLabels[entry.category] || "插件";
-    rail.append(time, level, category);
-
-    const body = document.createElement("div");
-    body.className = "console-entry-body";
-    const source = document.createElement("span");
-    source.className = "console-source";
-    source.textContent = `${entry.source || "plugin"}:${entry.line || 0}`;
-    const message = document.createElement("pre");
-    message.textContent = entry.message || "";
-    body.append(source, message);
-    item.append(rail, body);
-    fragment.append(item);
+  const filterSignature = consoleFilterSignature();
+  const canAppend = append
+    && filterSignature === consoleLastFilterSignature
+    && consoleRenderedFirstId !== null
+    && consoleRenderedLastId !== null
+    && visible.length > 0
+    && visible[0].id === consoleRenderedFirstId;
+  if (canAppend) {
+    const newVisible = visible.filter((entry) => entry.id > consoleRenderedLastId);
+    if (newVisible.length) {
+      const fragment = document.createDocumentFragment();
+      for (const entry of newVisible) fragment.append(createConsoleEntryNode(entry));
+      list.append(fragment);
+      consoleRenderedLastId = newVisible[newVisible.length - 1].id;
+    }
+    empty.hidden = visible.length > 0;
+    document.querySelector("#console-visible-count").textContent = `显示 ${visible.length} 条`;
+    if (follow && document.querySelector("#console-follow").checked) {
+      requestAnimationFrame(() => {
+        viewport.scrollTop = viewport.scrollHeight;
+      });
+    }
+    return;
   }
+
+  const fragment = document.createDocumentFragment();
+  for (const entry of visible) fragment.append(createConsoleEntryNode(entry));
   list.replaceChildren(fragment);
+  consoleLastFilterSignature = filterSignature;
+  consoleRenderedFirstId = visible.length ? visible[0].id : null;
+  consoleRenderedLastId = visible.length ? visible[visible.length - 1].id : null;
   empty.hidden = visible.length > 0;
   document.querySelector("#console-visible-count").textContent = `显示 ${visible.length} 条`;
   if (follow && document.querySelector("#console-follow").checked) {
@@ -2955,20 +3060,33 @@ async function loadConsoleLogs({reset = false, quiet = false} = {}) {
       if (!data.stream_reset) data = await api("/api/logs?after=0&limit=1000");
     }
     consoleStreamId = data.stream_id || consoleStreamId;
-    if (consoleClearMarker !== null && data.cleared !== consoleClearMarker) {
+    const clearedChanged = consoleClearMarker !== null && data.cleared !== consoleClearMarker;
+    if (clearedChanged) {
       consoleEntries = [];
     }
     consoleClearMarker = data.cleared ?? consoleClearMarker ?? 0;
-    const known = new Set(consoleEntries.map((entry) => entry.id));
-    const incoming = (data.entries || []).filter((entry) => !known.has(entry.id));
-    consoleEntries.push(...incoming);
-    consoleEntries.sort((left, right) => left.id - right.id);
-    if (consoleEntries.length > (data.capacity || 1000)) {
-      consoleEntries = consoleEntries.slice(-(data.capacity || 1000));
+    const rawIncoming = data.entries || [];
+    const known = rawIncoming.length
+      ? new Set(consoleEntries.map((entry) => entry.id))
+      : null;
+    const incoming = rawIncoming.length
+      ? rawIncoming.filter((entry) => !known.has(entry.id))
+      : [];
+    if (incoming.length) {
+      consoleEntries.push(...incoming);
+      consoleEntries.sort((left, right) => left.id - right.id);
+      if (consoleEntries.length > (data.capacity || 1000)) {
+        consoleEntries = consoleEntries.slice(-(data.capacity || 1000));
+      }
     }
     consoleCursor = Number(data.cursor || consoleCursor);
     updateConsoleMeta(data);
-    renderConsoleLogs({follow: incoming.length > 0});
+    if (reset || streamChanged || clearedChanged || incoming.length > 0) {
+      renderConsoleLogs({
+        follow: incoming.length > 0,
+        append: !reset && !streamChanged && !clearedChanged && incoming.length > 0,
+      });
+    }
   } catch (error) {
     document.querySelector("#console-status").textContent = `日志读取失败：${error.message}`;
     if (!quiet) showToast(error.message, true);
@@ -4750,6 +4868,9 @@ document.querySelector("#provider-refresh").addEventListener("click", () => {
     ["intent", "#intent-router-select", "#intent-router-manual"],
     ["embedding", "#embedding-provider-select", "#embedding-provider-manual"],
     ["rerank", "#rerank-provider-select", "#rerank-provider-manual"],
+    ["judgeEmbedding", "#intent-judge-embedding-select", "#intent-judge-embedding-manual"],
+    ["judgeRerank", "#intent-judge-rerank-select", "#intent-judge-rerank-manual"],
+    ["judgeOnline", "#intent-judge-online-select", "#intent-judge-online-manual"],
   ]) {
     const select = document.querySelector(selectId);
     current[key] = select.value === "__manual__"
@@ -4764,6 +4885,9 @@ for (const [selectId, manualId] of [
   ["#intent-router-select", "#intent-router-manual"],
   ["#embedding-provider-select", "#embedding-provider-manual"],
   ["#rerank-provider-select", "#rerank-provider-manual"],
+  ["#intent-judge-embedding-select", "#intent-judge-embedding-manual"],
+  ["#intent-judge-rerank-select", "#intent-judge-rerank-manual"],
+  ["#intent-judge-online-select", "#intent-judge-online-manual"],
 ]) {
   document.querySelector(selectId).addEventListener("change", (event) => {
     document.querySelector(manualId).hidden = event.target.value !== "__manual__";
@@ -4876,6 +5000,7 @@ document.querySelector("#metadata-all").addEventListener("click", async (event) 
 document.querySelector("#archive-changed").addEventListener("click", (event) => runLoraArchive("changed", {button: event.currentTarget}));
 document.querySelector("#archive-selected").addEventListener("click", (event) => runLoraArchive("selected", {button: event.currentTarget}));
 document.querySelector("#archive-selected-inline").addEventListener("click", (event) => runLoraArchive("selected", {button: event.currentTarget}));
+document.querySelector("#batch-mark-29b")?.addEventListener("click", (event) => batchMark29bLoras(event.currentTarget));
 document.querySelector("#archive-all").addEventListener("click", async (event) => {
   const button = event.currentTarget;
   if (await confirmAction(
@@ -5015,6 +5140,15 @@ document.querySelector("#prompt-lab-use-composer").addEventListener("click", (ev
 });
 document.querySelector("#reload-data").addEventListener("click", loadCurrentPanel);
 document.querySelector("#logout-button").addEventListener("click", logout);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopTaskPolling();
+    stopConsolePolling();
+  } else {
+    if (currentPanel === "tasks") loadTasks({quiet: true});
+    if (currentPanel === "console" && !consolePaused) loadConsoleLogs({quiet: true});
+  }
+});
 window.addEventListener("beforeunload", () => {
   stopConsolePolling();
   stopTaskPolling();

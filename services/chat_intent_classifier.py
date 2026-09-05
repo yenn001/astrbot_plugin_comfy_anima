@@ -87,6 +87,14 @@ _DRAW_NEW_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Combination phrasing is common in roleplay requests and must not depend on
+# the model's later ``<pic>`` output to establish drawing intent.
+_DRAW_DELIVERY_RE = re.compile(
+    r"(?:画|绘|生成|拍).{0,12}(?:出来|给我看|让我看)|"
+    r"(?:想看|要看|让我看).{0,24}(?:画出来|生成出来|拍出来)",
+    flags=re.IGNORECASE,
+)
+
 _EDIT_LAST_RE = re.compile(
     r"换(?:成|上)?.{0,24}(?:造型|衣服|服装|发型|背景|姿势)|"
     r"改(?:一下|一改)?(?:上一张|这张|刚才|这图)|"
@@ -100,9 +108,23 @@ _QUERY_ONLY_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# G2: a role preset/character plus an observable action or scene is a visual
+# task even when the user does not explicitly write 画/图/照片.
+_VISUAL_TASK_RE = re.compile(
+    r"(?:角色预设|预设|角色|达妮娅|娅娅|她|他|你).{0,24}"
+    r"(?:穿着?|换(?:上|成)?|站着?|坐着?|躺着?|在(?:厨房|卧室|浴室|阳台|海边|"
+    r"公园|床上|沙发|街上|教室|办公室)|做|吃|喝|看|玩|唱|跳|走|跑|"
+    r"回头|眨眼|微笑|自拍)",
+    flags=re.IGNORECASE,
+)
+
 _NEGATED_DRAW_RE = re.compile(
     r"(?:不要|不用|别|无需|不想|拒绝|禁止).{0,20}"
-    r"(?:画|生成|发|给|看|出|提交).{0,12}(?:图|照片|图片|画面|pic)",
+    r"(?:画|生成|发|给|看|出|提交).{0,12}(?:图|照片|图片|画面|pic)|"
+    r"(?:不要|不用|别|无需|不想|拒绝|禁止).{0,8}"
+    r"(?:画|绘|生成|拍)|"
+    r"(?:明天|以后|下次|等会|稍后|过会|晚点).{0,8}"
+    r"(?:画|绘|生成|拍)",
     flags=re.IGNORECASE,
 )
 
@@ -116,6 +138,7 @@ def classify_chat_intent(
     *,
     has_recipe: bool = False,
     strict: bool = False,
+    enable_visual_task_intent: bool = True,
 ) -> ChatIntentDecision:
     """Classify one user message with deterministic rules only."""
 
@@ -152,7 +175,7 @@ def classify_chat_intent(
             visual_delivery=False,
             needs_previous_image=False,
             confidence=0.95,
-            rationale="drawing was explicitly negated",
+            rationale="drawing was explicitly negated or postponed",
         )
 
     if _CONTINUATION_RE.search(source):
@@ -190,6 +213,24 @@ def classify_chat_intent(
             rationale="explicit edit/redraw phrasing",
         )
 
+    if _DRAW_DELIVERY_RE.search(source):
+        return ChatIntentDecision(
+            INTENT_DRAW_NEW,
+            visual_delivery=True,
+            needs_previous_image=False,
+            confidence=1.0,
+            rationale="explicit drawing plus delivery phrasing",
+        )
+
+    if enable_visual_task_intent and _VISUAL_TASK_RE.search(source):
+        return ChatIntentDecision(
+            INTENT_DRAW_NEW,
+            visual_delivery=True,
+            needs_previous_image=False,
+            confidence=0.9,
+            rationale="role preset plus visual action/scene promoted to draw_new",
+        )
+
     if _DRAW_NEW_RE.search(source):
         return ChatIntentDecision(
             INTENT_DRAW_NEW,
@@ -225,6 +266,7 @@ def build_intent_plan(
     identity_required: bool = False,
     has_recipe: bool = False,
     recipe_has_preset: bool = False,
+    enable_visual_task_intent: bool = True,
 ) -> IntentPlan:
     """Build the deterministic probe plan for one user message.
 
@@ -233,7 +275,11 @@ def build_intent_plan(
     request tools outside this plan.
     """
 
-    resolved = decision or classify_chat_intent(message, has_recipe=has_recipe)
+    resolved = decision or classify_chat_intent(
+        message,
+        has_recipe=has_recipe,
+        enable_visual_task_intent=enable_visual_task_intent,
+    )
     source = _normalized(message)
     subject = str(requested_subject or "").strip()
     required: list[str] = []

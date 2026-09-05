@@ -36,6 +36,11 @@ from ..services.lora_semantic import (
 from ..services.reverse_prompt import ReversePromptResult
 from ..services.reverse_evidence import ReverseEvidence
 from ..services.reverse_workflow import ReverseWorkflowError
+from ._stubs import (
+    Plain as _Plain,
+    install_astrbot_stubs,
+    make_gate_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -44,98 +49,9 @@ class LoraRecord(_CatalogLoraRecord):
     compatibility_mode: str = "legacy_only"
 
 
-class _DecoratorGroup:
-    """模拟 AstrBot 指令组装饰器返回值。"""
-
-    def command(self, *_args, **_kwargs):
-        return lambda function: function
-
-
-class _FilterStub:
-    """模拟主模块定义阶段使用的 filter API。"""
-
-    class PermissionType:
-        ADMIN = "admin"
-
-    class PlatformAdapterType:
-        AIOCQHTTP = "aiocqhttp"
-
-    class EventMessageType:
-        ALL = "all"
-
-    @staticmethod
-    def command_group(*_args, **_kwargs):
-        return lambda _function: _DecoratorGroup()
-
-    @staticmethod
-    def _passthrough(*_args, **_kwargs):
-        return lambda function: function
-
-    command = _passthrough
-    llm_tool = _passthrough
-    permission_type = _passthrough
-    platform_adapter_type = _passthrough
-    event_message_type = _passthrough
-    on_llm_request = _passthrough
-    on_decorating_result = _passthrough
-    on_using_llm_tool = _passthrough
-    on_llm_tool_respond = _passthrough
-    on_agent_done = _passthrough
-    after_message_sent = _passthrough
-
-
-class _Star:
-    def __init__(self, context):
-        self.context = context
-
-
-class _Plain:
-    def __init__(self, text):
-        self.text = text
-
-
-class _Image:
-    @staticmethod
-    def fromFileSystem(path):
-        return ("image", str(path))
-
-
-class _Node:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
 def _install_astrbot_stubs() -> None:
-    """安装导入 main.py 所需的最小模块桩。"""
-    astrbot = types.ModuleType("astrbot")
-    api = types.ModuleType("astrbot.api")
-    event = types.ModuleType("astrbot.api.event")
-    star = types.ModuleType("astrbot.api.star")
-    components = types.ModuleType("astrbot.api.message_components")
-
-    api.logger = types.SimpleNamespace(
-        info=lambda *_args, **_kwargs: None,
-        warning=lambda *_args, **_kwargs: None,
-        error=lambda *_args, **_kwargs: None,
-    )
-    event.AstrMessageEvent = object
-    event.filter = _FilterStub
-    star.Context = object
-    star.Star = _Star
-    star.register = lambda *_args, **_kwargs: (lambda cls: cls)
-    components.Plain = _Plain
-    components.Image = _Image
-    components.Node = _Node
-
-    sys.modules.update(
-        {
-            "astrbot": astrbot,
-            "astrbot.api": api,
-            "astrbot.api.event": event,
-            "astrbot.api.star": star,
-            "astrbot.api.message_components": components,
-        }
-    )
+    """Install the shared minimal AstrBot stubs used by the whole test suite."""
+    install_astrbot_stubs()
 
 
 class _ExactCharacterIndex:
@@ -194,17 +110,24 @@ class MainCompatibilityTests(unittest.TestCase):
     def test_main_module_imports_with_documented_api_surface(self) -> None:
         self.assertTrue(hasattr(self.main, "ComfyAnimaPlugin"))
 
-    def test_webui_bootstrap_exports_all_chat_picture_switches(self) -> None:
+    def test_webui_bootstrap_exports_consolidated_draw_switches(self) -> None:
         source = Path(self.main.__file__).read_text(encoding="utf-8")
         for field in (
-            "enable_natural_draw",
-            "enable_llm_pic_trigger",
-            "enable_chat_draw_terminal_guard",
+            "natural_draw_mode",
+            "character_purity_mode",
+            "scene_extraction",
+            "chinese_prompt_translation",
         ):
             with self.subTest(field=field):
                 self.assertRegex(
                     source,
                     rf'"{field}":\s*(?:\(\s*)?settings\.{field}',
+                )
+        for legacy in ("enable_natural_draw", "enable_llm_pic_trigger"):
+            with self.subTest(legacy=legacy):
+                self.assertNotRegex(
+                    source,
+                    rf'"{legacy}":\s*settings\.{legacy}',
                 )
 
     def test_decorating_hook_is_render_not_intermediate_cleaner(self) -> None:
@@ -326,6 +249,13 @@ class MainCompatibilityTests(unittest.TestCase):
         event = types.SimpleNamespace(
             message_str="请画一张肖像",
             get_result=lambda: result,
+            get_extra=lambda key, default=None: {
+                "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                    self.main,
+                    self.main.DRAW_NOW,
+                    "请画一张肖像",
+                )
+            }.get(key, default),
         )
 
         asyncio.run(plugin.render_llm_picture_tags(event))
@@ -384,6 +314,13 @@ class MainCompatibilityTests(unittest.TestCase):
         event = types.SimpleNamespace(
             message_str="change the dress",
             get_result=lambda: result,
+            get_extra=lambda key, default=None: {
+                "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                    self.main,
+                    self.main.DRAW_NOW,
+                    "change the dress",
+                )
+            }.get(key, default),
         )
 
         asyncio.run(plugin.render_llm_picture_tags(event))
@@ -406,12 +343,22 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
     @staticmethod
-    def _event(message: str):
+    def _event(message: str, decision: str | None = None):
+        decision = decision or ChatDrawTerminalGuardTests.main.DRAW_NOW
+        payload = make_gate_payload(
+            ChatDrawTerminalGuardTests.main,
+            decision,
+            message,
+        )
+
         class Event:
             message_str = message
 
             def __init__(self) -> None:
-                self.extras = {"_llm_reasoning_content": "hidden"}
+                self.extras = {
+                    "_llm_reasoning_content": "hidden",
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": payload,
+                }
 
             def get_extra(self, key, default=None):
                 return self.extras.get(key, default)
@@ -567,7 +514,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         plugin._repair_chat_draw_terminal = AsyncMock(
             return_value='<pic prompt="must not run">'
         )
-        event = self._event("不要给我看图，只查逆兔女郎 LoRA")
+        event = self._event("不要给我看图，只查逆兔女郎 LoRA", self.main.NO_DRAW)
         request = types.SimpleNamespace(system_prompt="base")
 
         await plugin.inject_auto_draw_prompt(event, request)
@@ -772,7 +719,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_picture_trigger_never_starts_terminal_trace(self) -> None:
         plugin, _cleared = self._plugin()
-        plugin.settings.enable_llm_pic_trigger = False
+        plugin.settings.natural_draw_mode = "off"
         event = self._event("用 LoRA 画飞鸟马时")
 
         await plugin.track_chat_draw_asset_tool_start(
@@ -1272,6 +1219,13 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         event = types.SimpleNamespace(
             message_str="draw a portrait",
             get_result=lambda: result,
+            get_extra=lambda key, default=None: {
+                "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                    self.main,
+                    self.main.DRAW_NOW,
+                    "draw a portrait",
+                )
+            }.get(key, default),
         )
 
         asyncio.run(plugin.render_llm_picture_tags(event))
@@ -1977,6 +1931,171 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cleaned, "masterpiece, 1girl")
 
+    def test_session_recipe_roundtrips_character_lora_name(self) -> None:
+        from ..services.preset_manifest import PresetManifest
+        from ..services.session_picture_recipe import SessionPictureRecipe
+
+        manifest = PresetManifest.build(
+            preset_name="conversation_pic",
+            positive_terms=("1girl", "bare neck"),
+            negative_terms=("necklace",),
+            lora_entries=[{"name": "29B/anima-000040_29b", "weight": 0.9}],
+            identity_anchor="denia_(wuthering_waves)",
+            required_triggers=("denia",),
+        )
+        recipe = SessionPictureRecipe.from_success(
+            bot_id="bot",
+            session_id="session",
+            user_id="user",
+            run_id="run-1",
+            preset_name="conversation_pic",
+            pipeline="rtx",
+            width=1024,
+            height=1536,
+            prompt_recipe="<pic>...</pic>",
+            manifest=manifest,
+            content_fingerprint="fp",
+            character_lora_name="29B/anima-000040_29b.safetensors",
+        )
+        self.assertEqual(
+            recipe.character_lora_name,
+            "29B/anima-000040_29b.safetensors",
+        )
+        self.assertEqual(recipe.identity_anchor, "denia_(wuthering_waves)")
+        self.assertEqual(recipe.required_triggers, ("denia",))
+
+        restored = SessionPictureRecipe.from_mapping(recipe.to_mapping())
+        self.assertEqual(
+            restored.character_lora_name,
+            "29B/anima-000040_29b.safetensors",
+        )
+        self.assertEqual(restored.identity_anchor, "denia_(wuthering_waves)")
+
+    def test_session_recipe_without_character_lora_defaults_empty(self) -> None:
+        from ..services.session_picture_recipe import SessionPictureRecipe
+
+        payload = json.loads(json.dumps({
+            "schema_version": 1,
+            "bot_id": "bot",
+            "session_id": "session",
+            "user_id": "user",
+            "last_run_id": "run",
+            "preset_name": "conversation_pic",
+            "pipeline": "rtx",
+            "prompt_recipe": "<pic>...</pic>",
+            "positive_pool": ["1girl"],
+            "negative_pool": [],
+            "lora_manifest": [],
+            "manifest_hash": "hash",
+        }))
+        restored = SessionPictureRecipe.from_mapping(payload)
+        self.assertEqual(restored.character_lora_name, "")
+
+    def test_subject_appearance_anchors_from_bound_profile(self) -> None:
+        import types
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Store:
+            def get(self, canonical_tag):
+                return {
+                    "denia_(wuthering_waves)": types.SimpleNamespace(
+                        appearance_tags=(
+                            "pink hair",
+                            "long hair",
+                            "hair ornament",
+                            "ahoge",
+                        )
+                    )
+                }.get(canonical_tag)
+
+        plugin._character_appearance_profiles = Store()
+        binding = types.SimpleNamespace(canonical="denia_(wuthering_waves)")
+        anchors = plugin._subject_appearance_anchors(binding, user_text="")
+        self.assertEqual(
+            anchors,
+            ("pink hair", "long hair", "hair ornament", "ahoge"),
+        )
+        self.assertEqual(
+            plugin._subject_appearance_anchors(binding, user_text="红色头发"),
+            ("ahoge",),
+        )
+        self.assertEqual(
+            plugin._subject_appearance_anchors(
+                types.SimpleNamespace(canonical="unknown_character"),
+                user_text="",
+            ),
+            (),
+        )
+        self.assertEqual(plugin._subject_appearance_anchors(None), ())
+
+    def test_unique_archive_character_record_matches_name_and_work(self) -> None:
+        import types
+
+        records = (
+            types.SimpleNamespace(
+                name="29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+                character_name="remielle dan",
+                aliases=(),
+                source_work="绝区零 / Zenless Zone Zero",
+                companion_variant="remielle-dan-zzz-anima-Tanger.safetensors",
+            ),
+            types.SimpleNamespace(
+                name="remielle-dan-zzz-anima-Tanger.safetensors",
+                character_name="remielle-dan-zzz-anima-Tanger",
+                aliases=("remielle dan",),
+                source_work="绝区零 / Zenless Zone Zero",
+                companion_variant="29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+            ),
+        )
+        found = self.main.ComfyAnimaPlugin._unique_archive_character_record(
+            "Remielle Dan",
+            records,
+            work_hints=("Zenless Zone Zero",),
+        )
+        self.assertEqual(
+            found.name,
+            "29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+        )
+        # 同名但属于其他作品，必须按作品过滤掉。
+        other = types.SimpleNamespace(
+            name="remielle-dan-alt.safetensors",
+            character_name="remielle dan",
+            aliases=(),
+            source_work="some other anime",
+            companion_variant="",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._unique_archive_character_record(
+                "Remielle Dan",
+                (*records, other),
+                work_hints=("Zenless Zone Zero",),
+            ).name,
+            "29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+        )
+        # 同作品同名但根身份不同，必须拒绝（歧义）。
+        conflicting = types.SimpleNamespace(
+            name="remielle-dan-alternate.safetensors",
+            character_name="remielle dan",
+            aliases=(),
+            source_work="Zenless Zone Zero",
+            companion_variant="",
+        )
+        self.assertIsNone(
+            self.main.ComfyAnimaPlugin._unique_archive_character_record(
+                "Remielle Dan",
+                (*records, conflicting),
+                work_hints=("Zenless Zone Zero",),
+            )
+        )
+        self.assertIsNone(
+            self.main.ComfyAnimaPlugin._unique_archive_character_record(
+                "Nobody",
+                records,
+                work_hints=("Zenless Zone Zero",),
+            )
+        )
+
     def test_explicit_target_appearance_override_suppresses_default_profile_slot(
         self,
     ) -> None:
@@ -2228,7 +2347,22 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_runtime_global_lock_allows_only_admin(self) -> None:
-        plugin = self.main.ComfyAnimaPlugin(object(), {"global_lock": True})
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {"global_lock": True}
+        )
+        plugin._global_locked = plugin.settings.global_lock
+        plugin._access_controller = self.main.AccessController(
+            self.main.AccessPolicy(
+                global_locked=plugin._global_locked,
+                whitelist_enabled=plugin.settings.whitelist_only,
+                whitelist_groups=set(plugin.settings.group_whitelist),
+                default_filter_level=self.main.FilterLevel(
+                    plugin.settings.default_block_level
+                ),
+                group_filter_levels={},
+            )
+        )
 
         class Event:
             @staticmethod
@@ -2662,6 +2796,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertEqual(bound_overrides, {key: ("viola",)})
+
             english_job = self.main.GenerationJob("user", "draw", 0.0)
             english_prompt, _ = asyncio.run(
                 plugin._compile_llm_character_prompt(
@@ -2740,6 +2875,84 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("llm_character_lora_metadata_bound" in row for row in events))
         self.assertTrue(
             any("llm_character_lora_identity_anchor_used" in row for row in events)
+        )
+
+    def test_bind_accepts_unique_file_binding_without_declared_character(self) -> None:
+        """追画未声明角色：唯一文件绑定即身份声明，不得误判失效。"""
+        import types
+
+        plugin, _events = self._llm_character_validation_plugin()
+        record = LoraRecord(
+            "29B/anima-000040_29b.safetensors",
+            sha256="denia-sha",
+            category="character",
+            character_name="anima-000040_29b",
+            aliases=("娅娅", "达妮娅"),
+        )
+        binding = types.SimpleNamespace(
+            character_canonical="denia_(wuthering_waves)",
+            copyright_canonical="wuthering_waves",
+            activation_terms=(),
+            compatible_model_families=("anima_29b_40l",),
+        )
+        plugin._runtime_semantic_index = lambda: types.SimpleNamespace(
+            entry_for=lambda _record: types.SimpleNamespace(
+                present=True,
+                sha256="denia-sha",
+                identity_bindings=(binding,),
+                effective_values=lambda _key: (),
+            )
+        )
+
+        class _ReadyIndex:
+            def lookup_many(self, values, _category):
+                return tuple(
+                    types.SimpleNamespace(
+                        verified=True,
+                        canonical_tag=value,
+                        tag=value,
+                        aliases=(),
+                    )
+                    for value in values
+                )
+
+            def lookup(self, value, _category):
+                return types.SimpleNamespace(
+                    verified=True,
+                    canonical_tag=value,
+                    tag=value,
+                    aliases=(),
+                )
+
+        plugin._danbooru_index = _ReadyIndex()
+        plugin._danbooru_index_ready = lambda: True
+        plugin._verified_prompt_character_canonicals = AsyncMock(return_value=())
+
+        job = self.main.GenerationJob("user", "draw", 0.0)
+        key = self.main.canonical_lora_name(record.name).casefold()
+        selection = LoraSelection(record.name, 0.9)
+        kept, _overrides, bound_overrides, filtered = asyncio.run(
+            plugin._bind_llm_character_loras(
+                job,
+                prompt="1girl, lingerie, bedroom",
+                selections=(selection,),
+                resolved_records={key: record},
+                strict_keys=frozenset({key}),
+            )
+        )
+        self.assertEqual(filtered, ())
+        self.assertEqual(kept[0].name, record.name)
+        self.assertEqual(
+            bound_overrides,
+            {key: ("denia",)},
+        )
+        self.assertEqual(
+            job.character_identity["canonical"],
+            "denia_(wuthering_waves)",
+        )
+        self.assertEqual(
+            job.character_identity["lora_name"],
+            "29B/anima-000040_29b.safetensors",
         )
 
     def test_bound_lora_uses_activation_without_treating_it_as_identity(self) -> None:
@@ -3535,11 +3748,39 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin._director = None
         plugin._director_error = "test unavailable"
 
+        draw_now = self.main.DRAW_NOW
+
+        class FakeJudge:
+            async def judge(self, message, bot_reply, context=""):
+                return types.SimpleNamespace(
+                    decision=draw_now,
+                    confidence=0.9,
+                    backend_used="test",
+                    reason="test",
+                    latency_ms=0.0,
+                    trace={},
+                )
+
+        plugin._build_intent_judge_service = lambda: FakeJudge()
+
         class Event:
             message_str = "帮我画一个小猫"
 
             def __init__(self):
                 self.stopped = False
+                self._extras = {
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                        NaturalLanguageDrawLifecycleTests.main,
+                        draw_now,
+                        "帮我画一个小猫",
+                    )
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
 
             def stop_event(self):
                 self.stopped = True
@@ -3570,6 +3811,21 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin._access_error = lambda _event, _message: None
         plugin._director = object()
 
+        draw_now = self.main.DRAW_NOW
+
+        class FakeJudge:
+            async def judge(self, message, bot_reply, context=""):
+                return types.SimpleNamespace(
+                    decision=draw_now,
+                    confidence=0.9,
+                    backend_used="test",
+                    reason="test",
+                    latency_ms=0.0,
+                    trace={},
+                )
+
+        plugin._build_intent_judge_service = lambda: FakeJudge()
+
         async def generate_prompt(_event, _message):
             return "1girl, cat ears", "test-provider", "school uniform"
 
@@ -3591,6 +3847,19 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             def __init__(self):
                 self.stopped = False
+                self._extras = {
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                        NaturalLanguageDrawLifecycleTests.main,
+                        draw_now,
+                        "帮我画一个小猫",
+                    )
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
 
             def stop_event(self):
                 self.stopped = True
@@ -4785,8 +5054,7 @@ class PerUserImageQueueTests(unittest.IsolatedAsyncioTestCase):
                     second_operation,
                 )
             )
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
 
             self.assertFalse(second_started.is_set())
             self.assertTrue(any("等待位置 1/3" in item for item in second_event.messages))
@@ -4927,7 +5195,7 @@ class PerUserImageQueueTests(unittest.IsolatedAsyncioTestCase):
                     should_not_start,
                 )
             )
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
             queued_task = next(
                 item
                 for item in store.recent_tasks(limit=10)
@@ -5248,12 +5516,12 @@ class GenerationTimingAccountingTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             @staticmethod
             async def submit(_workflow):
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.02)
                 return "prompt-id"
 
             @staticmethod
             async def wait_for_images(_prompt_id, _preferred):
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.02)
                 return (object(),)
 
             @staticmethod
@@ -5305,7 +5573,9 @@ class GenerationReplyMetadataMutationTests(unittest.TestCase):
             selections=(LoraSelection("shared/remove-me", 0.8),),
         )
         persisted = []
-        plugin._persist_config_updates = lambda updates: persisted.append(updates) or True
+        plugin._persist_config_transaction_sync = (
+            lambda updates, **kwargs: persisted.append(updates) or True
+        )
 
         self.assertEqual(
             plugin._lora_preset_references("shared/remove-me.safetensors"),
@@ -5492,7 +5762,11 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin._lora_catalog = None
         plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(0)
-        plugin._persist_config = lambda *_args: True
+
+        async def persist(*_args):
+            return True
+
+        plugin._persist_config = persist
 
         first = plugin._schedule_self_reload(delay=0, reason="first")
         await entered.wait()
@@ -5547,7 +5821,7 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         plugin._refresh_lora_manager_before = refresh
         plugin._lora_catalog = Catalog()
 
-        def persist(_key, value):
+        async def persist(_key, value):
             return not any(item.get("name") == "失败风格" for item in value)
 
         plugin._persist_config = persist
@@ -5590,9 +5864,11 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
         persisted = []
         scheduled = []
-        plugin._persist_config = (
-            lambda key, value: persisted.append((key, value)) or True
-        )
+        async def persist(key, value):
+            persisted.append((key, value))
+            return True
+
+        plugin._persist_config = persist
         plugin._schedule_self_reload = (
             lambda **_kwargs: scheduled.append(True) or object()
         )
@@ -5615,6 +5891,52 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted[0][0], "lora_presets")
         self.assertEqual(persisted[0][1][0]["aliases"], ["风格2"])
         self.assertEqual(persisted[0][1][0]["note"], "画师测试备注")
+
+    async def test_style_save_rejects_semantic_identity_binding(self) -> None:
+        class Record:
+            name = "characters/denia.safetensors"
+
+        class Catalog:
+            async def resolve_selections_with_records(self, selections, *, strict):
+                return selections, {"characters/denia": Record()}
+
+            async def classify_selections(self, selections):
+                return {
+                    selection.name: self_main.PRESET_CATEGORY_ARTIST_STYLE
+                    for selection in selections
+                }
+
+        self_main = self.main
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=True,
+        )
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(
+            0, result=()
+        )
+        async def persist(_key, _value):
+            return True
+
+        plugin._persist_config = persist
+        fake_entry = types.SimpleNamespace(
+            identity_bindings=(object(),),
+        )
+        plugin._runtime_semantic_index = lambda: types.SimpleNamespace(
+            entry_for=lambda _record: fake_entry,
+        )
+
+        with self.assertRaisesRegex(self.main.LoraPresetError, "角色或混合"):
+            await plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="坏风格",
+                entries="<lora:characters/denia.safetensors:0.8>",
+            )
+
+        self.assertEqual(plugin._lora_presets.presets, ())
 
     async def test_conversation_tool_persists_and_survives_fresh_registry(self) -> None:
         self_main = self.main
@@ -5705,17 +6027,40 @@ class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_conversation_requires_committed_style_tool_result(self) -> None:
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
-        plugin.settings = types.SimpleNamespace(enable_llm_pic_trigger=True)
+        plugin.settings = types.SimpleNamespace(
+            natural_draw_mode="full",
+            enable_session_recipe_continuity=False,
+        )
         plugin._internal_llm_events = set()
         plugin._auto_draw_system_prompt = ""
         plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._chat_draw_terminal_states = {}
         plugin._director = types.SimpleNamespace(
             danbooru_runtime_context=lambda: (
                 "本地 Danbooru 索引状态：ready=true，canonical_tags=10，aliases=2。"
             )
         )
 
+        draw_now = self.main.DRAW_NOW
+
         class Event:
+            message_str = "管理员保存风格"
+
+            def __init__(self):
+                self._extras = {
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                        StyleSaveReloadTests.main,
+                        draw_now,
+                        "管理员保存风格",
+                    )
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
+
             @staticmethod
             def is_admin():
                 return True
@@ -5892,16 +6237,21 @@ class MandatoryLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
-    async def test_repeated_tool_calls_refresh_every_time(self) -> None:
+    async def test_repeated_tool_calls_honor_refresh_false_and_true(self) -> None:
         class Catalog:
             def __init__(self):
                 self.refreshes = 0
+                self.cache_reads = 0
 
             async def refresh_for_operation(self):
                 self.refreshes += 1
                 return (types.SimpleNamespace(name="denia"),)
 
-            async def format_for_llm(self, **_kwargs):
+            async def _get_records(self, **_kwargs):
+                self.cache_reads += 1
+                return (types.SimpleNamespace(name="denia"),)
+
+            async def format_records_for_llm(self, records, **kwargs):
                 return "fresh denia"
 
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
@@ -5910,14 +6260,54 @@ class MandatoryLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         first = await plugin.list_anima_loras(object(), keyword="denia")
         second = await plugin.list_anima_loras(object(), keyword="denia")
+        forced = await plugin.list_anima_loras(
+            object(),
+            keyword="denia",
+            refresh=True,
+        )
 
         self.assertEqual(first, "fresh denia")
         self.assertEqual(second, "fresh denia")
-        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+        self.assertEqual(forced, "fresh denia")
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+        self.assertEqual(plugin._lora_catalog.cache_reads, 2)
+
+    async def test_refresh_false_reuses_task_snapshot_when_enabled(self) -> None:
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (types.SimpleNamespace(name="denia"),)
+
+            async def format_records_for_llm(self, records, **kwargs):
+                return "fresh denia"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin.settings = types.SimpleNamespace(
+            lora_max_results=50,
+            enable_task_lora_snapshot=True,
+            lora_snapshot_max_age=300,
+        )
+        plugin._lora_operation_snapshots = {}
+        plugin._lora_snapshot_locks = {}
+
+        event = object()
+        first = await plugin.list_anima_loras(event, keyword="denia")
+        second = await plugin.list_anima_loras(event, keyword="denia")
+
+        self.assertEqual(first, "fresh denia")
+        self.assertEqual(second, "fresh denia")
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
 
     async def test_deleted_lora_preset_is_omitted_after_fresh_validation(self) -> None:
         class Catalog:
             async def refresh_for_operation(self):
+                return (types.SimpleNamespace(name="present"),)
+
+            async def _get_records(self, **_kwargs):
                 return (types.SimpleNamespace(name="present"),)
 
             async def resolve_selections(self, selections, *, strict):
@@ -5949,6 +6339,88 @@ class MandatoryLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<lora:present:0.5>", result)
         self.assertNotIn("<lora:deleted-denia:0.8>", result)
         self.assertIn("风格旧缓存", result)
+
+    async def test_list_anima_lora_presets_limit_truncates(self) -> None:
+        class Catalog:
+            async def _get_records(self, **_kwargs):
+                return (types.SimpleNamespace(name="present"),)
+
+            async def resolve_selections(self, selections, *, strict):
+                return selections
+
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        for index in range(3):
+            registry.save(
+                name=f"风格{index}",
+                category="style",
+                selections=(LoraSelection(f"styles/ink{index}", 0.5),),
+            )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = registry
+
+        result = await plugin.list_anima_lora_presets(
+            object(),
+            limit=1,
+        )
+
+        self.assertIn("… and 2 more presets", result)
+        self.assertIn("风格0", result)
+        self.assertNotIn("风格2", result)
+
+
+    async def test_unbound_character_loras_lists_only_unbound_characters(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._semantic_index = None
+        records = (
+            LoraRecord("characters/denia.safetensors", category="character"),
+            LoraRecord("characters/rio.safetensors", category="character"),
+            LoraRecord("styles/ink.safetensors", category="artist_style"),
+        )
+        index = LoraSemanticIndex.empty()
+        index.upsert(
+            SemanticEntry(
+                identity_key=semantic_identity_key("characters/rio", ""),
+                canonical_name="characters/rio",
+                identity_bindings=(
+                    LoraIdentityBinding(
+                        character_canonical="rio_(blue_archive)",
+                        copyright_canonical="blue_archive",
+                        activation_terms=("rio",),
+                    ),
+                ),
+            )
+        )
+        plugin._semantic_index = index
+
+        unbound = plugin._unbound_character_loras(records)
+
+        self.assertEqual(
+            [item["name"] for item in unbound],
+            ["characters/denia.safetensors"],
+        )
+
+    async def test_lora_refresh_summary_compares_fingerprints(self) -> None:
+        previous = (
+            LoraRecord("characters/denia.safetensors", sha256="a" * 64),
+            LoraRecord("styles/old.safetensors", sha256="b" * 64),
+        )
+        current = (
+            LoraRecord("characters/denia.safetensors", sha256="a" * 64),
+            LoraRecord("styles/old.safetensors", sha256="c" * 64),
+            LoraRecord("characters/rio.safetensors", sha256="d" * 64),
+        )
+
+        summary = self.main.ComfyAnimaPlugin._lora_refresh_summary(
+            previous,
+            current,
+        )
+
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["added"], 1)
+        self.assertEqual(summary["removed"], 0)
+        self.assertEqual(summary["changed"], 1)
+        self.assertEqual(summary["unchanged"], 1)
 
 
 class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -7367,7 +7839,12 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
     async def test_select_persists_then_hot_switches_generation_workflow(self) -> None:
         plugin = self._plugin()
         persisted = []
-        plugin._persist_config_updates = lambda updates: persisted.append(updates) or True
+
+        async def persist(updates):
+            persisted.append(updates)
+            return True
+
+        plugin._persist_config_updates = persist
 
         result = await plugin.web_ui_select_workflow("anima_iterative_api.json")
 
@@ -7387,7 +7864,10 @@ class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_select_rejects_upscale_and_running_jobs(self) -> None:
         plugin = self._plugin()
-        plugin._persist_config_updates = lambda _updates: True
+        async def persist(_updates):
+            return True
+
+        plugin._persist_config_updates = persist
         with self.assertRaisesRegex(self.main.WebUiActionError, "独立图片放大"):
             await plugin.web_ui_select_workflow("rtx_upscale_api.json")
 
@@ -8885,7 +9365,7 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
             plugin._schedule_prompt_lab_expiry("batch", time.time() + 0.01)
 
-            await asyncio.sleep(0.04)
+            await asyncio.sleep(0.15)
 
         self.assertNotIn("batch", plugin._prompt_lab_batches)
 

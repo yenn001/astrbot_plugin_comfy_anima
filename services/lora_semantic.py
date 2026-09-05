@@ -98,6 +98,10 @@ def _canonical_key(value: Any) -> str:
     return canonical_lora_name(_clean_text(value)).casefold()
 
 
+def _lookup_key(value: Any) -> str:
+    return _clean_text(value).casefold().replace("（", "(").replace("）", ")")
+
+
 def _clean_sha256(value: Any) -> str:
     text = re.sub(r"\s+", "", str(value or "")).casefold()
     return text if re.fullmatch(r"[0-9a-f]{8,128}", text) else ""
@@ -600,12 +604,51 @@ class LoraSemanticIndex:
     entries: dict[str, SemanticEntry] = field(default_factory=dict)
     schema_version: int = SEMANTIC_SCHEMA_VERSION
     updated_at: str = ""
+    alias_lookup: dict[str, tuple[str, ...]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    canonical_lookup: dict[str, tuple[str, ...]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if self.schema_version != SEMANTIC_SCHEMA_VERSION:
             raise LoraSemanticError(
                 f"Unsupported semantic schema version: {self.schema_version}"
             )
+        self.rebuild_lookup_tables()
+
+    def rebuild_lookup_tables(self) -> None:
+        """Rebuild alias/canonical lookup maps from the current entries."""
+        alias: dict[str, list[str]] = {}
+        canonical: dict[str, list[str]] = {}
+        for key, entry in self.entries.items():
+            canonical.setdefault(_lookup_key(entry.canonical_name), []).append(key)
+            for value in (
+                *entry.effective_values("aliases"),
+                *entry.effective_values("character_names"),
+                *entry.effective_values("source_works"),
+            ):
+                lookup = _lookup_key(value)
+                if lookup:
+                    alias.setdefault(lookup, []).append(key)
+            for binding in entry.identity_bindings:
+                canonical.setdefault(
+                    _lookup_key(binding.character_canonical), []
+                ).append(key)
+                for term in (
+                    *binding.activation_terms,
+                    *binding.variant_aliases,
+                ):
+                    lookup = _lookup_key(term)
+                    if lookup:
+                        alias.setdefault(lookup, []).append(key)
+        self.alias_lookup = {
+            text: tuple(dict.fromkeys(keys)) for text, keys in alias.items()
+        }
+        self.canonical_lookup = {
+            text: tuple(dict.fromkeys(keys)) for text, keys in canonical.items()
+        }
 
     @classmethod
     def empty(cls) -> "LoraSemanticIndex":
@@ -816,6 +859,7 @@ class LoraSemanticIndex:
 
     def upsert(self, entry: SemanticEntry) -> None:
         self.entries[entry.identity_key] = entry
+        self.rebuild_lookup_tables()
 
     def sync_presence(self, records: Sequence[LoraRecord]) -> None:
         """Mark semantic rows present only when matched by the fresh catalog."""
@@ -828,6 +872,7 @@ class LoraSemanticIndex:
             key: replace(entry, present=key in present_keys)
             for key, entry in self.entries.items()
         }
+        self.rebuild_lookup_tables()
 
     def entry_for(self, record: LoraRecord) -> Optional[SemanticEntry]:
         digest = _clean_sha256(getattr(record, "sha256", ""))

@@ -110,7 +110,7 @@ async def identity_rerank(_query, documents, top_n):
 
 class LoraHybridSearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_generic_document_ranking_uses_embedding_and_rerank(self):
-        query = "碧蓝档案的飞鸟马时"
+        query = "碧蓝档案的飞鸟马时 泳装"
 
         def vectors(text):
             lowered = text.casefold()
@@ -239,8 +239,13 @@ class LoraHybridSearchTests(unittest.IsolatedAsyncioTestCase):
             result = await service.search(records, "Denia", limit=5)
 
         self.assertEqual(set(result), set(records))
-        self.assertTrue(embedding.calls)
-        self.assertNotEqual(service.last_diagnostics.get("mode"), "exact")
+        self.assertEqual(embedding.calls, [])
+        self.assertEqual(rerank.calls, [])
+        self.assertEqual(service.last_diagnostics.get("mode"), "lexical")
+        self.assertEqual(
+            service.last_diagnostics.get("rerank_skipped"),
+            "short_query",
+        )
 
     async def test_unique_semantic_alias_skips_embedding_and_rerank(self):
         embedding = FakeEmbeddingProvider(lambda _text: [1.0, 0.0, 0.0])
@@ -396,7 +401,7 @@ class LoraHybridSearchTests(unittest.IsolatedAsyncioTestCase):
                 cache_path=Path(directory) / "vectors.json",
             )
             result = await asyncio.wait_for(
-                service.search(records, "portrait", limit=2),
+                service.search(records, "portrait style", limit=2),
                 timeout=0.5,
             )
 
@@ -490,6 +495,115 @@ class LoraHybridSearchTests(unittest.IsolatedAsyncioTestCase):
         for secret in forbidden:
             with self.subTest(secret=secret):
                 self.assertNotIn(secret, serialized)
+
+
+    async def test_short_lexical_query_skips_embedding_and_rerank(self):
+        embedding = FakeEmbeddingProvider(lambda _text: [1.0, 0.0, 0.0])
+        rerank = FakeRerankProvider(identity_rerank)
+        records = (
+            LoraRecord("characters/rio_dark.safetensors"),
+            LoraRecord("characters/kei_light.safetensors"),
+        )
+        service = LoraHybridSearchService(
+            make_settings(),
+            make_context(embedding, rerank),
+        )
+
+        result = await service.search(records, "rio", limit=5)
+
+        self.assertEqual(result, (records[0],))
+        self.assertEqual(embedding.calls, [])
+        self.assertEqual(rerank.calls, [])
+        self.assertEqual(service.last_diagnostics.get("rerank_skipped"), "short_query")
+
+    async def test_bge_m3_dimension_mismatch_does_not_fail_search(self):
+        class BgeM3FakeEmbeddingProvider(FakeEmbeddingProvider):
+            def get_dim(self):
+                return 768
+
+        def vectors(text):
+            lowered = text.casefold()
+            if lowered == "scarlet swordswoman" or "moon_blade" in lowered:
+                return [1.0] + [0.0] * 1023
+            return [0.0] * 1023 + [1.0]
+
+        embedding = BgeM3FakeEmbeddingProvider(vectors, provider_id="embedding-bge")
+        embedding.provider_config["embedding_model"] = "bge-m3"
+        records = (
+            LoraRecord(
+                "characters/moon_blade.safetensors",
+                description="red-haired female warrior carrying a katana",
+            ),
+            LoraRecord(
+                "styles/pastel_landscape.safetensors",
+                description="soft scenery and watercolor backgrounds",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = LoraHybridSearchService(
+                make_settings(
+                    lora_rerank_provider_id="",
+                    lora_embedding_provider_id="embedding-bge",
+                ),
+                make_context(embedding=embedding),
+                cache_path=Path(directory) / "vectors.json",
+            )
+            result = await service.search(
+                records,
+                "scarlet swordswoman",
+                limit=1,
+            )
+
+        self.assertEqual(result, (records[0],))
+        self.assertEqual(
+            service.last_diagnostics.get("embedding_dimension"),
+            1024,
+        )
+        self.assertTrue(service.last_diagnostics.get("embedding_dimension_mismatch"))
+        self.assertEqual(
+            service.last_diagnostics.get("expected_embedding_dimension"),
+            768,
+        )
+
+    async def test_exact_matches_include_character_work_localized_and_danbooru_alias(self):
+        records = (
+            LoraRecord(
+                "characters/denia_lora.safetensors",
+                category="character",
+                character_name="Denia",
+            ),
+            LoraRecord(
+                "characters/kei_lora.safetensors",
+                category="character",
+                source_work="Blue Archive",
+            ),
+            LoraRecord(
+                "characters/rice_lora.safetensors",
+                category="character",
+                aliases=("米浴",),
+            ),
+            LoraRecord(
+                "characters/toki_lora.safetensors",
+                category="character",
+                aliases=("toki_(blue_archive)",),
+            ),
+        )
+        cases = (
+            ("Denia", records[0]),
+            ("Blue Archive", records[1]),
+            ("米浴", records[2]),
+            ("toki_(blue_archive)", records[3]),
+        )
+        for query, expected in cases:
+            with self.subTest(query=query):
+                service = LoraHybridSearchService(
+                    make_settings(),
+                    make_context(),
+                )
+                result = await service.search(records, query, limit=5)
+                self.assertEqual(result, (expected,))
+                self.assertEqual(service.last_diagnostics.get("exact_kind"), "alias")
 
 
 if __name__ == "__main__":

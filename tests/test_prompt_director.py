@@ -42,6 +42,10 @@ class PictureResponseParserTests(unittest.TestCase):
             ["1girl, white hair & blue eyes", "city skyline, night"],
         )
 
+    def test_clean_response_text_removes_internal_skill_and_reasoning_leaks(self) -> None:
+        output = "正常回复。<skill>documents</skill>\nWait, I shouldn't actually call a skill."
+        self.assertEqual(PromptDirector.clean_response_text(output), "正常回复。")
+
     def test_think_content_is_ignored_for_prompt_extraction(self) -> None:
         """隐藏思考中的 pic 标签不得触发绘图。"""
         output = (
@@ -1510,6 +1514,100 @@ class PromptDirectorProviderFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-secret", raised.exception.detail)
         self.assertNotIn("response_id=", raised.exception.detail)
         self.assertEqual(raised.exception.detail, "all_models_failed")
+
+
+    async def test_appearance_anchors_present_succeeds_immediately(self) -> None:
+        director = self._director()
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "completion_text": (
+                            '<pic prompt="1girl, pink hair, long hair, '
+                            'hair ornament, ahoge">'
+                        )
+                    },
+                )()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw denia",
+            required_appearance_anchors=(
+                "pink hair",
+                "long hair",
+                "hair ornament",
+                "ahoge",
+            ),
+        )
+        self.assertEqual(context.calls, 1)
+        self.assertIn("pink hair", instruction.prompt)
+        self.assertIn("ahoge", instruction.prompt)
+
+    async def test_missing_appearance_anchors_triggers_directed_repair(self) -> None:
+        director = self._director()
+
+        class Context:
+            calls = 0
+            prompts: list[str] = []
+
+            async def llm_generate(self, **_kwargs: object) -> object:
+                self.calls += 1
+                self.prompts.append(str(_kwargs.get("prompt", "")))
+                output = (
+                    '<pic prompt="1girl, brown hair, brown eyes">'
+                    if self.calls == 1
+                    else '<pic prompt="1girl, pink hair, long hair, '
+                    'hair ornament, ahoge">'
+                )
+                return type("Response", (), {"completion_text": output})()
+
+        context = Context()
+        instruction, _ = await director.generate_instruction(
+            context,
+            object(),
+            "draw denia",
+            required_appearance_anchors=(
+                "pink hair",
+                "long hair",
+                "hair ornament",
+                "ahoge",
+            ),
+        )
+        self.assertEqual(context.calls, 2)
+        self.assertIn("pink hair", instruction.prompt)
+        self.assertIn("appearance anchors MUST appear", context.prompts[1])
+
+    async def test_persistent_missing_anchors_fails_closed(self) -> None:
+        director = self._director()
+
+        class Context:
+            async def llm_generate(self, **_kwargs: object) -> object:
+                return type(
+                    "Response",
+                    (),
+                    {"completion_text": '<pic prompt="1girl, brown hair">'},
+                )()
+
+        with self.assertRaises(PromptDirectorError) as raised:
+            await director.generate_instruction(
+                Context(),
+                object(),
+                "draw denia",
+                required_appearance_anchors=("pink hair",),
+            )
+        self.assertTrue(raised.exception.fatal)
+        self.assertIn(
+            "character_appearance_anchors_missing:pink hair",
+            raised.exception.detail,
+        )
 
 
 if __name__ == "__main__":

@@ -2,13 +2,66 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [2.4.0] - 2026-08-30
+## [2.4.1] - 2026-09-05（内部构建 3.1.416）
 
-### 2.1.307 调用链收敛线正式发布
+### 自然闲聊出图
 
-- 以 2.4.0 发布已验证的 Legacy 单图调用链收敛实现；运行时兼容基线保持 v2.1.1。
-- 保留 PromptCatalog、确定性 IntentPlan、资产探针、主体身份门禁、Manifest 合并和请求级 ToolSet 隔离。
-- 2.9B 可执行路径继续 Deferred；交付回执在当前 aiocqhttp 运行时诚实降级为 UNKNOWN。
+- 意图闸门先于提示词注入执行，"（画出来）"等组合句式正确触发出图；
+- "不要画了 / 明天再画"等否定与推迟表达不再误触发；
+- 追画未声明角色时自动沿用上一张的角色 LoRA 与触发词（不再换人）；
+- 新增 `enable_time_context`：按现实时段自动补充 morning/day/sunset/night 光影标签。
+
+### 2.9B 模型族
+
+- 配方/清单/严格键的家族后缀归一化（`29B/`、`_29b`、`_legacy`）；
+- 角色 LoRA 记录按当前底模家族自动兜底匹配；
+- 未声明角色且唯一文件绑定时，绑定即身份声明。
+
+### 报错与体验
+
+- 模型类报错统一带【绘图导演思考模型】/【图片反推多模态模型】标签与 Provider；
+- 普通聊天不再出现"未通过意图判断"提示（仅记录运行控制台日志）；
+- WebUI 设置保存失败（AstrBotConfig 对象丢失）修复；
+- 提示词不再泄漏 skill / tool_calls 等内部文本。
+
+---
+
+## [2.4.1] - 2026-08-30
+
+### Intent Judge Stage 1
+
+- 新增双后端意图判断服务：off/rule/local/online/auto/both。
+- 本地后端使用 AstrBot Embedding + Rerank Provider，本地优先、失败降级 no_draw。
+- 在线后端使用独立 LLM Provider，输出 JSON 三分类。
+- WebUI 增加意图判断模式与 Provider 下拉选择。
+
+### Blueprint G1-G10 Consolidation
+
+- G1：新增 `on_llm_request(priority=15)` 意图路由闸门 hook 点，结果写入
+  event.extra；`intent_router_gate_mode=off` 默认保持 no-op，不改变现有路径。
+- G2：`chat_intent_classifier` 识别“角色预设 + 视觉动作/场景词”为 draw_new，
+  由 `enable_visual_task_intent` 控制。
+- G3：新增 `services/user_picture_preferences.py` 持久化用户图片偏好
+  （`user_picture_preferences_v1.json`），提供保存/使用/清除 API；
+  `enable_user_picture_preferences` 默认关闭。
+- G4：判定 draw 意图时在 event.extra 写 `enable_streaming=False`。
+- G5：Scene Bridge 新增 `scene_context_from_event`，从可用 AstrBot 只读接口
+  收集最近消息/人格名/记忆，缺失或异常时优雅回退并记录来源。
+- G6：任务事件 schema 常量补充
+  `intent_router_gate_start/result`、`visual_task_intent_promoted`、
+  `user_picture_preference_saved`、`scene_extracted`、
+  `roleplay_text_blocked`、`draw_terminal_forced`、
+  `director_instruction_generated`。
+- G7：新增蓝图专项测试（视觉任务意图、无配方澄清、偏好持久化、
+  禁用流式、角色扮演文本拦截、事件码）。
+- G8：补齐蓝图配置字段并写入 `_conf_schema.json`，默认值向后兼容。
+- G9：保留 `intent_judge_backend=off` 并增加配置校验测试。
+- G10：多 bundle 不单独实现，排队 + “继续” 已足够；路线图见 README 注释。
+
+<!-- Roadmap note (G10): multi-bundle image delivery is intentionally NOT
+implemented. The owner decision is that queuing plus the existing "继续"
+continuation flow is sufficient for 3.1.400; revisit only if a concrete user
+workflow needs multiple simultaneous bundles in one reply. -->
 
 ## [2.1.307] - 2026-08-28
 

@@ -69,7 +69,7 @@
               </select>
             </label>
             <span id="service-state" class="status-pill" role="status">连接中</span>
-            <span class="secondary" aria-disabled="true" title="2.4.0 暂缓 2.9B 可执行路径">2.9B 控制台已暂缓</span>
+            <span class="secondary" aria-disabled="true" title="2.1.307 暂缓 2.9B 可执行路径">2.9B 控制台已暂缓</span>
             <button id="reload-data" class="secondary">刷新当前页</button>
           </div>
         </header>
@@ -266,12 +266,48 @@
                 </div>
                 <label><span>意图判断超时（秒）</span><input name="intent_router_timeout" type="number" min="3" max="120" step="1"></label>
                 <label><span>意图判断 Temperature</span><input name="intent_router_temperature" type="number" min="0" max="1" step="0.05"></label>
+                <div class="span-2 provider-field">
+                  <label><span>意图判断后端模式</span></label>
+                  <select name="intent_judge_backend">
+                    <option value="rule">Rule：本地关键词</option>
+                    <option value="local">Local：Embedding + Rerank</option>
+                    <option value="online">Online：独立 LLM</option>
+                    <option value="auto">Auto：本地优先</option>
+                    <option value="both">Both：双后端互相印证</option>
+                    <option value="off">Off：只允许显式命令</option>
+                  </select>
+                  <small class="muted">本地失败/不确定时按 Auto 或 Both 规则降级为 no_draw。</small>
+                </div>
+                <div class="provider-field">
+                  <label for="intent-judge-embedding-select"><span>意图判断 Embedding</span></label>
+                  <div class="provider-picker"><select id="intent-judge-embedding-select" name="intent_judge_embedding_provider_id"><option value="">未配置</option></select></div>
+                  <input id="intent-judge-embedding-manual" placeholder="手动填写 Embedding Provider ID" hidden>
+                  <small id="intent-judge-embedding-note" class="muted">从 AstrBot Embedding Provider 列表选择。</small>
+                </div>
+                <div class="provider-field">
+                  <label for="intent-judge-rerank-select"><span>意图判断 Rerank</span></label>
+                  <div class="provider-picker"><select id="intent-judge-rerank-select" name="intent_judge_rerank_provider_id"><option value="">未配置</option></select></div>
+                  <input id="intent-judge-rerank-manual" placeholder="手动填写 Rerank Provider ID" hidden>
+                  <small id="intent-judge-rerank-note" class="muted">从 AstrBot Rerank Provider 列表选择。</small>
+                </div>
+                <div class="provider-field">
+                  <label for="intent-judge-online-select"><span>意图判断在线模型</span></label>
+                  <div class="provider-picker"><select id="intent-judge-online-select" name="intent_judge_online_provider_id"><option value="">未配置</option></select></div>
+                  <input id="intent-judge-online-manual" placeholder="手动填写 Chat Provider ID" hidden>
+                  <small id="intent-judge-online-note" class="muted">不能与绘图导演、图片反推相同。</small>
+                </div>
+                <label><span>Embedding 差值阈值</span><input name="intent_judge_local_embedding_threshold" type="number" min="-1" max="1" step="0.01"></label>
+                <label><span>Rerank 差值阈值</span><input name="intent_judge_local_rerank_threshold" type="number" min="-1" max="1" step="0.01"></label>
+                <label><span>Auto 本地置信度下限</span><input name="intent_judge_auto_confidence_floor" type="number" min="0" max="1" step="0.05"></label>
+                <label><span>在线判断超时（秒）</span><input name="intent_judge_online_timeout" type="number" min="1" max="120" step="0.5"></label>
                 <label><span>普通聊天模式</span><select name="interaction_mode"><option value="smart">Smart：独立模型判断</option><option value="strict">Strict：命令/确认后提交</option></select></label>
                 <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
                 <label><span>换角分类总超时（秒）</span><input name="character_swap_timeout" type="number" min="30" max="600" step="1"></label>
                 <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
-                <label class="toggle"><input name="enable_natural_draw" type="checkbox"><span>启用自然语言绘图</span></label>
-                <label class="toggle"><input name="enable_llm_pic_trigger" type="checkbox"><span>解析 &lt;pic prompt&gt;</span></label>
+                <label><span>自然语言绘图模式</span><select name="natural_draw_mode"><option value="off">关闭</option><option value="photo_only">仅照片/视觉请求</option><option value="full">完整自然绘图</option></select></label>
+                <label><span>角色纯净模式</span><select name="character_purity_mode"><option value="smart">智能移除</option><option value="strict">严格询问</option><option value="off">关闭</option></select></label>
+                <label class="toggle"><input name="scene_extraction" type="checkbox"><span>启用场景提取（想看/你在干嘛）</span></label>
+                <label class="toggle"><input name="chinese_prompt_translation" type="checkbox"><span>启用 /画图 中文服饰/场景翻译</span></label>
                 <label class="toggle"><input name="enable_chat_draw_terminal_guard" type="checkbox" checked disabled><span>普通聊天绘图终止守卫（协议必需）</span></label>
                 <div class="span-4 section-divider"><span>Prompt Composer v2</span></div>
                 <label class="toggle"><input name="enable_prompt_composer_v2" type="checkbox"><span>启用三层提示词整理</span></label>
@@ -356,6 +392,10 @@
                 <label><span>Embedding Top-K</span><input name="lora_embedding_top_k" type="number" min="4" max="100"></label>
                 <label><span>Rerank Top-N</span><input name="lora_rerank_top_n" type="number" min="1" max="50"></label>
                 <label><span>混合搜索超时（秒）</span><input name="lora_retrieval_timeout" type="number" min="3" max="120"></label>
+                <label><span>LoRA 目录缓存 TTL（秒）</span><input name="lora_cache_ttl" type="number" min="0" max="86400" step="1"></label>
+                <label><span>任务快照最长复用（秒）</span><input name="lora_snapshot_max_age" type="number" min="15" max="86400" step="1"></label>
+                <label class="toggle"><input name="enable_task_lora_snapshot" type="checkbox"><span>任务内复用 LoRA 规划快照</span></label>
+                <label class="toggle"><input name="auto_reload_after_style_save" type="checkbox"><span>保存风格后自动重载插件</span></label>
                 <label class="span-4"><span>LoRA 自定义别名（每行一条）</span><textarea name="lora_alias_rules" rows="5" placeholder="black deniav1-2=达妮娅,denia,鸣潮达妮娅"></textarea><small class="muted">格式：精确文件名=别名1,别名2。仅补充逻辑索引，不移动实际文件。</small></label>
               </div>
             </article>
@@ -513,6 +553,7 @@
                 <button id="lora-select-visible" class="ghost" type="button">全选当前筛选</button>
                 <button id="lora-clear-selection" class="ghost" type="button">清空全部选择</button>
                 <button id="metadata-selected" class="secondary" type="button">获取所选元数据</button>
+                <button id="batch-mark-29b" class="secondary" type="button">一键标记 29B 兼容</button>
                 <button id="archive-selected-inline" class="primary" type="button">AI 建档所选</button>
               </div>
             </div>

@@ -260,7 +260,8 @@ STANDARD_DENSITY_CONTRACT = """
 Density: Standard. Prefer obedience and stability. Use roughly 14-32 useful
 ordinary tags, at most a few relation/material phrases and one concise 18-45
 word scene sentence when the request benefits from it. Simpler images may be
-shorter. Weight only a few genuinely fragile anchors.
+shorter. Do not use weight syntax; emphasize by front-loading high-value
+anchors and adding visible detail.
 """.strip()
 
 ULTRA_DENSITY_CONTRACT = """
@@ -270,6 +271,25 @@ environment interaction, main/rim light and color separation. Roughly 30-65
 useful ordinary tags and one 35-80 word scene sentence are upper guidance, not
 quotas. Never use synonym repetition, conflicting effects or quality slogans to
 fake complexity.
+""".strip()
+
+QUALITY_BUDGET_CONTRACT = """
+Prompt quality budget:
+- Write the positive prompt as one English natural-language sentence ordered:
+  who + appearance DNA + outfit + action + expression + location + camera +
+  light. Small Danbooru tags may anchor the sentence; do not use weight syntax.
+- Cover all six DNA anchors for every character: hair color, hairstyle+length,
+  bangs, eye color, face shape, skin/body.
+- Per-person word budgets are upper limits, not minimums: N=1 <=150 words;
+  N=2 <=90 words per person; N>=3 <=70 words per person.
+- Final positive prompt soft cap 800 tokens and hard cap 1200 tokens. Token cap
+  governs the final prompt; do not restore a 2000-character final-prompt lock.
+- Camera: answer where, whose eyes, and what angle. Do not repeat
+  "front view + upper body + mid shot" across consecutive images.
+- Cross-image continuity: each image starts from the previous image state;
+  state only accumulates; reset only on an explicit trigger.
+- Evidence: use only verified LoRA names and character canonicals; never invent
+  facts.
 """.strip()
 
 
@@ -353,6 +373,8 @@ def build_director_contract(
         )
     elif task == TASK_PROMPT_PLAN:
         parts.append(CHARACTER_EVIDENCE_CONTRACT)
+    if task != TASK_MASKED_REDRAW:
+        parts.append(QUALITY_BUDGET_CONTRACT)
     if CAPABILITY_PROMPT_PLAN in caps:
         parts.append(PROMPT_PLAN_CAPABILITY_CONTRACT)
     if CAPABILITY_LORA in caps:
@@ -584,6 +606,7 @@ def build_auto_draw_contract(
         CONVERSATION_PIC_TRANSPORT_CONTRACT,
         HYBRID_PROMPT_CONTRACT,
         CHARACTER_EVIDENCE_CONTRACT,
+        QUALITY_BUDGET_CONTRACT,
         "If you query a style, LoRA, Danbooru tag or Prompt Plan for an explicit "
         "drawing request, the final visible response must still contain the `<pic>` "
         "tag. A bare tag string, bare LoRA string or promise that the image is ready "

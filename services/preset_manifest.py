@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -31,8 +32,17 @@ class LoraManifestEntry:
     def normalized(self) -> tuple[str, float, str]:
         """Return a hash-stable normalized tuple."""
 
+        name = str(self.name or "").strip().replace("\\", "/")
+        name = name.rsplit("/", 1)[-1]
+        if name.casefold().endswith(".safetensors"):
+            name = name[:-12]
+        elif name.casefold().endswith(".ckpt"):
+            name = name[:-5]
+        # Runtime catalogs append the active family suffix to filenames while
+        # preset records intentionally keep the family-neutral short name.
+        name = re.sub(r"_(?:29b|legacy)$", "", name, flags=re.IGNORECASE)
         return (
-            str(self.name or "").strip().casefold(),
+            name.casefold(),
             round(float(self.weight), 6),
             str(self.model_family or "").strip().casefold(),
         )

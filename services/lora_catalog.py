@@ -31,6 +31,11 @@ MAX_CATALOG_BYTES = 10 * 1024 * 1024
 MAX_MANAGER_PREVIEW_BYTES = 4 * 1024 * 1024
 MAX_CHARACTER_IDENTITIES_PER_LORA = 24
 MAX_WORK_IDENTITIES_PER_LORA = 24
+DEFAULT_RECOMMENDED_WEIGHT = "0.8"
+CONVERTED_29B_SUFFIX_RE = re.compile(
+    r"[-_](?:29b(?:_40l)?|40l)$",
+    re.IGNORECASE,
+)
 GENERIC_IDENTITY_TERMS = {
     "anima",
     "lora",
@@ -188,6 +193,8 @@ class LoraRecord:
     # silently sharing a Legacy asset.
     compatible_model_families: tuple[str, ...] = ()
     compatibility_mode: str = "unknown"
+    companion_variant: str = ""
+    native_in_families: tuple[str, ...] = ()
 
 
 class _DirectoryLinkParser(HTMLParser):
@@ -426,6 +433,7 @@ class LoraCatalogService:
             if not records:
                 raise LoraCatalogError("局域网清单中没有找到 LoRA 文件")
             records = self._apply_alias_rules(records)
+            records = self._inherit_converted_29b_metadata(records)
             # Freeze the authoritative source fingerprint before semantic
             # aliases/categories are overlaid for search and display.
             from .lora_semantic import semantic_source_fingerprint
@@ -1480,6 +1488,128 @@ class LoraCatalogService:
         return tuple(updated)
 
     @staticmethod
+    def _derive_base_lora_name(name: str) -> Optional[str]:
+        """从带有 _29b 等后缀的 LoRA 规范名称反推原始 LoRA 规范名称。"""
+        canonical = canonical_lora_name(name)
+        if "/" in canonical:
+            folder, basename = canonical.rsplit("/", 1)
+        else:
+            folder, basename = "", canonical
+        matched = CONVERTED_29B_SUFFIX_RE.search(basename)
+        if not matched:
+            return None
+        base_basename = basename[: matched.start()].strip()
+        if not base_basename:
+            return None
+        return f"{folder}/{base_basename}" if folder else base_basename
+
+    @classmethod
+    def _inherit_converted_29b_metadata(
+        cls,
+        records: tuple[LoraRecord, ...],
+    ) -> tuple[LoraRecord, ...]:
+        """使 _29b 等转换版 LoRA 继承原版 LoRA 的触发词和元数据，并标记 2.9B 家族兼容性。"""
+        from .lora_compatibility import ANIMA_29B_FAMILY
+
+        exact_index: dict[str, LoraRecord] = {}
+        basename_index: dict[str, list[LoraRecord]] = {}
+        for record in records:
+            c_name = canonical_lora_name(record.name)
+            if not cls._derive_base_lora_name(c_name):
+                c_key = c_name.casefold()
+                exact_index[c_key] = record
+                basename = c_key.rsplit("/", 1)[-1]
+                basename_index.setdefault(basename, []).append(record)
+
+        updated: list[LoraRecord] = []
+        companion_map: dict[str, str] = {}
+        for record in records:
+            derived_base = cls._derive_base_lora_name(record.name)
+            if not derived_base:
+                updated.append(record)
+                continue
+
+            base_key = derived_base.casefold()
+            base_record = exact_index.get(base_key)
+            if base_record is None:
+                base_basename = base_key.rsplit("/", 1)[-1]
+                candidates = basename_index.get(base_basename, [])
+                if len(candidates) == 1:
+                    base_record = candidates[0]
+
+            families = tuple(
+                dict.fromkeys((*record.compatible_model_families, ANIMA_29B_FAMILY))
+            )
+            mode = "native_29b"
+
+            if base_record is None:
+                updated.append(
+                    replace(
+                        record,
+                        compatible_model_families=families,
+                        compatibility_mode=mode,
+                    )
+                )
+                continue
+
+            # 建立双向配对索引
+            companion_map[record.name] = base_record.name
+            companion_map[base_record.name] = record.name
+
+            inherited_triggers = tuple(
+                dict.fromkeys((*base_record.trigger_words, *record.trigger_words))
+            )
+            inherited_tags = tuple(dict.fromkeys((*record.tags, *base_record.tags)))
+            inherited_aliases = cls._dedupe_identity_terms(
+                (*record.aliases, *base_record.aliases)
+            )
+            inherited_character = base_record.character_name or record.character_name
+            inherited_source_work = base_record.source_work or record.source_work
+            inherited_category = (
+                base_record.category
+                if base_record.category != "unknown"
+                else record.category
+            )
+            inherited_description = base_record.description or record.description
+            inherited_model_name = base_record.model_name or record.model_name
+            inherited_preview = record.preview_url or base_record.preview_url
+            inherited_from_civitai = record.from_civitai or base_record.from_civitai
+
+            updated.append(
+                replace(
+                    record,
+                    trigger_words=inherited_triggers,
+                    description=inherited_description,
+                    model_name=inherited_model_name,
+                    folder=record.folder or base_record.folder,
+                    preview_url=inherited_preview,
+                    tags=inherited_tags,
+                    category=inherited_category,
+                    aliases=inherited_aliases,
+                    character_name=inherited_character,
+                    source_work=inherited_source_work,
+                    from_civitai=inherited_from_civitai,
+                    compatible_model_families=families,
+                    compatibility_mode=mode,
+                    companion_variant=base_record.name,
+                )
+            )
+
+        # 把 base 记录的 companion_variant 也刷上
+        if companion_map:
+            final_records: list[LoraRecord] = []
+            for rec in updated:
+                if rec.name in companion_map and not rec.companion_variant:
+                    final_records.append(
+                        replace(rec, companion_variant=companion_map[rec.name])
+                    )
+                else:
+                    final_records.append(rec)
+            return tuple(final_records)
+
+        return tuple(updated)
+
+    @staticmethod
     def _infer_category(
         *,
         file_name: str,
@@ -2204,26 +2334,30 @@ class LoraCatalogService:
         for record in records:
             name = canonical_lora_name(record.name)
             line = f"- {name}"
-            if record.model_name and record.model_name != name:
-                line += f" | title: {record.model_name}"
-            if record.base_model:
-                line += f" | base: {record.base_model}"
+            if detail:
+                if record.model_name and record.model_name != name:
+                    line += f" | title: {record.model_name}"
+                if record.base_model:
+                    line += f" | base: {record.base_model}"
             if record.category != "unknown":
                 line += f" | category: {record.category}"
             if record.character_name:
                 line += f" | character: {record.character_name}"
             if record.source_work:
                 line += f" | work: {record.source_work}"
-            if record.aliases:
-                line += f" | aliases: {', '.join(record.aliases[:8])}"
-            if record.trigger_words:
-                line += f" | triggers: {', '.join(record.trigger_words)}"
-            if record.tags:
-                line += f" | tags: {', '.join(record.tags[:8])}"
-            if record.favorite:
-                line += " | favorite"
-            if record.description:
-                line += f" | {self._strip_html(record.description)[:400]}"
+            if detail:
+                if record.aliases:
+                    line += f" | aliases: {', '.join(record.aliases[:8])}"
+                if record.trigger_words:
+                    line += f" | triggers: {', '.join(record.trigger_words)}"
+                if record.tags:
+                    line += f" | tags: {', '.join(record.tags[:8])}"
+                if record.favorite:
+                    line += " | favorite"
+                if record.description:
+                    line += f" | {self._strip_html(record.description)[:400]}"
+            else:
+                line += f" | recommended weight: {DEFAULT_RECOMMENDED_WEIGHT}"
             lines.append(line)
         return "\n".join(lines)
 

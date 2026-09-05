@@ -36,22 +36,57 @@ class ModelFamilyGateTests(unittest.TestCase):
             )
         )
 
-    def test_native_29b_asset_is_rejected_everywhere(self) -> None:
-        for target in ("anima_legacy_28l", "anima_29b_40l", "other"):
-            with self.subTest(target=target):
-                with self.assertRaises(ModelFamilyGateError):
-                    gate_lora_selection(
-                        "asset",
-                        _record(("anima_29b_40l",), "native_29b"),
-                        target_family=target,
-                        patch_verified=False,
-                    )
+    def test_native_29b_asset_is_allowed_on_29b_target(self) -> None:
+        self.assertTrue(
+            gate_lora_selection(
+                "asset",
+                _record(("anima_29b_40l",), "native_29b"),
+                target_family="anima_29b_40l",
+                patch_verified=False,
+            )
+        )
 
-    def test_29b_target_family_is_deferred(self) -> None:
+    def test_native_29b_asset_is_rejected_on_legacy_target(self) -> None:
+        with self.assertRaises(ModelFamilyGateError):
+            gate_lora_selection(
+                "asset",
+                _record(("anima_29b_40l",), "native_29b"),
+                target_family="anima_legacy_28l",
+                patch_verified=False,
+            )
+
+    def test_legacy_asset_is_rejected_on_29b_target(self) -> None:
         with self.assertRaises(ModelFamilyGateError):
             gate_lora_selection(
                 "asset",
                 _record(("anima_legacy_28l",), "legacy_only"),
+                target_family="anima_29b_40l",
+                patch_verified=False,
+            )
+
+    def test_unclassified_asset_is_rejected_on_29b_target(self) -> None:
+        with self.assertRaises(ModelFamilyGateError):
+            gate_lora_selection(
+                "asset",
+                _record(),
+                target_family="anima_29b_40l",
+                patch_verified=False,
+            )
+
+    def test_unsupported_target_family_rejects_everything(self) -> None:
+        with self.assertRaises(ModelFamilyGateError):
+            gate_lora_selection(
+                "asset",
+                _record(("anima_legacy_28l",), "legacy_only"),
+                target_family="other",
+                patch_verified=False,
+            )
+
+    def test_missing_record_fails_closed(self) -> None:
+        with self.assertRaises(ModelFamilyGateError):
+            gate_lora_selection(
+                "asset",
+                None,
                 target_family="anima_29b_40l",
                 patch_verified=False,
             )

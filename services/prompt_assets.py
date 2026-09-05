@@ -1832,6 +1832,48 @@ class PromptAssetLibrary:
             CREATE INDEX idx_assets_updated ON assets(updated_at);
         """
 
+    @staticmethod
+    def _repair_schema_sql() -> str:
+        allowed = ",".join(f"'{item}'" for item in sorted(ASSET_TYPES))
+        return f"""
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS assets (
+                asset_id TEXT PRIMARY KEY,
+                asset_type TEXT NOT NULL CHECK(asset_type IN ({allowed})),
+                name_zh TEXT NOT NULL DEFAULT '',
+                name_en TEXT NOT NULL DEFAULT '',
+                aliases TEXT NOT NULL DEFAULT '[]',
+                tags TEXT NOT NULL DEFAULT '[]',
+                traits TEXT NOT NULL DEFAULT '[]',
+                categories TEXT NOT NULL DEFAULT '[]',
+                preview_key TEXT NOT NULL DEFAULT '',
+                preview_available INTEGER NOT NULL DEFAULT 0
+                    CHECK(preview_available IN (0, 1)),
+                provenance TEXT NOT NULL DEFAULT '{{}}',
+                source_key TEXT NOT NULL DEFAULT '',
+                is_custom INTEGER NOT NULL DEFAULT 0 CHECK(is_custom IN (0, 1)),
+                search_text TEXT NOT NULL DEFAULT '',
+                category_tokens TEXT NOT NULL DEFAULT '',
+                trait_tokens TEXT NOT NULL DEFAULT '',
+                tag_tokens TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS favourites (
+                asset_id TEXT PRIMARY KEY
+                    REFERENCES assets(asset_id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_assets_type ON assets(asset_type);
+            CREATE INDEX IF NOT EXISTS idx_assets_custom ON assets(is_custom);
+            CREATE INDEX IF NOT EXISTS idx_assets_source ON assets(source_key);
+            CREATE INDEX IF NOT EXISTS idx_assets_updated ON assets(updated_at);
+        """
+
     @classmethod
     def _build_database(
         cls,
@@ -2021,6 +2063,30 @@ class PromptAssetLibrary:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_snapshot_unlocked([], [], {})
+
+    def _ensure_schema_ready(self) -> None:
+        """Repair an existing database that is missing the assets table."""
+        if not self.path.is_file():
+            return
+        with self._write_lock():
+            if not self.path.is_file():
+                return
+            try:
+                connection = self._connect()
+                try:
+                    has_assets = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'assets'"
+                    ).fetchone()
+                    if has_assets is not None:
+                        return
+                    connection.executescript(self._repair_schema_sql())
+                    connection.commit()
+                    self._last_error = ""
+                finally:
+                    connection.close()
+            except sqlite3.Error as exc:
+                self._last_error = f"prompt asset schema repair failed: {exc}"
 
     def status(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -2229,6 +2295,7 @@ class PromptAssetLibrary:
         else:
             order = f"{display_name} COLLATE NOCASE, a.asset_id"
 
+        self._ensure_schema_ready()
         with self._read_lock():
             if not self.path.is_file():
                 return {
@@ -2239,39 +2306,51 @@ class PromptAssetLibrary:
                     "pages": 0,
                     "revision": "",
                 }
-            connection = self._connect(read_only=True)
             try:
-                connection.create_function(
-                    "prompt_asset_provenance_contains", 2, _provenance_contains
-                )
-                connection.create_function(
-                    "prompt_asset_relevance", 9, _relevance_score
-                )
-                base = "FROM assets a LEFT JOIN favourites f USING(asset_id)" + clause
-                total = int(
-                    connection.execute(
-                        "SELECT COUNT(*) " + base, parameters
-                    ).fetchone()[0]
-                )
-                rows = connection.execute(
-                    """SELECT a.*, CASE WHEN f.asset_id IS NULL THEN 0 ELSE 1 END
-                              AS favourite """
-                    + base
-                    + " ORDER BY "
-                    + order
-                    + " LIMIT ? OFFSET ?",
-                    [
-                        *parameters,
-                        *([normalized_query] if sort == "relevance" and normalized_query else []),
-                        page_size,
-                        (page - 1) * page_size,
-                    ],
-                ).fetchall()
-                revision_row = connection.execute(
-                    "SELECT value FROM metadata WHERE key = 'revision'"
-                ).fetchone()
-            finally:
-                connection.close()
+                connection = self._connect(read_only=True)
+                try:
+                    connection.create_function(
+                        "prompt_asset_provenance_contains", 2, _provenance_contains
+                    )
+                    connection.create_function(
+                        "prompt_asset_relevance", 9, _relevance_score
+                    )
+                    base = "FROM assets a LEFT JOIN favourites f USING(asset_id)" + clause
+                    total = int(
+                        connection.execute(
+                            "SELECT COUNT(*) " + base, parameters
+                        ).fetchone()[0]
+                    )
+                    rows = connection.execute(
+                        """SELECT a.*, CASE WHEN f.asset_id IS NULL THEN 0 ELSE 1 END
+                                  AS favourite """
+                        + base
+                        + " ORDER BY "
+                        + order
+                        + " LIMIT ? OFFSET ?",
+                        [
+                            *parameters,
+                            *([normalized_query] if sort == "relevance" and normalized_query else []),
+                            page_size,
+                            (page - 1) * page_size,
+                        ],
+                    ).fetchall()
+                    revision_row = connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'revision'"
+                    ).fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.Error as exc:
+                self._last_error = str(exc)
+                return {
+                    "items": [],
+                    "total": 0,
+                    "page": page,
+                    "page_size": page_size,
+                    "pages": 0,
+                    "revision": "",
+                    "error": self._last_error,
+                }
         return {
             "items": [
                 self._public_record(self._record_from_row(row), bool(row["favourite"]))
@@ -2321,6 +2400,7 @@ class PromptAssetLibrary:
             where.append("a.is_custom = ?")
             parameters.append(int(bool(custom_only)))
         clause = " WHERE " + " AND ".join(where) if where else ""
+        self._ensure_schema_ready()
         with self._read_lock():
             if not self.path.is_file():
                 return {
@@ -2330,45 +2410,85 @@ class PromptAssetLibrary:
                     "traits": [],
                     "revision": "",
                 }
-            connection = self._connect(read_only=True)
             try:
-                rows = connection.execute(
-                    """SELECT a.asset_type, a.categories, a.traits,
-                              a.provenance, a.source_key
-                       FROM assets a LEFT JOIN favourites f USING(asset_id)"""
-                    + clause,
-                    parameters,
-                ).fetchall()
-                revision_row = connection.execute(
-                    "SELECT value FROM metadata WHERE key = 'revision'"
-                ).fetchone()
-            finally:
-                connection.close()
+                connection = self._connect(read_only=True)
+                try:
+                    base = (
+                        "FROM assets a LEFT JOIN favourites f USING(asset_id)"
+                        + clause
+                    )
+                    type_rows = connection.execute(
+                        "SELECT a.asset_type AS value, COUNT(*) AS count "
+                        + base
+                        + " GROUP BY a.asset_type",
+                        parameters,
+                    ).fetchall()
+                    source_rows = connection.execute(
+                        "SELECT COALESCE(json_extract(a.provenance, '$.source'), "
+                        "a.source_key) AS value, COUNT(*) AS count "
+                        + base
+                        + " GROUP BY value",
+                        parameters,
+                    ).fetchall()
+                    category_rows = connection.execute(
+                        "SELECT json_each.value AS value, COUNT(*) AS count "
+                        "FROM assets a LEFT JOIN favourites f USING(asset_id), "
+                        "json_each(a.categories)"
+                        + clause
+                        + " GROUP BY json_each.value",
+                        parameters,
+                    ).fetchall()
+                    trait_rows = connection.execute(
+                        "SELECT json_each.value AS value, COUNT(*) AS count "
+                        "FROM assets a LEFT JOIN favourites f USING(asset_id), "
+                        "json_each(a.traits)"
+                        + clause
+                        + " GROUP BY json_each.value",
+                        parameters,
+                    ).fetchall()
+                    revision_row = connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'revision'"
+                    ).fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.Error as exc:
+                self._last_error = str(exc)
+                return {
+                    "type_counts": {item: 0 for item in sorted(ASSET_TYPES)},
+                    "sources": [],
+                    "categories": [],
+                    "traits": [],
+                    "revision": "",
+                    "error": self._last_error,
+                }
         type_counts = {item: 0 for item in sorted(ASSET_TYPES)}
+        source_labels: dict[str, str] = {}
         category_labels: dict[str, str] = {}
         trait_labels: dict[str, str] = {}
-        source_labels: dict[str, str] = {}
+        source_counts: dict[str, int] = {}
         category_counts: dict[str, int] = {}
         trait_counts: dict[str, int] = {}
-        source_counts: dict[str, int] = {}
-        for row in rows:
-            type_counts[str(row["asset_type"])] += 1
-            provenance = _decode_json_object(row["provenance"])
-            source_value = str(provenance.get("source") or row["source_key"])
+        for row in type_rows:
+            type_counts[str(row["value"])] += int(row["count"])
+        for row in source_rows:
+            source_value = str(row["value"] or "")
             source_key = normalize_asset_text(source_value)
             if source_key:
                 source_labels.setdefault(source_key, source_value)
-                source_counts[source_key] = source_counts.get(source_key, 0) + 1
-            for raw, labels, counts in (
-                (row["categories"], category_labels, category_counts),
-                (row["traits"], trait_labels, trait_counts),
-            ):
-                for value in _decode_json_list(raw):
-                    key = normalize_asset_text(value)
-                    if not key:
-                        continue
-                    labels.setdefault(key, value)
-                    counts[key] = counts.get(key, 0) + 1
+                source_counts[source_key] = source_counts.get(source_key, 0) + int(
+                    row["count"]
+                )
+        for rows, labels, counts in (
+            (category_rows, category_labels, category_counts),
+            (trait_rows, trait_labels, trait_counts),
+        ):
+            for row in rows:
+                value = str(row["value"] or "")
+                key = normalize_asset_text(value)
+                if not key:
+                    continue
+                labels.setdefault(key, value)
+                counts[key] = counts.get(key, 0) + int(row["count"])
 
         def ranked(
             labels: Mapping[str, str], counts: Mapping[str, int]

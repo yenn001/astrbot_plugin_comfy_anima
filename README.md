@@ -1,6 +1,6 @@
-# AstrBot ComfyAnima 插件
+# AstrBot ComfyAnima 插件 v2.4.1
 
-> 当前版本：2.4.0。2.9B 可执行路径暂缓，当前稳定路径是 Legacy 单图。
+> 当前版本：**2.4.1**（内部构建 3.1.416）。2.9B 底模已完整支持，角色和风格 LoRA 自动适配变体。
 
 让 AstrBot 里的角色（比如你的达妮娅）真的能“画图”的插件。
 
@@ -10,7 +10,23 @@
 > “我想看娅娅的照片”
 > “/画图 风格006 达妮娅”
 
-Bot 会生成图片并尝试发回来；如果平台没有回执，任务会诚实显示为“输出就绪”。
+Bot 就会真的生成图片发回来，而不是用嘴说自己画了。
+
+---
+
+## 最近更新（2.4.1）
+
+这次更新主要解决“时好时坏”和“追画换人”两大问题：
+
+- 🧠 **闲聊出图更懂你**：“检查穿着了！（画出来）”这种一句话能正确出图；说“不要画了”“明天再画”就不会画；
+- 👤 **追画不再换人**：“重新画一张没有项链的”——不用再提角色名，自动还是达妮娅；
+- 🔄 **2.9B 底模全自动适配**：角色和风格 LoRA 自动切换到 29B 变体，Legacy / 2.9B 来回切也不怕；
+- 🏷 **角色认得更准**：就算 LLM 偷懒没在提示词里写角色名，也能按 LoRA 绑定正确挂载；
+- 🕐 **出图同步现实时间**：中午聊天图里就是白天光线，晚上自动夜景——提示词里写了时间则以你为准；
+- 🧹 **提示词更干净**：内部工具文本（skill / tool_calls）不再泄漏进画面描述；
+- 🔎 **报错看得懂**：出问题会明确告诉你是【绘图导演思考模型】还是【图片反推多模态模型】、用的哪个 Provider、什么原因；
+- 🤫 **不再刷屏**：普通聊天不会出现“未通过意图判断”提示（只记录在运行控制台日志里）；
+- 💾 **设置保存修复**：WebUI 里改的设置终于能存住了（之前会提示保存失败并回滚）。
 
 ---
 
@@ -38,7 +54,7 @@ Bot 会生成图片并尝试发回来；如果平台没有回执，任务会诚�
 
 ### 方式二：手动安装
 
-1. 在 [Releases](https://github.com/yenn001/astrbot_plugin_comfy_anima/releases) 下载对应版本的 source-only ZIP（当前为 `astrbot_plugin_comfy_anima_2.4.0.zip`）；
+1. 下载本仓库最新的 `astrbot_plugin_comfy_anima_<版本>_release.zip`；
 2. 解压后把 `astrbot_plugin_comfy_anima` 文件夹放进：
    ```text
    AstrBot/data/plugins/
@@ -59,7 +75,7 @@ http://127.0.0.1:8188
 需要准备：
 
 - ComfyUI 已启动，并能在浏览器打开；
-- 插件包已内置默认 Anima 工作流；只有使用自定义工作流时，才需要额外放入 `workflow/` 目录；
+- 把本插件需要的 Anima 工作流放到 `workflow/` 目录（插件包已内置默认配置）；
 - 模型 / LoRA 放在 ComfyUI 对应的 `models/` 路径里；
 - 插件设置里选好你要用的工作流。
 
@@ -117,24 +133,25 @@ http://127.0.0.1:6198
 ## 常见问题
 
 **1. 一直提示“LoRA compatibility rejected”**
-- 2.4.0 的 Legacy 路径会放行没有 2.9B 声明的 LoRA；
+- 2.1.307 里 Legacy 模型会放行没有 2.9B 声明的 LoRA；
 - 如果报的是 2.9B，说明该 LoRA 明确属于 2.9B，本版本暂不使用。
 
 **2. 改图提示“请发送一张图片”**
 - 先用 QQ 发图给 Bot，再**回复这张图片**发命令。
 
-**3. 改图提示“LLM 分镜超时”**
+**3. 报错里带【绘图导演思考模型】或【图片反推多模态模型】**
 - 换一个协议稳定的绘图导演模型（推荐 DeepSeek V4 系列）；
 - 确认图片反推模型支持图片输入。
 
 **4. 出图不像角色**
 - 先确认 LoRA 已安装、已刷新；
 - 在 WebUI 的 LoRA 详情里补角色 / 作品 / 激活词；
-- 然后用“角色是 xxx”这种写法。
+- 然后用“角色是 xxx”这种写法；
+- 追画改图时不用重复角色名，插件会自动沿用上一张的角色。
 
 **5. 任务状态是 partial / output_ready**
 - 这是正常的。QQ 平台不返回 message_id，插件不会假装“已发送成功”；
-- 只要图已经生成，任务就是“输出就绪”；平台是否收到无法由插件机器确认。
+- 只要图已经生成并发出，任务就是“输出就绪”。
 
 ---
 
@@ -151,7 +168,6 @@ http://127.0.0.1:6198
 - 插件代码：`astrbot_plugin_comfy_anima/`
 - 测试：`tests/`（pytest）
 - 发布包：`release_<版本>/astrbot_plugin_comfy_anima_<版本>_release.zip`
-- 更新记录：[CHANGELOG.md](CHANGELOG.md)；配置项：[_conf_schema.json](_conf_schema.json)
 
 贡献前请跑：
 
@@ -163,6 +179,11 @@ python -m compileall -q .
 
 ---
 
+<!-- Roadmap (G10): multi-bundle image delivery is intentionally not
+implemented. Queuing plus the existing “继续” continuation flow is the owner
+decision for 3.1.400; do not reopen this as a new bundle feature without a
+concrete user workflow that needs multiple simultaneous bundles in one reply. -->
+
 ## License
 
-当前仓库未附正式 LICENSE；第三方模型、节点、LoRA 和数据请按各自许可使用。
+按仓库 LICENSE 文件执行。

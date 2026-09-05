@@ -46,6 +46,7 @@ class SessionPictureRecipe:
     model_family: str = ""
     identity_anchor: str = ""
     required_triggers: tuple[str, ...] = ()
+    character_lora_name: str = ""
     manifest_hash: str = ""
     content_fingerprint: str = ""
     created_at: float = 0.0
@@ -66,6 +67,7 @@ class SessionPictureRecipe:
         prompt_recipe: str,
         manifest: PresetManifest,
         content_fingerprint: str,
+        character_lora_name: str = "",
     ) -> "SessionPictureRecipe":
         """Build a recipe only from a verified successful submission."""
 
@@ -86,6 +88,7 @@ class SessionPictureRecipe:
             model_family=manifest.model_family,
             identity_anchor=manifest.identity_anchor,
             required_triggers=tuple(manifest.required_triggers),
+            character_lora_name=str(character_lora_name or "").strip()[:200],
             manifest_hash=manifest.manifest_hash,
             content_fingerprint=str(content_fingerprint or "").strip()[:160],
             created_at=now,
@@ -117,6 +120,7 @@ class SessionPictureRecipe:
             "model_family": self.model_family,
             "identity_anchor": self.identity_anchor,
             "required_triggers": list(self.required_triggers),
+            "character_lora_name": self.character_lora_name,
             "manifest_hash": self.manifest_hash,
             "content_fingerprint": self.content_fingerprint,
             "created_at": self.created_at,
@@ -159,6 +163,7 @@ class SessionPictureRecipe:
             model_family=manifest.model_family,
             identity_anchor=manifest.identity_anchor,
             required_triggers=tuple(manifest.required_triggers),
+            character_lora_name=str(value.get("character_lora_name") or "").strip()[:200],
             manifest_hash=manifest.manifest_hash,
             content_fingerprint=str(value.get("content_fingerprint") or "").strip()[:160],
             created_at=created_at,

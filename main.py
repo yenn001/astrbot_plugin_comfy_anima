@@ -1,5 +1,5 @@
 """
-AstrBot Comfy Anima 插件 v2.4.0
+AstrBot Comfy Anima 插件 v2.1.306
 
 功能描述：
 - 通过 AstrBot 指令提交 Anima 工作流到 ComfyUI
@@ -8,8 +8,8 @@ AstrBot Comfy Anima 插件 v2.4.0
 - 支持任务状态查询、取消和生成图片回传
 
 作者: Yen
-版本: 2.4.0
-日期: 2026-08-30
+版本: 2.1.306
+日期: 2026-08-27
 """
 
 import asyncio
@@ -22,12 +22,13 @@ import tempfile
 from uuid import uuid4
 import threading
 import time
+import types
 import unicodedata
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, AsyncGenerator, Mapping, Optional
+from typing import Any, AsyncGenerator, Mapping, Optional, Sequence
 
 from PIL import Image
 from astrbot.api import logger
@@ -41,6 +42,7 @@ except Exception:  # AstrBot < v4.24 may not expose the content-part helper.
     TextPart = None
 
 from .constants import (
+    INTERNAL_BUILD_ID,
     MAX_IMAGE_SIDE,
     MIN_IMAGE_SIDE,
     MessageEmoji,
@@ -79,6 +81,7 @@ from .models import (
     GenerationOptions,
     LoraSelection,
     PluginSettings,
+    migrate_legacy_consolidated_config,
 )
 from .services.comfy_client import ComfyClient, ComfyClientError
 from .services.character_swap import (
@@ -103,7 +106,15 @@ from .services.character_swap import (
     response_text as character_swap_response_text,
     trusted_lora_character_appearance,
 )
-from .services.config_profiles import ConfigProfileError, ConfigProfileService
+from .services.config_profiles import (
+    ConfigProfileError,
+    ConfigProfileService,
+    extract_environment_settings,
+)
+from .services.chinese_prompt_translator import (
+    ChinesePromptTranslation,
+    ChinesePromptTranslator,
+)
 from .services.character_identity import (
     CharacterIdentityResolution,
     character_identity_lookup_candidates,
@@ -155,6 +166,10 @@ from .services.experimental_profiles import inspect_experimental_profiles
 from .services.character_lora_gate import gate_character_lora_views
 from .services.character_lora_projection import build_character_lora_views
 from .services.lora_catalog import LoraCatalogError, LoraCatalogService, LoraRecord
+from .services.lora_family_adapter import (
+    adapt_lora_selections_for_target,
+    is_29b_model_family,
+)
 from .services.lora_identity_evidence import (
     build_lora_identity_discovery,
     resolve_lora_character_canonicals,
@@ -279,6 +294,7 @@ from .services.chat_intent_classifier import (
     PROBE_LORA_PRESETS,
     PROBE_PROMPT_PLAN,
     PROBE_SUBJECT,
+    ChatIntentDecision,
     IntentPlan,
     build_intent_plan,
     classify_chat_intent,
@@ -316,12 +332,45 @@ from .services.session_picture_recipe import (
 from .services.drawing_orchestrator import (
     BLOCKED_EXECUTION_TOOL_NAMES,
     DrawingOrchestrator,
-    detect_follow_up_draw_requests,
     extract_follow_up_lines,
 )
 from .services.drawing_state_machine import DuplicateSubmissionError
 from .services.task_store import TaskStore, TaskStoreError
+from .services.user_picture_preferences import (
+    UserPicturePreferencesError,
+    UserPicturePreferencesStore,
+)
 from .services.web_ui import WebUiActionError, WebUiError, WebUiService
+from .services.scene_bridge import (
+    SceneBridge,
+    has_visual_intent,
+    scene_context_from_event,
+)
+from .services.character_authority import (
+    CharacterAuthority,
+    CharacterPurityFilter,
+)
+from .services.atomic_config import (
+    AtomicConfigWriteError,
+    atomic_write_json,
+)
+from .services.intent_decision_ledger import (
+    IntentDecisionLedger,
+)
+from .services.intent_judge import (
+    DRAW_NOW,
+    NO_DRAW,
+    IntentJudgeResult,
+    IntentJudgeService,
+    IntentJudgeSettings,
+)
+from .services.multi_character_judge import (
+    BLOCKED_DECISION,
+    CLARIFY_DECISION,
+    COSPLAY_DECISION,
+    DUAL_DECISION,
+    MultiCharacterJudge,
+)
 
 
 _DANBOORU_TOOL_CATEGORIES = {
@@ -374,6 +423,8 @@ PIPELINE_PROFILE_MAP = {
 }
 
 _CHAT_DRAW_TERMINAL_EXTRA_KEY = f"{PLUGIN_NAME}:chat_draw_terminal_v2"
+_INTENT_ROUTER_GATE_EXTRA_KEY = f"{PLUGIN_NAME}:intent_router_gate_result"
+_INTENT_ROUTER_GATE_DONE_KEY = f"{PLUGIN_NAME}:intent_router_gate_done"
 _CHAT_DRAW_ASSET_TOOLS = frozenset(
     {
         "list_anima_loras",
@@ -381,6 +432,23 @@ _CHAT_DRAW_ASSET_TOOLS = frozenset(
         "search_anima_danbooru_tags",
         "list_anima_prompt_plans",
     }
+)
+_CHINESE_PROMPT_STRUCTURE_EXCLUSIONS = (
+    "角色",
+    "风格",
+    "分辨率",
+    "尺寸",
+    "画布",
+    "画图",
+    "绘图",
+    "作画",
+    "绘制",
+    "是",
+    "为",
+    "用",
+    "使用",
+    "采用",
+    "套用",
 )
 
 
@@ -421,6 +489,10 @@ WEB_UI_EDITABLE_FIELDS = (
     "default_height",
     "sampler_steps_override",
     "default_generation_pipeline",
+    "prompt_node_id",
+    "negative_node_id",
+    "workflow_positive_node_overrides",
+    "workflow_negative_node_overrides",
     "iterative_scale",
     "iterative_steps",
     "iterative_denoise",
@@ -437,6 +509,31 @@ WEB_UI_EDITABLE_FIELDS = (
     "intent_router_timeout",
     "intent_router_temperature",
     "intent_router_min_confidence",
+    "intent_judge_backend",
+    "intent_judge_embedding_provider_id",
+    "intent_judge_rerank_provider_id",
+    "intent_judge_online_provider_id",
+    "intent_judge_positive_anchors",
+    "intent_judge_negative_anchors",
+    "intent_judge_local_embedding_threshold",
+    "intent_judge_local_rerank_threshold",
+    "intent_judge_auto_confidence_floor",
+    "intent_judge_online_timeout",
+    "intent_judge_online_temperature",
+    "intent_judge_fallback",
+    "draw_pipeline_mode",
+    "intent_router_gate_mode",
+    "enable_visual_task_intent",
+    "enable_user_picture_preferences",
+    "user_picture_preferences_ttl",
+    "router_timeout_before_agent",
+    "scene_extraction_model",
+    "scene_context_window",
+    "scene_extraction_max_memories",
+    "natural_draw_mode",
+    "character_purity_mode",
+    "scene_extraction",
+    "chinese_prompt_translation",
     "enable_session_recipe_continuity",
     "invalidate_session_recipe_on_update",
     "enable_preset_manifest_gate",
@@ -483,8 +580,6 @@ WEB_UI_EDITABLE_FIELDS = (
     "prompt_llm_temperature",
     "prompt_llm_max_tokens",
     "character_swap_timeout",
-    "enable_natural_draw",
-    "enable_llm_pic_trigger",
     "enable_chat_draw_terminal_guard",
     "enable_reverse_prompt",
     "enable_workflow_reverse",
@@ -531,10 +626,12 @@ WEB_UI_EDITABLE_FIELDS = (
     "lora_embedding_top_k",
     "lora_rerank_top_n",
     "lora_retrieval_timeout",
+    "lora_cache_ttl",
     "enable_task_lora_snapshot",
     "lora_snapshot_max_age",
     "enable_layered_lora_retrieval",
     "strict_lora_validation",
+    "auto_reload_after_style_save",
     "default_block_level",
     "group_whitelist",
     "global_lock",
@@ -548,6 +645,16 @@ WEB_UI_EDITABLE_FIELDS = (
     "web_ui_username",
     "web_ui_password",
     "web_ui_session_ttl",
+)
+
+WEB_UI_LEGACY_FIELDS = frozenset(
+    {
+        "enable_natural_draw",
+        "enable_llm_pic_trigger",
+        "director_primary",
+        "enable_scene_extraction",
+        "enable_chinese_prompt_translation",
+    }
 )
 
 IMAGE_TASK_TYPES = frozenset(
@@ -617,7 +724,9 @@ class ComfyAnimaPlugin(Star):
         self.plugin_dir = Path(__file__).resolve().parent
         self._persistent_data_dir = self._resolve_persistent_data_dir()
         self._task_store_error = ""
+        self._intent_decision_ledger: Optional[IntentDecisionLedger] = None
         self._task_store: Optional[TaskStore] = None
+        self._gpu_name_cache: Optional[tuple[float, str]] = None
         try:
             self._task_store = TaskStore(
                 self._persistent_data_dir / "task_events.sqlite3"
@@ -664,6 +773,7 @@ class ComfyAnimaPlugin(Star):
                         )
                         for key, entry in self._semantic_index.entries.items()
                     }
+                    self._semantic_index.rebuild_lookup_tables()
                 self._semantic_index.save(self._semantic_index_path)
         except LoraSemanticError as exc:
             self._semantic_index_error = str(exc)
@@ -706,9 +816,37 @@ class ComfyAnimaPlugin(Star):
             self._lora_archiver = LoraArchiveService(
                 self._persistent_data_dir / "lora_archive.json"
             )
+        try:
+            config = self._migrate_and_writeback_consolidated_config(config)
+        except Exception:
+            self._close_startup_resources_on_failure()
+            raise
         self.settings = PluginSettings.from_mapping(config)
+        self._intent_decision_ledger = IntentDecisionLedger(
+            self._persistent_data_dir / "intent_judge_decisions_v1.jsonl",
+            public_version=PLUGIN_VERSION,
+            internal_target_version=INTERNAL_BUILD_ID,
+        )
         self.settings = self._force_deferred_29b_to_legacy(self.settings)
         self.config = self._canonical_legacy_config(self.settings, config)
+        self._user_picture_preferences: Optional[UserPicturePreferencesStore] = None
+        self._user_picture_preferences_error = ""
+        if getattr(self.settings, "enable_user_picture_preferences", False):
+            try:
+                self._user_picture_preferences = UserPicturePreferencesStore(
+                    self._persistent_data_dir / "user_picture_preferences_v1.json",
+                    ttl_seconds=float(
+                        getattr(self.settings, "user_picture_preferences_ttl", 0)
+                        or 0
+                    ),
+                )
+            except UserPicturePreferencesError as exc:
+                self._user_picture_preferences_error = str(exc)
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 用户图片偏好持久化初始化失败，偏好功能停用: {exc}"
+                )
+            else:
+                self._user_picture_preferences_error = ""
         self._ensure_builtin_environment_profiles()
         self._model_profile_error = self._model_profile_contract_error(self.settings)
         self._danbooru_index = DanbooruTagIndex(
@@ -1836,7 +1974,7 @@ class ComfyAnimaPlugin(Star):
     def _chat_draw_protocol_buffering_enabled(self) -> bool:
         """Return whether ordinary-chat picture controls require safe transport."""
 
-        return bool(getattr(self.settings, "enable_llm_pic_trigger", False))
+        return self._natural_draw_enabled()
 
     def _chat_draw_terminal_guard_enabled(self) -> bool:
         """Return whether picture-control terminal validation is required."""
@@ -1845,6 +1983,42 @@ class ComfyAnimaPlugin(Star):
         # protocol.  Keeping it behind a second switch can leak a partial
         # control tag and silently skip ComfyUI submission.
         return self._chat_draw_protocol_buffering_enabled()
+
+    def _user_picture_preference(self, event: AstrMessageEvent) -> Optional[dict[str, Any]]:
+        """Return the sender's persisted picture preference when enabled."""
+        store = getattr(self, "_user_picture_preferences", None)
+        if store is None:
+            return None
+        user_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
+        if not user_id:
+            return None
+        try:
+            return store.get_preference(user_id)
+        except UserPicturePreferencesError as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 用户图片偏好读取失败: {type(exc).__name__}"
+            )
+            return None
+
+    def _save_user_picture_preference(
+        self,
+        event: AstrMessageEvent,
+        preference: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Persist the sender's picture preference when the feature is enabled."""
+        store = getattr(self, "_user_picture_preferences", None)
+        if store is None:
+            return None
+        user_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
+        if not user_id:
+            return None
+        try:
+            return store.save_preference(user_id, preference)
+        except (UserPicturePreferencesError, ValueError) as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 用户图片偏好保存失败: {type(exc).__name__}"
+            )
+            return None
 
     @staticmethod
     def _new_chat_draw_terminal_trace(*, intent: bool) -> dict[str, Any]:
@@ -1888,6 +2062,114 @@ class ComfyAnimaPlugin(Star):
             allocate_run_id=lambda: uuid4().hex
         )
 
+    def _single_character_authority(self, message: str) -> CharacterAuthority | None:
+        """Build CharacterAuthority for a single-character natural request."""
+
+        subject = self._requested_subject_hint(str(message or ""))
+        if not subject:
+            return None
+        preset = self._subject_character_preset(subject)
+        anchor = (
+            str(preset.identity_anchor or preset.name or "").strip()
+            if preset is not None
+            else subject
+        )
+        return CharacterAuthority(identity_anchor=anchor)
+
+    def _subject_character_preset(self, subject: str) -> LoraPreset | None:
+        """Return the saved character preset matching a detected subject."""
+
+        folded = str(subject or "").strip().casefold()
+        if not folded:
+            return None
+        preset_store = getattr(self, "_lora_presets", None)
+        if preset_store is None:
+            return None
+        candidates = []
+        for preset in preset_store.list_presets(
+            category=PRESET_CATEGORY_CHARACTER
+        ):
+            hay = " ".join(
+                (
+                    preset.name,
+                    preset.character_canonical,
+                    preset.work_canonical,
+                    preset.identity_anchor,
+                    *preset.aliases,
+                )
+            ).casefold()
+            if folded in hay or hay in folded:
+                candidates.append(preset)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _preset_authorizes_subject(self, subject: str) -> bool:
+        """Return whether a saved character preset makes its identity authoritative.
+
+        A contract-enabled character preset with both an identity anchor and
+        required trigger terms is the user's explicit identity source. In that
+        case the exact Danbooru identity-binding gate is not required.
+        """
+
+        preset = self._subject_character_preset(subject)
+        return bool(
+            preset is not None
+            and preset.contract_enabled
+            and str(preset.identity_anchor or "").strip()
+            and tuple(preset.required_trigger_terms or ())
+        )
+
+    def _authorized_character_preset_lora_names(self) -> frozenset[str]:
+        """Return normalized LoRA names owned by contract-enabled character presets."""
+        names: set[str] = set()
+        registry = getattr(self, "_lora_presets", None)
+        if registry is None:
+            return frozenset()
+        try:
+            presets = registry.list_presets(category=PRESET_CATEGORY_CHARACTER)
+        except Exception:
+            presets = ()
+        for preset in presets or ():
+            if not (
+                getattr(preset, "contract_enabled", False)
+                and str(getattr(preset, "identity_anchor", "") or "").strip()
+                and tuple(getattr(preset, "required_trigger_terms", ()) or ())
+            ):
+                continue
+            for selection in getattr(preset, "selections", ()) or ():
+                name = str(getattr(selection, "name", "") or "").strip()
+                if name:
+                    names.add(canonical_lora_name(name).casefold())
+        return frozenset(names)
+
+    @staticmethod
+    def _find_subject_lora_by_alias(records: tuple[Any, ...], subject: str) -> Any:
+        """Fallback selection by file name / alias when semantic index lacks the record."""
+
+        folded = str(subject or "").strip().casefold()
+        if not folded:
+            return None
+        candidates = []
+        for record in records:
+            hay = " ".join(
+                (
+                    str(getattr(record, "name", "") or ""),
+                    str(getattr(record, "model_name", "") or ""),
+                    *(
+                        str(alias)
+                        for alias in (getattr(record, "aliases", ()) or ())
+                    ),
+                )
+            ).casefold()
+            if folded in hay:
+                candidates.append(record)
+        if not candidates and folded == "达妮娅":
+            for record in records:
+                if "denia" in str(getattr(record, "name", "") or "").casefold():
+                    candidates.append(record)
+        return candidates[0] if len(candidates) == 1 else None
+
     async def _subject_lora_selections(
         self,
         subject: str,
@@ -1903,12 +2185,15 @@ class ComfyAnimaPlugin(Star):
             return (), False, ()
         try:
             records = await self._lora_catalog.refresh_for_operation()
-            record = resolve_character_record(
-                records,
-                subject,
-                self._runtime_semantic_index(),
-                allow_equivalent_variants=False,
-            )
+            try:
+                record = resolve_character_record(
+                    records,
+                    subject,
+                    self._runtime_semantic_index(),
+                    allow_equivalent_variants=False,
+                )
+            except CharacterSwapError:
+                record = self._find_subject_lora_by_alias(records, subject)
         except (CharacterSwapError, LoraCatalogError, OSError, ValueError):
             return (), False, ()
         if record is None:
@@ -1931,10 +2216,17 @@ class ComfyAnimaPlugin(Star):
             for alias in getattr(semantic_entry, "aliases", ()) or ():
                 alias = getattr(alias, "value", alias)
                 alias = str(alias or "").strip()
-                if alias and alias.isascii() and " " in alias:
+                if alias and alias.isascii():
                     aliases.append(alias)
+            if not aliases:
+                for alias in getattr(record, "aliases", ()) or ():
+                    alias = str(alias or "").strip()
+                    if alias and alias.isascii():
+                        aliases.append(alias)
             aliases.sort(key=len, reverse=True)
-            activation_terms = (aliases[0],) if aliases else ()
+            if aliases:
+                with_space = next((alias for alias in aliases if " " in alias), "")
+                activation_terms = (with_space or aliases[0],)
         return (
             (LoraSelection(name=record.name, strength=0.8),),
             exact_binding_ok,
@@ -1964,15 +2256,56 @@ class ComfyAnimaPlugin(Star):
 
         source = str(message or "").strip()
         role_match = re.search(
-            r"角色(?:是|为|换成|改成)\s*([A-Za-z0-9_\-]{1,32})",
+            r"角色(?:是|为|换成|改成)[\s:：]*"
+            r"(.{1,60}?)(?=[，。！？!?,;；\n]|--|$)",
             source,
-            flags=re.IGNORECASE,
         )
         if role_match:
-            return role_match.group(1).strip(" ，。.!！?？")
+            raw = role_match.group(1).strip()
+            # “来自/from <作品> 的 <名字>”只保留名字部分
+            qualified = re.sub(
+                r"^(?:来自|from)\s*[^的]{1,60}的\s*",
+                "",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if qualified.strip():
+                raw = qualified
+            # 翻译管道可能残留 from 前缀或结尾的作品括号
+            raw = re.sub(r"^(?:来自|from)\s+", "", raw, flags=re.IGNORECASE)
+            # Danbooru 括号形式 elaina_(majo_no_tabitabi) 视为普通作品注释
+            raw = re.sub(
+                r"_\([^\)）]{0,60}[\)）]\s*$",
+                "",
+                raw,
+            )
+            raw = re.sub(
+                r"[\(（][^\)）]{0,60}[\)）]\s*$",
+                "",
+                raw,
+            )
+            cleaned = " ".join(raw.split()).strip(" ，。.!！?？").rstrip("_-.")
+            if cleaned and re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_\- ]{0,48}",
+                cleaned,
+            ):
+                return cleaned
         folded = source.casefold().replace("（", "(").replace("）", ")")
         index = getattr(self, "_semantic_index", None)
         if index is not None:
+            alias_lookup = getattr(index, "alias_lookup", None)
+            if alias_lookup:
+                best_alias = ""
+                for alias in alias_lookup:
+                    if (
+                        len(alias) >= 2
+                        and alias in folded
+                        and not alias.startswith(("character", "style"))
+                        and len(alias) > len(best_alias)
+                    ):
+                        best_alias = alias
+                if best_alias:
+                    return best_alias
             entries = getattr(index, "entries", ()) or ()
             if isinstance(entries, Mapping):
                 entries = tuple(entries.values())
@@ -2018,10 +2351,33 @@ class ComfyAnimaPlugin(Star):
     def _build_auto_draw_intent_plan(
         self,
         message: str,
+        *,
+        gate_payload: Mapping[str, Any] | None = None,
     ) -> IntentPlan:
-        """Build the deterministic probe plan for an ordinary-chat request."""
+        """Build the deterministic probe plan for an ordinary-chat request.
 
-        decision = classify_chat_intent(message)
+        When ``gate_payload`` is provided, the intent judge result is the
+        authoritative decision and the legacy deterministic classifier is
+        not consulted.
+        """
+
+        if isinstance(gate_payload, Mapping):
+            draw_now = gate_payload.get("decision") == DRAW_NOW
+            decision = ChatIntentDecision(
+                intent=INTENT_DRAW_NEW if draw_now else INTENT_QUERY_ONLY,
+                visual_delivery=draw_now,
+                needs_previous_image=False,
+                confidence=float(gate_payload.get("confidence") or 0.0),
+                source="intent_judge_gate",
+                rationale=str(gate_payload.get("reason") or ""),
+            )
+        else:
+            decision = classify_chat_intent(
+                message,
+                enable_visual_task_intent=bool(
+                    getattr(self.settings, "enable_visual_task_intent", True)
+                ),
+            )
         subject = self._requested_subject_hint(message)
         identity_required = bool(subject) and not is_original_character_query(
             subject
@@ -2031,6 +2387,9 @@ class ComfyAnimaPlugin(Star):
             decision=decision,
             requested_subject=subject,
             identity_required=identity_required,
+            enable_visual_task_intent=bool(
+                getattr(self.settings, "enable_visual_task_intent", True)
+            ),
         )
 
     def _director_verified_lora_names(self) -> tuple[str, ...]:
@@ -2066,9 +2425,16 @@ class ComfyAnimaPlugin(Star):
         *,
         subject_probe_available: bool = False,
     ) -> Any:
-        """Resolve the named subject before probes or generation; fail closed."""
+        """Resolve the named subject before probes or generation.
+
+        A unique verified binding is authoritative when available. Missing or
+        ambiguous bindings degrade to the tag-only flow instead of failing the
+        whole job, so characters without a local LoRA still generate.
+        """
 
         if not plan.identity_required or not plan.requested_subject:
+            return None
+        if self._preset_authorizes_subject(plan.requested_subject):
             return None
         evidence: list[dict[str, Any]] = []
         try:
@@ -2076,32 +2442,48 @@ class ComfyAnimaPlugin(Star):
         except Exception:
             index = None
         if index is not None:
-            for entry in getattr(index, "entries", ()) or ():
-                canonical = (
-                    getattr(entry, "character_canonical", "")
-                    or getattr(entry, "canonical", "")
-                ).strip()
-                if not canonical:
-                    continue
-                evidence.append(
-                    {
-                        "name": str(getattr(entry, "name", "") or "").strip(),
-                        "alias": str(getattr(entry, "alias", "") or "").strip(),
-                        "canonical": canonical,
-                        "work": str(getattr(entry, "work", "") or "").strip(),
-                        "activation_terms": tuple(
-                            getattr(entry, "activation_terms", ()) or ()
-                        ),
-                    }
-                )
+            entries = getattr(index, "entries", ()) or ()
+            if isinstance(entries, Mapping):
+                entries = tuple(entries.values())
+            subject_key = " ".join(
+                str(plan.requested_subject or "").strip().casefold().split()
+            )
+            candidate_keys: set[str] = set()
+            canonical_lookup = getattr(index, "canonical_lookup", None) or {}
+            alias_lookup = getattr(index, "alias_lookup", None) or {}
+            candidate_keys.update(canonical_lookup.get(subject_key, ()))
+            candidate_keys.update(alias_lookup.get(subject_key, ()))
+            if candidate_keys:
+                entries = [
+                    entry
+                    for key, entry in index.entries.items()
+                    if key in candidate_keys
+                ]
+            for entry in entries:
+                bindings = getattr(entry, "identity_bindings", ()) or ()
+                for binding in bindings:
+                    evidence.append(
+                        {
+                            "name": str(
+                                getattr(entry, "canonical_name", "") or ""
+                            ).strip(),
+                            "alias": str(
+                                getattr(entry, "canonical_name", "") or ""
+                            ).strip(),
+                            "canonical": str(
+                                getattr(binding, "character_canonical", "") or ""
+                            ).strip(),
+                            "work": str(
+                                getattr(binding, "copyright_canonical", "") or ""
+                            ).strip(),
+                            "activation_terms": tuple(
+                                getattr(binding, "activation_terms", ()) or ()
+                            ),
+                        }
+                    )
         if not evidence:
-            if not subject_probe_available:
-                raise PromptDirectorError(
-                    "已点名角色但当前运行时不具备主体解析工具，本次未生成图片",
-                    "subject_probe_unavailable",
-                    fatal=True,
-                )
-            # No cached binding yet: the required subject probe must run first.
+            # 未缓存绑定：交给主体探针（Danbooru 工具）处理；工具不可用时
+            # 也直接走 Tag 流程，不再整单拒绝。
             return None
         try:
             return resolve_requested_subject_binding(
@@ -2109,11 +2491,111 @@ class ComfyAnimaPlugin(Star):
                 evidence=evidence,
             )
         except IdentityBindingError as exc:
-            raise PromptDirectorError(
-                "已明确选择的角色尚未建立唯一 Danbooru 身份绑定，本次未生成图片",
-                f"identity_binding_failed: {exc}",
-                fatal=True,
-            ) from exc
+            # 唯一绑定失败时不整单失败：跳过身份强绑定，仅按 Tag 流程出图。
+            logger.warning(
+                f"[{PLUGIN_NAME}] subject binding unresolved: "
+                f"subject={plan.requested_subject!r}, detail={exc}"
+            )
+            return None
+
+    def _subject_appearance_anchors(
+        self,
+        binding: Any,
+        *,
+        user_text: str = "",
+        limit: int = 6,
+    ) -> tuple[str, ...]:
+        """Return verified profile anchors for one bound subject.
+
+        Slots the user explicitly customizes (hair/eye color language) are
+        dropped so the profile never overrides an explicit request; the
+        remaining anchors are enforced by the picture director.
+        """
+
+        if binding is None:
+            return ()
+        canonical = str(getattr(binding, "canonical", "") or "").strip()
+        if not canonical:
+            return ()
+        store = getattr(self, "_character_appearance_profiles", None)
+        if store is None:
+            return ()
+        try:
+            profile = store.get(canonical)
+        except (OSError, TypeError, ValueError):
+            return ()
+        if profile is None:
+            return ()
+        tags = self._filter_character_appearance_overrides(
+            profile.appearance_tags,
+            user_text,
+        )
+        return tuple(tags[: max(1, int(limit))])
+
+    @staticmethod
+    def _unique_archive_character_record(
+        name: str,
+        records: Sequence[Any],
+        *,
+        work_hints: Sequence[str] = (),
+    ) -> Any:
+        """Return one archived character record matching the name and work.
+
+        The Danbooru index may return several candidate identities for a
+        newer character. When exactly one local LoRA archive record matches
+        the requested name and its source work agrees with the user's work
+        hint, the archive is the identity authority. Returns ``None``
+        otherwise.
+        """
+
+        want = normalize_tag(name)
+        if not want:
+            return None
+        hint_works = {
+            normalize_tag(work)
+            for work in work_hints
+            if str(work or "").strip() and normalize_tag(str(work))
+        }
+        matches: list[Any] = []
+
+        def identity_root(record: Any) -> str:
+            c_name = canonical_lora_name(str(getattr(record, "name", "")))
+            companion = canonical_lora_name(
+                str(getattr(record, "companion_variant", "") or "")
+            )
+            if companion and re.search(
+                r"[-_](?:29b(?:_40l)?|40l)$",
+                c_name,
+                flags=re.IGNORECASE,
+            ):
+                return companion
+            return c_name
+
+        for record in records:
+            names = {
+                normalize_tag(str(getattr(record, "character_name", "") or ""))
+            }
+            for alias in getattr(record, "aliases", ()) or ():
+                value = normalize_tag(str(getattr(alias, "value", alias) or ""))
+                if value:
+                    names.add(value)
+            names.discard("")
+            if want not in names:
+                continue
+            record_works = {
+                normalize_tag(part)
+                for part in re.split(
+                    r"[/|、,，]",
+                    str(getattr(record, "source_work", "") or ""),
+                )
+                if normalize_tag(part)
+            }
+            if hint_works and record_works and not (hint_works & record_works):
+                continue
+            matches.append(record)
+        if len({identity_root(record) for record in matches}) == 1 and matches:
+            return matches[0]
+        return None
 
     def _ensure_chat_draw_terminal_trace(
         self,
@@ -2648,10 +3130,17 @@ class ComfyAnimaPlugin(Star):
                 output = Path(receipt.output_path)
                 actual_sha = ""
                 if output.is_file():
-                    try:
-                        actual_sha = hashlib.sha256(output.read_bytes()).hexdigest()
-                    except OSError:
-                        actual_sha = ""
+                    if receipt.output_sha256:
+                        actual_sha = receipt.output_sha256
+                    else:
+                        try:
+                            actual_sha = await asyncio.to_thread(
+                                lambda: hashlib.sha256(
+                                    output.read_bytes()
+                                ).hexdigest()
+                            )
+                        except OSError:
+                            actual_sha = ""
                 if not output.is_file():
                     evidence_error = "output_file_missing"
                 elif actual_sha != receipt.output_sha256:
@@ -2681,13 +3170,13 @@ class ComfyAnimaPlugin(Star):
                 event, run_state.run_id
             )
             if self._task_store is not None and run_state.run_id:
-                self._task_store.append_event(
+                await self._task_store.append_event_async(
                     run_state.run_id,
                     "delivery",
                     "图片发送回执已确认。",
                     event_code="image_delivery_confirmed",
                 )
-                self._task_store.finish_task(
+                await self._task_store.finish_task_async(
                     run_state.run_id,
                     "succeeded",
                     completed_items=1,
@@ -2842,7 +3331,9 @@ class ComfyAnimaPlugin(Star):
         event: AstrMessageEvent,
     ) -> str:
         if not self._director:
-            raise PromptDirectorError("LLM 分镜模块不可用", self._director_error or "")
+            raise PromptDirectorError(
+            "【绘图导演思考模型】LLM 分镜模块不可用", self._director_error or ""
+        )
         source = str(getattr(event, "message_str", "") or "")
         trace = self._chat_draw_terminal_trace(event) or {}
         evidence = list(trace.get("evidence") or ())[:6]
@@ -2913,7 +3404,7 @@ class ComfyAnimaPlugin(Star):
         keep_snapshot = False
         try:
             raw_text = str(getattr(resp, "completion_text", "") or "")
-            immersive = bool(getattr(self.settings, "director_primary", False))
+            immersive = self._natural_draw_enabled()
 
             def _roleplay_base() -> str:
                 if not immersive:
@@ -3005,7 +3496,9 @@ class ComfyAnimaPlugin(Star):
             try:
                 repaired_text = await self._repair_chat_draw_terminal(event)
                 if not self._strict_chat_picture_terminal(repaired_text):
-                    raise PromptDirectorError("终止协议修复没有返回唯一 pic 标签")
+                    raise PromptDirectorError(
+            "【绘图导演思考模型】终止协议修复没有返回唯一 pic 标签"
+        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3070,7 +3563,8 @@ class ComfyAnimaPlugin(Star):
         Args:
             keyword(string): 可选搜索词，如角色名、画风、服装或作者名。
             limit(number): 最多返回多少项，建议 10 到 50。
-            refresh(boolean): 兼容旧提示词；当前版本无论取值都强制刷新 Manager。
+            refresh(boolean): 为 true 时强制刷新 Manager 与 ComfyUI object_info；
+                为 false（默认）时复用任务 snapshot 或目录缓存。
             detail(boolean): 需要完整说明、推荐权重或详细触发词时设为 true。
         """
         if not self._lora_catalog:
@@ -3079,6 +3573,7 @@ class ComfyAnimaPlugin(Star):
             records = await self._refresh_lora_for_task(
                 "LLM 查询 LoRA",
                 event=event,
+                force=bool(refresh),
             )
             effective_limit = max(
                 1,
@@ -3115,7 +3610,7 @@ class ComfyAnimaPlugin(Star):
             if callable(formatter):
                 formatted = await formatter(
                     ranked,
-                    force_refresh=True,
+                    force_refresh=bool(refresh),
                     detail=bool(detail),
                     retrieval_info=diagnostics,
                 )
@@ -3133,7 +3628,7 @@ class ComfyAnimaPlugin(Star):
                             f"work: {binding.copyright_canonical or 'none'} | "
                             f"activation-only: {activation}"
                         )
-                if binding_lines:
+                if detail and binding_lines:
                     formatted += (
                         "\nIdentity bindings (file and activation names are not "
                         "Character tags):\n"
@@ -3161,6 +3656,7 @@ class ComfyAnimaPlugin(Star):
         keyword: str = "",
         category: str = "",
         detail: bool = False,
+        limit: int = 20,
     ) -> str:
         """查询管理员保存的角色、画师/风格或混合 LoRA 组合。
 
@@ -3168,6 +3664,7 @@ class ComfyAnimaPlugin(Star):
             keyword(string): 组合名称、用途、触发词或 LoRA 文件名搜索词。
             category(string): 可选分类：角色、风格、画师或混合。
             detail(boolean): 是否返回组合说明。
+            limit(number): 最多返回多少个预设，默认 20。
         """
         try:
             records = await self._refresh_lora_for_task(
@@ -3200,10 +3697,15 @@ class ComfyAnimaPlugin(Star):
                     invalid_names.append(preset.name)
                 else:
                     valid_presets.append(preset)
+            effective_limit = max(1, int(limit))
+            shown_presets = valid_presets[:effective_limit]
+            truncated = max(0, len(valid_presets) - len(shown_presets))
             result = self._lora_presets.format_selected_for_llm(
-                valid_presets,
+                shown_presets,
                 detail=bool(detail),
             )
+            if truncated:
+                result += f"\n… and {truncated} more presets"
             if invalid_names:
                 result += (
                     "\nUnavailable presets omitted after mandatory fresh validation: "
@@ -3274,14 +3776,171 @@ class ComfyAnimaPlugin(Star):
             "The preset is now available in WebUI and survives plugin reload."
         )
 
+    @filter.on_llm_request(priority=25)
+    async def intent_router_gate(self, event: AstrMessageEvent, req: Any) -> None:
+        """Run real intent judgment once before the Agent and store result.
+
+        AstrBot executes ``on_llm_request`` hooks in descending priority
+        order; this gate must run before ``inject_auto_draw_prompt`` (20) so
+        the injection sees the verdict of the SAME message instead of a
+        stale or missing one.
+
+        This gate is the single semantic decision point for natural-language
+        drawing. Explicit command paths are handled separately; this hook only
+        records a verdict that ``_natural_language_draw_impl`` and
+        ``on_decorating_result`` must respect.
+        """
+        del req
+        if (
+            str(getattr(self.settings, "intent_router_gate_mode", "on"))
+            .strip()
+            .casefold()
+            != "on"
+        ):
+            return
+        getter = getattr(event, "get_extra", None)
+        if callable(getter):
+            try:
+                if bool(getter(_INTENT_ROUTER_GATE_DONE_KEY, False)):
+                    return
+            except (TypeError, ValueError):
+                pass
+        message = str(getattr(event, "message_str", "") or "").strip()
+        judge = self._build_intent_judge_service()
+        result = None
+        decision_id = ""
+        result_hash = ""
+        ledger_error = ""
+        user_hash = self._event_user_id_hash(event)
+        context_hash = ""
+        context_source = ""
+        if judge is not None and not message.startswith(("/", "／")):
+            bot_context = ""
+            context_source = ""
+            try:
+                context = await scene_context_from_event(
+                    event,
+                    recent_limit=int(
+                        getattr(self.settings, "scene_context_window", 8)
+                    ),
+                    memory_limit=int(
+                        getattr(
+                            self.settings, "scene_extraction_max_memories", 5
+                        )
+                    ),
+                )
+                parts = []
+                if context.get("persona_name"):
+                    parts.append(f"Persona: {context['persona_name']}")
+                if context.get("recent_messages"):
+                    parts.append(
+                        "Recent context:\n"
+                        + "\n".join(context["recent_messages"][-8:])
+                    )
+                memories = context.get("memories") or ()
+                if memories:
+                    parts.append(
+                        "Memories:\n"
+                        + "\n".join(str(item) for item in memories[:5])
+                    )
+                source_parts = list(str(item) for item in context.get("sources", ()))
+                if context.get("persona_name"):
+                    source_parts.append("persona")
+                if context.get("recent_messages"):
+                    source_parts.append("conversation")
+                if memories:
+                    source_parts.append("memory")
+                context_source = ",".join(
+                    dict.fromkeys(part for part in source_parts if part)
+                )
+                bot_context = "\n".join(parts)
+            except Exception:
+                bot_context = ""
+            ledger = getattr(self, "_intent_decision_ledger", None)
+            user_hash = self._event_user_id_hash(event)
+            context_hash = hashlib.sha256(
+                str(bot_context or "").encode("utf-8")
+            ).hexdigest()
+            if ledger is not None:
+                try:
+                    decision_id = ledger.start(
+                        user_message=message,
+                        user_id_hash=user_hash,
+                        context_hash=context_hash,
+                        context_source=context_source,
+                    )
+                except Exception as exc:
+                    ledger_error = f"ledger_start_failed:{type(exc).__name__}"
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] intent decision ledger start failed: {exc}"
+                    )
+            if not ledger_error:
+                try:
+                    result = await judge.judge(message, "", bot_context)
+                except Exception as exc:
+                    result = IntentJudgeResult(
+                        decision=NO_DRAW,
+                        confidence=0.0,
+                        backend_used="uncaught",
+                        reason=f"judge_failed:{type(exc).__name__}",
+                        latency_ms=0.0,
+                    )
+                if ledger is not None and decision_id:
+                    try:
+                        result_hash = ledger.result(decision_id, result)
+                    except Exception as exc:
+                        ledger_error = f"ledger_result_failed:{type(exc).__name__}"
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] intent decision ledger result failed: {exc}"
+                        )
+        if ledger_error:
+            result = None
+            decision_id = ""
+            result_hash = ""
+        payload = {
+            "status": (
+                ledger_error
+                if ledger_error
+                else ("judged" if result is not None else "unavailable")
+            ),
+            "decision": result.decision if result is not None else NO_DRAW,
+            "decision_id": decision_id,
+            "result_hash": result_hash,
+            "user_message_hash": hashlib.sha256(
+                str(message or "").encode("utf-8")
+            ).hexdigest(),
+            "user_id_hash": user_hash,
+            "session_id_hash": self._event_session_id_hash(event),
+            "context_hash": context_hash,
+            "context_source": context_source,
+            "public_version": PLUGIN_VERSION,
+            "internal_target_version": INTERNAL_BUILD_ID,
+            "confidence": result.confidence if result is not None else 0.0,
+            "backend_used": result.backend_used if result is not None else "none",
+            "reason": (
+                ledger_error
+                if ledger_error
+                else (
+                    result.reason if result is not None else "judge_unavailable"
+                )
+            ),
+            "latency_ms": result.latency_ms if result is not None else 0.0,
+            "trace": result.trace if result is not None else {},
+            "once": True,
+        }
+        setter = getattr(event, "set_extra", None)
+        if callable(setter):
+            setter(_INTENT_ROUTER_GATE_DONE_KEY, True)
+            setter(_INTENT_ROUTER_GATE_EXTRA_KEY, payload)
+
     @filter.on_llm_request(priority=20)
     async def inject_auto_draw_prompt(self, event: AstrMessageEvent, req: Any) -> None:
         """向普通对话 LLM 注入可编辑的 pic 标签协议。"""
-        if not self.settings.enable_llm_pic_trigger:
+        if not self._natural_draw_enabled():
             return
         orchestrator = self._get_drawing_orchestrator()
         active = orchestrator.has_any_umo_drawing()
-        director_primary = bool(getattr(self.settings, "director_primary", False))
+        director_primary = self._natural_draw_enabled()
         keys = self._event_drawing_keys(event)
         internal = id(event) in self._internal_llm_events
         logger.info(
@@ -3328,12 +3987,6 @@ class ComfyAnimaPlugin(Star):
                     f"[{PLUGIN_NAME}] director_primary immersive tool isolation applied"
                 )
         message = str(getattr(event, "message_str", "") or "")
-        strict_mode = (
-            str(getattr(self.settings, "interaction_mode", "smart"))
-            .strip()
-            .casefold()
-            == "strict"
-        )
         request_prompt = str(getattr(req, "prompt", "") or "")
 
         recipe = None
@@ -3374,50 +4027,44 @@ class ComfyAnimaPlugin(Star):
                         )
                         self._set_chat_draw_terminal_trace(event, existing_trace)
                 return
-        follow_detections, follow_debug = detect_follow_up_draw_requests(
-            request_prompt,
-            has_recipe=recipe is not None,
-            strict=strict_mode,
-        )
-        decision = classify_chat_intent(
-            message,
-            has_recipe=recipe is not None,
-            strict=strict_mode,
-        )
-        effective_intent = decision.intent
-        effective_visual_delivery = decision.visual_delivery
+        gate_payload = self._event_intent_gate_result(event)
+        if not (
+            isinstance(gate_payload, Mapping)
+            and gate_payload.get("decision") == DRAW_NOW
+        ):
+            trace = self._ensure_chat_draw_terminal_trace(event, intent=False)
+            trace["intent_source"] = "intent_judge_gate"
+            trace["terminal_state"] = "no_draw"
+            # 未通过意图判断就是一次普通闲聊：不打扰用户，只在插件日志留痕。
+            logger.info(
+                f"[{PLUGIN_NAME}] intent gate: no_draw, not submitting to ComfyUI"
+            )
+            self._set_chat_draw_terminal_trace(event, trace)
+            return
+        effective_intent = INTENT_DRAW_NEW
+        effective_visual_delivery = True
         effective_message = message
-        follow_promoted = False
-        if follow_detections and not decision.visual_delivery and not follow_debug:
-            promoted = follow_detections[0]
-            effective_intent = INTENT_DRAW_NEW
-            effective_visual_delivery = True
-            effective_message = f"{message}\n[Follow-up drawing request] {promoted.text}"
-            follow_promoted = True
-        elif follow_debug and not decision.visual_delivery:
-            effective_intent = INTENT_DEBUG_ONLY
-            effective_visual_delivery = False
+
+        if effective_visual_delivery:
+            setter = getattr(event, "set_extra", None)
+            if callable(setter):
+                setter("enable_streaming", False)
 
         trace = self._ensure_chat_draw_terminal_trace(
             event,
-            intent=effective_visual_delivery
-            or effective_intent in {INTENT_QUERY_ONLY, INTENT_DEBUG_ONLY},
+            intent=effective_visual_delivery,
         )
-        trace["intent_source"] = (
-            "follow_up_notice" if follow_promoted else decision.source
-        )
+        trace["intent_source"] = "intent_judge_gate"
         trace["terminal_state"] = effective_intent
+        trace["decision_id"] = str(gate_payload.get("decision_id") or "")
         trace["decision"] = {
             "intent": effective_intent,
             "visual_delivery": effective_visual_delivery,
-            "needs_previous_image": decision.needs_previous_image,
-            "confidence": decision.confidence,
+            "needs_previous_image": False,
+            "confidence": float(gate_payload.get("confidence") or 0.0),
+            "backend_used": str(gate_payload.get("backend_used") or ""),
+            "reason": str(gate_payload.get("reason") or ""),
         }
-        if follow_promoted:
-            trace["follow_up_draw"] = {
-                "text": follow_detections[0].text[:200],
-                "source": "follow_up_notice",
-            }
         if recipe is not None:
             trace["recipe"] = {
                 "last_run_id": recipe.last_run_id,
@@ -3569,7 +4216,7 @@ class ComfyAnimaPlugin(Star):
 
     async def _render_llm_picture_tags_impl(self, event: AstrMessageEvent) -> None:
         """移除 think/pic 控制标签，并把 pic 标签替换为生成图片。"""
-        if not self.settings.enable_llm_pic_trigger or not self._director:
+        if not self._natural_draw_enabled() or not self._director:
             return
         result = event.get_result()
         if not result or not getattr(result, "chain", None):
@@ -3597,9 +4244,27 @@ class ComfyAnimaPlugin(Star):
             self._clean_intermediate_chat_draw_controls(event, result)
             return
 
+        gate_payload = self._event_intent_gate_result(event)
+        gate_ok = (
+            isinstance(gate_payload, Mapping)
+            and gate_payload.get("decision") == DRAW_NOW
+        )
+        explicit_command = (
+            str(getattr(event, "message_str", "") or "").startswith(("/", "／"))
+            or self._event_has_explicit_command_route(event)
+        )
         if not any(
             token in raw_text.lower() for token in ("<pic", "<edit", "<think")
         ):
+            if not (gate_ok or explicit_command):
+                # SceneBridge must never bypass the semantic gate.
+                return
+            if await self._try_scene_bridge_draw(event, result, raw_text):
+                return
+            return
+
+        if not (gate_ok or explicit_command):
+            # <pic>/<edit>/<think> submission must also carry a draw_now gate.
             return
 
         if not self._get_drawing_orchestrator().legacy_submission_allowed(event):
@@ -3860,6 +4525,23 @@ class ComfyAnimaPlugin(Star):
                         for item in _manifest_lora_selections
                     ],
                 )
+            character_activation_overrides: tuple[tuple[str, str], ...] = ()
+            if recipe_obj is not None and not character_queries:
+                # P4 追画连续性：追画未声明角色时，沿用上一次成功出图的角色身份。
+                continuity_query = str(
+                    getattr(recipe_obj, "identity_anchor", "") or ""
+                ).strip()
+                continuity_lora = str(
+                    getattr(recipe_obj, "character_lora_name", "") or ""
+                ).strip()
+                if continuity_query and continuity_lora:
+                    character_queries = (continuity_query,)
+                    activation = (
+                        recipe_obj.required_triggers[0]
+                        if recipe_obj.required_triggers
+                        else continuity_query
+                    )
+                    character_activation_overrides = ((continuity_lora, activation),)
             try:
                 image_paths, seed, _, _, _ = await self._run_job(
                     event,
@@ -3875,14 +4557,15 @@ class ComfyAnimaPlugin(Star):
                         llm_character_queries=character_queries,
                         llm_character_user_request=str(event.message_str or ""),
                         llm_prompt_source="conversation_pic",
+                        lora_activation_overrides=character_activation_overrides,
                         preset_manifest=expected_manifest,
                     ),
                 )
             except DuplicateSubmissionError:
-                if not bool(getattr(self.settings, "director_primary", False)):
+                if not self._natural_draw_enabled():
                     new_chain.append(
                         Comp.Plain(
-                            f"{MessageEmoji.ERROR} 同一回复仅允许一次绘图提交（2.4.0 单图合同），"
+                            f"{MessageEmoji.ERROR} 同一回复仅允许一次绘图提交（2.1.306 Stage 1），"
                             "后续 prompt 已拒绝"
                         )
                     )
@@ -4087,7 +4770,7 @@ class ComfyAnimaPlugin(Star):
 
         message = str(event.message_str or "").strip()
         if (
-            not self.settings.enable_natural_draw
+            not self._natural_draw_enabled()
             or not message
             or self._event_has_explicit_command_route(event)
             or message.startswith(("/", "／"))
@@ -4326,19 +5009,58 @@ class ComfyAnimaPlugin(Star):
     ) -> AsyncGenerator[Any, None]:
         """识别“帮我画一个……”并使用所选 LLM 自动生成提示词。"""
         message = (event.message_str or "").strip()
+        natural_mode = str(
+            getattr(self.settings, "natural_draw_mode", "full")
+        ).strip().casefold()
         if (
-            not self.settings.enable_natural_draw
+            natural_mode == "off"
             or self._event_has_explicit_command_route(event)
             or message.startswith(("/", "／"))
-            or not (
-                self._looks_like_draw_command(message)
-                or self._looks_like_photo_delivery_request(message)
-            )
         ):
             return
+        judge_result = None
+        stored = self._event_intent_gate_result(event)
+        if stored and stored.get("decision"):
+            judge_result = types.SimpleNamespace(
+                decision=stored.get("decision"),
+                confidence=stored.get("confidence", 0.0),
+                backend_used=stored.get("backend_used", ""),
+                reason=stored.get("reason", ""),
+                latency_ms=stored.get("latency_ms", 0.0),
+                trace=stored.get("trace", {}),
+            )
+        if judge_result is None or judge_result.decision != DRAW_NOW:
+            return
+        if not (
+            self._looks_like_draw_command(message)
+            or self._looks_like_photo_delivery_request(message)
+            or self._has_multi_character_signal(message)
+        ):
+            return
+        if has_visual_intent(message) and bool(
+            getattr(
+                self.settings,
+                "scene_extraction",
+                getattr(self.settings, "scene_extraction", True),
+            )
+        ):
+            if hasattr(event, "get_extra") and hasattr(event, "set_extra"):
+                try:
+                    ledger = self._response_ledger(event)
+                    envelope = ledger.ensure_envelope(
+                        allocate_run_id=lambda: uuid4().hex
+                    )
+                    if envelope.draw_bundle is None:
+                        ledger.new_bundle(BundleKind.DRAW)
+                except BundleOwnershipError:
+                    pass
+            return
+        multi_names = self._detect_multi_character_names(message)
+        multi_signal = self._has_multi_character_signal(message)
         if (
-            bool(getattr(self.settings, "director_primary", False))
+            self._natural_draw_enabled()
             and not self._looks_like_draw_command(message)
+            and not (multi_signal and not self._looks_like_photo_delivery_request(message))
         ):
             # Photo-delivery-only phrasing is the immersive chat contract's
             # job: no progress text, no stop_event, pre-created draw bundle.
@@ -4366,9 +5088,19 @@ class ComfyAnimaPlugin(Star):
             if access_error:
                 yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
                 return
+            if (
+                multi_signal
+                and not self._looks_like_draw_command(message)
+                and not self._looks_like_photo_delivery_request(message)
+            ):
+                async for response in self._handle_multi_character_draw(
+                    event, message, multi_names
+                ):
+                    yield response
+                return
             if not self._director:
                 yield event.plain_result(
-                    f"{MessageEmoji.ERROR} LLM 分镜模块不可用: {self._director_error}"
+                    f"{MessageEmoji.ERROR} 【绘图导演思考模型】LLM 分镜模块不可用: {self._director_error}"
                 )
                 return
             try:
@@ -4378,8 +5110,18 @@ class ComfyAnimaPlugin(Star):
                 yield event.plain_result(f"{MessageEmoji.ERROR} 请求参数错误: {exc}")
                 return
             style_preset = self._find_requested_style_preset(message)
+            subject_preset = self._subject_character_preset(
+                self._requested_subject_hint(message)
+            )
+            if subject_preset is not None:
+                style_preset = ",".join(
+                    part for part in (style_preset, subject_preset.name) if part
+                )
             self._ensure_response_envelope(event)
-            intent_plan = self._build_auto_draw_intent_plan(message)
+            intent_plan = self._build_auto_draw_intent_plan(
+                message,
+                gate_payload=self._event_intent_gate_result(event),
+            )
             yield event.plain_result(f"{MessageEmoji.DRAW} 正在分析画面并整理提示词……")
             director_started_at = time.monotonic()
             director_elapsed = 0.0
@@ -4404,6 +5146,21 @@ class ComfyAnimaPlugin(Star):
                 )
                 final_prompt = instruction.prompt
                 directed_negative = instruction.negative_prompt
+                authority = self._single_character_authority(message)
+                purity_mode = str(
+                    getattr(self.settings, "character_purity_mode", "smart")
+                ).strip().casefold()
+                if authority is not None and purity_mode != "off":
+                    forbidden = tuple(
+                        name
+                        for name in self._known_character_names()
+                        if name not in authority.allowed_canonicals()
+                    )
+                    purity = CharacterPurityFilter(forbidden).purify(
+                        final_prompt,
+                        authority,
+                    )
+                    final_prompt = purity.prompt
                 selected_pipeline = requested_pipeline or instruction.pipeline
                 final_access_error = self._access_error(event, final_prompt)
                 if final_access_error:
@@ -5838,7 +6595,10 @@ class ComfyAnimaPlugin(Star):
                 f"{MessageEmoji.ERROR} 整图改图反推失败: {exc.user_message}"
             )
             return
-        except (IncomingImageError, PromptDirectorError) as exc:
+        except IncomingImageError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 整图改图准备失败 (原图读取错误): {exc}")
+            return
+        except PromptDirectorError as exc:
             message = getattr(exc, "user_message", str(exc))
             logger.error(f"[{PLUGIN_NAME}] semantic redraw planning failed: {exc}", exc_info=True)
             yield event.plain_result(f"{MessageEmoji.ERROR} 整图改图准备失败: {message}")
@@ -5909,7 +6669,7 @@ class ComfyAnimaPlugin(Star):
             return
         if options.use_prompt_llm is not False and not self._director:
             yield event.plain_result(
-                f"{MessageEmoji.ERROR} LLM 分镜模块不可用: {self._director_error or '未知错误'}"
+                f"{MessageEmoji.ERROR} 【绘图导演思考模型】LLM 分镜模块不可用: {self._director_error or '未知错误'}"
             )
             return
 
@@ -6253,7 +7013,7 @@ class ComfyAnimaPlugin(Star):
             return
         if not self._director:
             yield event.plain_result(
-                f"{MessageEmoji.ERROR} LLM 分镜模块不可用: {self._director_error}"
+                f"{MessageEmoji.ERROR} 【绘图导演思考模型】LLM 分镜模块不可用: {self._director_error}"
             )
             return
         try:
@@ -6343,7 +7103,7 @@ class ComfyAnimaPlugin(Star):
         if normalized != "status":
             self._global_locked = normalized == "on"
             self._access_controller.set_global_lock(self._global_locked)
-            self._persist_config("global_lock", self._global_locked)
+            await self._persist_config("global_lock", self._global_locked)
         status_text = "已锁定（仅管理员可用）" if self._global_locked else "未锁定"
         yield event.plain_result(f"{MessageEmoji.INFO} ComfyUI 全局状态: {status_text}")
 
@@ -6490,7 +7250,7 @@ class ComfyAnimaPlugin(Star):
             yield event.plain_result(f"{MessageEmoji.ERROR} UNET 模型切换失败: {exc}")
             return
 
-        if not self._persist_config("unet_model_name", selected.name):
+        if not await self._persist_config("unet_model_name", selected.name):
             yield event.plain_result(
                 f"{MessageEmoji.ERROR} UNET 模型切换失败: 配置文件未能持久化"
             )
@@ -6556,7 +7316,7 @@ class ComfyAnimaPlugin(Star):
             f"{group}={filter_level}"
             for group, filter_level in sorted(self._group_block_levels.items())
         ]
-        self._persist_config("group_block_levels", serialized_levels)
+        await self._persist_config("group_block_levels", serialized_levels)
         yield event.plain_result(
             f"{MessageEmoji.SUCCESS} 当前群违禁词级别已设为 {selected.value}"
         )
@@ -6765,10 +7525,23 @@ class ComfyAnimaPlugin(Star):
             max_loras=self.settings.max_preset_loras,
         )
         if self._lora_catalog:
-            selections = await self._lora_catalog.resolve_selections(
-                selections,
-                strict=self.settings.strict_lora_validation,
+            resolver = getattr(
+                self._lora_catalog,
+                "resolve_selections_with_records",
+                None,
             )
+            if callable(resolver):
+                resolved_selections, records_by_name = await resolver(
+                    selections,
+                    strict=self.settings.strict_lora_validation,
+                )
+            else:
+                resolved_selections = await self._lora_catalog.resolve_selections(
+                    selections,
+                    strict=self.settings.strict_lora_validation,
+                )
+                records_by_name = {}
+            selections = resolved_selections
             classifications = await self._lora_catalog.classify_selections(selections)
             if (
                 category == PRESET_CATEGORY_ARTIST_STYLE
@@ -6783,6 +7556,24 @@ class ComfyAnimaPlugin(Star):
                     "风格串不能包含角色 LoRA，请把角色独立追加: "
                     + ", ".join(character_names)
                 )
+            if category == PRESET_CATEGORY_ARTIST_STYLE:
+                bound_names = sorted(
+                    {
+                        canonical_lora_name(record.name)
+                        for record in records_by_name.values()
+                        if (
+                            (entry := self._runtime_semantic_index().entry_for(record))
+                            is not None
+                            and entry.identity_bindings
+                        )
+                    },
+                    key=str.casefold,
+                )
+                if bound_names:
+                    raise LoraPresetError(
+                        "风格串包含已绑定角色身份的 LoRA，请改用角色或混合分类: "
+                        + ", ".join(bound_names)
+                    )
         if category == "auto":
             category = (
                 await self._lora_catalog.infer_preset_category(selections)
@@ -6813,7 +7604,7 @@ class ComfyAnimaPlugin(Star):
             variant_id=variant_id,
             enforce_character_contract=True,
         )
-        if not self._persist_config("lora_presets", self._lora_presets.to_config()):
+        if not await self._persist_config("lora_presets", self._lora_presets.to_config()):
             self._lora_presets.load(previous_presets)
             raise LoraPresetError("配置文件未能持久化，已回滚本次修改")
         return preset
@@ -6831,7 +7622,7 @@ class ComfyAnimaPlugin(Star):
             previous_presets = self._lora_presets.to_config()
             await self._refresh_lora_manager_before(refresh_action)
             preset = self._lora_presets.delete(identifier)
-            if not self._persist_config(
+            if not await self._persist_config(
                 "lora_presets",
                 self._lora_presets.to_config(),
             ):
@@ -8699,6 +9490,24 @@ QQ快捷指令:
                                 details={"work_conflict": True},
                             )
             if resolution.ambiguous:
+                archive_record = self._unique_archive_character_record(
+                    name,
+                    records,
+                    work_hints=(explicit_work, *work_hints),
+                )
+                if archive_record is not None:
+                    self._record_image_task_phase(
+                        job,
+                        "character_validation",
+                        "本地 Danbooru 命中多个身份，但唯一 LoRA 归档记录与用户作品名一致；采用归档身份继续，不注入未验证 canonical。",
+                        "llm_character_ambiguous_archive_backed",
+                        level="WARNING",
+                        details={
+                            "record": canonical_lora_name(archive_record.name),
+                            "work_confirmed": True,
+                        },
+                    )
+                    continue
                 raise CharacterPromptCompileError(
                     f"角色“{name}”在本地 Danbooru 中命中多个身份，请补充准确作品名",
                     code="character_resolution_ambiguous",
@@ -8794,6 +9603,11 @@ QQ快捷指令:
                 code="too_many_character_identities",
                 details={"character_count": len(canonical_rows)},
             )
+        # P4 角色连续性：编译期 exact 验证过的角色 canonical 必须传递给
+        # 角色 LoRA 绑定层。最终提示词未显式写出角色 Tag 时（LLM 依赖
+        # 角色 LoRA 本身），提示词文本验证会得到空集合，绑定层需要以
+        # 这里声明的身份为准。
+        job.llm_declared_character_canonicals = frozenset(canonical_rows)
 
         evidences: list[CharacterPromptEvidence] = []
         single_character = len(canonical_rows) == 1
@@ -9004,6 +9818,30 @@ QQ快捷指令:
             key = canonical_lora_name(selection.name).casefold()
             record = resolved_records.get(key)
             if record is None:
+                # Runtime 29B catalogs may expose a family directory and
+                # suffix while the request carries the family-neutral name.
+                wanted = re.sub(
+                    r"_(?:29b|legacy)$", "", key.rsplit("/", 1)[-1], flags=re.IGNORECASE
+                )
+                wanted = re.sub(r"\.(?:safetensors|ckpt|pt|bin)$", "", wanted, flags=re.IGNORECASE)
+                target_is_29b = is_29b_model_family(
+                    str(getattr(self.settings, "model_family", "") or "")
+                )
+                record = next(
+                    (
+                        candidate
+                        for candidate in resolved_records.values()
+                        if (
+                            ("_29b" in canonical_lora_name(candidate.name).casefold())
+                            == target_is_29b
+                            and re.sub(
+                            r"_(?:29b|legacy)$", "", canonical_lora_name(candidate.name).rsplit("/", 1)[-1], flags=re.IGNORECASE
+                            ).casefold() == wanted
+                        )
+                    ),
+                    None,
+                )
+            if record is None:
                 continue
             bindings = await asyncio.to_thread(
                 resolve_lora_identity_bindings,
@@ -9047,6 +9885,18 @@ QQ快捷指令:
                 expected_revision_signature=job.danbooru_revision_signature,
             )
         )
+        # 编译期已 exact 验证的角色声明是身份权威：最终提示词未显式写出
+        # 角色 Tag（依赖角色 LoRA 本身）时，提示词文本验证会得到空集合，
+        # 若不并入声明身份，严格绑定会误拒合法的角色 LoRA。
+        declared_canonicals = frozenset(
+            str(value)
+            for value in (
+                getattr(job, "llm_declared_character_canonicals", frozenset()) or ()
+            )
+            if str(value).strip()
+        )
+        if declared_canonicals and strict_keys:
+            expected = frozenset((*expected, *declared_canonicals))
         index = getattr(self, "_danbooru_index", None)
         if index is None or not self._danbooru_index_ready():
             return selections, {}, {}, ()
@@ -9128,6 +9978,18 @@ QQ快捷指令:
         overrides: dict[str, str] = {}
         bound_activation_overrides: dict[str, tuple[str, ...]] = {}
         filtered: list[str] = []
+        def strict_key_matches(value: str) -> bool:
+            key_value = canonical_lora_name(value).casefold()
+            if key_value in strict_keys:
+                return True
+            short = key_value.rsplit("/", 1)[-1]
+            short = re.sub(r"\.(?:safetensors|ckpt|pt|bin)$", "", short, flags=re.IGNORECASE)
+            short = re.sub(r"_(?:29b|legacy)$", "", short, flags=re.IGNORECASE)
+            return any(
+                re.sub(r"_(?:29b|legacy)$", "", canonical_lora_name(candidate).rsplit("/", 1)[-1], flags=re.IGNORECASE)
+                == short
+                for candidate in strict_keys
+            )
         for selection, record, triggers in character_rows:
             key = canonical_lora_name(selection.name).casefold()
             matched = tuple(
@@ -9153,6 +10015,12 @@ QQ快捷指令:
                 for binding in identity_bindings
                 if normalize_tag(binding.character_canonical) in expected
             )
+            if not expected and len(identity_bindings) == 1:
+                # P4：本次请求没有声明角色（提示词与编译均无角色声明，例如
+                # LLM 只挂了角色 LoRA 写场景）时，唯一文件绑定本身就是身份
+                # 声明，不得误判为"不一致或已失效"。声明了其他角色时仍然
+                # 严格拒绝。
+                binding_matches = identity_bindings
             if len(binding_matches) == 1:
                 binding = binding_matches[0]
                 semantic_entry = self._runtime_semantic_index().entry_for(record)
@@ -9185,6 +10053,13 @@ QQ快捷指令:
                 if selected_activations:
                     accepted_character_keys.add(key)
                     bound_activation_overrides[key] = selected_activations
+                    # P4 追画连续性：记录本次成功解析的角色身份三元组，
+                    # 供会话配方在未声明角色的追画中沿用。
+                    job.character_identity = {
+                        "canonical": str(binding.character_canonical or ""),
+                        "lora_name": str(getattr(record, "name", "") or ""),
+                        "activation_terms": tuple(selected_activations),
+                    }
                     self._record_image_task_phase(
                         job,
                         "lora",
@@ -9237,6 +10112,12 @@ QQ快捷指令:
                         bound_activation_overrides[key] = (selected_trigger,)
                     else:
                         overrides[key] = selected_trigger
+                    # P4 追画连续性：记录本次成功解析的角色身份三元组。
+                    job.character_identity = {
+                        "canonical": str(metadata_matches[0] or ""),
+                        "lora_name": str(getattr(record, "name", "") or ""),
+                        "activation_terms": (str(selected_trigger),),
+                    }
                     self._record_image_task_phase(
                         job,
                         "lora",
@@ -9258,7 +10139,7 @@ QQ快捷指令:
                             details={"binding_count": 1},
                         )
                     continue
-            if key in strict_keys:
+            if strict_key_matches(key):
                 semantic_entry = self._runtime_semantic_index().entry_for(record)
                 if semantic_entry is None or not semantic_entry.identity_bindings:
                     raise LoraWorkflowError(
@@ -11361,6 +12242,537 @@ QQ快捷指令:
             denoise=options.denoise,
         )
 
+    def _chinese_translation_exclusions(self, prompt: str) -> tuple[str, ...]:
+        """Return Chinese substrings that must not be translated in direct draw."""
+        exclusions = list(_CHINESE_PROMPT_STRUCTURE_EXCLUSIONS)
+        subject = self._requested_subject_hint(prompt)
+        if subject:
+            exclusions.append(subject)
+        registry = getattr(self, "_lora_presets", None)
+        if registry is not None:
+            for preset in registry.list_presets():
+                values = [
+                    preset.name,
+                    *preset.aliases,
+                    *registry.aliases_for(preset),
+                    preset.character_canonical,
+                    preset.work_canonical,
+                    preset.identity_anchor,
+                ]
+                for value in values:
+                    value = str(value or "").strip()
+                    if value and re.search(r"[\u4e00-\u9fff]", value):
+                        exclusions.append(value)
+        return tuple(dict.fromkeys(exclusions))
+
+    def _chinese_translation_llm_fn(self, event: AstrMessageEvent) -> Any:
+        """Return an event-bound LLM callback for the prompt translator."""
+
+        async def llm_fn(prompt: str, system_prompt: str, temperature: float) -> str:
+            if self._director is None:
+                raise RuntimeError("Chinese translation LLM backend unavailable")
+            provider_id = await self._director.resolve_provider_id(self.context, event)
+            async with self._internal_llm_request_scope(event):
+                response = await asyncio.wait_for(
+                    self._llm_generate_limited(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        max_tokens=128,
+                    ),
+                    timeout=30,
+                )
+            text = response_text(response).strip()
+            if not text:
+                raise RuntimeError("LLM returned an empty Chinese translation")
+            return text
+
+        return llm_fn
+
+    def _find_embedding_provider_by_id(self, identifier: str) -> Any:
+        identifier = str(identifier or "").strip()
+        if not identifier:
+            return None
+        getter = getattr(self.context, "get_provider_by_id", None)
+        provider = getter(identifier) if callable(getter) else None
+        if provider is not None and (
+            callable(getattr(provider, "get_embeddings", None))
+            or callable(getattr(provider, "get_embedding", None))
+        ):
+            return provider
+        getter = getattr(self.context, "get_all_embedding_providers", None)
+        providers = getter() if callable(getter) else ()
+        for item in providers or ():
+            if str(getattr(item, "id", "") or "") == identifier:
+                return item
+        return None
+
+    def _find_rerank_provider_by_id(self, identifier: str) -> Any:
+        identifier = str(identifier or "").strip()
+        if not identifier:
+            return None
+        getter = getattr(self.context, "get_provider_by_id", None)
+        provider = getter(identifier) if callable(getter) else None
+        if provider is not None and callable(getattr(provider, "rerank", None)):
+            return provider
+        manager = getattr(self.context, "provider_manager", None)
+        instances = getattr(manager, "rerank_provider_insts", ())
+        if isinstance(instances, Mapping):
+            direct = instances.get(identifier)
+            if direct is not None:
+                return direct
+            instances = instances.values()
+        for item in instances or ():
+            if str(getattr(item, "id", "") or "") == identifier:
+                return item
+        return None
+
+    def _build_intent_judge_service(self) -> IntentJudgeService | None:
+        """Build the configured intent judge from AstrBot providers."""
+
+        settings = self.settings
+        judge_settings = IntentJudgeSettings(
+            backend=getattr(settings, "intent_judge_backend", "rule"),
+            embedding_provider_id=getattr(
+                settings, "intent_judge_embedding_provider_id", ""
+            ),
+            rerank_provider_id=getattr(settings, "intent_judge_rerank_provider_id", ""),
+            online_provider_id=getattr(settings, "intent_judge_online_provider_id", ""),
+            positive_anchors=tuple(
+                getattr(settings, "intent_judge_positive_anchors", ()) or ()
+            ),
+            negative_anchors=tuple(
+                getattr(settings, "intent_judge_negative_anchors", ()) or ()
+            ),
+            local_embedding_threshold=float(
+                getattr(settings, "intent_judge_local_embedding_threshold", 0.10)
+            ),
+            local_rerank_threshold=float(
+                getattr(settings, "intent_judge_local_rerank_threshold", 0.05)
+            ),
+            auto_confidence_floor=float(
+                getattr(settings, "intent_judge_auto_confidence_floor", 0.70)
+            ),
+            online_timeout=float(
+                getattr(settings, "intent_judge_online_timeout", 10.0)
+            ),
+            online_temperature=float(
+                getattr(settings, "intent_judge_online_temperature", 0.0)
+            ),
+            fallback=str(getattr(settings, "intent_judge_fallback", NO_DRAW)),
+        )
+        embedding_provider = self._find_embedding_provider_by_id(
+            judge_settings.embedding_provider_id
+        )
+        rerank_provider = self._find_rerank_provider_by_id(
+            judge_settings.rerank_provider_id
+        )
+
+        async def embed_fn(texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+            if embedding_provider is None:
+                raise RuntimeError("embedding provider unavailable")
+            results: list[tuple[float, ...]] = []
+            batch_method = getattr(embedding_provider, "get_embeddings", None)
+            single_method = getattr(embedding_provider, "get_embedding", None)
+            for text in texts:
+                if callable(batch_method):
+                    response = await batch_method([text])
+                    if isinstance(response, (list, tuple)) and response:
+                        results.append(tuple(float(value) for value in response[0]))
+                    else:
+                        raise RuntimeError("embedding response invalid")
+                elif callable(single_method):
+                    response = await single_method(text)
+                    results.append(tuple(float(value) for value in response))
+                else:
+                    raise RuntimeError("embedding method unavailable")
+            return tuple(results)
+
+        async def rerank_fn(query: str, docs: tuple[str, ...]) -> tuple[float, ...]:
+            if rerank_provider is None:
+                raise RuntimeError("rerank provider unavailable")
+            response = await rerank_provider.rerank(query, list(docs), top_n=len(docs))
+            raw_items = getattr(response, "results", response)
+            if not isinstance(raw_items, (list, tuple)):
+                raise RuntimeError("rerank response invalid")
+            scores: dict[int, float] = {}
+            for item in raw_items:
+                if isinstance(item, Mapping):
+                    index = item.get("index")
+                    score = item.get("relevance_score", item.get("score", 0.0))
+                else:
+                    index = getattr(item, "index", None)
+                    score = getattr(
+                        item, "relevance_score", getattr(item, "score", 0.0)
+                    )
+                if isinstance(index, int) and 0 <= index < len(docs):
+                    scores[index] = float(score)
+            return tuple(scores.get(index, 0.0) for index in range(len(docs)))
+
+        online_provider_id = judge_settings.online_provider_id
+
+        async def llm_fn(prompt: str, system: str, temperature: float) -> str:
+            if not online_provider_id:
+                raise RuntimeError("online provider unavailable")
+            response = await self._llm_generate_limited(
+                chat_provider_id=online_provider_id,
+                prompt=prompt,
+                system_prompt=system,
+                temperature=temperature,
+                max_tokens=256,
+            )
+            return response_text(response).strip()
+
+        return IntentJudgeService(
+            judge_settings,
+            embed_fn=embed_fn,
+            rerank_fn=rerank_fn,
+            llm_fn=llm_fn,
+        )
+
+    def _build_scene_bridge(self, event: AstrMessageEvent) -> SceneBridge | None:
+        """Build a SceneBridge when a Director LLM provider is available."""
+        context = getattr(self, "context", None)
+        if self._director is None or context is None or not hasattr(context, "llm_generate"):
+            return None
+
+        async def llm_fn(prompt: str, system_prompt: str, temperature: float) -> str:
+            provider_id = str(
+                getattr(self.settings, "scene_extraction_model", "") or ""
+            ).strip()
+            if not provider_id:
+                provider_id = str(
+                    getattr(self.settings, "intent_router_model", "") or ""
+                ).strip()
+            if not provider_id:
+                provider_id = await self._director.resolve_provider_id(
+                    self.context, event
+                )
+            async with self._internal_llm_request_scope(event):
+                response = await asyncio.wait_for(
+                    self._llm_generate_limited(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        max_tokens=256,
+                    ),
+                    timeout=30,
+                )
+            text = response_text(response).strip()
+            if not text:
+                raise RuntimeError("Scene Bridge returned an empty result")
+            return text
+
+        return SceneBridge(
+            llm_fn,
+            context_limit=int(getattr(self.settings, "scene_context_window", 8)),
+        )
+
+    @staticmethod
+    def _scene_bridge_prompt(scene: Any, *, persona_name: str = "") -> str:
+        """Compose a visual prompt from extracted scene facts."""
+        parts: list[str] = []
+        for value in (
+            getattr(scene, "location", ""),
+            getattr(scene, "action", ""),
+            getattr(scene, "clothing", ""),
+            getattr(scene, "pose", ""),
+            getattr(scene, "emotion", ""),
+        ):
+            value = str(value or "").strip()
+            if value and value.casefold() != "unknown":
+                parts.append(value)
+        if not parts and persona_name:
+            parts.append(str(persona_name).strip())
+        return ", ".join(dict.fromkeys(parts))
+
+    async def _try_scene_bridge_draw(
+        self,
+        event: AstrMessageEvent,
+        result: Any,
+        raw_text: str,
+    ) -> bool:
+        """Handle a visual-intent ordinary chat reply through SceneBridge."""
+        gate_payload = self._event_intent_gate_result(event)
+        if not (
+            isinstance(gate_payload, Mapping)
+            and gate_payload.get("decision") == DRAW_NOW
+        ):
+            return False
+        if not bool(
+            getattr(
+                self.settings,
+                "scene_extraction",
+                getattr(self.settings, "scene_extraction", True),
+            )
+        ):
+            return False
+        message = str(event.message_str or "")
+        if not has_visual_intent(message):
+            return False
+        if not self._get_drawing_orchestrator().legacy_submission_allowed(event):
+            return False
+        bridge = self._build_scene_bridge(event)
+        if bridge is None:
+            return False
+        context = await scene_context_from_event(
+            event,
+            recent_limit=int(getattr(self.settings, "scene_context_window", 8)),
+            memory_limit=int(
+                getattr(self.settings, "scene_extraction_max_memories", 5)
+            ),
+        )
+        scene_result = await bridge.decide(
+            message,
+            raw_text,
+            recent_messages=context["recent_messages"],
+            persona_name=context["persona_name"],
+            memories=context["memories"],
+        )
+        if scene_result.action == "skip":
+            return False
+        if scene_result.action == "ask":
+            result.chain.append(
+                Comp.Plain(
+                    f"{MessageEmoji.INFO} 场景还不够明确，请再描述一下当前画面。"
+                )
+            )
+            return True
+        scene = scene_result.scene
+        if scene is None:
+            return False
+        try:
+            width, height = self._extract_resolution_request(message)
+        except ValueError as exc:
+            result.chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {exc}"))
+            return True
+        subject = self._requested_subject_hint(message) or context["persona_name"]
+        preset = self._subject_character_preset(subject)
+        style_preset = str(preset.name) if preset is not None else ""
+        prompt = self._scene_bridge_prompt(scene, persona_name=context["persona_name"])
+        if preset is not None:
+            prefix = tuple(preset.required_prompt_terms)
+            prompt = ", ".join(dict.fromkeys((*prefix, prompt) if prefix else (prompt,)))
+        access_error = self._access_error(event, prompt)
+        if access_error:
+            result.chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {access_error}"))
+            return True
+        if not self._client or (
+            not self._workflow_builder and not self._pipeline_builders
+        ):
+            result.chain.append(
+                Comp.Plain(f"{MessageEmoji.ERROR} ComfyUI 插件尚未就绪")
+            )
+            return True
+        try:
+            image_paths, seed, _, _, _ = await self._run_job(
+                event,
+                GenerationOptions(
+                    prompt=prompt,
+                    use_prompt_llm=False,
+                    width=width,
+                    height=height,
+                    lora_preset=style_preset,
+                    validate_llm_characters=False,
+                    llm_character_user_request=message,
+                    llm_prompt_source="scene_bridge",
+                ),
+            )
+        except ValueError as exc:
+            result.chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {exc}"))
+            return True
+        except (ComfyClientError, WorkflowError) as exc:
+            logger.error(f"[{PLUGIN_NAME}] SceneBridge 出图失败: {exc}", exc_info=True)
+            message_text = getattr(exc, "user_message", str(exc))
+            result.chain.append(
+                Comp.Plain(f"{MessageEmoji.ERROR} 自动绘图失败: {message_text}")
+            )
+            return True
+        if bool(getattr(self.settings, "show_chat_generation_details", True)):
+            result.chain.append(Comp.Plain(self._generation_summary(image_paths, seed)))
+        result.chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
+        self._schedule_cleanup(image_paths)
+        return True
+
+    def _build_chinese_translator(self, event: AstrMessageEvent) -> ChinesePromptTranslator:
+        """Build the direct-draw translator with currently available backends."""
+        llm_fn = None
+        context = getattr(self, "context", None)
+        if self._director is not None and context is not None and hasattr(
+            context, "llm_generate"
+        ):
+            llm_fn = self._chinese_translation_llm_fn(event)
+        return ChinesePromptTranslator(llm_fn=llm_fn)
+
+    async def _translate_direct_draw_chinese(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+    ) -> tuple[str, tuple[ChinesePromptTranslation, ...]]:
+        """Translate Chinese clothing/scene fragments, preserving exclusions."""
+        if not bool(
+            getattr(
+                self.settings,
+                "chinese_prompt_translation",
+                getattr(self.settings, "chinese_prompt_translation", True),
+            )
+        ):
+            return prompt, ()
+        if not re.search(r"[\u4e00-\u9fff]", prompt):
+            return prompt, ()
+        masked = prompt
+        for value in self._chinese_translation_exclusions(prompt):
+            if value:
+                masked = masked.replace(value, "\x00" * len(value))
+        translator = self._build_chinese_translator(event)
+        results: list[ChinesePromptTranslation] = []
+        output: list[str] = []
+        last = 0
+        for match in re.finditer(r"(?:[A-Za-z0-9_]*[\u4e00-\u9fff]+)+", masked):
+            output.append(prompt[last : match.start()])
+            fragment = match.group(0)
+            result = await translator.translate(fragment)
+            results.append(result)
+            output.append(result.translated if result.source != "none" else fragment)
+            last = match.end()
+        output.append(prompt[last:])
+        translated_prompt = re.sub(r"[ \t]+", " ", "".join(output)).strip()
+        return translated_prompt, tuple(results)
+
+    async def _handle_multi_character_draw(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+        names: tuple[str, ...],
+    ) -> AsyncGenerator[Any, None]:
+        """Handle natural multi-character requests through MultiCharacterJudge."""
+        if (
+            self._has_multi_character_connector(message)
+            and not self._has_multi_character_draw_phrase(message)
+        ):
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 你是想同框，还是 cos？"
+                "请补充“同框”或“cos”，并说“画出来”。"
+            )
+            return
+        judge = self._multi_character_judge(message)
+        if judge is None or judge.decision not in {
+            COSPLAY_DECISION,
+            DUAL_DECISION,
+            CLARIFY_DECISION,
+            BLOCKED_DECISION,
+        }:
+            return
+        if judge.decision == CLARIFY_DECISION:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 你想让 "
+                f"{' 和 '.join(judge.characters[:2])} 同框，还是其中一人 cos 另一人？"
+                "请补充“同框”或“cos”。"
+            )
+            return
+        if judge.decision == BLOCKED_DECISION:
+            yield event.plain_result(
+                f"{MessageEmoji.WARNING} 检测到多个角色（{'、'.join(judge.characters)}），"
+                "为避免误画请确认要同时出现的角色。"
+            )
+            return
+        try:
+            width, height = self._extract_resolution_request(message)
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.ERROR} 请求参数错误: {exc}")
+            return
+        if judge.decision == COSPLAY_DECISION:
+            preset = self._subject_character_preset(judge.authority.identity_anchor)
+            if preset is None:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 角色“{judge.authority.identity_anchor}”"
+                    "没有已保存的角色预设，无法执行 cosplay 出图"
+                )
+                return
+            lora_preset = preset.name
+            prompt = self._build_cosplay_multi_prompt(judge.authority, preset)
+        else:
+            presets: list[Any] = []
+            for character in judge.authority.allowed_canonicals():
+                preset = self._subject_character_preset(character)
+                if preset is not None:
+                    presets.append(preset)
+            if len(presets) < 2:
+                yield event.plain_result(
+                    f"{MessageEmoji.ERROR} 多角色请求缺少已保存的角色预设，无法执行双人出图"
+                )
+                return
+            lora_preset = ",".join(preset.name for preset in presets)
+            prompt = self._build_dual_multi_prompt(judge.authority, presets)
+        access_error = self._access_error(event, prompt)
+        if access_error:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {access_error}")
+            return
+        if not self._client or (not self._workflow_builder and not self._pipeline_builders):
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 插件尚未就绪: {self._initialization_error}"
+            )
+            return
+        yield event.plain_result(
+            f"{MessageEmoji.DRAW} 正在生成多角色图片……"
+        )
+        try:
+            image_paths, seed, _, _, _ = await self._run_job(
+                event,
+                GenerationOptions(
+                    prompt=prompt,
+                    use_prompt_llm=False,
+                    width=width,
+                    height=height,
+                    lora_preset=lora_preset,
+                    validate_llm_characters=False,
+                    llm_character_user_request=message,
+                    llm_prompt_source="multi_character_draw",
+                ),
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"{MessageEmoji.WARNING} {exc}")
+            return
+        except PromptDirectorError as exc:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 多角色出图失败: {exc.user_message}"
+            )
+            return
+        except (ComfyClientError, WorkflowError) as exc:
+            logger.error(f"[{PLUGIN_NAME}] 多角色出图失败: {exc}", exc_info=True)
+            message_text = getattr(exc, "user_message", str(exc))
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 生成失败: {message_text}"
+            )
+            return
+        yield self._make_image_result(event, image_paths, seed, forward=False)
+        self._schedule_cleanup(image_paths)
+
+    @staticmethod
+    def _build_cosplay_multi_prompt(authority: Any, preset: Any) -> str:
+        """Build a cosplay prompt that never adds the target as a second identity."""
+        parts: list[str] = []
+        for term in preset.required_prompt_terms:
+            if str(term or "").strip():
+                parts.append(str(term).strip())
+        if str(getattr(authority, "cosplay_source", "") or "").strip():
+            parts.append(str(authority.cosplay_source).strip())
+        parts.extend(["1girl", "solo"])
+        return ", ".join(dict.fromkeys(part for part in parts if part))
+
+    @staticmethod
+    def _build_dual_multi_prompt(authority: Any, presets: list[Any]) -> str:
+        """Build a dual-character prompt from the two saved character presets."""
+        parts: list[str] = []
+        for preset in presets:
+            for term in preset.required_prompt_terms:
+                if str(term or "").strip():
+                    parts.append(str(term).strip())
+        parts.extend(["two girls", "together"])
+        return ", ".join(dict.fromkeys(part for part in parts if part))
+
     async def _handle_direct_draw(
         self, event: AstrMessageEvent, prompt: str, *, forward: bool
     ) -> AsyncGenerator[Any, None]:
@@ -11461,18 +12873,28 @@ QQ快捷指令:
                 else "已提交 ComfyUI，请稍候……"
             )
             yield event.plain_result(f"{MessageEmoji.DRAW} {notice}")
+        subject = self._requested_subject_hint(prompt)
+        prompt, _ = await self._translate_direct_draw_chinese(event, prompt)
         try:
-            subject = self._requested_subject_hint(prompt)
-            (
-                subject_loras,
-                subject_binding_ok,
-                subject_activation_terms,
-            ) = await self._subject_lora_selections(subject)
-            if use_prompt_llm and not subject_binding_ok:
-                # Let the Director's own probe/tool evidence resolve the
-                # character; do not force an unbound LoRA into strict mode.
+            character_preset = self._subject_character_preset(subject)
+            if character_preset is not None:
+                preset_name = ",".join(
+                    part for part in (preset_name, character_preset.name) if part
+                )
                 subject_loras = ()
+                subject_binding_ok = False
                 subject_activation_terms = ()
+            else:
+                (
+                    subject_loras,
+                    subject_binding_ok,
+                    subject_activation_terms,
+                ) = await self._subject_lora_selections(subject)
+                if use_prompt_llm and not subject_binding_ok:
+                    # Let the Director's own probe/tool evidence resolve the
+                    # character; do not force an unbound LoRA into strict mode.
+                    subject_loras = ()
+                    subject_activation_terms = ()
             (
                 image_paths,
                 seed,
@@ -11687,7 +13109,9 @@ QQ快捷指令:
     ) -> tuple[str, str, str]:
         """调用分镜模型，并防止内部请求再次注入自动绘图提示词。"""
         if not self._director:
-            raise PromptDirectorError("LLM 分镜模块不可用", self._director_error or "")
+            raise PromptDirectorError(
+            "【绘图导演思考模型】LLM 分镜模块不可用", self._director_error or ""
+        )
         async with self._internal_llm_request_scope(event):
             lookup_tools = self._get_lora_tool_set()
             available_tools = self._registered_llm_tool_names()
@@ -11728,17 +13152,27 @@ QQ快捷指令:
             prompt, provider_id, negative = await legacy_override(event, scene_text)
             return PictureInstruction(prompt, negative, ""), provider_id
         if not self._director:
-            raise PromptDirectorError("LLM 分镜模块不可用", self._director_error or "")
+            raise PromptDirectorError(
+            "【绘图导演思考模型】LLM 分镜模块不可用", self._director_error or ""
+        )
         async with self._internal_llm_request_scope(event):
             if intent_plan is None or not isinstance(intent_plan, IntentPlan):
                 intent_plan = self._build_auto_draw_intent_plan(scene_text)
             available_tools = self._registered_llm_tool_names()
-            self._resolve_subject_binding_gate(
+            subject_binding = self._resolve_subject_binding_gate(
                 intent_plan,
                 subject_probe_available=(
                     "search_anima_danbooru_tags" in available_tools
                 ),
             )
+            subject_appearance_anchors: tuple[str, ...] = ()
+            if intent_plan is not None and getattr(
+                intent_plan, "identity_required", False
+            ) and getattr(intent_plan, "requested_subject", ""):
+                subject_appearance_anchors = self._subject_appearance_anchors(
+                    subject_binding,
+                    user_text=scene_text,
+                )
             lookup_tools = None
             runtime_capabilities: tuple[str, ...] = ()
             for probe in intent_plan.required_probes:
@@ -11800,6 +13234,7 @@ QQ快捷指令:
                         expansion_mode=expansion_mode,
                         task_kind=task_kind,
                         runtime_capabilities=runtime_capabilities,
+                        required_appearance_anchors=subject_appearance_anchors,
                     )
                 return await self._director.generate_instruction(
                     self.context,
@@ -11813,6 +13248,7 @@ QQ快捷指令:
                     expansion_mode=expansion_mode,
                     task_kind=task_kind,
                     runtime_capabilities=runtime_capabilities,
+                    required_appearance_anchors=subject_appearance_anchors,
                 )
 
     async def _generate_directed_edit_instruction(
@@ -11821,7 +13257,9 @@ QQ快捷指令:
         """Return a structured, mask-bounded redraw instruction."""
 
         if not self._director:
-            raise PromptDirectorError("LLM 分镜模块不可用", self._director_error or "")
+            raise PromptDirectorError(
+            "【绘图导演思考模型】LLM 分镜模块不可用", self._director_error or ""
+        )
         async with self._internal_llm_request_scope(event):
             needs_lora_tools = self._scene_needs_lora_tools(scene_text)
             needs_danbooru_tools = self._scene_needs_danbooru_tools(scene_text)
@@ -12170,7 +13608,14 @@ QQ快捷指令:
                     )
                 output_path = str(image_paths[0]) if image_paths else ""
                 output_sha256 = ""
-                if image_paths and image_paths[0].is_file():
+                if image_paths:
+                    output_sha256 = str(
+                        getattr(image_paths, "output_sha256s", {}).get(
+                            str(image_paths[0]), ""
+                        )
+                        or ""
+                    )
+                if not output_sha256 and image_paths and image_paths[0].is_file():
                     try:
                         output_sha256 = hashlib.sha256(
                             image_paths[0].read_bytes()
@@ -12352,6 +13797,81 @@ QQ快捷指令:
         return "当前请求不允许绘图"
 
     @staticmethod
+    def _event_session_id_hash(event: AstrMessageEvent) -> str:
+        session_id = str(
+            getattr(event, "get_session_id", lambda: "")()
+            or getattr(event, "session_id", "")
+            or ""
+        ).strip()
+        return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    def _event_intent_gate_result(self, event: AstrMessageEvent) -> Mapping[str, Any]:
+        """Return a verified intent gate payload, or an empty mapping.
+
+        Incomplete, expired, or forged extras never pass this boundary.
+        """
+
+        getter = getattr(event, "get_extra", None)
+        if not callable(getter):
+            return {}
+        try:
+            payload = getter(_INTENT_ROUTER_GATE_EXTRA_KEY, None)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        if str(payload.get("status") or "") != "judged":
+            return {}
+        if not str(payload.get("decision_id") or "").strip():
+            return {}
+        if not str(payload.get("result_hash") or "").strip():
+            return {}
+        if str(payload.get("public_version") or "") != PLUGIN_VERSION:
+            return {}
+        if str(payload.get("internal_target_version") or "") != INTERNAL_BUILD_ID:
+            return {}
+        if not str(payload.get("user_id_hash") or ""):
+            return {}
+        if str(payload.get("user_id_hash") or "") != self._event_user_id_hash(event):
+            return {}
+        if str(payload.get("session_id_hash") or "") != self._event_session_id_hash(event):
+            return {}
+        current_message_hash = hashlib.sha256(
+            str(getattr(event, "message_str", "") or "").encode("utf-8")
+        ).hexdigest()
+        if str(payload.get("user_message_hash") or "") != current_message_hash:
+            return {}
+        ledger = getattr(self, "_intent_decision_ledger", None)
+        if ledger is None:
+            # Fail closed: the gate result is only trustworthy when it is
+            # backed by a persisted decision ledger.
+            return {}
+        verifier = getattr(ledger, "verify", None)
+        if not callable(verifier) or not bool(
+            verifier(str(payload.get("decision_id") or ""), payload)
+        ):
+            return {}
+        return payload
+
+    @staticmethod
+    def _event_user_id_hash(event: AstrMessageEvent) -> str:
+        user_id = str(
+            getattr(event, "get_user_id", lambda: "")()
+            or getattr(event, "session_id", "")
+            or ""
+        ).strip()
+        return hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+
+    def _natural_draw_enabled(self) -> bool:
+        """Consolidated natural-draw switch (replaces legacy flags)."""
+        return (
+            str(
+                getattr(self.settings, "natural_draw_mode", "full")
+            ).strip().casefold()
+            != "off"
+        )
+
+    @staticmethod
     def _looks_like_draw_command(message: str) -> bool:
         """Recognize explicit command-style natural drawing requests."""
         patterns = (
@@ -12372,6 +13892,139 @@ QQ快捷指令:
             r"(?:照片|图片|自拍|什么样子|样子|画面|图)"
         )
         return bool(re.search(pattern, message, flags=re.IGNORECASE))
+
+    def _known_character_names(self) -> tuple[str, ...]:
+        """Return saved character preset names, canonicals and aliases."""
+        names: list[str] = []
+        registry = getattr(self, "_lora_presets", None)
+        if registry is not None:
+            try:
+                presets = registry.list_presets(category=PRESET_CATEGORY_CHARACTER)
+            except Exception:
+                presets = ()
+            for preset in presets or ():
+                for value in (
+                    getattr(preset, "name", ""),
+                    getattr(preset, "character_canonical", ""),
+                    getattr(preset, "work_canonical", ""),
+                    getattr(preset, "identity_anchor", ""),
+                    *tuple(getattr(preset, "aliases", ()) or ()),
+                ):
+                    value = str(value or "").strip()
+                    if value and value not in names:
+                        names.append(value)
+        return tuple(names)
+
+    @staticmethod
+    def _has_multi_character_connector(message: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:cos|cosplay|和|同框|一起)",
+                str(message or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _has_multi_character_draw_phrase(message: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:画出来|画一下|画给我|出图|生成|来一张|画一张)",
+                str(message or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _has_multi_character_signal(message: str) -> bool:
+        """Enter multi-character handling when either explicit signal exists."""
+        return (
+            ComfyAnimaPlugin._has_multi_character_connector(message)
+            or ComfyAnimaPlugin._has_multi_character_draw_phrase(message)
+        )
+
+    def _detect_multi_character_names(self, message: str) -> tuple[str, ...]:
+        """Return two or more character names mentioned in a message."""
+
+        source = str(message or "")
+        if not self._has_multi_character_signal(source):
+            return ()
+        found: list[tuple[int, str]] = []
+        for name in sorted(self._known_character_names(), key=len, reverse=True):
+            if not name:
+                continue
+            index = source.find(name)
+            if index >= 0 and name not in {value for _, value in found}:
+                found.append((index, name))
+        found.sort(key=lambda item: item[0])
+        if not self._has_multi_character_connector(source):
+            return tuple(name for _, name in found)
+        raw_parts = re.split(
+            r"\s*(?:cos|cosplay|和|同框|一起)\s*",
+            source,
+            flags=re.IGNORECASE,
+        )
+        raw_names: list[str] = []
+        for part in raw_parts:
+            value = str(part).strip().strip(" ，。.!！?？")
+            value = re.sub(
+                r"(?:画出来|画一下|画给我|出图|生成|来一张|画一张)\s*$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip(" ，。.!！?？")
+            if not value or len(value) > 16:
+                continue
+            if value not in {name for _, name in found} and value not in raw_names:
+                raw_names.append(value)
+        return tuple(name for _, name in found) + tuple(raw_names)
+
+    def _resolve_cosplay_tag(self, target: str) -> str:
+        """Resolve a cosplay target to a Danbooru-style general cosplay tag."""
+        canonical_target = self._normalize_detected_character_name(target)
+        preset = self._subject_character_preset(canonical_target)
+        base = (
+            str(preset.character_canonical or preset.identity_anchor or "").strip()
+            if preset is not None
+            else ""
+        )
+        base = base or str(canonical_target or "").strip()
+        return f"{base}_(cosplay)" if base else "cosplay"
+
+    def _normalize_detected_character_name(self, name: str) -> str:
+        """Resolve a detected raw name to its local Danbooru canonical."""
+
+        raw = str(name or "").strip()
+        if not raw:
+            return raw
+        localized_index = getattr(self, "_localized_character_aliases", None)
+        danbooru_index = getattr(self, "_danbooru_index", None)
+        if localized_index is not None and danbooru_index is not None:
+            try:
+                resolution = localized_index.resolve_character(
+                    raw,
+                    "",
+                    danbooru_index,
+                )
+                if bool(getattr(resolution, "verified", False)):
+                    canonical = str(
+                        getattr(resolution, "canonical_tag", "") or ""
+                    ).strip()
+                    if canonical:
+                        return canonical
+            except (ValueError, RuntimeError, OSError):
+                pass
+        return raw
+
+    def _multi_character_judge(self, message: str) -> Any:
+        names = self._detect_multi_character_names(message)
+        if len(names) < 2:
+            return None
+        names = tuple(self._normalize_detected_character_name(name) for name in names)
+        return MultiCharacterJudge(
+            known_characters=self._known_character_names(),
+            cosplay_tag_resolver=self._resolve_cosplay_tag,
+        ).judge(message, detected_characters=names)
 
     @staticmethod
     def _looks_like_draw_request(message: str) -> bool:
@@ -12816,18 +14469,45 @@ QQ快捷指令:
         if store is None or not run_id:
             return
         try:
-            store.append_event(
-                run_id,
-                phase,
-                message,
-                level=level,
-                event_code=event_code,
-                details=dict(details or {}),
+            task = asyncio.create_task(
+                store.append_event_async(
+                    run_id,
+                    phase,
+                    message,
+                    level=level,
+                    event_code=event_code,
+                    details=dict(details or {}),
+                )
             )
-        except (TaskStoreError, ValueError, TypeError) as exc:
-            logger.warning(
-                f"[{PLUGIN_NAME}] task event persistence failed: {type(exc).__name__}"
-            )
+        except RuntimeError:
+            try:
+                store.append_event(
+                    run_id,
+                    phase,
+                    message,
+                    level=level,
+                    event_code=event_code,
+                    details=dict(details or {}),
+                )
+            except (TaskStoreError, ValueError, TypeError) as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] task event persistence failed: "
+                    f"{type(exc).__name__}"
+                )
+            return
+
+        def _log_store_write_failure(done_task: asyncio.Task[Any]) -> None:
+            try:
+                done_task.exception()
+            except (asyncio.CancelledError, TaskStoreError, ValueError, TypeError):
+                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] task event persistence failed: "
+                    f"{type(exc).__name__}"
+                )
+
+        task.add_done_callback(_log_store_write_failure)
 
     @asynccontextmanager
     async def _tracked_v170_operation(
@@ -12843,14 +14523,14 @@ QQ快捷指令:
         store = getattr(self, "_task_store", None)
         if store is not None:
             try:
-                run_id = store.create_task(
+                run_id = await store.create_task_async(
                     task_type,
                     mode="web_ui",
                     requested_by="dashboard_admin",
                     total_items=1,
                     metadata=safe_metadata,
                 )
-                store.start_task(run_id, total_items=1)
+                await store.start_task_async(run_id, total_items=1)
             except (TaskStoreError, ValueError, TypeError) as exc:
                 run_id = ""
                 logger.warning(
@@ -12870,7 +14550,7 @@ QQ快捷指令:
         except asyncio.CancelledError:
             if store is not None and run_id:
                 try:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "cancelled",
                         completed_items=0,
@@ -12895,7 +14575,7 @@ QQ快捷指令:
             )
             if store is not None and run_id:
                 try:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "failed",
                         completed_items=0,
@@ -12917,7 +14597,7 @@ QQ快捷指令:
             )
             if store is not None and run_id:
                 try:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "succeeded",
                         completed_items=1,
@@ -12927,21 +14607,34 @@ QQ快捷指令:
                 except TaskStoreError:
                     pass
 
-    def _persist_config(self, key: str, value: Any) -> bool:
+    async def _persist_config(self, key: str, value: Any) -> bool:
         """更新 AstrBot 插件配置，写盘并在可用时回读校验。"""
-        return self._persist_config_transaction(
+        return await self._persist_config_transaction(
             {key: value},
             operation=f"save config key {key}",
         )
 
-    def _persist_config_updates(self, updates: dict[str, Any]) -> bool:
+    async def _persist_config_updates(self, updates: dict[str, Any]) -> bool:
         """Persist multiple fields atomically and verify the on-disk snapshot."""
-        return self._persist_config_transaction(
+        return await self._persist_config_transaction(
             updates,
             operation="save configuration updates",
         )
 
-    def _persist_config_transaction(
+    async def _persist_config_transaction(
+        self,
+        updates: Mapping[str, Any],
+        *,
+        operation: str,
+    ) -> bool:
+        """Run the durable config write and read-back in a worker thread."""
+        return await asyncio.to_thread(
+            self._persist_config_transaction_sync,
+            updates,
+            operation=operation,
+        )
+
+    def _persist_config_transaction_sync(
         self,
         updates: Mapping[str, Any],
         *,
@@ -13051,6 +14744,14 @@ QQ快捷指令:
             "sampler_steps_override": settings.sampler_steps_override,
             "samplers": [],
             "default_generation_pipeline": settings.default_generation_pipeline,
+            "prompt_node_id": settings.prompt_node_id,
+            "negative_node_id": settings.negative_node_id,
+            "workflow_positive_node_overrides": (
+                settings.workflow_positive_node_overrides
+            ),
+            "workflow_negative_node_overrides": (
+                settings.workflow_negative_node_overrides
+            ),
             "pipelines": [],
         }
         runtime_builder = self._pipeline_builders.get(
@@ -13167,6 +14868,14 @@ QQ快捷指令:
                 "default_height": settings.default_height,
                 "sampler_steps_override": settings.sampler_steps_override,
                 "default_generation_pipeline": settings.default_generation_pipeline,
+                "prompt_node_id": settings.prompt_node_id,
+                "negative_node_id": settings.negative_node_id,
+                "workflow_positive_node_overrides": (
+                    settings.workflow_positive_node_overrides
+                ),
+                "workflow_negative_node_overrides": (
+                    settings.workflow_negative_node_overrides
+                ),
                 "iterative_scale": settings.iterative_scale,
                 "iterative_steps": settings.iterative_steps,
                 "iterative_denoise": settings.iterative_denoise,
@@ -13189,8 +14898,39 @@ QQ快捷指令:
                 "intent_router_model": settings.intent_router_model,
                 "intent_router_timeout": settings.intent_router_timeout,
                 "intent_router_temperature": settings.intent_router_temperature,
+                "intent_router_min_confidence": settings.intent_router_min_confidence,
+                "intent_judge_backend": settings.intent_judge_backend,
+                "intent_judge_embedding_provider_id": (
+                    settings.intent_judge_embedding_provider_id
+                ),
+                "intent_judge_rerank_provider_id": (
+                    settings.intent_judge_rerank_provider_id
+                ),
+                "intent_judge_online_provider_id": (
+                    settings.intent_judge_online_provider_id
+                ),
+                "intent_judge_positive_anchors": settings.intent_judge_positive_anchors,
+                "intent_judge_negative_anchors": settings.intent_judge_negative_anchors,
+                "intent_judge_local_embedding_threshold": (
+                    settings.intent_judge_local_embedding_threshold
+                ),
+                "intent_judge_local_rerank_threshold": (
+                    settings.intent_judge_local_rerank_threshold
+                ),
+                "intent_judge_auto_confidence_floor": (
+                    settings.intent_judge_auto_confidence_floor
+                ),
+                "intent_judge_online_timeout": settings.intent_judge_online_timeout,
+                "intent_judge_online_temperature": (
+                    settings.intent_judge_online_temperature
+                ),
+                "intent_judge_fallback": settings.intent_judge_fallback,
                 "interaction_mode": settings.interaction_mode,
                 "enable_prompt_composer_v2": settings.enable_prompt_composer_v2,
+                "natural_draw_mode": settings.natural_draw_mode,
+                "character_purity_mode": settings.character_purity_mode,
+                "scene_extraction": settings.scene_extraction,
+                "chinese_prompt_translation": settings.chinese_prompt_translation,
                 "adaptive_negative_mode": settings.adaptive_negative_mode,
                 "enable_prompt_diagnostics": settings.enable_prompt_diagnostics,
                 "prompt_diagnostics_include_content": (
@@ -13248,8 +14988,6 @@ QQ快捷指令:
                     settings.lora_visual_thumbnail_size
                 ),
                 "character_swap_timeout": settings.character_swap_timeout,
-                "enable_natural_draw": settings.enable_natural_draw,
-                "enable_llm_pic_trigger": settings.enable_llm_pic_trigger,
                 "enable_chat_draw_terminal_guard": (
                     settings.enable_chat_draw_terminal_guard
                 ),
@@ -13312,6 +15050,12 @@ QQ快捷指令:
                 "lora_embedding_top_k": settings.lora_embedding_top_k,
                 "lora_rerank_top_n": settings.lora_rerank_top_n,
                 "lora_retrieval_timeout": settings.lora_retrieval_timeout,
+                "lora_cache_ttl": settings.lora_cache_ttl,
+                "enable_task_lora_snapshot": settings.enable_task_lora_snapshot,
+                "lora_snapshot_max_age": settings.lora_snapshot_max_age,
+                "auto_reload_after_style_save": (
+                    settings.auto_reload_after_style_save
+                ),
                 "strict_lora_validation": settings.strict_lora_validation,
                 "default_block_level": settings.default_block_level,
                 "group_whitelist": list(settings.group_whitelist),
@@ -13346,6 +15090,11 @@ QQ快捷指令:
         """Validate, persist and reload configuration changed in the Web UI."""
         if self.config is None:
             raise WebUiActionError("当前 AstrBot 配置对象不支持持久化")
+        legacy_keys = set(payload).intersection(WEB_UI_LEGACY_FIELDS)
+        if legacy_keys:
+            raise WebUiActionError(
+                f"以下配置已迁移，请使用新字段：{', '.join(sorted(legacy_keys))}"
+            )
         running_danbooru = getattr(self, "_danbooru_update_task", None)
         if running_danbooru is not None and not running_danbooru.done():
             raise WebUiActionError(
@@ -13466,7 +15215,7 @@ QQ快捷指令:
         # The terminal guard is a compatibility field, not an independent
         # operator policy. Keep persisted stores canonical whenever the
         # <pic>/<edit> transport is enabled, including partial WebUI saves.
-        if normalized.enable_llm_pic_trigger:
+        if normalized.natural_draw_mode != "off":
             candidate["enable_chat_draw_terminal_guard"] = True
             supplied.add("enable_chat_draw_terminal_guard")
             normalized = PluginSettings.from_mapping(candidate)
@@ -13479,7 +15228,7 @@ QQ快捷指令:
                 raise WebUiActionError(str(exc)) from exc
 
         updates = {key: getattr(normalized, key) for key in supplied}
-        if not self._persist_config_updates(updates):
+        if not await self._persist_config_updates(updates):
             raise WebUiActionError("配置文件保存失败，修改已回滚")
         reload_task = self._schedule_self_reload(
             delay=1.5,
@@ -13693,6 +15442,9 @@ QQ快捷指令:
             "selected_reverse": getattr(self.settings, "reverse_prompt_provider_id", ""),
             "selected_embedding": getattr(self.settings, "lora_embedding_provider_id", ""),
             "selected_rerank": getattr(self.settings, "lora_rerank_provider_id", ""),
+            "selected_judge_embedding": getattr(self.settings, "intent_judge_embedding_provider_id", ""),
+            "selected_judge_rerank": getattr(self.settings, "intent_judge_rerank_provider_id", ""),
+            "selected_judge_online": getattr(self.settings, "intent_judge_online_provider_id", ""),
             "chat": groups["chat"],
             "embedding": groups["embedding"],
             "rerank": groups["rerank"],
@@ -15131,6 +16883,7 @@ QQ快捷指令:
                                 preview_key,
                                 content,
                                 content_type,
+                                prune=False,
                             )
                         except Exception as exc:
                             self._v170_task_event(
@@ -15162,6 +16915,7 @@ QQ快捷指令:
                 )
                 remote_succeeded = sum(bool(result) for result in remote_results)
                 remote_failed = len(remote_results) - remote_succeeded
+                await asyncio.to_thread(service.prune_cache)
             schedule_payload["remote_requested"] = len(remote_keys)
             schedule_payload["remote_succeeded"] = remote_succeeded
             schedule_payload["remote_failed"] = remote_failed
@@ -15387,7 +17141,7 @@ QQ快捷指令:
             "source": source_url if mode == "url" else self.settings.danbooru_api_base_url,
             "old_revision": str(self._danbooru_index.status().get("revision") or ""),
         }
-        run_id = store.create_task(
+        run_id = await store.create_task_async(
             "danbooru_index_update",
             mode=mode,
             requested_by=requested_by,
@@ -15412,7 +17166,9 @@ QQ快捷指令:
                 if task_info is None or task_info.get("status") not in {"queued", "running"}:
                     return
                 completed = max(0, min(7, int(event.get("completed") or 0)))
-                store.heartbeat(run_id, completed_items=completed, total_items=7)
+                await store.heartbeat_async(
+                    run_id, completed_items=completed, total_items=7
+                )
                 phase = str(event.get("phase") or "run")[:100]
                 now = time.monotonic()
                 if phase == last_progress["phase"] and now - last_progress["time"] < 2.0:
@@ -15423,7 +17179,7 @@ QQ快捷指令:
                     for key, value in event.items()
                     if key not in {"message"} and isinstance(value, (str, int, float, bool))
                 }
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     phase,
                     str(event.get("message") or "Danbooru 索引任务正在执行"),
@@ -15432,7 +17188,7 @@ QQ快捷指令:
                 )
 
             try:
-                store.start_task(run_id, total_items=7)
+                await store.start_task_async(run_id, total_items=7)
                 self._danbooru_update_state.update(
                     {"status": "running", "started_at": time.time()}
                 )
@@ -15488,7 +17244,7 @@ QQ快捷指令:
                     )
                 task_info = store.get_task(run_id)
                 if task_info is not None and task_info.get("status") in {"queued", "running"}:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "succeeded",
                         completed_items=7,
@@ -15503,7 +17259,7 @@ QQ快捷指令:
                 cancel_event.set()
                 task_info = store.get_task(run_id)
                 if task_info is not None and task_info.get("status") in {"queued", "running"}:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "cancelled",
                         failed_items=0,
@@ -15521,7 +17277,7 @@ QQ快捷指令:
             except (DanbooruBuildError, DanbooruIndexError) as exc:
                 task_info = store.get_task(run_id)
                 if task_info is not None and task_info.get("status") in {"queued", "running"}:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "failed",
                         completed_items=int(task_info.get("completed_items") or 0),
@@ -15543,7 +17299,7 @@ QQ快捷指令:
             except Exception as exc:
                 task_info = store.get_task(run_id)
                 if task_info is not None and task_info.get("status") in {"queued", "running"}:
-                    store.finish_task(
+                    await store.finish_task_async(
                         run_id,
                         "failed",
                         completed_items=int(task_info.get("completed_items") or 0),
@@ -15748,16 +17504,38 @@ QQ快捷指令:
             "pending": archive_summary["analysis"]["pending"],
             "percent": archive_summary["analysis"]["percent"],
         }
+        unbound_character_loras = self._unbound_character_loras(catalog_records)
         return {
             "total": len(records),
             "catalog_total": len(catalog_records),
             "retrieval": retrieval_diagnostics,
             "archive": archive_summary,
+            "unbound_character_loras": unbound_character_loras,
+            "unbound_character_lora_count": len(unbound_character_loras),
             "items": [
                 self._web_ui_lora_item_v2(record)
                 for record in records[:limit]
             ],
         }
+
+    def _unbound_character_loras(
+        self,
+        records: tuple[Any, ...],
+    ) -> list[dict[str, Any]]:
+        """List character LoRAs that have no semantic identity binding yet."""
+        semantic_index = self._runtime_semantic_index()
+        unbound: list[dict[str, Any]] = []
+        for record in records:
+            entry = semantic_index.entry_for(record)
+            category = str(getattr(record, "category", "") or "")
+            if entry is not None and entry.effective_category in SEMANTIC_CATEGORIES:
+                category = entry.effective_category
+            if category != "character":
+                continue
+            if entry is not None and entry.identity_bindings:
+                continue
+            unbound.append(self._web_ui_lora_item_v2(record))
+        return unbound
 
     def _runtime_semantic_index(self) -> LoraSemanticIndex:
         """Return the v2 index, including lightweight compatibility instances."""
@@ -15912,16 +17690,92 @@ QQ快捷指令:
         }
 
     async def web_ui_refresh_loras(self) -> dict[str, Any]:
-        """Run the mandatory LoRA Manager refresh gate."""
+        """Run the mandatory LoRA Manager refresh gate and report the diff."""
         if self._lora_catalog is None:
             raise WebUiActionError("LoRA 工具未启用")
         try:
+            previous_records = tuple(
+                getattr(self._lora_catalog, "_cache", ()) or ()
+            )
             records = await self._lora_catalog.refresh_for_operation()
         except LoraCatalogError as exc:
             raise WebUiActionError(exc.user_message) from exc
+        summary = self._lora_refresh_summary(previous_records, records)
+        if summary["added"]:
+            logger.info(
+                f"[{PLUGIN_NAME}] LoRA 刷新新增（前 20）: "
+                + ", ".join(summary["added"][:20])
+            )
+        if summary["removed"]:
+            logger.info(
+                f"[{PLUGIN_NAME}] LoRA 刷新移除（前 20）: "
+                + ", ".join(summary["removed"][:20])
+            )
+        if summary["changed"]:
+            logger.info(
+                f"[{PLUGIN_NAME}] LoRA 刷新变化（前 20）: "
+                + ", ".join(summary["changed"][:20])
+            )
         return {
-            "total": len(records),
+            **summary,
             "message": f"LoRA Manager 已刷新，共 {len(records)} 个可加载文件",
+        }
+
+    @staticmethod
+    def _lora_refresh_summary(
+        previous_records: tuple[Any, ...],
+        current_records: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        """Compare catalog record fingerprints by canonical name and digest."""
+        def fingerprint(record: Any) -> str:
+            return str(
+                getattr(record, "sha256", "")
+                or getattr(record, "source_fingerprint", "")
+                or ""
+            ).strip().casefold()
+
+        previous: dict[str, set[str]] = {}
+        for record in previous_records:
+            key = canonical_lora_name(record.name).casefold()
+            previous.setdefault(key, set()).add(fingerprint(record))
+        current: dict[str, str] = {}
+        for record in current_records:
+            key = canonical_lora_name(record.name).casefold()
+            current[key] = fingerprint(record)
+
+        added = sorted(
+            (name for name in current if name not in previous),
+            key=str.casefold,
+        )
+        removed = sorted(
+            (name for name in previous if name not in current),
+            key=str.casefold,
+        )
+        changed = sorted(
+            (
+                name
+                for name, digest in current.items()
+                if name in previous and previous[name] != {digest}
+            ),
+            key=str.casefold,
+        )
+        unchanged = sorted(
+            (
+                name
+                for name, digest in current.items()
+                if name in previous and previous[name] == {digest}
+            ),
+            key=str.casefold,
+        )
+        return {
+            "total": len(current_records),
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": len(unchanged),
+            "added_names": added,
+            "removed_names": removed,
+            "changed_names": changed,
         }
 
     async def web_ui_download_lora(self, url: str) -> dict[str, Any]:
@@ -16506,6 +18360,93 @@ QQ快捷指令:
             "message": f"已保存 LoRA 人工语义审核：{record.name}",
         }
 
+    async def web_ui_batch_set_lora_family(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """批量设置或一键自动标记 29B 模型族兼容模式。"""
+        if self._lora_catalog is None:
+            raise WebUiActionError("LoRA 工具未启用")
+        try:
+            records = await self._lora_catalog.refresh_for_operation()
+        except LoraCatalogError as exc:
+            raise WebUiActionError(exc.user_message) from exc
+
+        names = payload.get("names", [])
+        auto_detect_29b = bool(payload.get("auto_detect_29b", False))
+        mode = str(payload.get("compatibility_mode") or "native_29b").strip().casefold()
+        families = tuple(
+            dict.fromkeys(
+                str(f).strip().casefold()
+                for f in payload.get("compatible_model_families", ["anima_29b_40l"])
+                if str(f).strip()
+            )
+        )
+
+        semantic_index = self._runtime_semantic_index()
+        updated_records = []
+
+        target_records: list[LoraRecord] = []
+        if auto_detect_29b or not names:
+            for r in records:
+                c_name = canonical_lora_name(r.name)
+                if c_name.casefold().startswith("29b/") or re.search(
+                    r"[-_](?:29b(?:_40l)?|40l)$", c_name, re.IGNORECASE
+                ):
+                    target_records.append(r)
+        else:
+            name_set = {canonical_lora_name(str(n)).casefold() for n in names}
+            target_records = [
+                r for r in records if canonical_lora_name(r.name).casefold() in name_set
+            ]
+
+        for record in target_records:
+            previous = semantic_index.entry_for(record)
+            identity_key = semantic_identity_key(record.name, record.sha256)
+            fields = {
+                field_name: previous.facts(field_name) if previous is not None else ()
+                for field_name in (
+                    "category",
+                    "character_names",
+                    "source_works",
+                    "activation_terms",
+                    "artist_style_names",
+                    "aliases",
+                )
+            }
+            entry = SemanticEntry(
+                identity_key=identity_key,
+                canonical_name=record.name,
+                sha256=record.sha256,
+                analysis_status=(
+                    previous.analysis_status if previous else "searchable"
+                ),
+                analysis_summary=(previous.analysis_summary if previous else "批量设置模型族兼容性。"),
+                analysis_confidence=(previous.analysis_confidence if previous else 1.0),
+                source_fingerprint=semantic_source_fingerprint(record),
+                updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                error="",
+                present=True,
+                identity_bindings=previous.identity_bindings if previous else (),
+                compatible_model_families=families,
+                compatibility_mode=mode,
+                **fields,
+            )
+            semantic_index.upsert(entry)
+            updated_records.append(record.name)
+
+        if updated_records:
+            try:
+                semantic_index.save(self._semantic_index_path)
+            except LoraSemanticError as exc:
+                raise WebUiActionError(f"保存批量模型族结果失败：{exc}") from exc
+
+        return {
+            "success": True,
+            "updated_count": len(updated_records),
+            "updated_names": updated_records,
+            "message": f"已为 {len(updated_records)} 个 LoRA 设置模型族兼容模式（{mode}）",
+        }
+
     async def _run_lora_archive_llm(
         self,
         system_prompt: str,
@@ -16658,7 +18599,7 @@ QQ快捷指令:
 
         provider_id = await self._require_lora_analysis_provider()
         selected_names = [record.name for record in selected_records]
-        run_id = store.create_task(
+        run_id = await store.create_task_async(
             "lora_semantic_analysis",
             mode="all" if select_all else "selected",
             requested_by="web_ui",
@@ -16670,7 +18611,7 @@ QQ快捷指令:
                 "per_item_requests": True,
             },
         )
-        store.append_event(
+        await store.append_event_async(
             run_id,
             "queue",
             "LoRA 语义建档任务已排队，等待再次刷新实时清单。",
@@ -16736,8 +18677,8 @@ QQ快捷指令:
     ) -> None:
         store = self._require_task_store()
         try:
-            store.start_task(run_id, total_items=len(selected_names))
-            store.append_event(
+            await store.start_task_async(run_id, total_items=len(selected_names))
+            await store.append_event_async(
                 run_id,
                 "refresh",
                 "正在执行建档前的 LoRA Manager 扫描与 ComfyUI 可加载清单刷新。",
@@ -16747,7 +18688,7 @@ QQ快捷指令:
             by_name = {record.name: record for record in records}
             missing = [name for name in selected_names if name not in by_name]
             if missing:
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     "refresh",
                     "建档前实时清单已变化；任务已安全停止，请重新选择。",
@@ -16755,7 +18696,7 @@ QQ快捷指令:
                     event_code="fresh_catalog_changed",
                     details={"missing_count": len(missing)},
                 )
-                store.finish_task(
+                await store.finish_task_async(
                     run_id,
                     "failed",
                     completed_items=0,
@@ -16767,7 +18708,7 @@ QQ快捷指令:
                 )
                 return
             selected_records = [by_name[name] for name in selected_names]
-            store.append_event(
+            await store.append_event_async(
                 run_id,
                 "refresh",
                 f"实时清单刷新完成，确认 {len(selected_records)} 个精确文件身份。",
@@ -16777,13 +18718,13 @@ QQ快捷指令:
 
             details = []
             for index, record in enumerate(selected_records, start=1):
-                store.heartbeat(
+                await store.heartbeat_async(
                     run_id,
                     completed_items=0,
                     failed_items=0,
                     total_items=len(selected_records),
                 )
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     "metadata",
                     "正在聚合 Manager 元数据、模型/版本描述和使用提示。",
@@ -16794,7 +18735,7 @@ QQ快捷指令:
                 )
                 detail = await self._lora_catalog.get_detail_v2(record)
                 details.append(detail)
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     "metadata",
                     f"LoRA 资料包已就绪（健康状态：{detail.metadata_health.status}）。",
@@ -16822,7 +18763,7 @@ QQ快捷指令:
         except asyncio.CancelledError:
             current = store.get_task(run_id)
             if current and current.get("status") in {"queued", "running"}:
-                store.finish_task(
+                await store.finish_task_async(
                     run_id,
                     "cancelled",
                     error_code="cancelled",
@@ -16832,7 +18773,7 @@ QQ快捷指令:
         except (LoraAnalysisError, LoraCatalogError, LoraSemanticError) as exc:
             current = store.get_task(run_id)
             if current and current.get("status") in {"queued", "running"}:
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     "run",
                     "LoRA 语义建档任务安全失败。",
@@ -16840,7 +18781,7 @@ QQ快捷指令:
                     event_code="analysis_setup_failed",
                     details={"exception_type": type(exc).__name__},
                 )
-                store.finish_task(
+                await store.finish_task_async(
                     run_id,
                     "failed",
                     error_code="analysis_setup_failed",
@@ -16849,7 +18790,7 @@ QQ快捷指令:
         except Exception as exc:
             current = store.get_task(run_id)
             if current and current.get("status") in {"queued", "running"}:
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     "run",
                     "LoRA 语义建档发生未预期错误。",
@@ -16857,7 +18798,7 @@ QQ快捷指令:
                     event_code="analysis_unexpected_error",
                     details={"exception_type": type(exc).__name__},
                 )
-                store.finish_task(
+                await store.finish_task_async(
                     run_id,
                     "failed",
                     error_code="analysis_unexpected_error",
@@ -17132,15 +19073,15 @@ QQ快捷指令:
         store = self._task_store
         run_id = ""
         if store is not None:
-            run_id = store.create_task(
+            run_id = await store.create_task_async(
                 "asset_delete",
                 mode=asset_type,
                 requested_by="web_ui",
                 total_items=1,
                 metadata={"asset_type": asset_type, "exact_name": exact_name},
             )
-            store.start_task(run_id, total_items=1)
-            store.append_event(
+            await store.start_task_async(run_id, total_items=1)
+            await store.append_event_async(
                 run_id,
                 "refresh",
                 "正在强制刷新 LoRA Manager 与 ComfyUI 最新可加载清单。",
@@ -17208,7 +19149,7 @@ QQ快捷指令:
                     event_message += " 删除前的 LoRA 组合配置和运行状态已恢复。"
                 elif rollback_failed:
                     event_message += " LoRA 组合回滚失败，请立即检查配置。"
-                store.append_event(
+                await store.append_event_async(
                     run_id,
                     "delete",
                     event_message,
@@ -17223,7 +19164,7 @@ QQ快捷指令:
                         "preset_rollback_failed": rollback_failed,
                     },
                 )
-                store.finish_task(
+                await store.finish_task_async(
                     run_id,
                     "failed",
                     completed_items=0,
@@ -17237,7 +19178,7 @@ QQ快捷指令:
         response["run_id"] = run_id
         response["message"] = f"已安全删除 {asset_type.upper()}：{result.exact_name}"
         if store is not None and run_id:
-            store.append_event(
+            await store.append_event_async(
                 run_id,
                 "delete",
                 "远端删除成功，并已完成删除后的实时清单刷新。",
@@ -17248,7 +19189,7 @@ QQ快捷指令:
                     "preset_cleanup_count": result.preset_cleanup_count,
                 },
             )
-            store.finish_task(
+            await store.finish_task_async(
                 run_id,
                 "succeeded",
                 completed_items=1,
@@ -17694,7 +19635,7 @@ QQ快捷指令:
                 "default_generation_pipeline": pipeline,
                 "enable_upscale": pipeline != "base",
             }
-            if not self._persist_config_updates(updates):
+            if not await self._persist_config_updates(updates):
                 raise WebUiActionError("工作流配置保存失败，运行时未切换")
 
             self.settings = replace(
@@ -17806,7 +19747,7 @@ QQ快捷指令:
             )
         except (OSError, ValueError, WorkflowError) as exc:
             raise WebUiActionError(f"UNET 模型无法应用到全部工作流：{exc}") from exc
-        if not self._persist_config("unet_model_name", selected.name):
+        if not await self._persist_config("unet_model_name", selected.name):
             raise WebUiActionError("UNET 模型保存失败")
         self.settings = new_settings
         self._workflow_builder = new_legacy_builder
@@ -17837,22 +19778,12 @@ QQ快捷指令:
     def _ensure_builtin_environment_profiles(self) -> None:
         """Seed only the Legacy executable profile.
 
-        2.9B is deferred in 2.4.0: no executable 2.9B profile is created,
+        2.9B is deferred in 2.1.307: no executable 2.9B profile is created,
         updated, activated or switched to. Any previously persisted 2.9B
         profile remains only as read-only metadata and is rejected by the
         profile create/switch APIs.
         """
-        current = {
-            field: getattr(self.settings, field, getattr(PluginSettings(), field))
-            for field in (
-                "comfyui_url", "workflow_dir", "workflow_file",
-                "lora_loader_node_id",
-                "unet_loader_node_id", "unet_model_input_name",
-                "unet_model_name", "unet_model_root", "clip_model_name",
-                "clip_model_root", "vae_model_name", "vae_model_root",
-                "lora_model_root",
-            )
-        }
+        current = extract_environment_settings(self.config or {})
         try:
             existing = {
                 str(item.get("name") or "").casefold()
@@ -17895,8 +19826,60 @@ QQ快捷指令:
             or "2.9b" in normalized_name
         ):
             raise WebUiActionError(
-                "Anima 2.9B 在 2.4.0 已暂缓：不允许创建、激活或切换该 Profile"
+                "Anima 2.9B 在 2.1.307 已暂缓：不允许创建、激活或切换该 Profile"
             )
+
+    def _close_startup_resources_on_failure(self) -> None:
+        """Close resources opened before config migration when startup fails."""
+        for attr in ("_task_store", "_log_console"):
+            resource = getattr(self, attr, None)
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    def _migrate_and_writeback_consolidated_config(
+        self,
+        config: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """One-time config migration + single atomic write-back path.
+
+        When migration is needed but cannot be written atomically, this
+        method raises before any ``PluginSettings`` can be built: the old
+        config is never silently reinterpreted with new defaults.
+
+        Returns the host-provided durable config object (AstrBotConfig) when
+        one exists, so ``save_config()``/``config_path`` survive for every
+        later persistence transaction; returns the migrated dict otherwise.
+        """
+        migrated = migrate_legacy_consolidated_config(config)
+        original = getattr(self, "config", None)
+        changed = dict(migrated) != dict(config)
+        if changed and isinstance(original, Mapping):
+            config_path = original.get("config_path") or getattr(
+                original, "config_path", None
+            )
+            if not config_path:
+                raise RuntimeError(
+                    "配置迁移需要写回，但 config_path 不可用；"
+                    "为避免内存/磁盘分叉，插件启动中止"
+                )
+            try:
+                atomic_write_json(Path(str(config_path)), migrated)
+                original.clear()
+                original.update(migrated)
+            except AtomicConfigWriteError as exc:
+                raise RuntimeError(
+                    "配置迁移写回失败，插件启动中止，避免内存与磁盘不一致"
+                ) from exc
+        # 必须返回宿主传入的持久化配置对象（AstrBotConfig），而不是迁移产出的
+        # 普通 dict：save_config()/config_path 只存在于原对象上，一旦丢失，
+        # 之后所有 WebUI 保存都会以"配置文件保存失败"被拒绝。
+        if isinstance(original, Mapping):
+            return original
+        return migrated
 
     @staticmethod
     def _canonical_legacy_config(
@@ -17941,7 +19924,7 @@ QQ快捷指令:
         defaults = PluginSettings()
         logger.warning(
             f"[{PLUGIN_NAME}] startup config was anima_29b; "
-            "2.9B is deferred in 2.4.0, forcing Anima Legacy."
+            "2.9B is deferred in 2.1.307, forcing Anima Legacy."
         )
         return replace(
             settings,
@@ -18012,8 +19995,11 @@ QQ快捷指令:
         """Run role-LoRA projection gates immediately before graph submission."""
         if getattr(self.settings, "model_profile_id", "anima_legacy") != "anima_29b":
             return
+        authorized_names = self._authorized_character_preset_lora_names()
         semantic_index = getattr(self, "_semantic_index", None)
         for selection in selections:
+            if canonical_lora_name(selection.name).casefold() in authorized_names:
+                continue
             record = records_by_name.get(canonical_lora_name(selection.name).casefold())
             if record is None:
                 continue
@@ -18041,16 +20027,39 @@ QQ快捷指令:
         self,
         selections: tuple[LoraSelection, ...],
         records_by_name: Mapping[str, Any],
+        *,
+        target_family: str = "",
+        snapshot_records: tuple[Any, ...] = (),
     ) -> None:
-        """Prevent implicit cross-family LoRA reuse at submission time."""
-        target_family = str(
-            getattr(self.settings, "model_family", "") or "anima_legacy_28l"
-        ).strip().casefold()
+        """Prevent implicit cross-family LoRA reuse at submission time.
+
+        ``target_family`` is the same authoritative 2.9B/Legacy detection the
+        adapter used; ``snapshot_records`` is the full refreshed catalog so
+        names that the adapter promoted to a ``_29b`` companion (or demoted to
+        the base) still resolve here.
+        """
+        if not target_family:
+            target_family = str(
+                getattr(self.settings, "model_family", "") or "anima_legacy_28l"
+            ).strip().casefold()
         patch_verified = not bool(self._model_profile_contract_error(self.settings))
+        authorized_names = self._authorized_character_preset_lora_names()
+        lookup: dict[str, Any] = {}
+        iterable_snapshot = (
+            snapshot_records
+            if isinstance(snapshot_records, (tuple, list, set, frozenset))
+            else ()
+        )
+        for record in iterable_snapshot:
+            key = canonical_lora_name(getattr(record, "name", "")).strip()
+            if key:
+                lookup[key.casefold()] = record
+        lookup.update(records_by_name)
         for selection in selections:
-            record = records_by_name.get(
-                canonical_lora_name(selection.name).casefold()
-            )
+            canonical_selection = canonical_lora_name(selection.name).casefold()
+            if canonical_selection in authorized_names:
+                continue
+            record = lookup.get(canonical_selection)
             if record is None:
                 raise LoraWorkflowError(
                     "2.9B LoRA compatibility rejected: asset metadata missing for "
@@ -18151,7 +20160,7 @@ QQ快捷指令:
             contract_error = self._model_profile_contract_error(candidate_settings)
             if contract_error:
                 raise WebUiActionError(contract_error)
-            profile = self._config_profiles.switch_profile(
+            profile = await self._config_profiles.switch_profile_async(
                 identifier,
                 self.config,
                 persist_updates=self._persist_config_updates,
@@ -18253,7 +20262,7 @@ QQ快捷指令:
                 None,
             )
         if image_job is not None and image_job.task is not None:
-            store.append_event(
+            await store.append_event_async(
                 run_id,
                 "cancel",
                 "管理员请求取消图片任务。",
@@ -18273,7 +20282,7 @@ QQ快捷指令:
         if cancel_event is not None:
             cancel_event.set()
         task.cancel()
-        store.append_event(
+        await store.append_event_async(
             run_id,
             "cancel",
             "管理员请求取消任务",
@@ -18366,7 +20375,7 @@ QQ快捷指令:
         job.state = "cancelled"
         if self._task_store is not None and job.task_run_id:
             if task_info is not None and task_info.get("status") in {"queued", "running"}:
-                self._task_store.finish_task(
+                await self._task_store.finish_task_async(
                     job.task_run_id,
                     "cancelled",
                     completed_items=0,
@@ -18460,7 +20469,7 @@ QQ快捷指令:
             if not queue:
                 queues.pop(user_id, None)
 
-    def _create_image_task_record(
+    async def _create_image_task_record(
         self,
         job: GenerationJob,
         event: AstrMessageEvent,
@@ -18474,7 +20483,7 @@ QQ快捷指令:
             event,
             detail=job.task_type,
         )
-        job.task_run_id = self._task_store.create_task(
+        job.task_run_id = await self._task_store.create_task_async(
             job.task_type,
             mode="qq_command",
             requested_by=job.user_id,
@@ -18482,6 +20491,21 @@ QQ快捷指令:
             metadata={"operation": job.task_type},
             run_id=run_state.run_id,
         )
+        gate_payload = self._event_intent_gate_result(event)
+        decision_id = str(gate_payload.get("decision_id") or "")
+        if decision_id:
+            await self._task_store.append_event_async(
+                job.task_run_id,
+                "intent",
+                "唯一意图闸门决策已关联到本任务",
+                event_code="intent_judge_result",
+                details={
+                    "decision_id": decision_id,
+                    "decision": str(gate_payload.get("decision") or ""),
+                    "backend_used": str(gate_payload.get("backend_used") or ""),
+                    "confidence": float(gate_payload.get("confidence") or 0.0),
+                },
+            )
         merge_trace = str(
             (self._chat_draw_terminal_trace(event) or {}).get(
                 "preset_merge_trace", ""
@@ -18489,7 +20513,7 @@ QQ快捷指令:
             or ""
         ).strip()
         if merge_trace:
-            self._task_store.append_event(
+            await self._task_store.append_event_async(
                 job.task_run_id,
                 "manifest",
                 "会话配方与风格预设已完成确定性合并。",
@@ -18497,7 +20521,7 @@ QQ快捷指令:
                 details={"merge_trace": merge_trace, "conflicts": 0},
             )
         if job.was_queued:
-            self._task_store.append_event(
+            await self._task_store.append_event_async(
                 job.task_run_id,
                 "queue",
                 "图片任务已进入个人 FIFO 队列，等待前序任务完成。",
@@ -18522,9 +20546,9 @@ QQ快捷指令:
                     f"{MessageEmoji.DRAW} 已轮到你的排队任务，现已自动开始执行。",
                 )
             if self._task_store is not None and job.task_run_id:
-                self._task_store.start_task(job.task_run_id, total_items=1)
+                await self._task_store.start_task_async(job.task_run_id, total_items=1)
                 self._get_drawing_orchestrator().mark_running(event, job.task_run_id)
-                self._task_store.append_event(
+                await self._task_store.append_event_async(
                     job.task_run_id,
                     "run",
                     (
@@ -18541,14 +20565,14 @@ QQ快捷指令:
                 )
             result = await operation(job)
             if self._task_store is not None and job.task_run_id:
-                self._task_store.append_event(
+                await self._task_store.append_event_async(
                     job.task_run_id,
                     "run",
                     "图片任务的全部生成阶段已执行完成；发送状态等待平台回执。",
                     event_code="image_task_output_ready",
                     details={"final_state": job.state},
                 )
-                self._task_store.finish_task(
+                await self._task_store.finish_task_async(
                     job.task_run_id,
                     "partial",
                     completed_items=1,
@@ -18572,7 +20596,7 @@ QQ快捷指令:
                     "queued",
                     "running",
                 }:
-                    self._task_store.finish_task(
+                    await self._task_store.finish_task_async(
                         job.task_run_id,
                         "cancelled",
                         completed_items=0,
@@ -18602,7 +20626,7 @@ QQ快捷指令:
                     and isinstance(exc.details, Mapping)
                     else {}
                 )
-                self._task_store.append_event(
+                await self._task_store.append_event_async(
                     job.task_run_id,
                     "run",
                     "图片任务在当前阶段失败。",
@@ -18616,7 +20640,7 @@ QQ快捷指令:
                         "error_code": error_code,
                     },
                 )
-                self._task_store.finish_task(
+                await self._task_store.finish_task_async(
                     job.task_run_id,
                     "failed",
                     completed_items=0,
@@ -18654,7 +20678,7 @@ QQ快捷指令:
         if error:
             return error
         try:
-            self._create_image_task_record(job, event)
+            await self._create_image_task_record(job, event)
         except Exception:
             await self._release_image_job(job)
             raise
@@ -18709,7 +20733,7 @@ QQ快捷指令:
         if error:
             raise ValueError(error)
         try:
-            self._create_image_task_record(job, event)
+            await self._create_image_task_record(job, event)
         except Exception:
             await self._release_image_job(job)
             raise
@@ -18740,16 +20764,42 @@ QQ快捷指令:
         details: Optional[dict[str, Any]] = None,
         level: str = "INFO",
     ) -> None:
-        if getattr(self, "_task_store", None) is None or not job.task_run_id:
+        store = getattr(self, "_task_store", None)
+        if store is None or not job.task_run_id:
             return
-        self._task_store.append_event(
-            job.task_run_id,
-            phase,
-            message,
-            level=level,
-            event_code=event_code,
-            details=details,
-        )
+        try:
+            task = asyncio.create_task(
+                store.append_event_async(
+                    job.task_run_id,
+                    phase,
+                    message,
+                    level=level,
+                    event_code=event_code,
+                    details=details,
+                )
+            )
+        except RuntimeError:
+            store.append_event(
+                job.task_run_id,
+                phase,
+                message,
+                level=level,
+                event_code=event_code,
+                details=details,
+            )
+            return
+
+        def _log_store_write_failure(done_task: asyncio.Task[Any]) -> None:
+            try:
+                done_task.exception()
+            except (asyncio.CancelledError, TaskStoreError):
+                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] task event write failed: {type(exc).__name__}"
+                )
+
+        task.add_done_callback(_log_store_write_failure)
 
     @asynccontextmanager
     async def _unbounded_preparation(self) -> AsyncGenerator[None, None]:
@@ -18861,9 +20911,9 @@ QQ快捷指令:
         """Limit only the GPU/Comfy execution phase, not LLM preparation."""
 
         assert self._client is not None
-        async with self._generation_slot():
-            comfy_started_at = time.monotonic()
-            try:
+        comfy_started_at = time.monotonic()
+        try:
+            async with self._generation_slot():
                 job.state = "submitting"
                 job.prompt_id = await self._client.submit(dict(workflow))
                 job.state = active_state
@@ -18873,28 +20923,41 @@ QQ快捷指令:
                     job.prompt_id,
                     preferred_nodes,
                 )
-                job.state = "downloading"
-                job_dir = self._temp_dir / job.prompt_id
-                for reference in references:
-                    image_paths.append(
-                        await self._client.download_image(reference, job_dir)
-                    )
-            finally:
-                image_paths.comfy_elapsed_seconds += max(
-                    0.0,
-                    time.monotonic() - comfy_started_at,
+        finally:
+            image_paths.comfy_elapsed_seconds += max(
+                0.0,
+                time.monotonic() - comfy_started_at,
+            )
+        job.state = "downloading"
+        job_dir = self._temp_dir / job.prompt_id
+        download_with_sha = getattr(self._client, "download_image_with_sha", None)
+        for reference in references:
+            if callable(download_with_sha):
+                path, sha256 = await download_with_sha(reference, job_dir)
+                image_paths.append(path)
+                image_paths.output_sha256s[str(path)] = sha256
+            else:
+                image_paths.append(
+                    await self._client.download_image(reference, job_dir)
                 )
 
     async def _safe_gpu_name(self) -> str:
+        """Return cached GPU model when fresh, otherwise fetch and cache it."""
+        now = time.monotonic()
+        cached = getattr(self, "_gpu_name_cache", None)
+        if cached is not None and now - cached[0] < 30.0:
+            return cached[1]
         if self._client is None:
             return ""
         try:
-            return str(await self._client.gpu_name() or "")
+            name = str(await self._client.gpu_name() or "")
         except Exception as exc:
             logger.warning(
                 f"[{PLUGIN_NAME}] unable to prefetch ComfyUI GPU model: {type(exc).__name__}"
             )
             return ""
+        self._gpu_name_cache = (now, name)
+        return name
 
     async def _execute_upscale_job(
         self,
@@ -18908,11 +20971,7 @@ QQ快捷指令:
         source: Optional[Path] = None
         image_paths = GeneratedImagePaths()
         started_at = time.monotonic()
-        gpu_task = (
-            asyncio.create_task(self._safe_gpu_name())
-            if self._parallel_preflight_enabled()
-            else None
-        )
+        gpu_task = asyncio.create_task(self._safe_gpu_name())
         try:
             job.state = "reading_image"
             source = await self._image_input.collect_one(event)
@@ -19269,6 +21328,20 @@ QQ快捷指令:
             for source in sources:
                 source.unlink(missing_ok=True)
 
+    def _resolve_target_family(
+        self, options: Optional[GenerationOptions] = None
+    ) -> str:
+        workflow = (
+            (getattr(options, "workflow_file", "") if options else "")
+            or getattr(self.settings, "workflow_file", "")
+            or ""
+        )
+        unet = str(getattr(self.settings, "unet_model_name", "") or "")
+        combined = f"{workflow} {unet}"
+        if is_29b_model_family("", combined):
+            return "anima_29b_40l"
+        return "anima_legacy_28l"
+
     async def _prepare_inpaint_options(
         self,
         options: GenerationOptions,
@@ -19385,6 +21458,22 @@ QQ快捷指令:
             prompt_loras,
         )
         dynamic_loras = merge_plan.selections
+        target_family = self._resolve_target_family(options)
+        dynamic_loras, bypassed_records, _ = adapt_lora_selections_for_target(
+            dynamic_loras,
+            target_family=target_family,
+            records_by_name=resolved_records,
+            workflow_or_model=(getattr(options, "workflow_file", "") or getattr(self.settings, "workflow_file", "")),
+        )
+        if bypassed_records:
+            bypassed_terms = tuple(
+                t
+                for r in bypassed_records
+                for t in r.trigger_words
+                if t and t not in clean_prompt
+            )
+            if bypassed_terms:
+                clean_prompt = f"{clean_prompt}, {', '.join(bypassed_terms)}" if clean_prompt else ", ".join(bypassed_terms)
         if len(dynamic_loras) > self.settings.max_total_dynamic_loras:
             raise WorkflowError(
                 "组合、指令与提示词中的动态 LoRA 合计最多允许 "
@@ -19527,11 +21616,7 @@ QQ快捷指令:
         pair = None
         image_paths = GeneratedImagePaths()
         started_at = time.monotonic()
-        gpu_task = (
-            asyncio.create_task(self._safe_gpu_name())
-            if self._parallel_preflight_enabled()
-            else None
-        )
+        gpu_task = asyncio.create_task(self._safe_gpu_name())
         try:
             job.state = "reading_image"
             pair = await self._image_input.collect_inpaint_pair(event)
@@ -19651,8 +21736,25 @@ QQ快捷指令:
         negative_prompt: str,
         manifest: PresetManifest,
         resolved_records: tuple[Any, ...],
+        character_identity: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist the just-succeeded picture plan for later continuations."""
+
+        # P4 追画连续性：把成功解析的角色身份写进配方，追画未声明角色时沿用。
+        identity = dict(character_identity or {})
+        canonical = str(identity.get("canonical") or "").strip()
+        activations = tuple(
+            str(term).strip()
+            for term in (identity.get("activation_terms") or ())
+            if str(term).strip()
+        )
+        character_lora_name = str(identity.get("lora_name") or "").strip()
+        if canonical and activations:
+            manifest = replace(
+                manifest,
+                identity_anchor=canonical,
+                required_triggers=activations,
+            )
 
         try:
             prompt_recipe = self._director.render_picture_instruction(
@@ -19683,6 +21785,7 @@ QQ快捷指令:
             prompt_recipe=prompt_recipe,
             manifest=manifest,
             content_fingerprint=fingerprint,
+            character_lora_name=character_lora_name,
         )
         await self._session_recipe_store.put(recipe)
         self._record_image_task_phase(
@@ -19694,6 +21797,8 @@ QQ快捷指令:
                 "session_id": recipe.session_id,
                 "preset_name": recipe.preset_name,
                 "manifest_hash": recipe.manifest_hash,
+                "character_lora_name": recipe.character_lora_name,
+                "identity_anchor": recipe.identity_anchor,
             },
         )
 
@@ -19723,11 +21828,7 @@ QQ快捷指令:
             raise WorkflowError("control and img2img conditioning cannot be combined")
         started_at = time.monotonic()
         image_paths = GeneratedImagePaths()
-        gpu_task = (
-            asyncio.create_task(self._safe_gpu_name())
-            if self._parallel_preflight_enabled()
-            else None
-        )
+        gpu_task = asyncio.create_task(self._safe_gpu_name())
         effective_prompt = options.prompt
         provider_id = ""
         director_negative = ""
@@ -19762,7 +21863,8 @@ QQ快捷指令:
                     try:
                         if not self._director:
                             raise PromptDirectorError(
-                                "LLM 分镜模块不可用", self._director_error or ""
+                                "【绘图导演思考模型】LLM 分镜模块不可用",
+                                self._director_error or "",
                             )
                         director_request = options.prompt
                         if options.control_modes:
@@ -19961,6 +22063,22 @@ QQ快捷指令:
                         resolved_prompt_loras,
                     )
                     dynamic_loras = merge_plan.selections
+                    target_family = self._resolve_target_family(options)
+                    dynamic_loras, bypassed_records, _ = adapt_lora_selections_for_target(
+                        dynamic_loras,
+                        target_family=target_family,
+                        records_by_name=resolved_records,
+                        workflow_or_model=(getattr(options, "workflow_file", "") or getattr(self.settings, "workflow_file", "")),
+                    )
+                    if bypassed_records:
+                        bypassed_terms = tuple(
+                            t
+                            for r in bypassed_records
+                            for t in r.trigger_words
+                            if t and t not in clean_prompt
+                        )
+                        if bypassed_terms:
+                            clean_prompt = f"{clean_prompt}, {', '.join(bypassed_terms)}" if clean_prompt else ", ".join(bypassed_terms)
                     if merge_plan.ignored_locked_overrides:
                         logger.warning(
                             f"[{PLUGIN_NAME}] 已忽略对保存风格权重的覆盖: "
@@ -20374,6 +22492,8 @@ QQ快捷指令:
                 self._gate_active_profile_lora_compatibility(
                     tuple(dynamic_loras),
                     resolved_records,
+                    target_family=target_family,
+                    snapshot_records=snapshot_records,
                 )
                 if options.control_modes:
                     assert isinstance(builder, ControlWorkflowBuilder)
@@ -20587,6 +22707,7 @@ QQ快捷指令:
                         combined_negative,
                         actual_manifest,
                         resolved_records,
+                        character_identity=getattr(job, "character_identity", None),
                     )
                 return (
                     image_paths,
@@ -20654,6 +22775,7 @@ QQ快捷指令:
                 action,
                 event=event,
                 force=force,
+                allow_cached=not force,
             )
         except TypeError as exc:
             message = str(exc)
@@ -20667,6 +22789,7 @@ QQ快捷指令:
         *,
         event: Optional[AstrMessageEvent] = None,
         force: bool = False,
+        allow_cached: bool = False,
     ) -> tuple[Any, ...]:
         """Refresh once for planning, reuse it, and force-refresh for submit."""
         if not self._lora_catalog:
@@ -20710,6 +22833,14 @@ QQ快捷指令:
                 )
                 return snapshot.records
 
+        if not force and allow_cached and self._lora_catalog:
+            records = await self._lora_catalog._get_records(force_refresh=False)
+            logger.info(
+                f"[{PLUGIN_NAME}] {action}: reused LoRA catalog cache "
+                f"records={len(records)}"
+            )
+            return records
+
         records = await self._lora_catalog.refresh_for_operation()
         logger.info(
             f"[{PLUGIN_NAME}] {action}: LoRA Manager force refresh completed, "
@@ -20735,21 +22866,34 @@ QQ快捷指令:
             == "anima_29b_40l"
         )
         if explicit_identifier:
-            explicit = self._lora_presets.resolve(explicit_identifier)
-            if explicit.category in {
-                PRESET_CATEGORY_ARTIST_STYLE,
-                PRESET_CATEGORY_MIXED,
-            }:
-                return (explicit,), True
-            if explicit.category == PRESET_CATEGORY_CHARACTER:
-                default_style = (
-                    None
-                    if is_29b_profile
-                    else self._resolve_default_style_preset()
-                )
-                if default_style:
-                    return (default_style, explicit), True
-                return (explicit,), False
+            identifiers = [
+                item.strip()
+                for item in str(explicit_identifier).split(",")
+                if item.strip()
+            ]
+            resolved: list[LoraPreset] = []
+            replace_stack = False
+            for identifier in identifiers:
+                explicit = self._lora_presets.resolve(identifier)
+                resolved.append(explicit)
+                if explicit.category in {
+                    PRESET_CATEGORY_ARTIST_STYLE,
+                    PRESET_CATEGORY_MIXED,
+                }:
+                    replace_stack = True
+            if resolved:
+                if any(
+                    preset.category == PRESET_CATEGORY_CHARACTER
+                    for preset in resolved
+                ) and not replace_stack:
+                    default_style = (
+                        None
+                        if is_29b_profile
+                        else self._resolve_default_style_preset()
+                    )
+                    if default_style:
+                        return (default_style, *resolved), True
+                return tuple(resolved), replace_stack
 
         expanded_style = self._lora_presets.match_style_selections(parsed_loras)
         if expanded_style:
@@ -20802,11 +22946,12 @@ QQ快捷指令:
             and current_default == default_style
         ):
             return False
-        if not self._persist_config_updates(
+        if not self._persist_config_transaction_sync(
             {
                 "lora_presets": presets,
                 "default_style_preset": default_style,
-            }
+            },
+            operation="restore lora preset state",
         ):
             raise ModelManagerError(
                 "删除失败后无法恢复 LoRA 组合配置，请立即检查配置文件"
@@ -20843,7 +22988,10 @@ QQ快捷指令:
         updates: dict[str, Any] = {"lora_presets": updated}
         if self.settings.default_style_preset in removed_preset_names:
             updates["default_style_preset"] = ""
-        if not self._persist_config_updates(updates):
+        if not self._persist_config_transaction_sync(
+            updates,
+            operation="clean lora presets",
+        ):
             raise ModelManagerError("LoRA 预设清理保存失败，已阻止删除")
         self._lora_presets.load(updated)
         return changed_count

@@ -247,16 +247,40 @@ class LoraArchiveService:
         return _sha256_json(_fingerprint_source(record))
 
     @classmethod
-    def catalog_fingerprint(cls, records: Sequence[LoraRecord]) -> str:
-        """Return a stable fingerprint independent from catalog ordering."""
+    def catalog_fingerprint(
+        cls,
+        records: Sequence[LoraRecord],
+        *,
+        record_fingerprints: Optional[Mapping[str, str]] = None,
+    ) -> str:
+        """Return a stable fingerprint independent from catalog ordering.
+
+        ``record_fingerprints`` may be supplied by callers that already computed
+        per-record source digests, avoiding a second fingerprint pass.
+        """
         payload = sorted(
             (
                 _name_key(record.name),
-                cls.record_fingerprint(record),
+                (
+                    record_fingerprints[_name_key(record.name)]
+                    if record_fingerprints is not None
+                    and _name_key(record.name) in record_fingerprints
+                    else cls.record_fingerprint(record)
+                ),
             )
             for record in records
         )
         return _sha256_json(payload)
+
+    @classmethod
+    def _record_fingerprint_map(
+        cls,
+        records: Sequence[LoraRecord],
+    ) -> dict[str, str]:
+        return {
+            _name_key(record.name): cls.record_fingerprint(record)
+            for record in records
+        }
 
     @staticmethod
     def _empty_index() -> dict[str, Any]:
@@ -307,15 +331,14 @@ class LoraArchiveService:
         index = self.read_index()
         entries = index.get("entries", {})
         current = {_name_key(record.name): record for record in records}
+        fingerprints = self._record_fingerprint_map(records)
         added: list[str] = []
         modified: list[str] = []
         for key, record in current.items():
             entry = entries.get(key)
             if not isinstance(entry, dict):
                 added.append(record.name)
-            elif entry.get("catalog_source_fingerprint") != self.record_fingerprint(
-                record
-            ):
+            elif entry.get("catalog_source_fingerprint") != fingerprints[key]:
                 modified.append(record.name)
         removed = [
             str(entry.get("name") or key)
@@ -327,7 +350,10 @@ class LoraArchiveService:
         added.sort(key=str.casefold)
         modified.sort(key=str.casefold)
         removed.sort(key=str.casefold)
-        fingerprint = self.catalog_fingerprint(records)
+        fingerprint = self.catalog_fingerprint(
+            records,
+            record_fingerprints=fingerprints,
+        )
         archived_fingerprint = str(index.get("catalog_fingerprint") or "")
         pending = tuple((*added, *modified))
         changed = bool(

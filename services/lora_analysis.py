@@ -20,6 +20,8 @@ from pathlib import Path
 import re
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
 
+from ..core.lora import canonical_lora_name
+from .lora_catalog import LoraCatalogService
 from .lora_detail import LoraDetailV2
 from .lora_semantic import (
     SEMANTIC_CATEGORIES,
@@ -488,6 +490,38 @@ class LoraAnalysisPipeline:
             },
         )
 
+        cloned_entry = self._try_clone_from_base_entry(detail, source_fingerprint)
+        if cloned_entry is not None:
+            self._commit_entry(cloned_entry)
+            self.task_store.append_event(
+                run_id,
+                "persist",
+                f"同源快速克隆完成（免调用 LLM，Token 消耗：0）：克隆自同源 Base LoRA",
+                item_name=detail.name,
+                batch_index=item_index,
+                batch_total=item_total,
+                event_code="item_saved",
+                details={
+                    "analysis_status": "searchable",
+                    "cloned_from_base": True,
+                    "token_cost": 0,
+                },
+            )
+            return LoraAnalysisItemResult(
+                name=detail.name,
+                asset_id=detail.asset_id,
+                success=True,
+                attempts=0,
+                analysis_status=cloned_entry.analysis_status,
+                category=cloned_entry.effective_category,
+                character_names=cloned_entry.effective_values("character_names"),
+                source_works=cloned_entry.effective_values("source_works"),
+                artist_style_names=cloned_entry.effective_values("artist_style_names"),
+                aliases=cloned_entry.effective_values("aliases"),
+                summary=cloned_entry.analysis_summary,
+                confidence=cloned_entry.analysis_confidence,
+            )
+
         base_prompt = self._build_user_prompt(payload)
         previous_output = ""
         validation_error: Optional[LoraAnalysisValidationError] = None
@@ -751,6 +785,59 @@ class LoraAnalysisPipeline:
             else:
                 self.semantic_index.entries[entry.identity_key] = previous
             raise
+
+    def _try_clone_from_base_entry(
+        self,
+        detail: LoraDetailV2,
+        source_fingerprint: str,
+    ) -> Optional[SemanticEntry]:
+        """若当前 LoRA 为 _29b 衍生变体，且原版 Base LoRA 具备已有语义档案，则执行零 Token 快速克隆。"""
+        derived_base = LoraCatalogService._derive_base_lora_name(detail.name)
+        if not derived_base:
+            canonical = canonical_lora_name(detail.name)
+            if canonical.casefold().startswith("29b/"):
+                derived_base = canonical[4:].strip("/")
+
+        if not derived_base:
+            return None
+
+        base_canonical = canonical_lora_name(derived_base).casefold()
+        base_basename = base_canonical.rsplit("/", 1)[-1]
+
+        base_entry: Optional[SemanticEntry] = None
+        for entry in self.semantic_index.entries.values():
+            entry_cname = canonical_lora_name(entry.canonical_name).casefold()
+            if entry_cname == base_canonical:
+                base_entry = entry
+                break
+            if entry_cname.rsplit("/", 1)[-1] == base_basename:
+                base_entry = entry
+
+        if base_entry is None or not base_entry.present:
+            return None
+
+        identity_key = semantic_identity_key(detail.name, detail.file_status.sha256)
+        cloned = SemanticEntry(
+            identity_key=identity_key,
+            canonical_name=canonical_lora_name(detail.name),
+            sha256=detail.file_status.sha256,
+            analysis_status="searchable",
+            analysis_summary=f"同源快速克隆自 [{base_entry.canonical_name}]。{base_entry.analysis_summary}",
+            analysis_confidence=max(0.9, base_entry.analysis_confidence),
+            source_fingerprint=source_fingerprint,
+            updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            present=True,
+            compatible_model_families=("anima_29b_40l",),
+            compatibility_mode="native_29b",
+            category=base_entry.category,
+            character_names=base_entry.character_names,
+            source_works=base_entry.source_works,
+            activation_terms=base_entry.activation_terms,
+            artist_style_names=base_entry.artist_style_names,
+            aliases=base_entry.aliases,
+            identity_bindings=base_entry.identity_bindings,
+        )
+        return cloned
 
     def _set_analysis_status(
         self,

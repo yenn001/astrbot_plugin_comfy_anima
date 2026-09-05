@@ -11,6 +11,7 @@ from ..services.response_envelope import (
     BundleKind,
     ReceiptState,
 )
+from ._stubs import make_gate_payload
 
 
 class _FilterStub:
@@ -91,6 +92,21 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
 
+    @staticmethod
+    def _fake_judge(decision: str) -> object:
+        class FakeJudge:
+            async def judge(self, message: str, bot: str) -> object:
+                return types.SimpleNamespace(
+                    decision=decision,
+                    confidence=0.9,
+                    backend_used="test",
+                    reason="test",
+                    latency_ms=0.0,
+                    trace={},
+                )
+
+        return FakeJudge()
+
     def test_named_photo_request_is_photo_not_command(self) -> None:
         self.assertTrue(
             self.main.ComfyAnimaPlugin._looks_like_photo_delivery_request(
@@ -158,6 +174,12 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
             director_primary=True,
         )
         plugin._event_has_explicit_command_route = lambda _event: False
+        plugin._build_intent_judge_service = lambda: self._fake_judge(
+            self.main.DRAW_NOW
+        )
+        plugin._intent_decision_ledger = types.SimpleNamespace(
+            verify=lambda decision_id, expected: True
+        )
 
         class Event:
             message_str = "我想看娅娅的照片"
@@ -172,6 +194,10 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
                 self._extras[key] = value
 
         event = Event()
+        event.set_extra(
+            "astrbot_plugin_comfy_anima:intent_router_gate_result",
+            make_gate_payload(self.main, self.main.DRAW_NOW, "我想看娅娅的照片"),
+        )
 
         async def collect():
             return [item async for item in plugin._natural_language_draw_impl(event)]
@@ -215,7 +241,7 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
         assert envelope is not None
         receipt = envelope.image_bundle.receipt
         assert receipt is not None
-        self.assertEqual(receipt.status, ReceiptState.FAILED.value)
+        self.assertEqual(receipt.status, ReceiptState.FAILED)
         self.assertEqual(receipt.last_error, "output_file_missing")
 
     def test_ordinary_message_does_not_begin_drawing_session(self) -> None:
@@ -225,6 +251,9 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
         )
         plugin._event_has_explicit_command_route = lambda _event: False
         plugin._event_drawing_keys = lambda _event: ("key",)
+        plugin._build_intent_judge_service = lambda: self._fake_judge(
+            self.main.NO_DRAW
+        )
 
         class Orchestrator:
             def __init__(self):
@@ -259,6 +288,12 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
         plugin._event_has_explicit_command_route = lambda _event: False
         plugin._event_drawing_keys = lambda _event: ("key",)
         plugin._access_error = lambda *_args: "blocked for test"
+        plugin._build_intent_judge_service = lambda: self._fake_judge(
+            self.main.DRAW_NOW
+        )
+        plugin._intent_decision_ledger = types.SimpleNamespace(
+            verify=lambda decision_id, expected: True
+        )
 
         class Orchestrator:
             def __init__(self):
@@ -276,12 +311,35 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
         orchestrator = plugin._orchestrator
 
         async def collect(message):
-            event = types.SimpleNamespace(
-                message_str=message,
-                stop_event=lambda: None,
-                plain_result=lambda text: text,
-            )
-            return [item async for item in plugin._natural_language_draw_impl(event)]
+            draw_now = self.main.DRAW_NOW
+            payload = make_gate_payload(self.main, draw_now, message)
+
+            class Event:
+                message_str = message
+
+                def __init__(self):
+                    self._extras = {
+                        "astrbot_plugin_comfy_anima:intent_router_gate_result": payload
+                    }
+                    self.stopped = False
+
+                def get_extra(self, key, default=None):
+                    return self._extras.get(key, default)
+
+                def set_extra(self, key, value):
+                    self._extras[key] = value
+
+                def stop_event(self):
+                    self.stopped = True
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            return [
+                item
+                async for item in plugin._natural_language_draw_impl(Event())
+            ]
 
         import asyncio
 
@@ -305,6 +363,39 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
             plugin._requested_subject_hint("画一张达妮娅自拍"),
             "达妮娅",
         )
+
+    def test_character_preset_has_priority_for_named_subject(self) -> None:
+        from ..services.lora_presets import LoraPreset
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_presets = types.SimpleNamespace(
+            list_presets=lambda category=None: (
+                LoraPreset(
+                    name="达妮娅",
+                    category="character",
+                    selections=(),
+                ),
+            )
+        )
+        self.assertEqual(
+            plugin._subject_character_preset("达妮娅").name,
+            "达妮娅",
+        )
+        self.assertIsNone(plugin._subject_character_preset("调月莉音"))
+
+    def test_single_character_authority_uses_preset_anchor(self) -> None:
+        from ..services.lora_presets import LoraPreset
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._requested_subject_hint = lambda message: "达妮娅"
+        plugin._subject_character_preset = lambda subject: LoraPreset(
+            name="达妮娅",
+            category="character",
+            selections=(),
+            identity_anchor="denia_(wuthering_waves)",
+        )
+        authority = plugin._single_character_authority("画一张达妮娅")
+        self.assertEqual(authority.identity_anchor, "denia_(wuthering_waves)")
 
     def test_production_routing_does_not_call_compat_union(self) -> None:
         source = Path(self.main.__file__).read_text(encoding="utf-8")
@@ -360,9 +451,12 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
             "lora_patch_required": True,
         }
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
-        plugin.config = dict(raw)
         plugin.settings = self.main.ComfyAnimaPlugin._force_deferred_29b_to_legacy(
             PluginSettings.from_mapping(raw)
+        )
+        plugin.config = self.main.ComfyAnimaPlugin._canonical_legacy_config(
+            plugin.settings,
+            dict(raw),
         )
 
         class Profiles:
@@ -415,6 +509,40 @@ class PhotoDeliveryRoutingTests(unittest.TestCase):
                         compatibility_mode="native_29b",
                     )
                 },
+            )
+
+    def test_gate_resolves_adapter_promoted_companion_from_snapshot(self) -> None:
+        from ..models import LoraSelection, PluginSettings
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = PluginSettings.from_mapping(
+            {"model_family": "anima_legacy_28l"}
+        )
+        plugin._model_profile_contract_error = lambda _settings: ""
+        plugin._semantic_index = types.SimpleNamespace(entries={})
+
+        # 适配器把底座升级成 _29b 同伴：前置 records 只有底座，同伴只在快照里。
+        plugin._gate_active_profile_lora_compatibility(
+            (LoraSelection("29B/(画质)anima-highres-aesthetic-boost_29b", 0.5),),
+            {},
+            target_family="anima_29b_40l",
+            snapshot_records=(
+                types.SimpleNamespace(
+                    name="29B/(画质)anima-highres-aesthetic-boost_29b.safetensors",
+                    sha256="a" * 64,
+                    compatible_model_families=("anima_29b_40l",),
+                    compatibility_mode="native_29b",
+                ),
+            ),
+        )
+
+        # 名称在 records 与快照里都没有时仍然失败关闭。
+        with self.assertRaises(self.main.LoraWorkflowError):
+            plugin._gate_active_profile_lora_compatibility(
+                (LoraSelection("29B/missing-asset_29b", 0.5),),
+                {},
+                target_family="anima_29b_40l",
+                snapshot_records=(),
             )
 
     def test_canonical_legacy_config_overrides_29b_executable_fields(self) -> None:

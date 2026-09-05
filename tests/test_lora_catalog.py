@@ -1113,5 +1113,34 @@ class FunctionalPresetCategoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await service.infer_preset_category(selections), "mixed")
 
 
+class LoraCatalogFormatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_format_records_for_llm_compact_and_detail(self) -> None:
+        service = LoraCatalogService(PluginSettings.from_mapping({}))
+        records = (
+            LoraRecord(
+                "characters/denia.safetensors",
+                category="character",
+                character_name="Denia",
+                source_work="Wuthering Waves",
+                trigger_words=("denia",),
+                tags=("character",),
+                description="portrait lighting secret",
+            ),
+        )
+
+        compact = await service.format_records_for_llm(records)
+        detail = await service.format_records_for_llm(records, detail=True)
+
+        self.assertIn("| character: Denia", compact)
+        self.assertIn("| work: Wuthering Waves", compact)
+        self.assertIn("| recommended weight: 0.8", compact)
+        self.assertNotIn("| triggers:", compact)
+        self.assertNotIn("| tags:", compact)
+        self.assertNotIn("portrait lighting secret", compact)
+        self.assertIn("| triggers: denia", detail)
+        self.assertIn("| tags: character", detail)
+        self.assertIn("portrait lighting secret", detail)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,10 +22,13 @@ def _normalized(value: str) -> str:
     return _SPACE_RE.sub(" ", value).strip()
 
 
-def _contains(text: str, phrase: str) -> bool:
-    haystack = f" {_normalized(text)} "
+def _contains_normalized(haystack: str, phrase: str) -> bool:
     needle = _normalized(phrase)
     return bool(needle) and f" {needle} " in haystack
+
+
+def _contains(text: str, phrase: str) -> bool:
+    return _contains_normalized(f" {_normalized(text)} ", phrase)
 
 
 @dataclass(frozen=True)
@@ -344,14 +347,17 @@ def validate_semantic_prompt(
 ) -> tuple[str, ...]:
     """Validate the final post-LoRA positive prompt against edit invariants."""
 
+    normalized_haystack = f" {_normalized(positive_prompt)} "
     issues: list[str] = []
     for code, aliases in required_groups:
-        if not any(_contains(positive_prompt, alias) for alias in aliases):
+        if not any(
+            _contains_normalized(normalized_haystack, alias) for alias in aliases
+        ):
             issues.append(f"missing:{code}")
     for term in forbidden_terms:
-        if _contains(positive_prompt, term):
+        if _contains_normalized(normalized_haystack, term):
             issues.append("retained_source_outfit")
     for term in preserved_terms:
-        if not _contains(positive_prompt, term):
+        if not _contains_normalized(normalized_haystack, term):
             issues.append("missing_preserved_composition")
     return tuple(dict.fromkeys(issues))

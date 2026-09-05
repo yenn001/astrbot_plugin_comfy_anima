@@ -625,6 +625,43 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             (plugin_root / "pages" / "control" / "app.css").read_bytes(),
         )
 
+    def test_web_asset_sync_script_copies_and_verifies_hashes(self) -> None:
+        import sys
+
+        plugin_root = Path(__file__).resolve().parents[1]
+        script_root = plugin_root / "scripts"
+        if str(script_root) not in sys.path:
+            sys.path.insert(0, str(script_root))
+        import sync_web_assets
+
+        with tempfile.TemporaryDirectory() as directory:
+            web_dir = Path(directory) / "web"
+            pages_dir = Path(directory) / "pages" / "control"
+            web_dir.mkdir(parents=True)
+            pages_dir.mkdir(parents=True)
+            for name in sync_web_assets.SHARED_FILES:
+                (web_dir / name).write_bytes(b"source-" + name.encode())
+            copied = sync_web_assets.sync_web_assets(web_dir, pages_dir)
+            self.assertEqual(set(copied), set(sync_web_assets.SHARED_FILES))
+            sync_web_assets.verify_hashes(web_dir, pages_dir)
+            self.assertEqual(
+                sync_web_assets.file_sha256(web_dir / "app.js"),
+                sync_web_assets.file_sha256(pages_dir / "app.js"),
+            )
+
+    def test_task_phase_and_console_polling_use_incremental_guards(self) -> None:
+        for marker in (
+            "task.latest_phase",
+            "taskLatestPhases",
+            "event.seq > taskEventCursor",
+            "taskEvents.length > 2000",
+            "consoleLastFilterSignature",
+            "document.addEventListener(\"visibilitychange\"",
+            "append: !reset && !streamChanged && !clearedChanged && incoming.length > 0",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.javascript)
+
     def test_anima_29b_page_is_deferred(self) -> None:
         plugin_root = Path(__file__).resolve().parents[1]
         page_root = plugin_root / "web" / "anima_29b"
@@ -1468,6 +1505,61 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(theme.status, 200)
         self.assertIn("application/javascript", theme.headers["Content-Type"])
         self.assertIn("comfy-anima-theme", await theme.text())
+
+    async def test_static_assets_are_revalidated_with_etag(self) -> None:
+        await self._login()
+        first = await self.client.get("/assets/app.js")
+        self.assertEqual(first.status, 200)
+        self.assertEqual(first.headers["Cache-Control"], "no-cache")
+        self.assertIn("ETag", first.headers)
+        self.assertIn("Last-Modified", first.headers)
+
+        revalidated = await self.client.get(
+            "/assets/app.js",
+            headers={"If-None-Match": first.headers["ETag"]},
+        )
+        self.assertEqual(revalidated.status, 304)
+        self.assertEqual(revalidated.headers["Cache-Control"], "no-cache")
+
+        html = await self.client.get("/")
+        self.assertEqual(html.status, 200)
+        self.assertEqual(html.headers["Cache-Control"], "no-store")
+
+    async def test_settings_save_validates_schema_and_reports_normalized(self) -> None:
+        csrf = await self._login()
+        response = await self.client.put(
+            "/api/settings",
+            json={
+                "intent_router_timeout": "30",
+                "intent_router_temperature": "0.2",
+                "interaction_mode": "STRICT",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(
+            self.controller.saved_settings,
+            {
+                "intent_router_timeout": 30,
+                "intent_router_temperature": 0.2,
+                "interaction_mode": "strict",
+            },
+        )
+        payload = await response.json()
+        self.assertEqual(
+            set(payload["data"]["normalized"]),
+            {"intent_router_timeout", "intent_router_temperature", "interaction_mode"},
+        )
+
+        previous_saved = self.controller.saved_settings
+        out_of_range = await self.client.put(
+            "/api/settings",
+            json={"intent_router_timeout": 200},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(out_of_range.status, 400)
+        self.assertFalse((await out_of_range.json())["ok"])
+        self.assertEqual(self.controller.saved_settings, previous_saved)
 
 
 if __name__ == "__main__":

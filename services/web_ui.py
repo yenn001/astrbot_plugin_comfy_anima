@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from email.utils import formatdate
 import hmac
 import ipaddress
+import json
+import math
+import re
 import secrets
 import time
 from collections import defaultdict, deque
@@ -55,6 +59,111 @@ ANIMA_29B_ASSET_CONTENT_TYPES = {
     "app.css": "text/css",
     "app.js": "application/javascript",
 }
+
+_STRING_BOOL_TRUE = {"1", "true", "yes", "on"}
+_STRING_BOOL_FALSE = {"0", "false", "no", "off"}
+
+
+def _normalize_web_setting_value(
+    key: str,
+    value: Any,
+    spec: dict[str, Any],
+) -> tuple[Any, bool]:
+    """Validate one WebUI setting against the plugin schema.
+
+    Returns ``(normalized_value, changed)``.  Values outside schema bounds or
+    enum options raise :class:`WebUiActionError` instead of being silently
+    clamped by later model parsing.
+    """
+    field_type = str(spec.get("type") or "")
+    if field_type == "bool":
+        if isinstance(value, bool):
+            return value, False
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value in (0, 1):
+                return bool(value), True
+            raise WebUiActionError(f"{key} 必须是布尔值")
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in _STRING_BOOL_TRUE:
+                return True, True
+            if normalized in _STRING_BOOL_FALSE:
+                return False, True
+        raise WebUiActionError(f"{key} 必须是布尔值")
+    if field_type == "int":
+        if isinstance(value, bool):
+            raise WebUiActionError(f"{key} 必须是整数")
+        if isinstance(value, int):
+            normalized = value
+        elif isinstance(value, float) and value.is_integer():
+            normalized = int(value)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not re.fullmatch(r"[+-]?\d+", stripped):
+                raise WebUiActionError(f"{key} 必须是整数")
+            normalized = int(stripped)
+        else:
+            raise WebUiActionError(f"{key} 必须是整数")
+        minimum = spec.get("min")
+        maximum = spec.get("max")
+        if minimum is not None and normalized < int(minimum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        if maximum is not None and normalized > int(maximum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        return normalized, value != normalized
+    if field_type == "float":
+        if isinstance(value, bool):
+            raise WebUiActionError(f"{key} 必须是数字")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise WebUiActionError(f"{key} 必须是数字") from exc
+        if not math.isfinite(normalized):
+            raise WebUiActionError(f"{key} 必须是有限数字")
+        minimum = spec.get("min")
+        maximum = spec.get("max")
+        if minimum is not None and normalized < float(minimum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        if maximum is not None and normalized > float(maximum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        return normalized, value != normalized
+    if field_type == "string":
+        if not isinstance(value, str):
+            raise WebUiActionError(f"{key} 必须是字符串")
+        options = spec.get("options")
+        if options:
+            def _extract_opt_val(opt: Any) -> str:
+                if isinstance(opt, dict):
+                    return str(opt.get("value", ""))
+                return str(opt)
+
+            target_val = value.strip().casefold()
+            canonical = next(
+                (
+                    _extract_opt_val(option)
+                    for option in options
+                    if _extract_opt_val(option).casefold() == target_val
+                ),
+                None,
+            )
+            if canonical is None:
+                raise WebUiActionError(f"{key} 不是受支持的选项")
+            return str(canonical), value != canonical
+        return value, False
+    if field_type in {"list", "list<string>"}:
+        if isinstance(value, str):
+            cleaned = [
+                item.strip()
+                for item in re.split(r"[\n,，]+", value)
+                if item.strip()
+            ]
+            return cleaned, True
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise WebUiActionError(f"{key} 必须是字符串数组")
+        return value, False
+    return value, False
 
 
 class WebUiError(RuntimeError):
@@ -159,6 +268,10 @@ class WebUiController(Protocol):
     async def web_ui_get_lora_detail(self, name: str) -> dict[str, Any]: ...
 
     async def web_ui_save_lora_semantic(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_batch_set_lora_family(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]: ...
 
@@ -371,6 +484,7 @@ class WebUiService:
                 web.get("/api/loras/detail", self._get_lora_detail),
                 web.post("/api/loras/delete", self._delete_lora),
                 web.put("/api/loras/semantic", self._save_lora_semantic),
+                web.post("/api/loras/batch-family", self._batch_set_lora_family),
                 web.get("/api/loras/archive", self._get_lora_archive),
                 web.post("/api/loras/archive", self._archive_loras),
                 web.post("/api/lora/archive", self._archive_loras),
@@ -494,7 +608,10 @@ class WebUiService:
         handler: Any,
     ) -> web.StreamResponse:
         response = await handler(request)
-        response.headers["Cache-Control"] = "no-store"
+        is_static_asset = request.path.startswith("/assets/") or request.path.startswith(
+            "/anima-29b/assets/"
+        )
+        response.headers["Cache-Control"] = "no-cache" if is_static_asset else "no-store"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
@@ -551,6 +668,41 @@ class WebUiService:
     def _asset_path(self, filename: str) -> Path:
         return self._plugin_dir / "web" / filename
 
+    @staticmethod
+    def _static_file_response(
+        request: web.Request,
+        path: Path,
+        content_type: str,
+    ) -> web.StreamResponse:
+        stat = path.stat()
+        etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+        last_modified = formatdate(stat.st_mtime, usegmt=True)
+        if_none_match = request.headers.get("If-None-Match", "")
+        if if_none_match == etag or if_none_match == "*":
+            raise web.HTTPNotModified(
+                headers={
+                    "Cache-Control": "no-cache",
+                    "ETag": etag,
+                    "Last-Modified": last_modified,
+                }
+            )
+        if request.headers.get("If-Modified-Since", "") == last_modified:
+            raise web.HTTPNotModified(
+                headers={
+                    "Cache-Control": "no-cache",
+                    "ETag": etag,
+                    "Last-Modified": last_modified,
+                }
+            )
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": f"{content_type}; charset=utf-8",
+                "ETag": etag,
+                "Last-Modified": last_modified,
+            },
+        )
+
     async def _index(self, _request: web.Request) -> web.FileResponse:
         return web.FileResponse(self._asset_path("index.html"))
 
@@ -566,7 +718,7 @@ class WebUiService:
             "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<title>Comfy Anima · 2.9B 控制台已暂缓</title></head><body>"
             "<h1>Anima 2.9B 控制台已暂缓</h1>"
-            "<p>2.4.0 Deferred Scope：所有 2.9B 可执行路径均已禁用。</p>"
+            "<p>2.1.307 Deferred Scope：所有 2.9B 可执行路径均已禁用。</p>"
             "<a href=\"/\">返回 Legacy 控制台</a></body></html>"
         )
         return web.Response(text=page, content_type="text/html")
@@ -580,7 +732,7 @@ class WebUiService:
         self, _request: web.Request
     ) -> web.Response:
         return web.json_response(
-            {"ok": False, "error": "2.9B settings are deferred in 2.4.0"},
+            {"ok": False, "error": "2.9B settings are deferred in 2.1.307"},
             status=423,
         )
 
@@ -595,10 +747,7 @@ class WebUiService:
         path = self._anima_29b_asset_path(filename)
         if not path.is_file():
             raise web.HTTPNotFound()
-        return web.FileResponse(
-            path,
-            headers={"Content-Type": f"{content_type}; charset=utf-8"},
-        )
+        return self._static_file_response(request, path, content_type)
 
     async def _login_page(self, request: web.Request) -> web.StreamResponse:
         if self._read_session(request) is not None:
@@ -613,10 +762,10 @@ class WebUiService:
         content_type = ASSET_CONTENT_TYPES.get(filename)
         if content_type is None:
             raise web.HTTPNotFound()
-        return web.FileResponse(
-            self._asset_path(filename),
-            headers={"Content-Type": f"{content_type}; charset=utf-8"},
-        )
+        path = self._asset_path(filename)
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return self._static_file_response(request, path, content_type)
 
     async def _login(self, request: web.Request) -> web.Response:
         remote = request.remote or "unknown"
@@ -671,9 +820,38 @@ class WebUiService:
         payload["csrf_token"] = request[REQUEST_CSRF_KEY]
         return web.json_response({"ok": True, "data": payload})
 
+    def _normalize_settings_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        schema_path = self._plugin_dir / "_conf_schema.json"
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise WebUiActionError("配置 Schema 无法读取") from exc
+        if not isinstance(schema, dict):
+            raise WebUiActionError("配置 Schema 格式无效")
+        normalized_payload = dict(payload)
+        normalized_fields: list[str] = []
+        for key, value in payload.items():
+            spec = schema.get(key)
+            if not isinstance(spec, dict):
+                continue
+            normalized_value, changed = _normalize_web_setting_value(
+                key,
+                value,
+                spec,
+            )
+            normalized_payload[key] = normalized_value
+            if changed:
+                normalized_fields.append(key)
+        return normalized_payload, sorted(normalized_fields)
+
     async def _save_settings(self, request: web.Request) -> web.Response:
         async def save() -> dict[str, Any]:
-            payload = await self._read_json(request)
+            payload, normalized_fields = self._normalize_settings_payload(
+                await self._read_json(request)
+            )
             if "sampler_steps_override" in payload:
                 raw_value = payload["sampler_steps_override"]
                 if isinstance(raw_value, bool):
@@ -687,7 +865,10 @@ class WebUiService:
                 if str(raw_value).strip() != str(value) or not 0 <= value <= 100:
                     raise WebUiActionError("采样步数覆盖必须是 0–100 的整数")
                 payload["sampler_steps_override"] = value
-            return await self._controller.web_ui_save_settings(payload)
+            result = await self._controller.web_ui_save_settings(payload)
+            if normalized_fields:
+                result["normalized"] = normalized_fields
+            return result
 
         return await self._controller_response(save())
 
@@ -918,6 +1099,13 @@ class WebUiService:
     async def _save_lora_semantic(self, request: web.Request) -> web.Response:
         return await self._controller_response(
             self._controller.web_ui_save_lora_semantic(
+                await self._read_json(request)
+            )
+        )
+
+    async def _batch_set_lora_family(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_batch_set_lora_family(
                 await self._read_json(request)
             )
         )

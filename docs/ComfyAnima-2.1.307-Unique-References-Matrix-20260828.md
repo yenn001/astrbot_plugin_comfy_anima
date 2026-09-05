@@ -1,11 +1,11 @@
 ---
 type: unique-references-matrix
 project: astrbot_plugin_comfy_anima
-target_version: 2.4.0
+target_version: 2.1.307
 date: 2026-08-28
 ---
 
-# 2.4.0 唯一引用矩阵
+# 2.1.307 唯一引用矩阵
 
 每个验收项只出现一次，且唯一绑定一条资产/命令/证据来源。重复引用
 在打包验证阶段视为失败。

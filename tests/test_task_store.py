@@ -8,7 +8,13 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ..services.task_store import TaskStore, TaskStoreError
+from ..services.task_store import (
+    ALLOWED_EVENT_CODES,
+    BLUEPRINT_EVENT_CODES,
+    TaskStore,
+    TaskStoreError,
+    validate_event_code,
+)
 
 
 class TaskStoreTests(unittest.TestCase):
@@ -323,6 +329,45 @@ class TaskStoreTests(unittest.TestCase):
         run_id = self.store.create_task("test")
         with self.assertRaises(ValueError):
             self.store.finish_task(run_id, "running")
+
+
+class EventCodeSchemaTests(unittest.TestCase):
+    def test_blueprint_event_codes_are_allowed(self) -> None:
+        for code in BLUEPRINT_EVENT_CODES:
+            with self.subTest(code=code):
+                self.assertIn(code, ALLOWED_EVENT_CODES)
+                self.assertEqual(validate_event_code(code), code)
+
+    def test_unknown_event_code_is_rejected_by_validator(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_event_code("not_a_schema_code")
+
+    def test_blueprint_codes_append_to_task_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = TaskStore(
+                Path(temp_dir) / "events.sqlite3",
+                cleanup_interval=1000,
+            )
+            run_id = store.create_task("intent_router")
+            store.append_event(
+                run_id,
+                "intent",
+                "intent router gate started",
+                event_code="intent_router_gate_start",
+            )
+            store.append_event(
+                run_id,
+                "intent",
+                "visual task promoted",
+                event_code="visual_task_intent_promoted",
+            )
+            codes = [
+                event["event_code"]
+                for event in store.read_events(run_id=run_id)["entries"]
+            ]
+            self.assertIn("intent_router_gate_start", codes)
+            self.assertIn("visual_task_intent_promoted", codes)
+            store.close()
 
 
 if __name__ == "__main__":

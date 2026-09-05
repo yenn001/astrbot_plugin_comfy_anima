@@ -8,6 +8,7 @@ between AstrBot's event-loop thread and worker threads.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -30,6 +31,93 @@ TASK_STATUSES = (
     "interrupted",
 )
 TERMINAL_TASK_STATUSES = frozenset(TASK_STATUSES) - {"queued", "running"}
+
+# Blueprint (G6) event codes that must be accepted by the task-events schema.
+BLUEPRINT_EVENT_CODES = (
+    "intent_router_gate_start",
+    "intent_router_gate_result",
+    "intent_judge_start",
+    "intent_judge_result",
+    "visual_task_intent_promoted",
+    "user_picture_preference_saved",
+    "scene_extracted",
+    "roleplay_text_blocked",
+    "draw_terminal_forced",
+    "director_instruction_generated",
+)
+
+# Known event codes used by the plugin's task timelines.  The set is additive:
+# callers may still pass new codes; this constant is the documented schema for
+# the WebUI/event-code surface.
+ALLOWED_EVENT_CODES = frozenset(
+    {
+        "analysis_cancelled",
+        "analysis_finished",
+        "analysis_internal_error",
+        "analysis_queued",
+        "analysis_setup_failed",
+        "analysis_started",
+        "analysis_unexpected_error",
+        "asset_delete_failed",
+        "asset_delete_succeeded",
+        "asset_refresh_started",
+        "audit_async",
+        "cancel_requested",
+        "danbooru_progress",
+        "director_instruction_generated",
+        "draw_terminal_forced",
+        "fresh_catalog_changed",
+        "fresh_catalog_ready",
+        "fresh_catalog_refresh_started",
+        "image_delivery_confirmed",
+        "image_task_failed",
+        "image_task_output_ready",
+        "image_task_queued",
+        "image_task_started",
+        "intent_router_gate_result",
+        "intent_router_gate_start",
+        "intent_judge_start",
+        "intent_judge_result",
+        "item_failed",
+        "item_prepared",
+        "item_saved",
+        "metadata_fetch_completed",
+        "metadata_fetch_started",
+        "preset_manifest_merged",
+        "provider_error",
+        "provider_heartbeat",
+        "provider_requested",
+        "queued_task_interrupted_on_startup",
+        "repair_requested",
+        "response_received",
+        "roleplay_text_blocked",
+        "scene_extracted",
+        "semantic_save_failed",
+        "task_created",
+        "task_failed",
+        "task_finishing",
+        "task_finished",
+        "task_interrupted_on_startup",
+        "task_started",
+        "task_starting",
+        "update_preflight",
+        "user_picture_preference_saved",
+        "visual_task_intent_promoted",
+    }
+)
+
+
+def validate_event_code(event_code: str) -> str:
+    """Return the normalized event code when it is an allowed schema value.
+
+    Raises:
+        ValueError: if the code is non-empty and not in ``ALLOWED_EVENT_CODES``.
+    """
+    normalized = _bounded_text(event_code, 100).strip()
+    if normalized and normalized not in ALLOWED_EVENT_CODES:
+        raise ValueError(f"Unsupported event code: {event_code}")
+    return normalized
+
 
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_MAX_TASKS = 2000
@@ -205,6 +293,43 @@ class TaskStore:
 
     def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
         self.close()
+
+    async def create_task_async(self, *args: Any, **kwargs: Any) -> str:
+        """Run :meth:`create_task` in a worker thread without blocking the loop."""
+        return await asyncio.to_thread(self.create_task, *args, **kwargs)
+
+    async def start_task_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Run :meth:`start_task` in a worker thread without blocking the loop."""
+        return await asyncio.to_thread(self.start_task, *args, **kwargs)
+
+    async def heartbeat_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Run :meth:`heartbeat` in a worker thread without blocking the loop."""
+        return await asyncio.to_thread(self.heartbeat, *args, **kwargs)
+
+    async def finish_task_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Run :meth:`finish_task` in a worker thread without blocking the loop."""
+        return await asyncio.to_thread(self.finish_task, *args, **kwargs)
+
+    async def append_event_async(self, *args: Any, **kwargs: Any) -> int:
+        """Run :meth:`append_event` in a worker thread without blocking the loop."""
+        return await asyncio.to_thread(self.append_event, *args, **kwargs)
+
+    async def append_runtime_log_async(self, *args: Any, **kwargs: Any) -> int:
+        """Run :meth:`append_runtime_log` in a worker thread without blocking the loop."""
+        return await asyncio.to_thread(self.append_runtime_log, *args, **kwargs)
+
+    async def interrupt_queued_tasks_async(
+        self,
+        task_types: Optional[Sequence[str]] = None,
+        *,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Run :meth:`interrupt_queued_tasks` in a worker thread."""
+        return await asyncio.to_thread(
+            self.interrupt_queued_tasks,
+            task_types,
+            timestamp=timestamp,
+        )
 
     @property
     def journal_mode(self) -> str:
@@ -689,6 +814,44 @@ class TaskStore:
             cursor = entries[-1]["seq"] if entries else safe_after
             return {"entries": entries, "cursor": cursor}
 
+    def latest_events(
+        self,
+        run_ids: Sequence[str],
+        *,
+        k: int = 1,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return the newest ``k`` events for each requested run id.
+
+        The result is keyed by run id and ordered newest-first per run.  This is
+        the SQL path used by task-list hydration so it never reads the first
+        2000 events just to learn the current phase.
+        """
+        safe_k = max(1, min(20, int(k)))
+        identifiers = tuple(
+            dict.fromkeys(str(value) for value in run_ids if str(value).strip())
+        )
+        if not identifiers:
+            return {}
+        placeholders = ",".join("?" for _ in identifiers)
+        with self._lock:
+            rows = self._execute_locked(
+                f"""
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY run_id ORDER BY seq DESC
+                    ) AS _rank
+                    FROM task_events
+                    WHERE run_id IN ({placeholders})
+                ) WHERE _rank <= ?
+                ORDER BY run_id, seq DESC
+                """,
+                (*identifiers, safe_k),
+            ).fetchall()
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            result.setdefault(str(row["run_id"]), []).append(self._event_row(row))
+        return result
+
     def recent_tasks(
         self,
         *,
@@ -714,7 +877,12 @@ class TaskStore:
                 f"SELECT * FROM task_runs {where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
                 values,
             ).fetchall()
-            return [self._task_row(row) for row in rows]
+            tasks = [self._task_row(row) for row in rows]
+        latest = self.latest_events(tuple(task["run_id"] for task in tasks), k=1)
+        for task in tasks:
+            events = latest.get(task["run_id"])
+            task["latest_phase"] = events[0]["phase"] if events else ""
+        return tasks
 
     def interrupt_running_tasks(self, *, timestamp: Optional[float] = None) -> int:
         now = self._timestamp(timestamp)
@@ -1091,6 +1259,8 @@ class TaskStore:
 
 
 __all__ = [
+    "ALLOWED_EVENT_CODES",
+    "BLUEPRINT_EVENT_CODES",
     "DEFAULT_MAX_EVENTS",
     "DEFAULT_MAX_RUNTIME_LOGS",
     "DEFAULT_MAX_TASKS",
@@ -1099,4 +1269,5 @@ __all__ = [
     "TERMINAL_TASK_STATUSES",
     "TaskStore",
     "TaskStoreError",
+    "validate_event_code",
 ]

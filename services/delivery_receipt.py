@@ -1,6 +1,6 @@
 """Delivery receipt provider seam.
 
-2.4.0 ships with the Null provider because the aiocqhttp event API returns
+2.1.307 ships with the Null provider because the aiocqhttp event API returns
 ``None`` from ``event.send()`` and exposes no message_id. The SENT branch is
 therefore intentionally unreachable in this release; every send is recorded
 as UNKNOWN and the task stays ``partial``. Future providers must return a
@@ -23,7 +23,7 @@ class DeliveryReceiptProvider(Protocol):
 
 
 class NullDeliveryReceiptProvider:
-    """Permanent UNKNOWN downgrade for 2.4.0."""
+    """Permanent UNKNOWN downgrade for 2.1.307."""
 
     def capture_send(
         self,

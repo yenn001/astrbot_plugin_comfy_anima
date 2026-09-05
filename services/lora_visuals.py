@@ -25,7 +25,7 @@ import re
 import tempfile
 import threading
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from .lora_catalog import LoraRecord
 
@@ -355,6 +355,9 @@ class LoraVisualService:
         self._completed = 0
         self._failed = 0
         self._last_errors: dict[str, str] = {}
+        self._cache_bytes_estimate = 0
+        self._cache_writes_since_prune = 0
+        self.prune_cache()
 
     @property
     def max_workers(self) -> int:
@@ -380,7 +383,14 @@ class LoraVisualService:
         """Build a deterministic manifest without following remote preview URLs."""
 
         try:
-            built = [self._build_item(record) for record in records]
+            directory_files: dict[Path, dict[str, Path]] = {}
+            built = [
+                self._build_item(
+                    record,
+                    directory_files=directory_files,
+                )
+                for record in records
+            ]
         except Exception:
             with self._state_lock:
                 self._sources = {}
@@ -581,6 +591,8 @@ class LoraVisualService:
         preview_key: str,
         data: bytes | bytearray | memoryview,
         content_type: str,
+        *,
+        prune: bool = True,
     ) -> PreviewAsset:
         """Safely ingest bytes fetched elsewhere for a current remote preview.
 
@@ -660,7 +672,12 @@ class LoraVisualService:
                         temp_path.unlink()
                     except OSError:
                         pass
-        self.prune_cache()
+        self._track_cache_write(target)
+        if prune:
+            with self._cache_lock:
+                should_prune = self._cache_bytes_estimate > self._max_cache_bytes
+            if should_prune:
+                self.prune_cache()
         cached = self._cached_asset(key)
         if cached is None:
             raise LoraPreviewError("remote preview cache was rejected by the quota")
@@ -806,6 +823,8 @@ class LoraVisualService:
                 total -= size
                 removed += 1
                 removed_bytes += size
+            self._cache_bytes_estimate = total
+            self._cache_writes_since_prune = 0
             return {
                 "removed": removed,
                 "removed_bytes": removed_bytes,
@@ -847,6 +866,8 @@ class LoraVisualService:
                     continue
                 removed += 1
                 removed_bytes += size
+            self._cache_bytes_estimate = remaining_bytes
+            self._cache_writes_since_prune = 0
             return {
                 "removed": removed,
                 "removed_bytes": removed_bytes,
@@ -854,7 +875,10 @@ class LoraVisualService:
             }
 
     def _build_item(
-        self, record: LoraRecord
+        self,
+        record: LoraRecord,
+        *,
+        directory_files: Optional[dict[Path, dict[str, Path]]] = None,
     ) -> tuple[LoraVisualItem, _PreviewSource | None, bool]:
         model_path, path_status = self._resolve_model_path(record)
         size: int | None = None
@@ -869,7 +893,23 @@ class LoraVisualService:
         source: _PreviewSource | None = None
         preview_status = "missing"
         if model_path is not None:
-            source, preview_status = self._find_companion(model_path)
+            files = None
+            if directory_files is not None:
+                files = directory_files.get(model_path.parent)
+                if files is None:
+                    try:
+                        files = {
+                            entry.name.casefold(): entry
+                            for entry in sorted(
+                                model_path.parent.iterdir(),
+                                key=lambda path: path.name,
+                            )
+                            if entry.is_file()
+                        }
+                    except OSError:
+                        files = {}
+                    directory_files[model_path.parent] = files
+            source, preview_status = self._find_companion(model_path, files=files)
         has_remote_preview = bool(str(record.preview_url or "").strip())
 
         preview_key = ""
@@ -1069,7 +1109,12 @@ class LoraVisualService:
             return True
         return False
 
-    def _find_companion(self, model_path: Path) -> tuple[_PreviewSource | None, str]:
+    def _find_companion(
+        self,
+        model_path: Path,
+        *,
+        files: Optional[dict[str, Path]] = None,
+    ) -> tuple[_PreviewSource | None, str]:
         base = model_path.stem
         full = model_path.name
         desired: list[str] = []
@@ -1082,14 +1127,18 @@ class LoraVisualService:
                     f"{full}{extension}",
                 )
             )
-        try:
-            files = {
-                entry.name.casefold(): entry
-                for entry in sorted(model_path.parent.iterdir(), key=lambda path: path.name)
-                if entry.is_file()
-            }
-        except OSError:
-            return None, "missing"
+        if files is None:
+            try:
+                files = {
+                    entry.name.casefold(): entry
+                    for entry in sorted(
+                        model_path.parent.iterdir(),
+                        key=lambda path: path.name,
+                    )
+                    if entry.is_file()
+                }
+            except OSError:
+                return None, "missing"
 
         saw_invalid = False
         for candidate_name in desired:
@@ -1298,8 +1347,17 @@ class LoraVisualService:
                         temp_path.unlink()
                     except OSError:
                         pass
-        self.prune_cache()
+        self._track_cache_write(target)
         return self._cached_asset(safe_key)
+
+    def _track_cache_write(self, target: Path) -> None:
+        try:
+            size = target.stat().st_size
+        except OSError:
+            return
+        with self._cache_lock:
+            self._cache_bytes_estimate += size
+            self._cache_writes_since_prune += 1
 
     def _write_webp(self, source_path: Path, target_path: Path) -> None:
         assert Image is not None and ImageOps is not None
@@ -1393,6 +1451,9 @@ class LoraVisualService:
             else:
                 self._completed += 1
                 self._last_errors.pop(key, None)
+            batch_done = not self._inflight
+        if batch_done:
+            self.prune_cache()
 
 
 __all__ = [

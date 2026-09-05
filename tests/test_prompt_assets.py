@@ -380,6 +380,37 @@ class PromptAssetLibraryTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_search_and_facets_repair_missing_assets_table(self) -> None:
+        broken = Path(self.directory.name) / "broken_assets.sqlite3"
+        connection = sqlite3.connect(broken)
+        try:
+            connection.execute(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('schema_version', '1')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        library = PromptAssetLibrary(broken)
+        search = library.search()
+        self.assertEqual(search["items"], [])
+        self.assertEqual(search["total"], 0)
+        facets = library.facets()
+        self.assertEqual(facets["categories"], [])
+        self.assertEqual(facets["traits"], [])
+        connection = sqlite3.connect(broken)
+        try:
+            self.assertIsNotNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'assets'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
     def test_merge_replace_and_replace_source_preserve_custom_and_favourites(
         self,
     ) -> None:

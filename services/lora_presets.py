@@ -802,33 +802,46 @@ class LoraPresetRegistry:
         for preset in presets:
             index = global_indices[id(preset)]
             label = CATEGORY_LABELS[preset.category]
-            line = f"- {index}. {preset.name} | category: {label} | {preset.lora_tags}"
+            if detail:
+                line = f"- {index}. {preset.name} | category: {label} | {preset.lora_tags}"
+            else:
+                summary = ", ".join(
+                    f"<lora:{selection.name}:{selection.strength:g}>"
+                    for selection in preset.selections[:8]
+                )
+                if len(preset.selections) > 8:
+                    summary += f", … +{len(preset.selections) - 8} more"
+                line = (
+                    f"- {index}. {preset.name} | category: {label} | "
+                    f"lora_tags: {summary}"
+                )
             if not preset.enabled:
                 line += " | disabled"
-            if preset.trigger_words:
-                line += f" | triggers: {preset.trigger_words}"
-            if preset.character_canonical:
-                line += f" | character: {preset.character_canonical}"
-            if preset.work_canonical:
-                line += f" | work: {preset.work_canonical}"
-            if preset.identity_anchor:
-                line += f" | identity_anchor: {preset.identity_anchor}"
-            if preset.required_trigger_terms:
-                line += (
-                    " | required_triggers: "
-                    + ", ".join(preset.required_trigger_terms)
-                )
-            if preset.positive_tags:
-                line += " | positive_tags: " + ", ".join(preset.positive_tags)
-            if preset.negative_tags:
-                line += " | negative_tags: " + ", ".join(preset.negative_tags)
-            if preset.variant_id != "default":
-                line += f" | variant: {preset.variant_id}"
-            if preset.aliases:
-                line += f" | aliases: {', '.join(preset.aliases)}"
-            if detail and preset.description:
-                line += f" | {preset.description[:300]}"
-            if detail and preset.note:
-                line += f" | note: {preset.note[:300]}"
+            if detail:
+                if preset.trigger_words:
+                    line += f" | triggers: {preset.trigger_words}"
+                if preset.character_canonical:
+                    line += f" | character: {preset.character_canonical}"
+                if preset.work_canonical:
+                    line += f" | work: {preset.work_canonical}"
+                if preset.identity_anchor:
+                    line += f" | identity_anchor: {preset.identity_anchor}"
+                if preset.required_trigger_terms:
+                    line += (
+                        " | required_triggers: "
+                        + ", ".join(preset.required_trigger_terms)
+                    )
+                if preset.positive_tags:
+                    line += " | positive_tags: " + ", ".join(preset.positive_tags)
+                if preset.negative_tags:
+                    line += " | negative_tags: " + ", ".join(preset.negative_tags)
+                if preset.variant_id != "default":
+                    line += f" | variant: {preset.variant_id}"
+                if preset.aliases:
+                    line += f" | aliases: {', '.join(preset.aliases)}"
+                if preset.description:
+                    line += f" | {preset.description[:300]}"
+                if preset.note:
+                    line += f" | note: {preset.note[:300]}"
             lines.append(line)
         return "\n".join(lines)

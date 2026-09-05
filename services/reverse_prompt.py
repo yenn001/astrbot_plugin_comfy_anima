@@ -1199,7 +1199,9 @@ class ReversePromptService:
                 umo=event.unified_msg_origin
             )
         except Exception as exc:
-            raise ReversePromptError("没有可用的在线反推 Provider") from exc
+            raise ReversePromptError(
+                "【图片反推多模态模型】没有可用的在线反推 Provider，请先在设置中选择"
+            ) from exc
 
     @staticmethod
     def _reject_explicit_text_only_provider(context: Any, provider_id: str) -> None:
@@ -1230,7 +1232,7 @@ class ReversePromptService:
             for value in values
         ):
             raise ReversePromptError(
-                "所选反推 Provider 明确为纯文本模型，请改选支持图片输入的模型",
+                "【图片反推多模态模型】所选反推 Provider 明确为纯文本模型，请改选支持图片输入的模型",
                 code="text_only_provider",
             )
 
@@ -1282,9 +1284,9 @@ class ReversePromptService:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise ReversePromptError(
-                    "在线反推超时",
+                    f"【图片反推多模态模型】在线反推超时 (Provider: {provider_id})",
                     code="timeout",
-                    details={"attempt": attempt},
+                    details={"attempt": attempt, "provider_id": provider_id},
                 )
             if attempt == 2:
                 self._emit_progress(
@@ -1312,18 +1314,19 @@ class ReversePromptService:
                 )
             except asyncio.TimeoutError as exc:
                 raise ReversePromptError(
-                    "在线反推超时",
+                    f"【图片反推多模态模型】在线反推超时 (Provider: {provider_id})",
                     code="timeout",
-                    details={"attempt": attempt},
+                    details={"attempt": attempt, "provider_id": provider_id},
                 ) from exc
             except Exception as exc:
                 raise ReversePromptError(
-                    "在线反推失败，请确认所选 Provider 支持图片输入",
-                    f"Provider call failed ({type(exc).__name__}).",
+                    f"【图片反推多模态模型】在线反推调用失败 (Provider: {provider_id})，请确认所选 Provider 支持图片输入且状态正常",
+                    f"Provider call failed ({type(exc).__name__}): {exc}",
                     code="provider_error",
                     details={
                         "attempt": attempt,
                         "exception_type": type(exc).__name__,
+                        "provider_id": provider_id,
                     },
                 ) from exc
 
@@ -1395,9 +1398,14 @@ class ReversePromptService:
             code="invalid_json",
         )
         if len(attempts) == 1:
-            raise final_error
+            raise ReversePromptError(
+                f"【图片反推多模态模型】{final_error.user_message}",
+                final_error.detail,
+                code=final_error.code,
+                details=final_error.details,
+            ) from final_error
         raise ReversePromptError(
-            "反推模型连续两次未返回可用的结构化结果",
+            f"【图片反推多模态模型】反推模型连续两次未返回可用的结构化结果 (Provider: {provider_id})",
             final_error.user_message,
             code="repair_exhausted",
             details={
