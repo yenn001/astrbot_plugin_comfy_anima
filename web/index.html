@@ -310,6 +310,22 @@
                 <label class="toggle"><input name="scene_extraction" type="checkbox"><span>启用场景提取（想看/你在干嘛）</span></label>
                 <label class="toggle"><input name="chinese_prompt_translation" type="checkbox"><span>启用 /画图 中文服饰/场景翻译</span></label>
                 <label class="toggle"><input name="enable_chat_draw_terminal_guard" type="checkbox" checked disabled><span>普通聊天绘图终止守卫（协议必需）</span></label>
+                <div class="span-4 section-divider"><span>Bot 回复意图续画（仅管理员会话）</span></div>
+                <label class="toggle"><input name="enable_bot_reply_draw" type="checkbox"><span>按 Bot 回复意图续画（图追加进同一条回复，无技术脚注；无成功配方不出图）</span></label>
+                <label><span>同会话冷却（秒）</span><input name="bot_reply_draw_cooldown_seconds" type="number" min="0" max="3600" step="1"></label>
+                <div class="span-2 provider-field">
+                  <label><span>Bot 回复判定后端</span></label>
+                  <select name="bot_reply_intent_backend">
+                    <option value="rule">Rule：本地关键词</option>
+                    <option value="local">Local：Embedding + Rerank</option>
+                    <option value="online">Online：独立 LLM</option>
+                    <option value="auto">Auto：本地优先</option>
+                    <option value="both">Both：双后端互相印证</option>
+                    <option value="off">Off：关闭判定</option>
+                  </select>
+                  <small class="muted">独立于上方用户消息闸门后端；管理员门禁跟随 AstrBot 平台主管理员列表，插件内不另设名单。</small>
+                </div>
+                <label class="span-3"><span>交付语词表（逗号或换行，仅作用于 Bot 回复判定）</span><textarea name="bot_reply_draw_delivery_phrases" rows="2"></textarea></label>
                 <div class="span-4 section-divider"><span>Prompt Composer v2</span></div>
                 <label class="toggle"><input name="enable_prompt_composer_v2" type="checkbox"><span>启用三层提示词整理</span></label>
                 <label><span>动态负面词策略</span><select name="adaptive_negative_mode"><option value="off">关闭</option><option value="conservative">保守</option><option value="standard">标准</option></select></label>
@@ -411,6 +427,7 @@
                 <label class="toggle"><input name="admin_ignore_cooldown" type="checkbox"><span>管理员无视冷却</span></label>
                 <label class="toggle"><input name="admin_ignore_whitelist" type="checkbox"><span>管理员无视白名单</span></label>
                 <label class="toggle"><input name="admin_ignore_blocklist" type="checkbox"><span>管理员无视违禁词</span></label>
+                <small class="muted span-4">这里的"管理员"跟随 AstrBot 平台主管理员列表（主配置 admins_id），插件内不另设名单；Bot 回复意图续画的管理员门禁同源。</small>
               </div>
             </article>
 

@@ -426,6 +426,8 @@ PIPELINE_PROFILE_MAP = {
 _CHAT_DRAW_TERMINAL_EXTRA_KEY = f"{PLUGIN_NAME}:chat_draw_terminal_v2"
 _INTENT_ROUTER_GATE_EXTRA_KEY = f"{PLUGIN_NAME}:intent_router_gate_result"
 _INTENT_ROUTER_GATE_DONE_KEY = f"{PLUGIN_NAME}:intent_router_gate_done"
+_BOT_REPLY_INTENT_EXTRA_KEY = f"{PLUGIN_NAME}:bot_reply_intent_result"
+_BOT_REPLY_DRAW_REENTRY_KEY = f"{PLUGIN_NAME}:bot_reply_draw_reentry"
 _CHAT_DRAW_ASSET_TOOLS = frozenset(
     {
         "list_anima_loras",
@@ -829,6 +831,7 @@ class ComfyAnimaPlugin(Star):
             public_version=PLUGIN_VERSION,
             internal_target_version=INTERNAL_BUILD_ID,
         )
+        self._bot_reply_draw_last: dict[str, float] = {}
         self.settings = self._force_deferred_29b_to_legacy(self.settings)
         self.config = self._canonical_legacy_config(self.settings, config)
         self._user_picture_preferences: Optional[UserPicturePreferencesStore] = None
@@ -4258,10 +4261,11 @@ class ComfyAnimaPlugin(Star):
         if not any(
             token in raw_text.lower() for token in ("<pic", "<edit", "<think")
         ):
-            if not (gate_ok or explicit_command):
+            if gate_ok or explicit_command:
                 # SceneBridge must never bypass the semantic gate.
-                return
-            if await self._try_scene_bridge_draw(event, result, raw_text):
+                if await self._try_scene_bridge_draw(event, result, raw_text):
+                    return
+            elif await self._maybe_draw_from_bot_reply(event, result, raw_text):
                 return
             return
 
@@ -4413,195 +4417,526 @@ class ComfyAnimaPlugin(Star):
                 if index < len(parsed_character_queries)
                 else ()
             )
-            compose_picture = getattr(
-                self._director,
-                "compose_picture_instruction",
-                None,
+            keep_going = await self._render_picture_instruction(
+                event,
+                new_chain,
+                PictureInstruction(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    pipeline=pipeline,
+                    character_queries=character_queries,
+                ),
+                width=width,
+                height=height,
+                style_preset=style_preset,
+                footnotes=True,
+                llm_prompt_source="conversation_pic",
+                user_request=request_text,
             )
-            if (
-                getattr(self.settings, "enable_prompt_composer_v2", True)
-                and callable(compose_picture)
-            ):
-                try:
-                    instruction = compose_picture(
-                        PictureInstruction(
-                            prompt=prompt,
-                            negative_prompt=negative_prompt,
-                            pipeline=pipeline,
-                            character_queries=character_queries,
-                        ),
-                        source="conversation_pic",
-                    )
-                except PromptDirectorError as exc:
+            if not keep_going:
+                break
+        result.chain = new_chain
+
+    async def _render_picture_instruction(
+        self,
+        event: AstrMessageEvent,
+        new_chain: list[Any],
+        instruction: PictureInstruction,
+        *,
+        width: int,
+        height: int,
+        style_preset: str,
+        footnotes: bool,
+        llm_prompt_source: str,
+        user_request: str,
+    ) -> bool:
+        """渲染一条绘图指令进回复链（`<pic>` 主路径与 Bot 回复重入共用）。
+
+        配方在场时（``recipe_obj`` trace），LoRA 栈、负面池与身份锚点作为
+        不变量确定性携带；场景内容由导演提供。``footnotes=False`` 抑制技术
+        脚注与错误提示（Bot 回复重入的沉浸交付语义）。返回 False 表示重复
+        提交，调用方应停止后续指令。
+        """
+
+        prompt = instruction.prompt
+        negative_prompt = instruction.negative_prompt
+        pipeline = instruction.pipeline
+        character_queries = tuple(
+            getattr(instruction, "character_queries", ()) or ()
+        )
+        compose_picture = getattr(
+            self._director,
+            "compose_picture_instruction",
+            None,
+        )
+        if (
+            getattr(self.settings, "enable_prompt_composer_v2", True)
+            and callable(compose_picture)
+        ):
+            try:
+                instruction = compose_picture(
+                    PictureInstruction(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        pipeline=pipeline,
+                        character_queries=character_queries,
+                    ),
+                    source=llm_prompt_source,
+                )
+            except PromptDirectorError as exc:
+                if footnotes:
                     new_chain.append(
                         Comp.Plain(
                             f"{MessageEmoji.ERROR} 自动绘图提示词整理失败: "
                             f"{exc.user_message}"
                         )
                     )
-                    continue
-                prompt = instruction.prompt
-                negative_prompt = instruction.negative_prompt
-                pipeline = instruction.pipeline
-                character_queries = getattr(instruction, "character_queries", ())
-                prompt = self._sync_time_context(
-                    prompt, user_request=str(event.message_str or "")
-                )
-            access_error = self._access_error(event, prompt)
-            if access_error:
+                return True
+            prompt = instruction.prompt
+            negative_prompt = instruction.negative_prompt
+            pipeline = instruction.pipeline
+            character_queries = getattr(instruction, "character_queries", ())
+            prompt = self._sync_time_context(
+                prompt, user_request=user_request
+            )
+        access_error = self._access_error(event, prompt)
+        if access_error:
+            if footnotes:
                 new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {access_error}"))
-                continue
-            if not self._client or (
-                not self._workflow_builder and not self._pipeline_builders
-            ):
+            return True
+        if not self._client or (
+            not self._workflow_builder and not self._pipeline_builders
+        ):
+            if footnotes:
                 new_chain.append(
                     Comp.Plain(f"{MessageEmoji.ERROR} ComfyUI 插件尚未就绪")
                 )
-                continue
-            active_trace = self._chat_draw_terminal_trace(event) or {}
-            recipe_obj = active_trace.get("recipe_obj")
-            if recipe_obj is not None:
-                recipe_entries = [
-                    {
-                        "name": entry.name,
-                        "weight": entry.weight,
-                        "model_family": entry.model_family,
-                    }
-                    for entry in recipe_obj.lora_manifest
-                ]
-                preset_entries: list[dict[str, Any]] = []
-                if style_preset:
-                    try:
-                        preset_obj = self._lora_presets.resolve(style_preset)
-                        preset_entries = [
-                            {
-                                "name": selection.name,
-                                "weight": selection.strength,
-                            }
-                            for selection in preset_obj.selections
-                        ]
-                    except LoraPresetError:
-                        preset_entries = []
+            return True
+        active_trace = self._chat_draw_terminal_trace(event) or {}
+        recipe_obj = active_trace.get("recipe_obj")
+        recipe_lora_stack: tuple[LoraSelection, ...] = ()
+        anchor = ""
+        if recipe_obj is not None:
+            recipe_entries = [
+                {
+                    "name": entry.name,
+                    "weight": entry.weight,
+                    "model_family": entry.model_family,
+                }
+                for entry in recipe_obj.lora_manifest
+            ]
+            preset_entries: list[dict[str, Any]] = []
+            if style_preset:
                 try:
-                    merge_result = merge_preset_manifests_with_trace(
-                        recipe_entries,
-                        preset_entries,
-                        preset_name=recipe_obj.preset_name,
-                        positive_terms=recipe_obj.positive_pool,
-                        negative_terms=recipe_obj.negative_pool,
-                    )
-                except PresetManifestError as manifest_exc:
-                    raise PresetManifestError(
-                        f"会话配方与风格预设合并失败: {manifest_exc}"
-                    ) from manifest_exc
-                logger.info(
-                    f"[{PLUGIN_NAME}] preset manifest merge trace: "
-                    f"conflicts={merge_result.conflicts}; "
-                    f"{merge_result.merge_trace_text}"
-                )
-                active_trace["preset_merge_trace"] = (
-                    merge_result.merge_trace_text
-                )
-                self._set_chat_draw_terminal_trace(event, active_trace)
-                expected_manifest = PresetManifest.build(
+                    preset_obj = self._lora_presets.resolve(style_preset)
+                    preset_entries = [
+                        {
+                            "name": selection.name,
+                            "weight": selection.strength,
+                        }
+                        for selection in preset_obj.selections
+                    ]
+                except LoraPresetError:
+                    preset_entries = []
+            try:
+                merge_result = merge_preset_manifests_with_trace(
+                    recipe_entries,
+                    preset_entries,
                     preset_name=recipe_obj.preset_name,
                     positive_terms=recipe_obj.positive_pool,
                     negative_terms=recipe_obj.negative_pool,
-                    lora_entries=merge_result.effective_manifest.lora_entries,
-                    model_family=recipe_obj.model_family,
-                    identity_anchor=recipe_obj.identity_anchor,
-                    required_triggers=recipe_obj.required_triggers,
                 )
-            else:
-                _manifest_clean_prompt, _manifest_lora_selections = extract_lora_selections(
-                    prompt,
-                    max_loras=getattr(
-                        self.settings,
-                        "max_total_dynamic_loras",
-                        getattr(self.settings, "max_dynamic_loras", 12),
-                    ),
-                )
-                expected_manifest = PresetManifest.build(
-                    preset_name=style_preset or "conversation_pic",
-                    positive_terms=_manifest_clean_prompt,
-                    negative_terms=negative_prompt,
-                    lora_entries=[
-                        LoraManifestEntry(name=item.name, weight=item.strength)
-                        for item in _manifest_lora_selections
-                    ],
-                )
-            character_activation_overrides: tuple[tuple[str, str], ...] = ()
-            if recipe_obj is not None and not character_queries:
-                # P4 追画连续性：追画未声明角色时，沿用上一次成功出图的角色身份。
-                continuity_query = str(
-                    getattr(recipe_obj, "identity_anchor", "") or ""
-                ).strip()
-                continuity_lora = str(
-                    getattr(recipe_obj, "character_lora_name", "") or ""
-                ).strip()
-                if continuity_query and continuity_lora:
-                    character_queries = (continuity_query,)
-                    activation = (
-                        recipe_obj.required_triggers[0]
-                        if recipe_obj.required_triggers
-                        else continuity_query
+            except PresetManifestError as manifest_exc:
+                raise PresetManifestError(
+                    f"会话配方与风格预设合并失败: {manifest_exc}"
+                ) from manifest_exc
+            logger.info(
+                f"[{PLUGIN_NAME}] preset manifest merge trace: "
+                f"conflicts={merge_result.conflicts}; "
+                f"{merge_result.merge_trace_text}"
+            )
+            active_trace["preset_merge_trace"] = (
+                merge_result.merge_trace_text
+            )
+            self._set_chat_draw_terminal_trace(event, active_trace)
+            expected_manifest = PresetManifest.build(
+                preset_name=recipe_obj.preset_name,
+                positive_terms=recipe_obj.positive_pool,
+                negative_terms=recipe_obj.negative_pool,
+                lora_entries=merge_result.effective_manifest.lora_entries,
+                model_family=recipe_obj.model_family,
+                identity_anchor=recipe_obj.identity_anchor,
+                required_triggers=recipe_obj.required_triggers,
+            )
+            # 配方不变量确定性携带：清单要求 LoRA 栈、负面池与身份锚点存活到
+            # 最终 workflow，不依赖导演复述（3.1.422 收敛自捷径）。
+            recipe_lora_stack = tuple(
+                LoraSelection(name=entry.name, strength=entry.weight)
+                for entry in recipe_obj.lora_manifest
+            )
+            negative_prompt = ", ".join(
+                dict.fromkeys(
+                    term
+                    for part in (
+                        *recipe_obj.negative_pool,
+                        *negative_prompt.split(","),
                     )
-                    character_activation_overrides = ((continuity_lora, activation),)
-            try:
-                image_paths, seed, _, _, _ = await self._run_job(
-                    event,
-                    GenerationOptions(
-                        prompt=prompt,
-                        use_prompt_llm=False,
-                        width=width,
-                        height=height,
-                        lora_preset=style_preset,
-                        negative_prompt=negative_prompt,
-                        pipeline=pipeline,
-                        validate_llm_characters=True,
-                        llm_character_queries=character_queries,
-                        llm_character_user_request=str(event.message_str or ""),
-                        llm_prompt_source="conversation_pic",
-                        lora_activation_overrides=character_activation_overrides,
-                        preset_manifest=expected_manifest,
-                    ),
+                    if (term := part.strip())
                 )
-            except DuplicateSubmissionError:
-                if not self._natural_draw_enabled():
-                    new_chain.append(
-                        Comp.Plain(
-                            f"{MessageEmoji.ERROR} 同一回复仅允许一次绘图提交（2.1.306 Stage 1），"
-                            "后续 prompt 已拒绝"
-                        )
+            )
+            anchor = str(getattr(recipe_obj, "identity_anchor", "") or "").strip()
+            if anchor and anchor.casefold() not in prompt.casefold():
+                prompt = f"{anchor}, {prompt}"
+        else:
+            _manifest_clean_prompt, _manifest_lora_selections = extract_lora_selections(
+                prompt,
+                max_loras=getattr(
+                    self.settings,
+                    "max_total_dynamic_loras",
+                    getattr(self.settings, "max_dynamic_loras", 12),
+                ),
+            )
+            expected_manifest = PresetManifest.build(
+                preset_name=style_preset or "conversation_pic",
+                positive_terms=_manifest_clean_prompt,
+                negative_terms=negative_prompt,
+                lora_entries=[
+                    LoraManifestEntry(name=item.name, weight=item.strength)
+                    for item in _manifest_lora_selections
+                ],
+            )
+        character_activation_overrides: tuple[tuple[str, str], ...] = ()
+        if recipe_obj is not None and not character_queries:
+            # P4 追画连续性：追画未声明角色时，沿用上一次成功出图的角色身份。
+            continuity_query = str(
+                getattr(recipe_obj, "identity_anchor", "") or ""
+            ).strip()
+            continuity_lora = str(
+                getattr(recipe_obj, "character_lora_name", "") or ""
+            ).strip()
+            if continuity_query and continuity_lora:
+                character_queries = (continuity_query,)
+                activation = (
+                    recipe_obj.required_triggers[0]
+                    if recipe_obj.required_triggers
+                    else continuity_query
+                )
+                character_activation_overrides = ((continuity_lora, activation),)
+        try:
+            image_paths, seed, _, _, _ = await self._run_job(
+                event,
+                GenerationOptions(
+                    prompt=prompt,
+                    use_prompt_llm=False,
+                    width=width,
+                    height=height,
+                    lora_preset=style_preset,
+                    dynamic_loras=recipe_lora_stack,
+                    negative_prompt=negative_prompt,
+                    pipeline=pipeline,
+                    validate_llm_characters=True,
+                    llm_character_queries=character_queries,
+                    llm_character_user_request=user_request,
+                    llm_prompt_source=llm_prompt_source,
+                    lora_activation_overrides=character_activation_overrides,
+                    preset_manifest=expected_manifest,
+                ),
+                notify_queue=footnotes,
+            )
+        except DuplicateSubmissionError:
+            if footnotes and not self._natural_draw_enabled():
+                new_chain.append(
+                    Comp.Plain(
+                        f"{MessageEmoji.ERROR} 同一回复仅允许一次绘图提交（2.1.306 Stage 1），"
+                        "后续 prompt 已拒绝"
                     )
-                break
-            except ValueError as exc:
+                )
+            return False
+        except ValueError as exc:
+            if footnotes:
                 new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {exc}"))
-                continue
-            except (ComfyClientError, WorkflowError) as exc:
-                logger.error(f"[{PLUGIN_NAME}] pic 标签出图失败: {exc}", exc_info=True)
+            return True
+        except (ComfyClientError, WorkflowError) as exc:
+            logger.error(f"[{PLUGIN_NAME}] 绘图指令出图失败: {exc}", exc_info=True)
+            if footnotes:
                 message = getattr(exc, "user_message", str(exc))
                 new_chain.append(
                     Comp.Plain(f"{MessageEmoji.ERROR} 自动绘图失败: {message}")
                 )
-                continue
-            if bool(getattr(self.settings, "show_chat_generation_details", True)):
-                new_chain.append(
-                    Comp.Plain(self._generation_summary(image_paths, seed))
+            return True
+        if footnotes and bool(
+            getattr(self.settings, "show_chat_generation_details", True)
+        ):
+            new_chain.append(
+                Comp.Plain(self._generation_summary(image_paths, seed))
+            )
+        new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
+        self._schedule_cleanup(image_paths)
+        run_state = self._get_drawing_orchestrator().state(event)
+        if run_state is not None:
+            # Observation only: delivery state is owned by the
+            # after-message-sent receipt callback.
+            self._get_drawing_orchestrator().mark_completed(
+                event, run_state.run_id
+            )
+        # The delivered image is this event's terminal drawing. Drop any
+        # stale terminal trace so no later pass can re-run the repair loop.
+        self._set_chat_draw_terminal_trace(event, None)
+        return True
+
+    async def _maybe_draw_from_bot_reply(
+        self, event: AstrMessageEvent, result: Any, reply_text: str
+    ) -> bool:
+        """管理员会话专属：按 Bot 回复意图续画（3.1.418，3.1.422 收敛进主渲染链）。
+
+        判定只决定"画不画"；命中后把 Bot 原话+权威配方约束交给绘图导演，
+        与 `<pic>` 主路径共用 `_render_picture_instruction`，不存在独立的
+        options 组装捷径。图片追加进本条回复且不附技术脚注；会话没有成功
+        配方时不出图（缺少身份锚点的凭空生成会破坏沉浸感）。
+        """
+
+        if not bool(getattr(self.settings, "enable_bot_reply_draw", False)):
+            logger.info(f"[{PLUGIN_NAME}] Bot 回复续画跳过：开关未启用")
+            return False
+        getter = getattr(event, "get_extra", None)
+        if callable(getter):
+            try:
+                already = getter(_BOT_REPLY_DRAW_REENTRY_KEY, None)
+            except TypeError:
+                already = getter(_BOT_REPLY_DRAW_REENTRY_KEY)
+            if already:
+                # 本事件已有一次 bot 重入在渲染或已交付，不再二次判定。
+                return False
+        is_admin = getattr(event, "is_admin", None)
+        if not callable(is_admin) or not bool(is_admin()):
+            logger.info(f"[{PLUGIN_NAME}] Bot 回复续画跳过：会话对象非管理员")
+            return False
+        session_id = str(event.get_session_id() or "")
+        if not session_id:
+            logger.info(f"[{PLUGIN_NAME}] Bot 回复续画跳过：空会话")
+            return False
+        now = time.monotonic()
+        cooldown = float(
+            getattr(self.settings, "bot_reply_draw_cooldown_seconds", 30.0) or 0.0
+        )
+        horizon = max(cooldown * 2, 3600.0)
+        for stale_session in list(self._bot_reply_draw_last):
+            if now - self._bot_reply_draw_last[stale_session] > horizon:
+                del self._bot_reply_draw_last[stale_session]
+        last = self._bot_reply_draw_last.get(session_id)
+        if last is not None and now - last < cooldown:
+            logger.info(f"[{PLUGIN_NAME}] Bot 回复续画跳过：冷却中")
+            return False
+        if not self._get_drawing_orchestrator().legacy_submission_allowed(event):
+            return False
+        recipe = await self._session_recipe_store.get(
+            str(event.get_self_id() or ""),
+            session_id,
+            str(event.get_sender_id() or ""),
+        )
+        if recipe is None:
+            logger.info(f"[{PLUGIN_NAME}] Bot 回复续画跳过：会话无成功配方")
+            return False
+        judge = self._build_intent_judge_service(
+            backend_override=getattr(self.settings, "bot_reply_intent_backend", None),
+            delivery_phrases=tuple(
+                getattr(self.settings, "bot_reply_draw_delivery_phrases", ()) or ()
+            ),
+        )
+        if judge is None:
+            return False
+        payload = await self._judge_bot_reply_intent(event, judge, reply_text)
+        if payload is None or payload.get("decision") != DRAW_NOW:
+            logger.info(
+                f"[{PLUGIN_NAME}] Bot 回复意图判定: "
+                f"{payload.get('decision') if payload else 'unavailable'} "
+                f"(backend={payload.get('backend_used') if payload else 'none'}, "
+                f"reason={payload.get('reason') if payload else 'judge_unavailable'})"
+            )
+            return False
+        setter = getattr(event, "set_extra", None)
+        if callable(setter):
+            setter(_BOT_REPLY_INTENT_EXTRA_KEY, payload)
+        if not self._event_bot_reply_intent_result(event, reply_text):
+            logger.warning(
+                f"[{PLUGIN_NAME}] Bot 回复续画拒绝：意图载荷校验失败"
+            )
+            return False
+        if callable(setter):
+            setter(_BOT_REPLY_DRAW_REENTRY_KEY, True)
+        # 重入主渲染链：终稿 decoration 时 on_agent_done 已消费并清空 terminal
+        # trace，而共享段的 recipe_obj 分支靠它携带配方不变量，必须重建。
+        trace = self._ensure_chat_draw_terminal_trace(event, intent=True)
+        trace["recipe_obj"] = recipe
+        scene_text = (
+            f"{reply_text}\n\n"
+            "<authoritative_picture_recipe>\n"
+            + json.dumps(
+                {
+                    "identity_anchor": str(
+                        getattr(recipe, "identity_anchor", "") or ""
+                    ),
+                    "required_triggers": list(recipe.required_triggers),
+                    "character_lora_name": str(
+                        getattr(recipe, "character_lora_name", "") or ""
+                    ),
+                    "lora_manifest": [
+                        {"name": entry.name, "weight": entry.weight}
+                        for entry in recipe.lora_manifest
+                    ],
+                    "pipeline": recipe.pipeline,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n</authoritative_picture_recipe>\n"
+            "以上为本次续画的权威配方约束：角色身份、激活词与 LoRA 栈必须原样"
+            "写入绘图指令，场景内容按 Bot 刚说出的话展开。"
+        )
+        try:
+            instruction, _ = await self._generate_directed_instruction(
+                event,
+                scene_text,
+                intent_plan=self._build_auto_draw_intent_plan(
+                    reply_text, gate_payload=payload
+                ),
+            )
+        except PromptDirectorError as exc:
+            logger.info(
+                f"[{PLUGIN_NAME}] Bot 回复续画跳过：导演拒答或失败: {exc.user_message}"
+            )
+            return False
+        self._bot_reply_draw_last[session_id] = now
+        chain = list(result.chain)
+        chain_before = len(chain)
+        await self._render_picture_instruction(
+            event,
+            chain,
+            instruction,
+            width=int(recipe.width or 0),
+            height=int(recipe.height or 0),
+            style_preset="",
+            footnotes=False,
+            llm_prompt_source="bot_reply_intent",
+            user_request=reply_text,
+        )
+        result.chain = chain
+        # footnotes=False 时失败分支不向链内追加任何组件，链增长即图片已交付。
+        drawn = len(chain) > chain_before
+        if drawn:
+            logger.info(f"[{PLUGIN_NAME}] Bot 回复意图续画出图（主链重入）")
+        return drawn
+
+    async def _judge_bot_reply_intent(
+        self, event: AstrMessageEvent, judge: Any, reply_text: str
+    ) -> Optional[dict[str, Any]]:
+        """判定 Bot 回复意图并把决定封进账本载荷。"""
+
+        ledger = getattr(self, "_intent_decision_ledger", None)
+        reply_hash = hashlib.sha256(str(reply_text or "").encode("utf-8")).hexdigest()
+        context_hash = hashlib.sha256(
+            str(getattr(event, "message_str", "") or "").encode("utf-8")
+        ).hexdigest()
+        decision_id = ""
+        result_hash = ""
+        ledger_error = ""
+        if ledger is not None:
+            try:
+                decision_id = ledger.start(
+                    user_message=reply_text,
+                    user_id_hash=self._event_user_id_hash(event),
+                    context_hash=context_hash,
+                    context_source="bot_reply",
                 )
-            new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
-            self._schedule_cleanup(image_paths)
-            run_state = self._get_drawing_orchestrator().state(event)
-            if run_state is not None:
-                # Observation only: delivery state is owned by the
-                # after-message-sent receipt callback.
-                self._get_drawing_orchestrator().mark_completed(
-                    event, run_state.run_id
+            except Exception as exc:
+                ledger_error = f"ledger_start_failed:{type(exc).__name__}"
+                logger.warning(f"[{PLUGIN_NAME}] bot 回复账本 start 失败: {exc}")
+        result = None
+        if not ledger_error:
+            try:
+                result = await judge.judge(
+                    str(getattr(event, "message_str", "") or ""), reply_text, ""
                 )
-            # The delivered image is this event's terminal drawing. Drop any
-            # stale terminal trace so no later pass can re-run the repair loop.
-            self._set_chat_draw_terminal_trace(event, None)
-        result.chain = new_chain
+            except Exception as exc:
+                result = IntentJudgeResult(
+                    decision=NO_DRAW,
+                    confidence=0.0,
+                    backend_used="uncaught",
+                    reason=f"judge_failed:{type(exc).__name__}",
+                    latency_ms=0.0,
+                )
+            if ledger is not None and decision_id:
+                try:
+                    result_hash = ledger.result(decision_id, result)
+                except Exception as exc:
+                    ledger_error = f"ledger_result_failed:{type(exc).__name__}"
+                    logger.warning(f"[{PLUGIN_NAME}] bot 回复账本 result 失败: {exc}")
+        if ledger_error or result is None:
+            return None
+        return {
+            "status": "judged",
+            "decision": result.decision,
+            "decision_id": decision_id,
+            "result_hash": result_hash,
+            "user_message_hash": reply_hash,
+            "user_id_hash": self._event_user_id_hash(event),
+            "session_id_hash": self._event_session_id_hash(event),
+            "context_hash": context_hash,
+            "context_source": "bot_reply",
+            "public_version": PLUGIN_VERSION,
+            "internal_target_version": INTERNAL_BUILD_ID,
+            "confidence": result.confidence,
+            "backend_used": result.backend_used,
+            "reason": result.reason,
+            "latency_ms": result.latency_ms,
+            "trace": result.trace,
+            "once": True,
+        }
+
+    def _event_bot_reply_intent_result(
+        self, event: AstrMessageEvent, reply_text: str
+    ) -> Mapping[str, Any]:
+        """返回校验通过的 Bot 回复意图载荷，否则空映射。"""
+
+        getter = getattr(event, "get_extra", None)
+        if not callable(getter):
+            return {}
+        try:
+            payload = getter(_BOT_REPLY_INTENT_EXTRA_KEY, None)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        if str(payload.get("status") or "") != "judged":
+            return {}
+        if not str(payload.get("decision_id") or "").strip():
+            return {}
+        if not str(payload.get("result_hash") or "").strip():
+            return {}
+        if str(payload.get("public_version") or "") != PLUGIN_VERSION:
+            return {}
+        if str(payload.get("internal_target_version") or "") != INTERNAL_BUILD_ID:
+            return {}
+        if str(payload.get("user_id_hash") or "") != self._event_user_id_hash(event):
+            return {}
+        if (
+            str(payload.get("session_id_hash") or "")
+            != self._event_session_id_hash(event)
+        ):
+            return {}
+        reply_hash = hashlib.sha256(str(reply_text or "").encode("utf-8")).hexdigest()
+        if str(payload.get("user_message_hash") or "") != reply_hash:
+            return {}
+        ledger = getattr(self, "_intent_decision_ledger", None)
+        if ledger is None:
+            # Fail closed: the payload is only trustworthy when ledger-backed.
+            return {}
+        verifier = getattr(ledger, "verify", None)
+        if not callable(verifier) or not bool(
+            verifier(str(payload.get("decision_id") or ""), payload)
+        ):
+            return {}
+        return payload
 
     @filter.command("换角色")
     async def cmd_character_swap(
@@ -12333,12 +12668,19 @@ QQ快捷指令:
                 return item
         return None
 
-    def _build_intent_judge_service(self) -> IntentJudgeService | None:
+    def _build_intent_judge_service(
+        self,
+        *,
+        backend_override: str | None = None,
+        delivery_phrases: tuple[str, ...] = (),
+    ) -> IntentJudgeService | None:
         """Build the configured intent judge from AstrBot providers."""
 
         settings = self.settings
         judge_settings = IntentJudgeSettings(
-            backend=getattr(settings, "intent_judge_backend", "rule"),
+            backend=backend_override
+            or getattr(settings, "intent_judge_backend", "rule"),
+            delivery_phrases=delivery_phrases,
             embedding_provider_id=getattr(
                 settings, "intent_judge_embedding_provider_id", ""
             ),
@@ -13597,7 +13939,6 @@ QQ快捷指令:
         forward: bool,
     ) -> Any:
         """按命令模式构造普通图片或 NapCat 合并转发消息。"""
-        images = [Comp.Image.fromFileSystem(path) for path in image_paths]
         summary = self._generation_summary(image_paths, seed)
         run_state = self._get_drawing_orchestrator().state(event)
         run_id = str(getattr(run_state, "run_id", "") or "")
@@ -13637,12 +13978,19 @@ QQ快捷指令:
             except BundleOwnershipError:
                 pass
         if not forward:
+            images = [Comp.Image.fromFileSystem(path) for path in image_paths]
             return event.chain_result([Comp.Plain(summary), *images])
+        # aiocqhttp 适配器只对顶层图片段做 base64 转换，Node 内容内的路径
+        # 原样透传；容器路径宿主机 NapCat 不可读，转发图片必须内联。
+        node_images = [
+            Comp.Image.fromBase64(base64.b64encode(path.read_bytes()).decode("ascii"))
+            for path in image_paths
+        ]
         self_id = str(getattr(event.message_obj, "self_id", "0") or "0")
         node = Comp.Node(
             uin=self_id,
             name=self.settings.forward_sender_name,
-            content=[Comp.Plain(summary)] + images,
+            content=[Comp.Plain(summary)] + node_images,
         )
         return event.chain_result([node])
 
@@ -14931,6 +15279,14 @@ QQ快捷指令:
                     settings.intent_judge_online_temperature
                 ),
                 "intent_judge_fallback": settings.intent_judge_fallback,
+                "enable_bot_reply_draw": settings.enable_bot_reply_draw,
+                "bot_reply_draw_cooldown_seconds": (
+                    settings.bot_reply_draw_cooldown_seconds
+                ),
+                "bot_reply_intent_backend": settings.bot_reply_intent_backend,
+                "bot_reply_draw_delivery_phrases": (
+                    list(settings.bot_reply_draw_delivery_phrases)
+                ),
                 "interaction_mode": settings.interaction_mode,
                 "enable_prompt_composer_v2": settings.enable_prompt_composer_v2,
                 "natural_draw_mode": settings.natural_draw_mode,
@@ -20708,11 +21064,21 @@ QQ快捷指令:
         return job
 
     async def _run_job(
-        self, event: AstrMessageEvent, options: GenerationOptions
+        self,
+        event: AstrMessageEvent,
+        options: GenerationOptions,
+        *,
+        notify_queue: bool = True,
     ) -> tuple[list[Path], int, str, str, Optional[str]]:
-        """登记、等待并清理一次用户生成任务。"""
+        """登记、等待并清理一次用户生成任务。
+
+        ``notify_queue=False`` 抑制排队提示的旁发独立消息：Bot 回复重入的
+        交付语义要求图片只长在本条回复里，不允许另发技术通知。
+        """
         user_id = str(event.get_sender_id() or "unknown")
-        job_or_error = await self._create_job(user_id, options, event)
+        job_or_error = await self._create_job(
+            user_id, options, event, notify_queue=notify_queue
+        )
         if isinstance(job_or_error, str):
             raise ValueError(job_or_error)
         job = job_or_error
@@ -21811,6 +22177,12 @@ QQ快捷指令:
                 pair.source.unlink(missing_ok=True)
                 pair.mask.unlink(missing_ok=True)
 
+    @staticmethod
+    def _commits_session_picture_recipe(source: str) -> bool:
+        """成功出图后应回写会话配方的提示词来源（配方延续出图与 Bot 回复续画）。"""
+
+        return source in {"conversation_pic", "bot_reply_intent"}
+
     async def _commit_session_picture_recipe(
         self,
         event: AstrMessageEvent,
@@ -22779,7 +23151,7 @@ QQ快捷指令:
                         details={"image_count": len(image_paths)},
                     )
                 if (
-                    options.llm_prompt_source == "conversation_pic"
+                    self._commits_session_picture_recipe(options.llm_prompt_source)
                     and isinstance(actual_manifest, PresetManifest)
                     and bool(getattr(self.settings, "enable_session_recipe_continuity", True))
                 ):

@@ -444,6 +444,56 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
         cls.html = (web_dir / "index.html").read_text(encoding="utf-8")
         cls.javascript = (web_dir / "app.js").read_text(encoding="utf-8")
 
+    def test_settings_form_fields_are_all_exposed_by_bootstrap(self) -> None:
+        # 漂移守卫：控制台表单里每个可填字段都必须出现在
+        # `web_ui_bootstrap` 的 settings 投影里，否则表单永远显示空值
+        # （3.1.423 的 Bot 回复四字段就漏过一次）。唯一例外是密码：
+        # 秘密值不回传浏览器，只回传"是否已设置"。
+        import ast
+        import re
+
+        plugin_root = Path(__file__).resolve().parents[1]
+        tree = ast.parse((plugin_root / "main.py").read_text(encoding="utf-8"))
+        projection: set[str] = set()
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.AsyncFunctionDef) and node.name == "web_ui_bootstrap"
+            ):
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Dict):
+                    continue
+                for key, value in zip(sub.keys, sub.values):
+                    if (
+                        isinstance(key, ast.Constant)
+                        and key.value == "settings"
+                        and isinstance(value, ast.Dict)
+                    ):
+                        projection = {
+                            inner.value
+                            for inner in value.keys
+                            if isinstance(inner, ast.Constant)
+                        }
+        self.assertTrue(projection, "web_ui_bootstrap settings projection not found")
+        form = re.search(
+            r'<form[^>]*id="settings-form".*?</form>', self.html, re.S
+        )
+        self.assertIsNotNone(form)
+        fields = set(re.findall(r'name="([a-z_0-9]+)"', form.group(0)))
+        self.assertEqual(fields - projection, {"web_ui_password"})
+
+    def test_bot_reply_draw_settings_have_form_fields_and_type_wiring(self) -> None:
+        # 3.1.423：Bot 回复续画四设置项必须出现在控制台表单，且 JS 类型
+        # 集合与数组切分分支已接线；管理员门禁有同源说明。
+        self.assertIn('name="enable_bot_reply_draw" type="checkbox"', self.html)
+        self.assertIn('name="bot_reply_draw_cooldown_seconds" type="number"', self.html)
+        self.assertIn('name="bot_reply_intent_backend"', self.html)
+        self.assertIn('name="bot_reply_draw_delivery_phrases"', self.html)
+        self.assertIn('"enable_bot_reply_draw",', self.javascript)
+        self.assertIn('"bot_reply_draw_cooldown_seconds",', self.javascript)
+        self.assertIn('field.name === "bot_reply_draw_delivery_phrases"', self.javascript)
+        self.assertIn("admins_id", self.html)
+
     def test_timeline_defaults_to_newest_first_with_supported_page_sizes(self) -> None:
         self.assertIn('<option value="desc" selected>最新在上</option>', self.html)
         for size in (10, 20, 50, 100, 200):
@@ -1560,6 +1610,31 @@ class WebUiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out_of_range.status, 400)
         self.assertFalse((await out_of_range.json())["ok"])
         self.assertEqual(self.controller.saved_settings, previous_saved)
+
+    async def test_bot_reply_draw_settings_save_roundtrip(self) -> None:
+        # 四键走 schema 规范化：字符串冷却→float，后端枚举→小写，
+        # 交付语数组原样透传。
+        csrf = await self._login()
+        response = await self.client.put(
+            "/api/settings",
+            json={
+                "enable_bot_reply_draw": True,
+                "bot_reply_draw_cooldown_seconds": "45",
+                "bot_reply_intent_backend": "rule",
+                "bot_reply_draw_delivery_phrases": ["给你看", "穿给你看"],
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(
+            self.controller.saved_settings,
+            {
+                "enable_bot_reply_draw": True,
+                "bot_reply_draw_cooldown_seconds": 45.0,
+                "bot_reply_intent_backend": "rule",
+                "bot_reply_draw_delivery_phrases": ["给你看", "穿给你看"],
+            },
+        )
 
 
 if __name__ == "__main__":

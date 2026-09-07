@@ -89,6 +89,7 @@ class IntentJudgeSettings:
     online_timeout: float = 10.0
     online_temperature: float = 0.0
     fallback: Decision = NO_DRAW
+    delivery_phrases: tuple[str, ...] = ()
 
     @property
     def backend_kind(self) -> str:
@@ -158,12 +159,26 @@ class RuleIntentJudge:
     )
     _FUTURE_WORDS = ("明天", "以后", "下次", "等会", "稍后", "过会", "晚点")
 
+    def __init__(self, delivery_phrases: tuple[str, ...] = ()) -> None:
+        # Bot 交付语（"给你看"等）只注入 Bot 回复判定实例，用户消息闸门词表不变。
+        self._delivery_phrases = tuple(delivery_phrases or ())
+        self._positive_words = self._DRAW_NOW_WORDS + self._delivery_phrases
+
     def judge(self, text: str) -> IntentJudgeResult:
         started = time.monotonic()
         folded = str(text or "").casefold()
         has_negative = any(word in folded for word in self._NEGATIVE_WORDS)
         has_future = any(word in folded for word in self._FUTURE_WORDS)
-        has_draw_now = any(word in folded for word in self._DRAW_NOW_WORDS)
+        has_draw_now = any(word in folded for word in self._positive_words)
+        if self._delivery_phrases:
+            # 交付语是子串匹配："不给你看/别给你看"与疑问句式必须拦在 draw_now 前。
+            has_negative = has_negative or any(
+                f"{neg}{phrase}" in folded
+                for neg in ("不", "别")
+                for phrase in self._delivery_phrases
+            ) or any(
+                word in folded for word in ("要不要", "想不想", "好不好")
+            ) or folded.rstrip().endswith("？")
         if has_draw_now and not has_negative and not has_future:
             decision, confidence = DRAW_NOW, 0.80
             reason = "keyword_positive"
@@ -368,7 +383,7 @@ class IntentJudgeService:
         llm_fn: LlmFn | None = None,
     ) -> None:
         self._settings = settings
-        self._rule = RuleIntentJudge()
+        self._rule = RuleIntentJudge(settings.delivery_phrases)
         self._local = (
             LocalIntentJudge(settings, embed_fn, rerank_fn)
             if embed_fn is not None and rerank_fn is not None

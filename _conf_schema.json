@@ -1061,7 +1061,7 @@
   "intent_judge_online_provider_id": {
     "description": "意图判断在线 LLM Provider",
     "type": "string",
-    "hint": "从 AstrBot Provider 列表选择；不能与导演/反推相同",
+    "hint": "从 AstrBot Provider 列表选择；可任意选用，含与导演/反推相同模型",
     "default": ""
   },
   "intent_judge_positive_anchors": {
@@ -1674,5 +1674,29 @@
     "type": "bool",
     "hint": "开启后按当前时段自动补充 morning/day/sunset/night 光影标签；提示词已写明时间或用户指定时间时不覆盖",
     "default": true
+  },
+  "enable_bot_reply_draw": {
+    "description": "Bot 回复意图续画（仅管理员会话）",
+    "type": "bool",
+    "hint": "开启后：会话对象为 AstrBot 管理员且会话存在成功出图配方时，对 Bot 回复做意图判定；draw_now 时以配方身份续画并把图片追加进同一条回复（无技术脚注）；无配方不出图",
+    "default": false
+  },
+  "bot_reply_draw_cooldown_seconds": {
+    "description": "Bot 回复续画冷却秒数",
+    "type": "float",
+    "hint": "同一会话两次 Bot 回复续画之间的最小间隔",
+    "default": 30.0
+  },
+  "bot_reply_intent_backend": {
+    "description": "Bot 回复意图判定后端",
+    "type": "string",
+    "hint": "off/rule/local/online/auto/both；独立于用户消息闸门后端 intent_judge_backend",
+    "default": "auto"
+  },
+  "bot_reply_draw_delivery_phrases": {
+    "description": "Bot 交付语词表（每行一条）",
+    "type": "list",
+    "hint": "规则后端识别的 Bot 交付语（如“给你看”）；只作用于 Bot 回复判定，否定/推迟句式仍被拦",
+    "default": ["给你看", "给你瞧瞧", "快看", "拍给你看", "穿给你看", "我给你看"]
   }
 }

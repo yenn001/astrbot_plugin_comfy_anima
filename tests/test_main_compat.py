@@ -238,7 +238,7 @@ class MainCompatibilityTests(unittest.TestCase):
         plugin._schedule_cleanup = lambda _paths: None
         calls = []
 
-        async def run_job(event, options):
+        async def run_job(event, options, *, notify_queue=True):
             calls.append((event, options))
             return [Path("generated.png")], 123, options.prompt, "", "base"
 
@@ -1043,7 +1043,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         plugin._access_error = lambda *_args, **_kwargs: None
         plugin._schedule_cleanup = lambda _paths: None
 
-        async def run_job(event_, options):
+        async def run_job(event_, options, *, notify_queue=True):
             self.assertEqual(options.prompt, "1girl, portrait")
             return [Path("generated.png")], 123, options.prompt, "", "base"
 
@@ -1208,7 +1208,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         plugin._schedule_cleanup = lambda _paths: None
         calls = []
 
-        async def run_job(event, options):
+        async def run_job(event, options, *, notify_queue=True):
             calls.append((event, options))
             return [Path("generated.png")], 123, options.prompt, "", "base"
 
@@ -1664,7 +1664,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
             )
             captured = []
 
-            async def run_job(_event, options):
+            async def run_job(_event, options, *, notify_queue=True):
                 captured.append(options)
                 return (
                     [Path("generated.png")],
@@ -2242,7 +2242,7 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
         plugin._find_requested_style_preset = lambda _text: ""
         plugin._access_error = lambda *_args, **_kwargs: None
 
-        async def run_job(_event, _options):
+        async def run_job(_event, _options, *, notify_queue=True):
             raise self.main.PromptDirectorError(
                 "绘图模型连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI",
                 "invalid_picture_protocol",
@@ -3831,7 +3831,7 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         captured_options = []
 
-        async def run_job(_event, _options):
+        async def run_job(_event, _options, *, notify_queue=True):
             captured_options.append(_options)
             return (["test.png"], 123, "", "", "")
 
@@ -9110,7 +9110,7 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
             calls = []
 
-            async def run_job(event, options):
+            async def run_job(event, options, *, notify_queue=True):
                 calls.append((event, options))
                 return [Path("plan.png")], 321, options.prompt, "", None
 
@@ -9199,7 +9199,7 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             calls = []
 
-            async def run_job(event, options):
+            async def run_job(event, options, *, notify_queue=True):
                 calls.append((event, options))
                 return [Path("plan.png")], 654, options.prompt, "", None
 
@@ -9278,7 +9278,7 @@ class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             plugin._generate_directed_instruction = AsyncMock()
             calls = []
 
-            async def run_job(event, options):
+            async def run_job(event, options, *, notify_queue=True):
                 calls.append(options)
                 return [Path("raw.png")], 1, options.prompt, "", None
 

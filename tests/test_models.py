@@ -479,10 +479,10 @@ class PluginSettingsTests(unittest.TestCase):
         )
         changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(PLUGIN_VERSION, "2.4.1")
+        self.assertEqual(PLUGIN_VERSION, "2.4.2")
         self.assertEqual(metadata_version, PLUGIN_VERSION)
         self.assertIn(f"v{PLUGIN_VERSION}", readme_head)
-        self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-08-30", changelog)
+        self.assertIn(f"## [{PLUGIN_VERSION}] - 2026-09-08", changelog)
 
 
 if __name__ == "__main__":

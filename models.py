@@ -410,6 +410,19 @@ class PluginSettings:
     intent_router_temperature: float = 0.0
     intent_router_min_confidence: float = 0.7
     intent_judge_backend: str = "auto"
+    enable_bot_reply_draw: bool = False
+    bot_reply_draw_cooldown_seconds: float = 30.0
+    bot_reply_intent_backend: str = "auto"
+    bot_reply_draw_delivery_phrases: list[str] = field(
+        default_factory=lambda: [
+            "给你看",
+            "给你瞧瞧",
+            "快看",
+            "拍给你看",
+            "穿给你看",
+            "我给你看",
+        ]
+    )
     intent_judge_embedding_provider_id: str = ""
     intent_judge_rerank_provider_id: str = ""
     intent_judge_online_provider_id: str = ""
@@ -943,6 +956,24 @@ class PluginSettings:
             intent_judge_backend=str(
                 data.get("intent_judge_backend", "auto")
             ).strip().casefold(),
+            enable_bot_reply_draw=_as_bool(data.get("enable_bot_reply_draw"), False),
+            bot_reply_draw_cooldown_seconds=_as_float(
+                data.get("bot_reply_draw_cooldown_seconds"), 30.0
+            ),
+            bot_reply_intent_backend=str(
+                data.get("bot_reply_intent_backend", "auto")
+            ).strip().casefold(),
+            bot_reply_draw_delivery_phrases=_as_string_list(
+                data.get("bot_reply_draw_delivery_phrases"),
+                [
+                    "给你看",
+                    "给你瞧瞧",
+                    "快看",
+                    "拍给你看",
+                    "穿给你看",
+                    "我给你看",
+                ],
+            ),
             intent_judge_embedding_provider_id=str(
                 data.get("intent_judge_embedding_provider_id", "")
             ).strip(),

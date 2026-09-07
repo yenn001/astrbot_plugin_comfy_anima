@@ -62,6 +62,10 @@ class Image:
     def fromFileSystem(path):
         return ("image", str(path))
 
+    @staticmethod
+    def fromBase64(base64_data):
+        return ("image-base64", base64_data)
+
 
 class Node:
     def __init__(self, **kwargs):

@@ -235,6 +235,7 @@ const numberFields = new Set([
   "danbooru_api_timeout",
   "danbooru_api_max_records",
   "danbooru_auto_update_interval_hours",
+  "bot_reply_draw_cooldown_seconds",
 ]);
 
 const booleanFields = new Set([
@@ -269,6 +270,7 @@ const booleanFields = new Set([
   "admin_ignore_blocklist",
   "enable_web_ui",
   "enable_time_context",
+  "enable_bot_reply_draw",
 ]);
 
 function pluginPageBridge() {
@@ -1222,7 +1224,10 @@ function collectSettings(form) {
         : field.checked;
     } else if (numberFields.has(field.name)) {
       result[field.name] = Number(field.value);
-    } else if (field.name === "group_whitelist") {
+    } else if (
+      field.name === "group_whitelist" ||
+      field.name === "bot_reply_draw_delivery_phrases"
+    ) {
       result[field.name] = field.value
         .split(/[\n,]+/)
         .map((value) => value.trim())
