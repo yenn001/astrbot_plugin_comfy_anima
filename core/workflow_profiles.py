@@ -26,6 +26,8 @@ class SamplerBinding:
     steps_input: str = "steps"
     cfg_input: str = "cfg"
     denoise_input: str = "denoise"
+    sampler_input: str = ""
+    scheduler_input: str = ""
 
 
 @dataclass(frozen=True)
@@ -299,6 +301,18 @@ def load_workflow_profile(
     for index, item in enumerate(sampler_raw):
         if not isinstance(item, Mapping):
             raise WorkflowProfileError(f"samplers[{index}] must be an object")
+        # 显式 ""/null 的 denoise_input 表示该采样器没有降噪输入
+        # （如 KSampler Adv. (Efficient) 用 start/end_at_step），必须保留
+        # 空串而不是回落到默认 "denoise"，否则运行时会写入非法输入名。
+        if "denoise_input" in item:
+            denoise_raw = item["denoise_input"]
+            denoise_input = (
+                _clean_id(denoise_raw, f"samplers[{index}].denoise_input", allow_empty=True)
+                if isinstance(denoise_raw, str)
+                else ""
+            )
+        else:
+            denoise_input = "denoise"
         samplers.append(
             SamplerBinding(
                 node_id=_clean_id(item.get("node_id"), f"samplers[{index}].node_id"),
@@ -310,9 +324,16 @@ def load_workflow_profile(
                     item.get("cfg_input") or "cfg",
                     f"samplers[{index}].cfg_input",
                 ),
-                denoise_input=_clean_id(
-                    item.get("denoise_input") or "denoise",
-                    f"samplers[{index}].denoise_input",
+                denoise_input=denoise_input,
+                sampler_input=_clean_id(
+                    item.get("sampler_input") or "",
+                    f"samplers[{index}].sampler_input",
+                    allow_empty=True,
+                ),
+                scheduler_input=_clean_id(
+                    item.get("scheduler_input") or "",
+                    f"samplers[{index}].scheduler_input",
+                    allow_empty=True,
                 ),
             )
         )

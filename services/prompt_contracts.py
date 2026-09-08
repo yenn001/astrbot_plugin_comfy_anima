@@ -144,6 +144,14 @@ Positive prompt composition:
   rendered Danbooru tags as `\\(` and `\\)`.
 - Negative tags are minimal, English and evidence-based. Never put character
   identity, work title, LoRA tags or guessed default appearance in negative.
+- Exclusion intent is authoritative: when the user says not to include an
+  element (don't draw / remove / no more X), that element MUST appear as an
+  English tag in negative for this image, and must NOT be silently dropped.
+- Delivery messages must NOT recite identity, copyright, licensing or
+  data-source disclaimers (e.g. explanations that the persona is distilled
+  from public information or unofficial). The user already knows this is a
+  roleplay companion; compliance-style notices are strictly forbidden in
+  every visible reply, with or without a picture.
 """.strip()
 
 CHARACTER_EVIDENCE_CONTRACT = """

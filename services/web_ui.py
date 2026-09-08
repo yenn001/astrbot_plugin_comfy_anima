@@ -178,6 +178,9 @@ class WebUiController(Protocol):
     """Operations exposed by the plugin to the HTTP layer."""
 
     async def web_ui_bootstrap(self) -> dict[str, Any]: ...
+    async def web_ui_list_user_negatives(self) -> dict[str, Any]: ...
+    async def web_ui_add_user_negative(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def web_ui_delete_user_negative(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def web_ui_save_settings(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -506,6 +509,9 @@ class WebUiService:
                 ),
                 web.get("/api/loras/preview", self._lora_preview),
                 web.get("/api/presets", self._list_presets),
+                web.get("/api/user-negatives", self._list_user_negatives),
+                web.post("/api/user-negatives/add", self._add_user_negative),
+                web.post("/api/user-negatives/delete", self._delete_user_negative),
                 web.post("/api/presets", self._save_preset),
                 web.delete(
                     "/api/presets/{identifier}",
@@ -1178,6 +1184,21 @@ class WebUiService:
 
     async def _list_presets(self, _request: web.Request) -> web.Response:
         return await self._controller_response(self._controller.web_ui_list_presets())
+
+    async def _list_user_negatives(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_user_negatives()
+        )
+
+    async def _add_user_negative(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_add_user_negative(await self._read_json(request))
+        )
+
+    async def _delete_user_negative(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_user_negative(await self._read_json(request))
+        )
 
     async def _save_preset(self, request: web.Request) -> web.Response:
         return await self._controller_response(

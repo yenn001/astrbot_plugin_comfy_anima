@@ -352,3 +352,74 @@ def intent_allows_picture_tools(intent: str) -> bool:
     """Return whether the intent may retain asset/delivery tool visibility."""
 
     return intent in {INTENT_DRAW_NEW, INTENT_EDIT_LAST_IMAGE, INTENT_QUERY_ONLY}
+
+
+# ---------------------------------------------------------------------------
+# 会话粘性负面指令识别（3.1.427）
+#
+# 独立于 classify_chat_intent 决策链：粘性禁令/解禁是用户对插件的配置指令，
+# 不是绘图意图，绝不能影响 follow-up 绘图检测或意图路由。只允许
+# sticky-negative 监听滤镜与 /别画、/解禁 命令调用。
+# ---------------------------------------------------------------------------
+
+_STICKY_FORBID_RE = re.compile(
+    r"(?:"
+    r"(?:以后|今后|从今以后|以后都|今后都)[^。！？，,\n]{0,6}"
+    r"(?:别|不要|不准|不许|不用再?|无需再?)"
+    r"|(?:再也不?|不再)[^。！？，,\n]{0,2}"
+    r"(?:别|不要|不准|不许|不用再?|无需再?)?"
+    r")"
+    r"(?:再)?"
+    r"(?:画|出现|加进|加|带|放|穿)"
+    r"(?:上|进|出)?"
+    r"([^。！？\n]{1,24}?)"
+    r"(?:[了哦吧嘛]\s*)?[。！？.,!?~～]?\s*$"
+)
+_STICKY_RELEASE_RE = re.compile(
+    r"(?:可以|能|允许)(?:画|出现|加|带|穿)"
+    r"([^。！？\n]{1,24}?)"
+    r"了?\s*[。！？.,!?~～]?\s*$"
+    r"|解禁\s*[:：]?\s*([^。！？\n]{1,24})"
+    r"|(?:不用|不再)避讳\s*[:：]?\s*([^。！？\n]{1,24})"
+)
+_STICKY_ONESHOT_HINT_RE = re.compile(r"这次|这张|本次|这一张|这一次")
+_STICKY_TERM_STRIP_RE = re.compile(
+    r"^(?:给我|帮我|把|那个|那个啥|就)+"
+)
+_STICKY_TERM_EDGE_RE = re.compile(
+    r"[了哦吧嘛呢的\s。！？.,!?~～～]+$|^[的把\s]+"
+)
+
+
+def _clean_sticky_term(raw: str) -> str:
+    term = str(raw or "").strip()
+    term = _STICKY_TERM_STRIP_RE.sub("", term)
+    term = _STICKY_TERM_EDGE_RE.sub("", term)
+    return term.strip()
+
+
+def parse_sticky_negative_update(message: str) -> Optional[dict[str, str]]:
+    """识别会话粘性负面指令；返回 {"action": "add"|"remove", "term": ...}。
+
+    只匹配明确的持久化措辞（含"以后/今后/再也不"等未来时间词）；"这次别画X"
+    属单张排除（走导演契约），含"这次/这张"等限定词时不在此登记。未命中
+    返回 None——识别失败永远是无动作，不会静默误设。
+    """
+
+    text = str(message or "").strip()
+    if not text or _STICKY_ONESHOT_HINT_RE.search(text):
+        return None
+    forbid = _STICKY_FORBID_RE.search(text)
+    if forbid:
+        term = _clean_sticky_term(forbid.group(1))
+        if term:
+            return {"action": "add", "term": term}
+        return None
+    release = _STICKY_RELEASE_RE.search(text)
+    if release:
+        term = _clean_sticky_term(
+            release.group(1) or release.group(2) or release.group(3) or ""
+        )
+        if term:
+            return {"action": "remove", "term": term}
+    return None

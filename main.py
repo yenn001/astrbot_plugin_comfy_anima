@@ -330,6 +330,9 @@ from .services.session_picture_recipe import (
     SessionPictureRecipe,
     SessionPictureRecipeStore,
 )
+from .services.session_artifact_ledger import SessionArtifactLedger
+from .services.user_negatives import UserNegativesStore
+from .services.chat_intent_classifier import parse_sticky_negative_update
 from .services.drawing_orchestrator import (
     BLOCKED_EXECUTION_TOOL_NAMES,
     DrawingOrchestrator,
@@ -426,8 +429,49 @@ PIPELINE_PROFILE_MAP = {
 _CHAT_DRAW_TERMINAL_EXTRA_KEY = f"{PLUGIN_NAME}:chat_draw_terminal_v2"
 _INTENT_ROUTER_GATE_EXTRA_KEY = f"{PLUGIN_NAME}:intent_router_gate_result"
 _INTENT_ROUTER_GATE_DONE_KEY = f"{PLUGIN_NAME}:intent_router_gate_done"
+_STICKY_NEGATIVE_DONE_KEY = f"{PLUGIN_NAME}:sticky_negative_done"
 _BOT_REPLY_INTENT_EXTRA_KEY = f"{PLUGIN_NAME}:bot_reply_intent_result"
 _BOT_REPLY_DRAW_REENTRY_KEY = f"{PLUGIN_NAME}:bot_reply_draw_reentry"
+# 单张排除提取（3.1.428）：用户消息里的"这次别画X / X也别画出来"等排他意图，
+# 确定性注入本次 negative——不依赖 LLM 契约自觉，也绝不进入粘性/持久池。
+_ONESHOT_EXCLUDE_TIME_RE = re.compile(
+    r"(?:这次|这张|本次|这一次|这一张)[^。！？,\n]{0,6}"
+    r"(?:别|不要|不准|不许)(?:再)?(?:画|出现|加|带|戴|放|穿)(?:上|进|出)?"
+    r"([^。！？,\n]{1,24}?)(?:[了哦吧嘛]\s*)?[。！？.,!?~～]?\s*$"
+)
+# 泛化句式（"项链也别画出来"）必须从标点/串边界起捕，否则会把整句前缀
+# 当成排除词。
+_ONESHOT_EXCLUDE_GENERIC_RE = re.compile(
+    r"(?:^|[，。！？,!?；;\s])([^。！？,\n]{1,20}?)\s*"
+    r"也?别(?:再)?(?:画|出现|加|带|戴|放|穿)(?:出来|上|进)?(?:了)?"
+)
+
+
+def _clean_oneshot_term(raw: str) -> str:
+    term = re.sub(r"^[的把给我\s]+|[的了哦吧嘛呢\s。！？.,!?~～]+$", "", str(raw or "").strip())
+    return term.strip()
+
+
+def _extract_oneshot_exclusions(message: str) -> tuple[str, ...]:
+    """从用户/请求文本提取单张排除词；未命中返回空，绝不误设持久状态。"""
+
+    text = str(message or "").strip()
+    if not text:
+        return ()
+    terms: list[str] = []
+    time_match = _ONESHOT_EXCLUDE_TIME_RE.search(text)
+    if time_match:
+        term = _clean_oneshot_term(time_match.group(1))
+        if term:
+            terms.append(term)
+    if not terms:
+        generic_match = _ONESHOT_EXCLUDE_GENERIC_RE.search(text)
+        if generic_match:
+            term = _clean_oneshot_term(generic_match.group(1))
+            if term:
+                terms.append(term)
+    return tuple(dict.fromkeys(terms))
+
 _CHAT_DRAW_ASSET_TOOLS = frozenset(
     {
         "list_anima_loras",
@@ -501,8 +545,14 @@ WEB_UI_EDITABLE_FIELDS = (
     "iterative_denoise",
     "enable_inpaint",
     "enable_upscale",
+    "enable_ttp_detail",
+    "global_extra_positive_tags",
+    "global_extra_negative_tags",
     "rtx_scale",
     "rtx_quality",
+    "sampler_cfg_override",
+    "sampler_name_override",
+    "sampler_scheduler_override",
     "max_concurrent_jobs",
     "max_queued_jobs_per_user",
     "provider_max_concurrent_jobs",
@@ -753,6 +803,12 @@ class ComfyAnimaPlugin(Star):
         )
         self._session_recipe_store = SessionPictureRecipeStore(
             self._persistent_data_dir / "session_picture_recipes_v1.json"
+        )
+        self._session_artifact_ledger = SessionArtifactLedger(
+            self._persistent_data_dir / "session_artifacts_v1.json"
+        )
+        self._user_negatives_store = UserNegativesStore(
+            self._persistent_data_dir / "user_negatives_v1.json"
         )
         self._session_recipe_store_error = ""
         self._semantic_index_path = self._persistent_data_dir / "lora_semantic_v2.json"
@@ -1379,6 +1435,23 @@ class ComfyAnimaPlugin(Star):
                     logger.info(
                         f"[{PLUGIN_NAME}] 检测到插件版本变化，旧会话配方已按规范清空"
                     )
+        artifact_ledger = getattr(self, "_session_artifact_ledger", None)
+        if artifact_ledger is not None:
+            try:
+                await artifact_ledger.initialize()
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 会话产物账本加载失败（编辑入口身份判据降级）: "
+                    f"{type(exc).__name__}"
+                )
+        sticky_store = getattr(self, "_user_negatives_store", None)
+        if sticky_store is not None:
+            try:
+                await sticky_store.terms("", "warm-up", "")
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 粘性负面词库加载失败: {type(exc).__name__}"
+                )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -3781,6 +3854,82 @@ class ComfyAnimaPlugin(Star):
             "The preset is now available in WebUI and survives plugin reload."
         )
 
+    @filter.on_llm_request(priority=22)
+    async def sticky_negative_listener(self, event: AstrMessageEvent, req: Any) -> None:
+        """会话粘性负面指令监听（3.1.427，priority 22：闸门后、契约注入前）。
+
+        命中"以后都别画X/可以画X了"等持久化措辞时登记/解除 ``user_negatives``
+        并向本轮请求注入设置事件通知，由 BOT 以角色口吻向用户转述确认。
+        规则在插件侧即时生效，与 BOT 措辞无关。唯一语义决策点缺口：agent
+        工具循环中的追加用户消息只合入 ``req.prompt``，此类兜底交给
+        ``/别画`` / ``/解禁`` 命令。
+        """
+
+        setter = getattr(event, "set_extra", None)
+        getter = getattr(event, "get_extra", None)
+        if not callable(setter) or not callable(getter):
+            return
+        try:
+            already = getter(_STICKY_NEGATIVE_DONE_KEY, None)
+        except TypeError:
+            already = getter(_STICKY_NEGATIVE_DONE_KEY)
+        if already:
+            return
+        setter(_STICKY_NEGATIVE_DONE_KEY, True)
+        if id(event) in self._internal_llm_events:
+            return
+        store = getattr(self, "_user_negatives_store", None)
+        if store is None:
+            return
+        update = parse_sticky_negative_update(str(getattr(event, "message_str", "") or ""))
+        if update is None:
+            return
+        bot_id = str(event.get_self_id() or "")
+        session_id = str(event.get_session_id() or "")
+        user_id = str(event.get_sender_id() or "")
+        if not session_id:
+            return
+        action = update["action"]
+        term = update["term"]
+        try:
+            if action == "add":
+                changed = await store.add(bot_id, session_id, user_id, term)
+            else:
+                changed = await store.remove(bot_id, session_id, user_id, term)
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 粘性负面登记失败: {type(exc).__name__}: {exc}"
+            )
+            return
+        if not changed:
+            return
+        logger.info(
+            f"[{PLUGIN_NAME}] 粘性负面{'登记' if action == 'add' else '解除'}: "
+            f"{term} (session={session_id})"
+        )
+        if action == "add":
+            notice = (
+                "[绘图设置事件] 主人刚才设定了一条持久化绘图禁令：今后出图都不要"
+                f"出现「{term}」（对应英文负面 tag 建议：{term}，如你能确定更准确"
+                "的英文写法请在确认中给出）。请以你的角色口吻自然地向主人确认这"
+                "条禁令已生效，并告诉他以后只要说「可以画"
+                f"{term}了」或 /解禁 {term} 就能解除。"
+            )
+        else:
+            notice = (
+                "[绘图设置事件] 主人刚才解除了对「{term}」的持久化绘图禁令，"
+                "今后出图不再排除该元素。请以你的角色口吻自然地向主人确认解除"
+                "已生效。"
+            ).format(term=term)
+        try:
+            part = TextPart(notice)
+            marker = getattr(part, "mark_as_temp", None)
+            if callable(marker):
+                part = marker()
+            req.extra_user_content_parts.append(part)
+        except AttributeError:
+            pass
+
     @filter.on_llm_request(priority=25)
     async def intent_router_gate(self, event: AstrMessageEvent, req: Any) -> None:
         """Run real intent judgment once before the Agent and store result.
@@ -4399,6 +4548,7 @@ class ComfyAnimaPlugin(Star):
                 )
             new_chain.extend(Comp.Image.fromFileSystem(path) for path in image_paths)
             self._schedule_cleanup(image_paths)
+            await self._register_session_artifacts(event, image_paths)
             result.chain = new_chain
             return
 
@@ -4652,17 +4802,19 @@ class ComfyAnimaPlugin(Star):
                     )
                 )
             return False
-        except ValueError as exc:
-            if footnotes:
-                new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {exc}"))
-            return True
         except (ComfyClientError, WorkflowError) as exc:
+            # WorkflowError 是 ValueError 子类，必须先于 ValueError 匹配，
+            # 否则工作流级失败会被降级成 ⚠️ 警告前缀（掩盖根因）。
             logger.error(f"[{PLUGIN_NAME}] 绘图指令出图失败: {exc}", exc_info=True)
             if footnotes:
                 message = getattr(exc, "user_message", str(exc))
                 new_chain.append(
                     Comp.Plain(f"{MessageEmoji.ERROR} 自动绘图失败: {message}")
                 )
+            return True
+        except ValueError as exc:
+            if footnotes:
+                new_chain.append(Comp.Plain(f"{MessageEmoji.WARNING} {exc}"))
             return True
         if footnotes and bool(
             getattr(self.settings, "show_chat_generation_details", True)
@@ -4679,6 +4831,11 @@ class ComfyAnimaPlugin(Star):
             self._get_drawing_orchestrator().mark_completed(
                 event, run_state.run_id
             )
+        await self._register_session_artifacts(
+            event,
+            image_paths,
+            run_id=run_state.run_id if run_state is not None else "",
+        )
         # The delivered image is this event's terminal drawing. Drop any
         # stale terminal trace so no later pass can re-run the repair loop.
         self._set_chat_draw_terminal_trace(event, None)
@@ -7064,6 +7221,7 @@ class ComfyAnimaPlugin(Star):
             *(Comp.Image.fromFileSystem(path) for path in image_paths),
         ]
         yield event.chain_result(components)
+        await self._register_session_artifacts(event, image_paths)
         self._schedule_cleanup(image_paths)
 
     async def _handle_inpaint(
@@ -7149,6 +7307,7 @@ class ComfyAnimaPlugin(Star):
             *(Comp.Image.fromFileSystem(path) for path in image_paths),
         ]
         yield event.chain_result(components)
+        await self._register_session_artifacts(event, image_paths)
         self._schedule_cleanup(image_paths)
 
     @anima.command("draw")
@@ -7629,6 +7788,81 @@ class ComfyAnimaPlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("别画")
+    async def cmd_forbid_draw(
+        self, event: AstrMessageEvent, term: str = ""
+    ) -> AsyncGenerator[Any, None]:
+        """登记会话粘性绘图禁令：今后出图都排除该元素。"""
+
+        clean = str(term or "").strip()
+        store = getattr(self, "_user_negatives_store", None)
+        session_id = str(event.get_session_id() or "")
+        if store is None or not session_id:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 粘性禁令功能未就绪"
+            )
+            return
+        if not clean:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 用法: /别画 元素（如 /别画 项圈）"
+            )
+            return
+        changed = await store.add(
+            str(event.get_self_id() or ""),
+            session_id,
+            str(event.get_sender_id() or ""),
+            clean,
+        )
+        if not changed:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 禁令已存在：今后出图都不画「{clean}」"
+            )
+            return
+        logger.info(
+            f"[{PLUGIN_NAME}] 粘性负面登记(命令): {clean} (session={session_id})"
+        )
+        yield event.plain_result(
+            f"{MessageEmoji.INFO} 已记住：今后出图都不画「{clean}」。"
+            f"说「可以画{clean}了」或 /解禁 {clean} 可解除。"
+        )
+
+    @filter.command("解禁")
+    async def cmd_release_draw(
+        self, event: AstrMessageEvent, term: str = ""
+    ) -> AsyncGenerator[Any, None]:
+        """解除一条会话粘性绘图禁令。"""
+
+        clean = str(term or "").strip()
+        store = getattr(self, "_user_negatives_store", None)
+        session_id = str(event.get_session_id() or "")
+        if store is None or not session_id:
+            yield event.plain_result(
+                f"{MessageEmoji.ERROR} 粘性禁令功能未就绪"
+            )
+            return
+        if not clean:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 用法: /解禁 元素（如 /解禁 项圈）"
+            )
+            return
+        changed = await store.remove(
+            str(event.get_self_id() or ""),
+            session_id,
+            str(event.get_sender_id() or ""),
+            clean,
+        )
+        if not changed:
+            yield event.plain_result(
+                f"{MessageEmoji.INFO} 没有找到「{clean}」的禁令（可能已解除）"
+            )
+            return
+        logger.info(
+            f"[{PLUGIN_NAME}] 粘性负面解除(命令): {clean} (session={session_id})"
+        )
+        yield event.plain_result(
+            f"{MessageEmoji.INFO} 已解除：今后的出图不再排除「{clean}」。"
+        )
+
     @filter.command("违禁级别")
     async def cmd_filter_level(
         self, event: AstrMessageEvent, level: str = ""
@@ -9366,11 +9600,20 @@ QQ快捷指令:
         job.danbooru_revision_signature = ""
 
         index = getattr(self, "_danbooru_index", None)
+        # 协议字段名/属性回显不是角色名（纵深防御：解析层已滤一次），
+        # 混入只会产出无意义的"角色校验失败"。合法含冒号的作品名放行。
         declared_queries = tuple(
             dict.fromkeys(
                 item
                 for raw in character_queries
                 if (item := re.sub(r"\s+", " ", str(raw or "")).strip())
+                and not re.search(
+                    r"^(?:negative_?prompt|positive_?prompt|prompt|characters|pipeline|lora)\s*[:=]"
+                    r'|=\s*"'
+                    r'|"\s*(?:/>|>)?\s*$',
+                    item,
+                    re.IGNORECASE,
+                )
             )
         )[:4]
         if index is None or not self._danbooru_index_ready():
@@ -13977,6 +14220,14 @@ QQ快捷指令:
                 )
             except BundleOwnershipError:
                 pass
+        # 本函数为同步上下文（async 处理器内直接调用）：登记走 fire-and-forget
+        # task，失败已被 helper 内部吞掉，绝不影响交付。
+        try:
+            asyncio.get_running_loop().create_task(
+                self._register_session_artifacts(event, image_paths, run_id=run_id)
+            )
+        except RuntimeError:
+            pass
         if not forward:
             images = [Comp.Image.fromFileSystem(path) for path in image_paths]
             return event.chain_result([Comp.Plain(summary), *images])
@@ -15235,8 +15486,18 @@ QQ快捷指令:
                 "iterative_denoise": settings.iterative_denoise,
                 "enable_inpaint": settings.enable_inpaint,
                 "enable_upscale": settings.enable_upscale,
+                "enable_ttp_detail": settings.enable_ttp_detail,
+                "global_extra_positive_tags": list(
+                    settings.global_extra_positive_tags
+                ),
+                "global_extra_negative_tags": list(
+                    settings.global_extra_negative_tags
+                ),
                 "rtx_scale": settings.rtx_scale,
                 "rtx_quality": settings.rtx_quality,
+                "sampler_cfg_override": settings.sampler_cfg_override,
+                "sampler_name_override": settings.sampler_name_override,
+                "sampler_scheduler_override": settings.sampler_scheduler_override,
                 "max_concurrent_jobs": settings.max_concurrent_jobs,
                 "max_queued_jobs_per_user": settings.max_queued_jobs_per_user,
                 "user_cooldown": settings.user_cooldown,
@@ -19247,6 +19508,40 @@ QQ快捷指令:
         )
         return response
 
+    async def web_ui_list_user_negatives(self) -> dict[str, Any]:
+        """粘性禁令面板数据：全部会话的登记条目。"""
+
+        store = getattr(self, "_user_negatives_store", None)
+        if store is None:
+            raise WebUiActionError("粘性禁令功能未就绪")
+        return {"entries": await store.all_entries()}
+
+    async def web_ui_add_user_negative(self, payload: dict[str, Any]) -> dict[str, Any]:
+        term = str(payload.get("term") or "").strip()
+        session_id = str(payload.get("session_id") or "").strip()
+        if not term or not session_id:
+            raise WebUiActionError("term 与 session_id 必填")
+        await self._user_negatives_store.add(
+            str(payload.get("bot_id") or ""),
+            session_id,
+            str(payload.get("user_id") or ""),
+            term,
+        )
+        return {"message": f"已登记禁令：{term}"}
+
+    async def web_ui_delete_user_negative(self, payload: dict[str, Any]) -> dict[str, Any]:
+        key = str(payload.get("key") or "")
+        term = str(payload.get("term") or "").strip()
+        parts = key.split("|") if key else []
+        if len(parts) != 3 or not term:
+            raise WebUiActionError("key 与 term 必填")
+        removed = await self._user_negatives_store.remove(
+            parts[0], parts[1], parts[2], term
+        )
+        if not removed:
+            raise WebUiActionError(f"没有找到「{term}」的禁令")
+        return {"message": f"已解除禁令：{term}"}
+
     async def web_ui_list_presets(self) -> dict[str, Any]:
         """Refresh LoRA data and validate every saved preset."""
         if self._lora_catalog is None:
@@ -21530,6 +21825,32 @@ QQ快捷指令:
                 if callable(collect_two)
                 else [await self._image_input.collect_one(event)]
             )
+            # 会话产物判据（3.1.427）：底图控制的目标图若是本插件交付的图
+            # （sha 精确命中），挂配方身份不变量并激活清单闸门；负面池恒挂。
+            edit_bundle = await self._session_edit_invariants(
+                event, sources[0] if sources else None
+            )
+            if edit_bundle:
+                options = replace(
+                    options,
+                    negative_prompt=self._merge_negative_pool(
+                        options.negative_prompt,
+                        edit_bundle["negative_pool"],
+                    ),
+                )
+                if edit_bundle["strong"]:
+                    anchor = edit_bundle["identity_anchor"]
+                    prompt_text = str(options.prompt or "")
+                    if anchor and anchor.casefold() not in prompt_text.casefold():
+                        options = replace(options, prompt=f"{anchor}, {prompt_text}")
+                    options = replace(
+                        options,
+                        preset_manifest=edit_bundle["expected_manifest"],
+                        dynamic_loras=edit_bundle["lora_stack"],
+                        validate_llm_characters=True,
+                        llm_character_queries=edit_bundle["character_queries"],
+                        lora_activation_overrides=edit_bundle["activation_overrides"],
+                    )
             plan = self._make_control_plan(options, image_count=len(sources))
             source = sources[0]
 
@@ -21961,6 +22282,14 @@ QQ快捷指令:
             raise WorkflowError(
                 f"应用 LoRA 触发词后的重绘提示词不能超过 {self.settings.max_prompt_length} 字符"
             )
+        # 会话/全局负面咽喉（重绘入口）：与 _execute_job 咽喉同一 helper，
+        # 位于触发词计划之后、effective 定型之前。
+        clean_prompt, combined_negative = await self._apply_session_negative_terms(
+            event,
+            clean_prompt,
+            combined_negative,
+            user_text=options.llm_character_user_request or options.prompt,
+        )
         effective = replace(
             options,
             prompt=clean_prompt,
@@ -22086,6 +22415,31 @@ QQ快捷指令:
                 director_negative = ""
                 provider_id = ""
                 mode = options.inpaint_mode or "quick"
+                # 会话产物判据（3.1.427）：负面池恒挂（加法性），身份不变量
+                # 仅在目标图精确命中交付账本时挂载。
+                edit_bundle = await self._session_edit_invariants(
+                    event, pair.source if pair is not None else None
+                )
+                if edit_bundle:
+                    options = replace(
+                        options,
+                        negative_prompt=self._merge_negative_pool(
+                            options.negative_prompt,
+                            edit_bundle["negative_pool"],
+                        ),
+                    )
+                    if edit_bundle["strong"]:
+                        anchor = edit_bundle["identity_anchor"]
+                        if anchor and anchor.casefold() not in effective_prompt.casefold():
+                            effective_prompt = f"{anchor}, {effective_prompt}"
+                        options = replace(
+                            options,
+                            preset_manifest=edit_bundle["expected_manifest"],
+                            dynamic_loras=edit_bundle["lora_stack"],
+                            validate_llm_characters=True,
+                            llm_character_queries=edit_bundle["character_queries"],
+                            lora_activation_overrides=edit_bundle["activation_overrides"],
+                        )
                 use_llm = (
                     self.settings.enable_prompt_llm
                     if options.use_prompt_llm is None
@@ -22123,6 +22477,31 @@ QQ快捷指令:
                 if final_access_error:
                     raise WorkflowError(
                         f"最终重绘提示词被风控拒绝：{final_access_error}"
+                    )
+                if edit_bundle and edit_bundle.get("strong"):
+                    # 强命中时的 options 级清单断言：角色栈、锚点与负面池
+                    # 必须存活到本次重绘（fail-closed，与聊天链闸门同语义）。
+                    expected_manifest = edit_bundle["expected_manifest"]
+                    actual_manifest = PresetManifest.build(
+                        preset_name=expected_manifest.preset_name,
+                        positive_terms=effective_options.prompt,
+                        negative_terms=effective_options.negative_prompt,
+                        lora_entries=[
+                            LoraManifestEntry(
+                                name=selection.name,
+                                weight=selection.strength,
+                                model_family=expected_manifest.model_family,
+                            )
+                            for selection in effective_options.dynamic_loras
+                        ],
+                        model_family=expected_manifest.model_family,
+                        identity_anchor=expected_manifest.identity_anchor,
+                        required_triggers=expected_manifest.required_triggers,
+                    )
+                    assert_preset_invariants(
+                        expected_manifest,
+                        actual_manifest,
+                        reason=f"inpaint run_id={job.task_run_id or ''}",
                     )
                 job.state = "uploading"
                 uploaded_source, uploaded_mask = await asyncio.gather(
@@ -22182,6 +22561,220 @@ QQ快捷指令:
         """成功出图后应回写会话配方的提示词来源（配方延续出图与 Bot 回复续画）。"""
 
         return source in {"conversation_pic", "bot_reply_intent"}
+
+    async def _register_session_artifacts(
+        self,
+        event: AstrMessageEvent,
+        image_paths: Any,
+        run_id: str = "",
+    ) -> None:
+        """把本次交付的图登记进会话产物账本。
+
+        登记是编辑入口（重绘/底图控制/`<edit>`）身份判据的数据源：目标图
+        sha 精确命中账本才允许挂会话配方的身份不变量。登记失败只降级
+        （后续强判据失配、维持旧行为），绝不阻断交付。
+        """
+
+        ledger = getattr(self, "_session_artifact_ledger", None)
+        if ledger is None or not image_paths:
+            return
+        try:
+            session_id = str(event.get_session_id() or "")
+            bot_id = str(event.get_self_id() or "")
+            user_id = str(event.get_sender_id() or "")
+        except AttributeError:
+            # 测试桩或非常规事件缺少会话键访问器：跳过登记，不影响交付。
+            return
+        if not session_id:
+            return
+        sha_map = getattr(image_paths, "output_sha256s", None) or {}
+        for path in image_paths:
+            try:
+                sha = sha_map.get(str(path), "")
+                if not sha:
+                    sha = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                with Image.open(path) as image:
+                    width, height = image.size
+                await ledger.record(
+                    bot_id,
+                    session_id,
+                    user_id,
+                    sha256=sha,
+                    width=width,
+                    height=height,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 会话产物登记失败（不影响交付）: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    async def _session_edit_invariants(
+        self,
+        event: AstrMessageEvent,
+        source_path: Any,
+    ) -> Optional[dict[str, Any]]:
+        """评估编辑请求的目标图，决定可挂载的会话不变量层级。
+
+        返回 None：会话无成功配方，仅咽喉类负面（粘性/全局）适用。
+        返回 dict：``strong=True`` 表示目标图 sha 精确命中交付账本，
+        允许挂身份不变量（角色 LoRA 栈/锚点/清单闸门）；``strong=False``
+        只允许挂加法性不变量（配方负面池）。QQ 往返失真下失配是常态，
+        失配只降级回旧行为，从不误挂。
+        """
+
+        store = getattr(self, "_session_recipe_store", None)
+        if store is None:
+            return None
+        bot_id = str(event.get_self_id() or "")
+        session_id = str(event.get_session_id() or "")
+        user_id = str(event.get_sender_id() or "")
+        recipe = await store.get(bot_id, session_id, user_id)
+        if recipe is None:
+            return None
+        strong = False
+        ledger = getattr(self, "_session_artifact_ledger", None)
+        if ledger is not None and source_path is not None:
+            try:
+                source_sha = hashlib.sha256(
+                    Path(source_path).read_bytes()
+                ).hexdigest()
+                strong = await ledger.is_artifact(
+                    bot_id, session_id, user_id, source_sha
+                )
+            except OSError:
+                strong = False
+        bundle: dict[str, Any] = {
+            "recipe": recipe,
+            "strong": strong,
+            "negative_pool": ", ".join(
+                term for term in recipe.negative_pool if str(term or "").strip()
+            ),
+        }
+        if not strong:
+            return bundle
+        expected_manifest = PresetManifest.build(
+            preset_name=recipe.preset_name,
+            positive_terms=recipe.positive_pool,
+            negative_terms=recipe.negative_pool,
+            lora_entries=recipe.lora_manifest,
+            model_family=recipe.model_family,
+            identity_anchor=recipe.identity_anchor,
+            required_triggers=recipe.required_triggers,
+        )
+        anchor = str(getattr(recipe, "identity_anchor", "") or "").strip()
+        character_lora = str(
+            getattr(recipe, "character_lora_name", "") or ""
+        ).strip()
+        character_queries: tuple[str, ...] = ()
+        activation_overrides: tuple[tuple[str, str], ...] = ()
+        if anchor and character_lora:
+            character_queries = (anchor,)
+            activation = (
+                recipe.required_triggers[0]
+                if recipe.required_triggers
+                else anchor
+            )
+            activation_overrides = ((character_lora, activation),)
+        bundle.update(
+            expected_manifest=expected_manifest,
+            lora_stack=tuple(
+                LoraSelection(name=entry.name, strength=entry.weight)
+                for entry in recipe.lora_manifest
+            ),
+            identity_anchor=anchor,
+            character_queries=character_queries,
+            activation_overrides=activation_overrides,
+        )
+        return bundle
+
+    @staticmethod
+    def _merge_negative_pool(base_negative: str, pool: str) -> str:
+        """把配方负面池并入本次负面（去重保序，加法性不变量）。"""
+
+        if not pool:
+            return base_negative
+        return ", ".join(
+            dict.fromkeys(
+                term
+                for part in (*pool.split(","), *base_negative.split(","))
+                if (term := part.strip())
+            )
+        )
+
+    async def _apply_session_negative_terms(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        negative: str,
+        user_text: str = "",
+    ) -> tuple[str, str]:
+        """负面/正向注入咽喉：粘性禁令与全局附加词并入口径的公共层。
+
+        必须在清单闸门 expected 构建之后调用（本函数只改 actual 侧的
+        clean_prompt/combined_negative），且会话配方提交只落 expected 的
+        negative_terms——注入集绝不进入持久池，否则 /解禁 后闸门会以
+        ``missing negative terms`` 误停图。
+        """
+
+        sticky_terms: tuple[str, ...] = ()
+        store = getattr(self, "_user_negatives_store", None)
+        get_session = getattr(event, "get_session_id", None)
+        session_id = str(get_session() or "") if callable(get_session) else ""
+        if store is not None and session_id:
+            get_self = getattr(event, "get_self_id", None)
+            get_sender = getattr(event, "get_sender_id", None)
+            bot_id = str(get_self() or "") if callable(get_self) else ""
+            sender_id = str(get_sender() or "") if callable(get_sender) else ""
+            try:
+                sticky_terms = await store.terms(bot_id, session_id, sender_id)
+            except Exception as exc:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 粘性负面读取失败（跳过注入）: "
+                    f"{type(exc).__name__}"
+                )
+        extra_negative = tuple(
+            tag
+            for tag in (
+                getattr(self.settings, "global_extra_negative_tags", ()) or ()
+            )
+            if str(tag or "").strip()
+        )
+        extra_positive = tuple(
+            tag
+            for tag in (
+                getattr(self.settings, "global_extra_positive_tags", ()) or ()
+            )
+            if str(tag or "").strip()
+        )
+        merged_negative = negative
+        # 单张排除：确定性提取本次请求文本里的"这次别画X"，只进本次
+        # negative，不进粘性清单，也不进配方持久池。
+        oneshot_terms = _extract_oneshot_exclusions(user_text)
+        negative_additions = tuple(
+            term
+            for term in (*sticky_terms, *extra_negative, *oneshot_terms)
+            if term.strip()
+        )
+        if negative_additions:
+            merged_negative = ", ".join(
+                dict.fromkeys(
+                    term
+                    for part in (*negative.split(","), *negative_additions)
+                    if (term := part.strip())
+                )
+            )
+        merged_prompt = prompt
+        if extra_positive:
+            merged_prompt = ", ".join(
+                dict.fromkeys(
+                    term
+                    for part in (*prompt.split(","), *extra_positive)
+                    if (term := part.strip())
+                )
+            )
+        return merged_prompt, merged_negative
 
     async def _commit_session_picture_recipe(
         self,
@@ -22769,6 +23362,22 @@ QQ快捷指令:
                                 ),
                             )
                         )
+                    # 会话/全局负面咽喉（3.1.427）：粘性禁令与全局附加词在此
+                    # 并入全部经 _execute_job 的请求，位于角色编译之后、触发词
+                    # 计划与清单闸门之前；瘦身提交只落 expected 池，注入集不
+                    # 会进入持久配方（否则 /解禁 后闸门会误停图）。
+                    if not options.control_modes:
+                        clean_prompt, combined_negative = (
+                            await self._apply_session_negative_terms(
+                                event,
+                                clean_prompt,
+                                combined_negative,
+                                user_text=(
+                                    options.llm_character_user_request
+                                    or str(getattr(event, "message_str", "") or "")
+                                ),
+                            )
+                        )
                     trigger_plan = build_lora_trigger_plan(
                         prompt=clean_prompt,
                         negative_prompt=combined_negative,
@@ -23155,13 +23764,31 @@ QQ快捷指令:
                     and isinstance(actual_manifest, PresetManifest)
                     and bool(getattr(self.settings, "enable_session_recipe_continuity", True))
                 ):
+                    # 瘦身提交（3.1.427）：持久池只落 expected 的负面词
+                    # （入口构建、不含咽喉注入集）。若把 combined_negative
+                    # 全量入池，/解禁 后续画 expected⊄actual 会误停图。
+                    expected_for_slim = getattr(options, "preset_manifest", None)
+                    if isinstance(expected_for_slim, PresetManifest):
+                        commit_manifest = PresetManifest.build(
+                            preset_name=actual_manifest.preset_name,
+                            positive_terms=actual_manifest.positive_terms,
+                            negative_terms=expected_for_slim.negative_terms,
+                            lora_entries=actual_manifest.lora_entries,
+                            model_family=actual_manifest.model_family,
+                            identity_anchor=actual_manifest.identity_anchor,
+                            required_triggers=actual_manifest.required_triggers,
+                        )
+                        commit_negative = ", ".join(commit_manifest.negative_terms)
+                    else:
+                        commit_manifest = actual_manifest
+                        commit_negative = combined_negative
                     await self._commit_session_picture_recipe(
                         event,
                         job,
                         requested_pipeline,
                         clean_prompt,
-                        combined_negative,
-                        actual_manifest,
+                        commit_negative,
+                        commit_manifest,
                         resolved_records,
                         character_identity=getattr(job, "character_identity", None),
                     )

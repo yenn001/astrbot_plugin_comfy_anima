@@ -49,6 +49,7 @@ class CommandAliasError(ValueError):
 
 _GENERATION_OPTION_ALIASES = {
     "--negative": "--negative",
+    "--负面": "--negative",
     "--n": "--negative",
     "--seed": "--seed",
     "--sd": "--seed",
@@ -88,6 +89,7 @@ _CHARACTER_SWAP_OPTION_ALIASES = {
     "--size": "--size",
     "--sz": "--size",
     "--negative": "--negative",
+    "--负面": "--negative",
     "--n": "--negative",
     "--preview": "--preview",
     "--v": "--preview",

@@ -38,6 +38,7 @@ from ..services.reverse_evidence import ReverseEvidence
 from ..services.reverse_workflow import ReverseWorkflowError
 from ._stubs import (
     Plain as _Plain,
+    _install_ledger_fallback,
     install_astrbot_stubs,
     make_gate_payload,
 )
@@ -106,6 +107,9 @@ class MainCompatibilityTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         _install_astrbot_stubs()
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        # ledger fallback 只能在 main 导入后挂载；单独运行本文件时
+        # install_astrbot_stubs 的首次安装先于导入，必须在此补装。
+        _install_ledger_fallback()
 
     def test_main_module_imports_with_documented_api_surface(self) -> None:
         self.assertTrue(hasattr(self.main, "ComfyAnimaPlugin"))

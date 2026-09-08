@@ -506,6 +506,15 @@ class PluginSettings:
         default_factory=lambda: [DEFAULT_PRIMARY_SAMPLER_NODE_ID]
     )
     sampler_steps_override: int = 0
+    # 全局采样覆写（0/空 = 不覆写；请求级显式值优先于这些默认）
+    sampler_cfg_override: float = 0.0
+    sampler_name_override: str = ""
+    sampler_scheduler_override: str = ""
+    # TTP 瓦片细节增强：仅在放大链路（rtx/ttp 变体）生效，关=纯 RTX 插值
+    enable_ttp_detail: bool = False
+    # 全局附加正/负词：追加进每一次出图的组装末尾，随清单闸门审计
+    global_extra_positive_tags: list[str] = field(default_factory=list)
+    global_extra_negative_tags: list[str] = field(default_factory=list)
     output_node_ids: list[str] = field(
         default_factory=lambda: [
             DEFAULT_UPSCALE_OUTPUT_NODE_ID,
@@ -1270,6 +1279,23 @@ class PluginSettings:
             sampler_steps_override=min(
                 MAX_STEPS,
                 _as_int(data.get("sampler_steps_override"), 0, 0),
+            ),
+            sampler_cfg_override=min(
+                30.0,
+                max(0.0, _as_float(data.get("sampler_cfg_override"), 0.0)),
+            ),
+            sampler_name_override=str(
+                data.get("sampler_name_override", "")
+            ).strip(),
+            sampler_scheduler_override=str(
+                data.get("sampler_scheduler_override", "")
+            ).strip(),
+            enable_ttp_detail=_as_bool(data.get("enable_ttp_detail"), False),
+            global_extra_positive_tags=_as_string_list(
+                data.get("global_extra_positive_tags"), []
+            ),
+            global_extra_negative_tags=_as_string_list(
+                data.get("global_extra_negative_tags"), []
             ),
             output_node_ids=_as_string_list(
                 data.get("output_node_ids"),

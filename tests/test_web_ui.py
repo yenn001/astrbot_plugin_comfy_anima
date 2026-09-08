@@ -691,8 +691,19 @@ class WebUiTaskAssetContractTests(unittest.TestCase):
             pages_dir.mkdir(parents=True)
             for name in sync_web_assets.SHARED_FILES:
                 (web_dir / name).write_bytes(b"source-" + name.encode())
+            (web_dir / "index.html").write_text(
+                '<!doctype html><head>'
+                '<script src="/assets/theme.js"></script>'
+                '<script src="/assets/app.js" defer></script>'
+                '</head><body></body>'
+            )
             copied = sync_web_assets.sync_web_assets(web_dir, pages_dir)
-            self.assertEqual(set(copied), set(sync_web_assets.SHARED_FILES))
+            self.assertEqual(
+                set(copied), set(sync_web_assets.SHARED_FILES) | {"index.html"}
+            )
+            page_html = (pages_dir / "index.html").read_text(encoding="utf-8")
+            self.assertIn('src="./theme.js"', page_html)
+            self.assertIn("/api/plugin/page/bridge-sdk.js", page_html)
             sync_web_assets.verify_hashes(web_dir, pages_dir)
             self.assertEqual(
                 sync_web_assets.file_sha256(web_dir / "app.js"),

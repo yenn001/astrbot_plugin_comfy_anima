@@ -95,7 +95,9 @@ _CONTROL_ATTR_RE = re.compile(
 _INTERNAL_LEAK_RE = re.compile(
     r"<\s*skill\b[^>]*>.*?<\s*/\s*skill\s*>|"
     r"^\s*wait,\s*i\s*shouldn't.*$|"
-    r"^\s*(?:tool_calls?|function_call|arguments)\s*:\s*\{.*$",
+    r"^\s*(?:tool_calls?|function_call|arguments)\s*:\s*\{.*$|"
+    r"^\s*(?:negative_prompt|positive_prompt|prompt)\s*[:=]\s*.*$|"
+    r"^\s*\{\s*\"(?:prompt|negative_tags|characters)\".*$",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
@@ -1991,6 +1993,9 @@ class PromptDirector:
         text = _ANY_PIC_TAG_RE.sub(marker, text)
         text = _EDIT_TAG_RE.sub(marker, text)
         text = _ANY_EDIT_TAG_RE.sub(marker, text)
+        # <lora:...> 是绘图协议标签，绝不允许出现在用户可见正文
+        # （3.1.428：修复交付正文泄漏 LoRA 标签与 prompt 的事故）。
+        text = re.sub(r"<\s*lora\s*:[^>]{0,200}>", marker, text, flags=re.IGNORECASE)
         escaped_marker = re.escape(marker)
         text = re.sub(rf"(?m)^[ \t]*(?:{escaped_marker}[ \t]*)+(?:\r?\n|$)", "", text)
         text = re.sub(
@@ -2088,6 +2093,18 @@ class PromptDirector:
                 raise PromptDirectorError("LLM 返回的角色声明含有控制字符")
             if len(item) > 160:
                 raise PromptDirectorError("LLM 返回的单个角色声明过长")
+            # 协议字段名/属性回显不是角色名：LLM 偶尔把 prompt/负面等协议
+            # 字样复述进 characters，让它进入 exact 身份校验只会产出无意义
+            # 的"角色校验失败"。只杀"协议字段名开头接 :/="与属性赋值回显
+            # （= 引号），放行合法含冒号的作品名（如 Honkai: Star Rail）。
+            if re.search(
+                r"^(?:negative_?prompt|positive_?prompt|prompt|characters|pipeline|lora)\s*[:=]"
+                r'|=\s*"'
+                r'|"\s*(?:/>|>)?\s*$',
+                item,
+                re.IGNORECASE,
+            ):
+                continue
             if item.count("|") > 1:
                 raise PromptDirectorError("角色声明只能包含一个 name|work 分隔符")
             name, separator, work = item.partition("|")

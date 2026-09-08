@@ -580,6 +580,13 @@ class WorkflowBuilder:
         effective_steps = options.steps
         if effective_steps is None and configured_steps > 0:
             effective_steps = configured_steps
+        configured_cfg = float(getattr(self._settings, "sampler_cfg_override", 0.0) or 0.0)
+        sampler_name_override = str(
+            getattr(self._settings, "sampler_name_override", "") or ""
+        ).strip()
+        scheduler_override = str(
+            getattr(self._settings, "sampler_scheduler_override", "") or ""
+        ).strip()
         for binding in self._profile.samplers:
             node = workflow.get(binding.node_id)
             if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
@@ -588,11 +595,18 @@ class WorkflowBuilder:
                 node["inputs"][binding.steps_input] = effective_steps
             if options.cfg is not None:
                 node["inputs"][binding.cfg_input] = options.cfg
+            elif configured_cfg > 0:
+                node["inputs"][binding.cfg_input] = configured_cfg
             if (
                 options.denoise is not None
+                and binding.denoise_input
                 and self._profile.profile_id != "anima_iterative"
             ):
                 node["inputs"][binding.denoise_input] = options.denoise
+            if sampler_name_override and binding.sampler_input:
+                node["inputs"][binding.sampler_input] = sampler_name_override
+            if scheduler_override and binding.scheduler_input:
+                node["inputs"][binding.scheduler_input] = scheduler_override
 
         if self._profile.upscale is not None:
             binding = self._profile.upscale
@@ -635,6 +649,16 @@ class WorkflowBuilder:
             else options.enable_upscale
         )
         variant_name = "rtx" if upscale_enabled else "base"
+        # TTP 细节增强只在放大链路上生效（瓦片输入来自 RTX 预放大），且仅当
+        # 模板声明了 "ttp" 变体；未命中时按 enable_upscale 重派生，不得直落
+        # active_output（anima_v2 的 default 是 rtx，会让用户关掉高清反而拿
+        # 到放大输出）。
+        if (
+            upscale_enabled
+            and getattr(self._settings, "enable_ttp_detail", False)
+            and "ttp" in self._profile.output_variants
+        ):
+            variant_name = "ttp"
         variant = self._profile.output_variants.get(variant_name)
         if variant is None:
             variant = self._profile.active_output

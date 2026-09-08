@@ -236,6 +236,7 @@ const numberFields = new Set([
   "danbooru_api_max_records",
   "danbooru_auto_update_interval_hours",
   "bot_reply_draw_cooldown_seconds",
+  "sampler_cfg_override",
 ]);
 
 const booleanFields = new Set([
@@ -271,7 +272,63 @@ const booleanFields = new Set([
   "enable_web_ui",
   "enable_time_context",
   "enable_bot_reply_draw",
+  "enable_ttp_detail",
 ]);
+
+async function refreshStickyNegatives() {
+  const list = document.querySelector("#sticky-negatives-list");
+  const empty = document.querySelector("#sticky-negatives-empty");
+  if (!list || !empty) return;
+  try {
+    const data = await api("/api/user-negatives");
+    const entries = (data && data.entries) || {};
+    const rows = [];
+    for (const [key, items] of Object.entries(entries)) {
+      for (const item of items) {
+        rows.push({ key, term: item.term, at: item.registered_at });
+      }
+    }
+    list.textContent = "";
+    empty.hidden = rows.length > 0;
+    for (const row of rows) {
+      const item = document.createElement("div");
+      item.className = "task-item";
+      item.role = "listitem";
+      const label = document.createElement("span");
+      label.textContent = `${row.term}　·　${key.split("|")[1] || row.key}`;
+      const remove = document.createElement("button");
+      remove.className = "secondary inverse compact";
+      remove.type = "button";
+      remove.textContent = "解除";
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try {
+          await api("/api/user-negatives/delete", {
+            method: "POST",
+            body: JSON.stringify({ key: row.key, term: row.term }),
+          });
+          await refreshStickyNegatives();
+        } catch (_error) {
+          remove.disabled = false;
+        }
+      });
+      item.append(label, remove);
+      list.append(item);
+    }
+  } catch (_error) {
+    empty.hidden = false;
+    empty.textContent = "粘性禁令读取失败（插件可能未就绪）。";
+  }
+}
+
+
+function bindStickyNegativesRefresh() {
+  const button = document.querySelector("#sticky-negatives-refresh");
+  if (button && !button.dataset.bound) {
+    button.dataset.bound = "1";
+    button.addEventListener("click", () => { void refreshStickyNegatives(); });
+  }
+}
 
 function pluginPageBridge() {
   const bridge = window.AstrBotPluginPage;
@@ -734,6 +791,8 @@ function renderLoraArchive(archive) {
 
 async function loadBootstrap() {
   const data = await api("/api/bootstrap");
+  bindStickyNegativesRefresh();
+  void refreshStickyNegatives();
   csrfToken = data.csrf_token;
   bootstrapData = data;
   activeModelFamily = data.settings?.model_family === "anima_29b_40l"
@@ -1226,7 +1285,9 @@ function collectSettings(form) {
       result[field.name] = Number(field.value);
     } else if (
       field.name === "group_whitelist" ||
-      field.name === "bot_reply_draw_delivery_phrases"
+      field.name === "bot_reply_draw_delivery_phrases" ||
+      field.name === "global_extra_positive_tags" ||
+      field.name === "global_extra_negative_tags"
     ) {
       result[field.name] = field.value
         .split(/[\n,]+/)

@@ -964,10 +964,28 @@
     "hint": "关闭后只执行首轮出图，可用 --upscale 为单次任务重新开启",
     "default": true
   },
+  "enable_ttp_detail": {
+    "description": "TTP 瓦片细节增强",
+    "type": "bool",
+    "hint": "仅在放大链路生效：RTX 预放大后 2×2 切块、逐块 WD14 反推并以低降噪重绘细节，再拼合（耗时约为纯 RTX 的 3-5 倍）；需要工作流模板声明 ttp 变体",
+    "default": false
+  },
+  "global_extra_positive_tags": {
+    "description": "全局附加正向词",
+    "type": "list",
+    "hint": "追加进每一次出图的最终正向提示词末尾（进清单审计），如固定画风词；每行一条",
+    "default": []
+  },
+  "global_extra_negative_tags": {
+    "description": "全局附加负面词",
+    "type": "list",
+    "hint": "追加进每一次出图的最终负面提示词（进清单审计），如永远不想出现的元素；每行一条",
+    "default": []
+  },
   "rtx_scale": {
     "description": "RTX 默认放大倍率",
     "type": "float",
-    "hint": "支持 1.0 到 4.0，默认 2 倍",
+    "hint": "支持 1.0 到 4.0，默认 2 倍；TTP 链路中该值同时是切块前的预放大倍率",
     "default": 2.0
   },
   "rtx_quality": {
@@ -1514,6 +1532,24 @@
     "type": "int",
     "hint": "0 表示读取并使用当前工作流原始步数；1-100 会覆盖档案中全部采样器",
     "default": 0
+  },
+  "sampler_cfg_override": {
+    "description": "WebUI CFG 覆盖",
+    "type": "float",
+    "hint": "0 表示使用工作流原始 CFG；1-30 会覆盖档案中全部采样器（请求显式指定时优先）",
+    "default": 0.0
+  },
+  "sampler_name_override": {
+    "description": "WebUI 采样器名覆盖",
+    "type": "string",
+    "hint": "留空使用工作流原始采样器；填 euler/euler_ancestral/dpmpp_2m 等覆盖档案中全部采样器",
+    "default": ""
+  },
+  "sampler_scheduler_override": {
+    "description": "WebUI 调度器覆盖",
+    "type": "string",
+    "hint": "留空使用工作流原始调度器；填 simple/normal/karras 等覆盖档案中全部采样器",
+    "default": ""
   },
   "output_node_ids": {
     "description": "旧工作流图片输出节点优先级",
