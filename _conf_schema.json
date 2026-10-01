@@ -1734,5 +1734,23 @@
     "type": "list",
     "hint": "规则后端识别的 Bot 交付语（如“给你看”）；只作用于 Bot 回复判定，否定/推迟句式仍被拦",
     "default": ["给你看", "给你瞧瞧", "快看", "拍给你看", "穿给你看", "我给你看"]
+  },
+  "enable_bot_character_binding": {
+    "description": "启用 BOT 绑定角色预设组合",
+    "type": "bool",
+    "hint": "开启后，未显式点名其它角色的出图会自动套用绑定的角色预设（身份确定性由配置保证，不依赖运行时 persona）",
+    "default": false
+  },
+  "bot_character_preset": {
+    "description": "本 BOT 绑定的角色预设名",
+    "type": "string",
+    "hint": "填已保存的「角色类」预设名（如 达妮娅）。必须是契约角色预设：身份锚点与必需触发词齐全，否则加载期报错",
+    "default": ""
+  },
+  "bot_character_preset_scopes": {
+    "description": "按作用域覆盖绑定（JSON 对象，精确优先）",
+    "type": "dict",
+    "hint": "键可为 unified_msg_origin（如 Bot:FriendMessage:719397082）、session:sender、self:session:sender 或平台段（如 Bot）；值为角色预设名。留空即只用全局绑定",
+    "default": {}
   }
 }

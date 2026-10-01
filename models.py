@@ -188,6 +188,19 @@ def _as_group_levels(value: Any) -> dict[str, str]:
     return result
 
 
+def _as_str_dict(value: Any) -> dict[str, str]:
+    """把映射清洗为 str→str（丢弃空键空值）；非映射返回空字典。"""
+    result: dict[str, str] = {}
+    if not isinstance(value, Mapping):
+        return result
+    for raw_key, raw_value in value.items():
+        key = str(raw_key or "").strip()
+        text = str(raw_value or "").strip()
+        if key and text:
+            result[key] = text
+    return result
+
+
 def migrate_legacy_auto_draw_prompt(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return a config copy with the 307 prompt fields present.
 
@@ -540,6 +553,12 @@ class PluginSettings:
     poll_interval: float = 2.0
     max_prompt_length: int = 2000
     max_image_size_mb: int = 50
+    # BOT 绑定角色预设组合：把「这个 BOT 是谁」变成配置事实，避免运行时
+    # 取 persona（跨版本接口不稳定）。scopes 可选，键为 unified_msg_origin、
+    # session:sender、self:session:sender 或平台段，精确优先。
+    enable_bot_character_binding: bool = False
+    bot_character_preset: str = ""
+    bot_character_preset_scopes: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, config: Optional[Mapping[str, Any]]) -> "PluginSettings":
@@ -1344,6 +1363,15 @@ class PluginSettings:
             poll_interval=_as_float(data.get("poll_interval"), 2.0, 0.25),
             max_prompt_length=_as_int(data.get("max_prompt_length"), 2000, 1),
             max_image_size_mb=_as_int(data.get("max_image_size_mb"), 50, 1),
+            enable_bot_character_binding=_as_bool(
+                data.get("enable_bot_character_binding"), False
+            ),
+            bot_character_preset=str(
+                data.get("bot_character_preset", "")
+            ).strip(),
+            bot_character_preset_scopes=_as_str_dict(
+                data.get("bot_character_preset_scopes", {})
+            ),
         )
 
     def resolve_workflow_path(self, plugin_dir: Path) -> Path:

@@ -1195,6 +1195,10 @@ class ComfyAnimaPlugin(Star):
             self.settings.lora_presets,
             max_loras=self.settings.max_preset_loras,
         )
+        # BOT 绑定角色预设：启动期把绑定状态与可用性写进日志，让"是否生效"
+        # 在运行时可直接观测（绑定非法只记 ERROR 并拒绝套用，不阻断插件加载
+        # ——预设可能被改名/删除，阻断加载会让整个绘图功能不可用）。
+        self._log_bot_character_binding_status()
         self._model_manager: Optional[ModelManagerService] = None
         self._model_manager_error = ""
         if (
@@ -2197,6 +2201,174 @@ class ComfyAnimaPlugin(Star):
             and preset.contract_enabled
             and str(preset.identity_anchor or "").strip()
             and tuple(preset.required_trigger_terms or ())
+        )
+
+    def _bound_character_identifier(self, event: Any) -> str:
+        """按作用域精确度解析 BOT 绑定的角色预设名（不校验可用性）。
+
+        作用域优先：事件键精确匹配（unified_msg_origin / session:sender /
+        self:session:sender）→ 平台段 → 全局 ``bot_character_preset``。
+        """
+
+        scopes = getattr(self.settings, "bot_character_preset_scopes", None) or {}
+        if not isinstance(scopes, Mapping):
+            scopes = {}
+        if event is not None:
+            for key in self._event_drawing_keys(event):
+                value = str(scopes.get(key, "") or "").strip()
+                if value:
+                    return value
+            unified = str(getattr(event, "unified_msg_origin", "") or "").strip()
+            platform = unified.split(":", 1)[0].strip() if unified else ""
+            if platform:
+                value = str(scopes.get(platform, "") or "").strip()
+                if value:
+                    return value
+        return str(getattr(self.settings, "bot_character_preset", "") or "").strip()
+
+    def _bound_character_preset_name(
+        self,
+        event: Any,
+        options: Optional[GenerationOptions] = None,
+    ) -> str:
+        """解析本次出图应套用的 BOT 绑定角色预设名；不适用时返回空串。
+
+        适用性闸门：显式点名了**其它**角色时绑定让位（显式意图优先）；
+        绑定预设必须是契约角色类（身份锚点与必需触发词齐全），否则视为
+        非法并记 warning——不猜、不静默降级为其它预设。
+        """
+
+        if not bool(getattr(self.settings, "enable_bot_character_binding", False)):
+            return ""
+        registry = getattr(self, "_lora_presets", None)
+        if registry is None:
+            return ""
+        identifier = self._bound_character_identifier(event)
+        if not identifier:
+            return ""
+
+        # 换角任务：用户显式要换成别的角色，绑定让位。
+        if options is not None and (
+            str(getattr(options, "character_swap_target_lora", "") or "").strip()
+            or bool(getattr(options, "character_swap_forbid_character_loras", False))
+        ):
+            logger.info(
+                f"[{PLUGIN_NAME}] bot character binding skipped: "
+                f"character swap task overrides binding {identifier!r}"
+            )
+            return ""
+
+        # 显式点名其它角色 → 绑定让位。
+        user_text = ""
+        if options is not None:
+            user_text = str(
+                getattr(options, "llm_character_user_request", "") or ""
+            ) or str(getattr(options, "prompt", "") or "")
+        if user_text:
+            subject = self._requested_subject_hint(user_text)
+            if subject:
+                named = self._subject_character_preset(subject)
+                named_name = str(getattr(named, "name", "") or "").strip()
+                if named_name != identifier:
+                    logger.info(
+                        f"[{PLUGIN_NAME}] bot character binding skipped: "
+                        f"explicit character named ({subject!r}) overrides "
+                        f"binding {identifier!r}"
+                    )
+                    return ""
+
+        try:
+            preset = registry.resolve(identifier)
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] bot character binding invalid: "
+                f"preset {identifier!r} unresolvable ({type(exc).__name__})"
+            )
+            return ""
+        problem = self._bot_binding_preset_error(identifier, preset=preset)
+        if problem:
+            logger.warning(
+                f"[{PLUGIN_NAME}] bot character binding invalid: "
+                f"preset {identifier!r} {problem}"
+            )
+            return ""
+        logger.info(
+            f"[{PLUGIN_NAME}] bot character binding applied: preset={identifier}"
+        )
+        return identifier
+
+    def _bot_binding_preset_error(
+        self,
+        identifier: str,
+        *,
+        preset: Any = None,
+    ) -> str:
+        """校验一个绑定预设是否可作确定性身份源；合法返回空串。
+
+        启动期与运行期共用同一判定，避免两处规则漂移。
+        """
+
+        registry = getattr(self, "_lora_presets", None)
+        if preset is None:
+            if registry is None:
+                return "LoRA 预设注册表不可用"
+            try:
+                preset = registry.resolve(identifier)
+            except Exception as exc:
+                return f"预设不可解析（{type(exc).__name__}）"
+        if getattr(preset, "category", "") != PRESET_CATEGORY_CHARACTER:
+            return "不是角色类预设"
+        if not getattr(preset, "contract_enabled", False):
+            return "缺少角色契约（identity_anchor/required_trigger_terms）"
+        if not str(getattr(preset, "identity_anchor", "") or "").strip():
+            return "缺少身份锚点"
+        if not tuple(getattr(preset, "required_trigger_terms", ()) or ()):
+            return "缺少必需触发词"
+        return ""
+
+    def _log_bot_character_binding_status(self) -> None:
+        """启动期记录 BOT 绑定状态与可用性，让"是否生效"可直接观测。
+
+        绑定非法只记 ERROR，不阻断插件加载——预设可能被改名或删除，阻断
+        加载会让整个绘图功能不可用；运行期套用前还会再校验一次。
+        """
+
+        if not bool(getattr(self.settings, "enable_bot_character_binding", False)):
+            logger.info(f"[{PLUGIN_NAME}] bot character binding: disabled")
+            return
+        global_default = str(
+            getattr(self.settings, "bot_character_preset", "") or ""
+        ).strip()
+        scopes = getattr(self.settings, "bot_character_preset_scopes", None)
+        scope_items = (
+            tuple(scopes.items()) if isinstance(scopes, Mapping) else ()
+        )
+        if not global_default and not scope_items:
+            logger.warning(
+                f"[{PLUGIN_NAME}] bot character binding enabled but no preset "
+                "configured; set bot_character_preset or "
+                "bot_character_preset_scopes"
+            )
+            return
+        problems: list[str] = []
+        entries = (("global", global_default),) + tuple(
+            (f"scope:{key}", str(value or "")) for key, value in scope_items
+        )
+        for label, name in entries:
+            if not name:
+                continue
+            problem = self._bot_binding_preset_error(name)
+            if problem:
+                problems.append(f"{label}={name!r}: {problem}")
+        if problems:
+            logger.error(
+                f"[{PLUGIN_NAME}] bot character binding invalid entries -> "
+                + "; ".join(problems)
+            )
+            return
+        logger.info(
+            f"[{PLUGIN_NAME}] bot character binding ready: "
+            f"global={global_default or '-'} scopes={len(scope_items)}"
         )
 
     def _authorized_character_preset_lora_names(self) -> frozenset[str]:
@@ -22353,6 +22525,7 @@ QQ快捷指令:
             options.lora_preset,
             parsed_loras,
             suppress_default_style=options.suppress_default_style,
+            bound_character=self._bound_character_preset_name(event, options),
         )
         resolved_records: dict[str, Any] = {}
 
@@ -23103,6 +23276,10 @@ QQ快捷指令:
         director_pipeline = ""
         director_character_queries = options.llm_character_queries
         director_warning: Optional[str] = None
+        # 实际使用的契约角色预设身份（消息点名或 BOT 绑定都会经 lora_preset
+        # 进入预设栈）；用于清单与配方回填身份锚点，避免身份被写空。
+        character_identity_anchor = ""
+        character_identity_triggers: tuple[str, ...] = ()
         provider_error_code = PromptDirector.provider_error_code(effective_prompt)
         if provider_error_code:
             self._record_image_task_phase(
@@ -23202,6 +23379,9 @@ QQ快捷指令:
                         options.lora_preset,
                         parsed_loras,
                         suppress_default_style=options.suppress_default_style,
+                        bound_character=self._bound_character_preset_name(
+                            event, options
+                        ),
                     )
                     resolved_records = {}
 
@@ -23279,6 +23459,13 @@ QQ快捷指令:
                         if not character_preset.required_trigger_terms:
                             raise WorkflowError(
                                 f"角色预设“{character_preset.name}”缺少必需触发词，已阻止提交"
+                            )
+                        if not character_identity_anchor:
+                            character_identity_anchor = (
+                                character_preset.identity_anchor.strip()
+                            )
+                            character_identity_triggers = tuple(
+                                character_preset.required_trigger_terms or ()
                             )
                     preset_positive_terms = tuple(
                         term
@@ -23895,8 +24082,14 @@ QQ快捷指令:
                             for selection in dynamic_loras
                         ],
                         model_family=expected_manifest.model_family,
-                        identity_anchor=expected_manifest.identity_anchor,
-                        required_triggers=expected_manifest.required_triggers,
+                        identity_anchor=(
+                            expected_manifest.identity_anchor
+                            or character_identity_anchor
+                        ),
+                        required_triggers=(
+                            tuple(expected_manifest.required_triggers)
+                            or character_identity_triggers
+                        ),
                     )
                     assert_preset_invariants(
                         expected_manifest,
@@ -24171,8 +24364,15 @@ QQ快捷指令:
         parsed_loras: tuple[Any, ...],
         *,
         suppress_default_style: bool = False,
+        bound_character: str = "",
     ) -> tuple[tuple[LoraPreset, ...], bool]:
-        """选择本次风格/角色预设，并决定是否替换节点 462 的原风格栈。"""
+        """选择本次风格/角色预设，并决定是否替换节点 462 的原风格栈。
+
+        ``bound_character`` 是 BOT 绑定的角色预设名（已由
+        ``_bound_character_preset_name`` 完成可用性与适用性校验）。当显式
+        预设里没有角色类预设时追加它——"这个 BOT 是谁"因此成为配置事实，
+        不依赖任何运行时 persona 接口。
+        """
         # The Legacy default style preset is a persisted user preference, but it
         # is not an implicit cross-model compatibility declaration. A 2.9B
         # profile must omit it unless the operator explicitly selects a preset
@@ -24182,6 +24382,17 @@ QQ快捷指令:
             str(getattr(self.settings, "model_family", "")).strip().casefold()
             == "anima_29b_40l"
         )
+        bound_preset: Optional[LoraPreset] = None
+        if bound_character:
+            try:
+                candidate = self._lora_presets.resolve(bound_character)
+            except LoraPresetError:
+                candidate = None
+            if (
+                candidate is not None
+                and candidate.category == PRESET_CATEGORY_CHARACTER
+            ):
+                bound_preset = candidate
         if explicit_identifier:
             identifiers = [
                 item.strip()
@@ -24199,6 +24410,12 @@ QQ快捷指令:
                 }:
                     replace_stack = True
             if resolved:
+                if bound_preset is not None and not any(
+                    preset.category == PRESET_CATEGORY_CHARACTER
+                    for preset in resolved
+                ):
+                    # 显式只给了风格/混合预设：绑定角色补位，形成双组合。
+                    resolved.append(bound_preset)
                 if any(
                     preset.category == PRESET_CATEGORY_CHARACTER
                     for preset in resolved
@@ -24214,7 +24431,17 @@ QQ快捷指令:
 
         expanded_style = self._lora_presets.match_style_selections(parsed_loras)
         if expanded_style:
+            if bound_preset is not None:
+                return (expanded_style, bound_preset), True
             return (expanded_style,), True
+
+        if bound_preset is not None:
+            default_style = (
+                None if is_29b_profile else self._resolve_default_style_preset()
+            )
+            if default_style:
+                return (default_style, bound_preset), True
+            return (bound_preset,), True
 
         if suppress_default_style or is_29b_profile:
             return (), False
