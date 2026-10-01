@@ -1749,5 +1749,11 @@
     "type": "bool",
     "hint": "开启后，一次出图请求期间的工具轮次不再逐轮发话（AstrBot 会投递每轮结果，多轮时会连出多条近似重复的话）；终稿（含图）不受影响。关闭 = 每轮台词照常放行",
     "default": false
+  },
+  "min_prompt_tags": {
+    "description": "tag 串下限（0 = 关闭）",
+    "type": "int",
+    "hint": "Anima 成图质量由 tag 串与自然语言共同决定；实测 tag 串中位数仅 22.5、23% 不足 20。仅对 txt2img 告警，不阻断出图；改图（img2img）靠源图供细节，不受此下限约束",
+    "default": 20
   }
 }

@@ -367,6 +367,7 @@
                 <label class="toggle"><input name="intent_router_probe_plan" type="checkbox"><span>意图路由使用探针计划（关闭则导演跳过一次资产预检直接出图）</span></label>
                 <div class="span-4 section-divider"><span>行为与调优</span></div>
                 <label><span>每回复最多出图数</span><input name="max_auto_images_per_reply" type="number" min="1" max="8" step="1"></label>
+                <label><span>tag 串下限（0=关闭）</span><input name="min_prompt_tags" type="number" min="0" max="60" step="1"></label>
                 <label><span>导演结构化传输</span><select name="structured_director_mode">
                   <option value="auto">auto：优先 Function Calling</option>
                   <option value="function_call">function_call：严格模式</option>

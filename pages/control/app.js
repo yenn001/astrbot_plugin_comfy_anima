@@ -255,6 +255,7 @@ const numberFields = new Set([
   "user_picture_preferences_ttl",
   "lora_max_results",
   "lora_tool_max_steps",
+  "min_prompt_tags",
 ]);
 
 const booleanFields = new Set([

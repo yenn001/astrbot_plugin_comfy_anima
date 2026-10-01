@@ -327,6 +327,9 @@ class PluginSettings:
     chat_roleplay_draw_prompt: str = ""
     director_creative_preference: str = ""
     max_auto_images_per_reply: int = 1
+    # tag 串下限（0 = 关闭）。Anima 成图质量由 tag 串与自然语言共同决定，
+    # tag 串长期压在 20 上下、23% 不足 20，故设下限并做可观测的计数。
+    min_prompt_tags: int = 20
     conversation_draw_cooldown_seconds: float = 8.0
     intent_router_probe_plan: bool = True
     enable_reverse_prompt: bool = True
@@ -708,6 +711,9 @@ class PluginSettings:
             ).strip(),
             max_auto_images_per_reply=_as_int(
                 data.get("max_auto_images_per_reply"), 1, 1
+            ),
+            min_prompt_tags=min(
+                60, _as_int(data.get("min_prompt_tags"), 20, 0)
             ),
             conversation_draw_cooldown_seconds=_as_float(
                 data.get("conversation_draw_cooldown_seconds"),

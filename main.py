@@ -246,6 +246,7 @@ from .services.prompt_composer import (
     PromptComposer,
     PromptDiagnosticsStore,
     remove_prompt_terms,
+    split_hybrid_prompt,
 )
 from .services.provider_response import response_error_code, response_text
 from .services.intent_router import (
@@ -724,6 +725,7 @@ WEB_UI_EDITABLE_FIELDS = (
     # 档1：日常会动的行为与超时开关
     "show_llm_prompt",
     "max_auto_images_per_reply",
+    "min_prompt_tags",
     "enable_session_recipe_continuity",
     "invalidate_session_recipe_on_update",
     "enable_preset_manifest_gate",
@@ -778,6 +780,62 @@ WEB_UI_GATE_MODES = frozenset({"on", "off"})
 WEB_UI_DIRECTOR_TRANSPORTS = frozenset({"auto", "function_call", "json", "legacy"})
 WEB_UI_PIPELINE_MODES = frozenset({"auto", "base", "rtx", "iterative", "legacy"})
 WEB_UI_DYNAMIC_LORA_MODES = frozenset({"append", "replace"})
+
+# tag 槽位诊断词表（近似）：用于回答"差在哪个槽位"，不参与强制判定。
+# 每个槽位给出可识别的标记词；命中数只表示该槽位是否被覆盖到，不代表 tag 个数。
+_PROMPT_TAG_SLOT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "identity": (
+        "hair", "bangs", "eyes", "eyelashes", "skin", "face", "freckles",
+        "mole", "ahoge", "twintails",
+    ),
+    "clothing": (
+        "dress", "shirt", "skirt", "jacket", "coat", "sweater", "socks",
+        "stockings", "boots", "shoes", "hat", "necklace", "earrings", "gloves",
+        "belt", "ribbon", "uniform", "underwear", "bra", "panties", "kimono",
+        "swimsuit", "apron", "scarf",
+    ),
+    "action": (
+        "sitting", "standing", "lying", "holding", "looking", "smiling",
+        "walking", "kneeling", "reaching", "hugging", "leaning", "turning",
+        "raising", "crossed",
+    ),
+    "camera": (
+        "close-up", "portrait", "full body", "upper body", "from above",
+        "from below", "from side", "from behind", "cowboy shot", "wide shot",
+        "depth of field", "angle", "pov",
+    ),
+    "scene": (
+        "indoors", "outdoors", "bedroom", "bathroom", "kitchen", "street",
+        "forest", "beach", "window", "bed", "sofa", "room", "sky", "city",
+        "garden", "school",
+    ),
+    "lighting": (
+        "lighting", "backlight", "sunlight", "moonlight", "shadow", "glow",
+        "rim light", "soft light", "neon", "candle", "lamp", "lens flare",
+    ),
+}
+
+def _prompt_tag_metrics(prompt: str) -> dict[str, Any]:
+    """Measure the tag block of a hybrid prompt against the configured floor.
+
+    Anima image quality is carried by the tag block together with the
+    natural-language scene sentence, so a tag floor applies to the tag block
+    only: the prompt is split at the sentence boundary first, and only the tag
+    side is counted. Slot markers are a keyword estimate for diagnosing which
+    slot is thin; they are not enforced.
+    """
+
+    tag_block, _scene_sentence = split_hybrid_prompt(prompt or "")
+    lowered = tag_block.casefold()
+    return {
+        "tag_count": len(split_character_validation_terms(tag_block)),
+        "tag_block_chars": len(tag_block),
+        "slot_markers": {
+            slot: sum(1 for keyword in keywords if keyword in lowered)
+            for slot, keywords in _PROMPT_TAG_SLOT_KEYWORDS.items()
+        },
+    }
+
 
 IMAGE_TASK_TYPES = frozenset(
     {
@@ -16056,6 +16114,7 @@ QQ快捷指令:
                 # 档1/档2 行为与调优项
                 "show_llm_prompt": settings.show_llm_prompt,
                 "max_auto_images_per_reply": settings.max_auto_images_per_reply,
+                "min_prompt_tags": settings.min_prompt_tags,
                 "enable_session_recipe_continuity": (
                     settings.enable_session_recipe_continuity
                 ),
@@ -16432,6 +16491,7 @@ QQ快捷指令:
             "intent_judge_online_temperature": (0, 2),
             "intent_router_min_confidence": (0, 1),
             "max_auto_images_per_reply": (1, 8),
+            "min_prompt_tags": (0, 60),
             "max_prompt_length": (1, 20000),
             "max_image_size_mb": (1, 512),
             "poll_interval": (0.25, 30),
@@ -24367,6 +24427,18 @@ QQ快捷指令:
                             "lora_entries_actual": len(actual_manifest.lora_entries),
                         },
                     )
+                tag_metrics = _prompt_tag_metrics(clean_prompt)
+                tag_floor = int(getattr(self.settings, "min_prompt_tags", 0) or 0)
+                if (
+                    tag_floor
+                    and conditioning_type == "txt2img"
+                    and tag_metrics["tag_count"] < tag_floor
+                ):
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] tag 串不足下限："
+                        f"{tag_metrics['tag_count']} < {tag_floor}"
+                        f"（槽位标记 {tag_metrics['slot_markers']}）；仅告警，不阻断出图。"
+                    )
                 self._record_image_task_phase(
                     job,
                     "workflow",
@@ -24374,6 +24446,7 @@ QQ快捷指令:
                     "workflow_payload_ready",
                     details={
                         "conditioning_type": conditioning_type,
+                        **tag_metrics,
                         "profile_id": getattr(profile, "profile_id", "legacy_or_test"),
                         "pipeline": requested_pipeline,
                         "positive_node_id": (
