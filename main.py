@@ -721,6 +721,40 @@ WEB_UI_EDITABLE_FIELDS = (
     "intent_judge_online_temperature",
     "intent_router_min_confidence",
     "enable_local_intent_router",
+    # 档1：日常会动的行为与超时开关
+    "show_llm_prompt",
+    "max_auto_images_per_reply",
+    "enable_session_recipe_continuity",
+    "invalidate_session_recipe_on_update",
+    "enable_preset_manifest_gate",
+    "intent_router_gate_mode",
+    "structured_director_mode",
+    "poll_interval",
+    "generation_timeout",
+    "request_timeout",
+    # 档2：上限、容错、并发与进阶模式
+    "max_prompt_length",
+    "max_image_size_mb",
+    "prompt_llm_timeout",
+    "prompt_llm_fallback",
+    "router_timeout_before_agent",
+    "enable_parallel_preflight",
+    "provider_max_concurrent_jobs",
+    "allow_global_interrupt",
+    "enable_visual_task_intent",
+    "scene_context_window",
+    "scene_extraction_max_memories",
+    "scene_extraction_model",
+    "enable_user_picture_preferences",
+    "user_picture_preferences_ttl",
+    "draw_pipeline_mode",
+    "dynamic_lora_mode",
+    "lora_max_results",
+    "lora_tool_max_steps",
+    "group_block_levels",
+    "forward_sender_name",
+    "enable_lock_command",
+    "enable_unet_switch",
 )
 
 WEB_UI_LEGACY_FIELDS = frozenset(
@@ -738,6 +772,11 @@ WEB_UI_REPLY_INTENT_BACKENDS = frozenset(
     {"off", "rule", "local", "online", "auto", "both"}
 )
 WEB_UI_INTENT_FALLBACKS = frozenset({"no_draw", "draw_now", "await"})
+# 与 PluginSettings.from_mapping 的规范化集合保持一致
+WEB_UI_GATE_MODES = frozenset({"on", "off"})
+WEB_UI_DIRECTOR_TRANSPORTS = frozenset({"auto", "function_call", "json", "legacy"})
+WEB_UI_PIPELINE_MODES = frozenset({"auto", "base", "rtx", "iterative", "legacy"})
+WEB_UI_DYNAMIC_LORA_MODES = frozenset({"append", "replace"})
 
 IMAGE_TASK_TYPES = frozenset(
     {
@@ -16008,6 +16047,51 @@ QQ快捷指令:
                 "suppress_intermediate_draw_text": (
                     settings.suppress_intermediate_draw_text
                 ),
+                # 档1/档2 行为与调优项
+                "show_llm_prompt": settings.show_llm_prompt,
+                "max_auto_images_per_reply": settings.max_auto_images_per_reply,
+                "enable_session_recipe_continuity": (
+                    settings.enable_session_recipe_continuity
+                ),
+                "invalidate_session_recipe_on_update": (
+                    settings.invalidate_session_recipe_on_update
+                ),
+                "enable_preset_manifest_gate": settings.enable_preset_manifest_gate,
+                "intent_router_gate_mode": settings.intent_router_gate_mode,
+                "structured_director_mode": settings.structured_director_mode,
+                "poll_interval": settings.poll_interval,
+                "generation_timeout": settings.generation_timeout,
+                "request_timeout": settings.request_timeout,
+                "max_prompt_length": settings.max_prompt_length,
+                "max_image_size_mb": settings.max_image_size_mb,
+                "prompt_llm_timeout": settings.prompt_llm_timeout,
+                "prompt_llm_fallback": settings.prompt_llm_fallback,
+                "router_timeout_before_agent": settings.router_timeout_before_agent,
+                "enable_parallel_preflight": settings.enable_parallel_preflight,
+                "provider_max_concurrent_jobs": (
+                    settings.provider_max_concurrent_jobs
+                ),
+                "allow_global_interrupt": settings.allow_global_interrupt,
+                "enable_visual_task_intent": settings.enable_visual_task_intent,
+                "scene_context_window": settings.scene_context_window,
+                "scene_extraction_max_memories": (
+                    settings.scene_extraction_max_memories
+                ),
+                "scene_extraction_model": settings.scene_extraction_model,
+                "enable_user_picture_preferences": (
+                    settings.enable_user_picture_preferences
+                ),
+                "user_picture_preferences_ttl": (
+                    settings.user_picture_preferences_ttl
+                ),
+                "draw_pipeline_mode": settings.draw_pipeline_mode,
+                "dynamic_lora_mode": settings.dynamic_lora_mode,
+                "lora_max_results": settings.lora_max_results,
+                "lora_tool_max_steps": settings.lora_tool_max_steps,
+                "group_block_levels": dict(settings.group_block_levels),
+                "forward_sender_name": settings.forward_sender_name,
+                "enable_lock_command": settings.enable_lock_command,
+                "enable_unet_switch": settings.enable_unet_switch,
                 "interaction_mode": settings.interaction_mode,
                 "enable_prompt_composer_v2": settings.enable_prompt_composer_v2,
                 "natural_draw_mode": settings.natural_draw_mode,
@@ -16272,6 +16356,18 @@ QQ快捷指令:
                 + "、".join(sorted(WEB_UI_INTENT_FALLBACKS))
             )
         self._validate_web_ui_character_binding(candidate, supplied)
+        for key, allowed in (
+            ("intent_router_gate_mode", WEB_UI_GATE_MODES),
+            ("structured_director_mode", WEB_UI_DIRECTOR_TRANSPORTS),
+            ("draw_pipeline_mode", WEB_UI_PIPELINE_MODES),
+            ("dynamic_lora_mode", WEB_UI_DYNAMIC_LORA_MODES),
+        ):
+            if key not in supplied:
+                continue
+            if str(payload[key]).strip().casefold() not in allowed:
+                raise WebUiActionError(
+                    f"{key} 仅支持 " + "、".join(sorted(allowed))
+                )
         router_id = str(candidate.get("intent_router_model") or "").strip()
         auto_cleared_router = False
         if router_id and router_id in {
@@ -16328,6 +16424,20 @@ QQ快捷指令:
             "bot_reply_draw_cooldown_seconds": (0, 3600),
             "intent_judge_online_temperature": (0, 2),
             "intent_router_min_confidence": (0, 1),
+            "max_auto_images_per_reply": (1, 8),
+            "max_prompt_length": (1, 20000),
+            "max_image_size_mb": (1, 512),
+            "poll_interval": (0.25, 30),
+            "generation_timeout": (10, 7200),
+            "request_timeout": (1, 300),
+            "prompt_llm_timeout": (10, 600),
+            "router_timeout_before_agent": (0, 120),
+            "provider_max_concurrent_jobs": (1, 32),
+            "scene_context_window": (1, 32),
+            "scene_extraction_max_memories": (0, 20),
+            "user_picture_preferences_ttl": (0, 31_536_000),
+            "lora_max_results": (1, 500),
+            "lora_tool_max_steps": (1, 12),
         }
         for key, (minimum, maximum) in numeric_ranges.items():
             if key not in supplied:

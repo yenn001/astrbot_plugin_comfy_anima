@@ -352,6 +352,57 @@
                 <label class="span-2"><span>绑定角色预设名</span><input name="bot_character_preset" placeholder="角色类预设名，例如 达妮娅；须为契约角色预设"></label>
                 <label class="span-3"><span>作用域覆盖（每行 `scope=预设名`；scope 可为 unified_msg_origin、session:sender、self:session:sender 或平台段）</span><textarea name="bot_character_preset_scopes" rows="2" placeholder="Bot:FriendMessage:719397082=达妮娅"></textarea></label>
                 <p class="span-4 muted">绑定把"这个 BOT 是谁"变成配置事实，不依赖运行时 persona。预设必须是契约角色预设（身份锚点与必需触发词齐全），否则保存会被拒绝并列出可用项。用户显式点名其它角色、或执行换角命令时，绑定自动让位。</p>
+                <div class="span-4 section-divider"><span>生成与超时</span></div>
+                <label><span>出图轮询间隔（秒）</span><input name="poll_interval" type="number" min="0.25" max="30" step="0.25"></label>
+                <label><span>出图总超时（秒）</span><input name="generation_timeout" type="number" min="10" max="7200" step="10"></label>
+                <label><span>HTTP 请求超时（秒）</span><input name="request_timeout" type="number" min="1" max="300" step="1"></label>
+                <label><span>提示词长度上限</span><input name="max_prompt_length" type="number" min="1" max="20000" step="1"></label>
+                <label><span>输出图片体积上限（MB）</span><input name="max_image_size_mb" type="number" min="1" max="512" step="1"></label>
+                <label><span>导演 LLM 超时（秒）</span><input name="prompt_llm_timeout" type="number" min="10" max="600" step="10"></label>
+                <label class="toggle"><input name="prompt_llm_fallback" type="checkbox"><span>导演失败时回退为原始提示词</span></label>
+                <label><span>Agent 前路由超时（秒）</span><input name="router_timeout_before_agent" type="number" min="0" max="120" step="1"></label>
+                <div class="span-4 section-divider"><span>行为与调优</span></div>
+                <label><span>每回复最多出图数</span><input name="max_auto_images_per_reply" type="number" min="1" max="8" step="1"></label>
+                <label><span>导演结构化传输</span><select name="structured_director_mode">
+                  <option value="auto">auto：优先 Function Calling</option>
+                  <option value="function_call">function_call：严格模式</option>
+                  <option value="json">json：JSON 传输</option>
+                  <option value="legacy">legacy：旧标签传输</option>
+                </select></label>
+                <label><span>意图闸门模式</span><select name="intent_router_gate_mode">
+                  <option value="on">on：强制先判意图</option>
+                  <option value="off">off：跳过闸门</option>
+                </select></label>
+                <label><span>出图管线模式</span><select name="draw_pipeline_mode">
+                  <option value="auto">auto：按设置/导演</option>
+                  <option value="base">base：底图直出</option>
+                  <option value="rtx">rtx：RTX 放大</option>
+                  <option value="iterative">iterative：分步重采样</option>
+                  <option value="legacy">legacy：旧行为</option>
+                </select></label>
+                <label><span>动态 LoRA 模式</span><select name="dynamic_lora_mode">
+                  <option value="append">append：追加</option>
+                  <option value="replace">replace：替换</option>
+                </select></label>
+                <label><span>LLM/模型并发上限</span><input name="provider_max_concurrent_jobs" type="number" min="1" max="32" step="1"></label>
+                <label><span>LoRA 搜索结果上限</span><input name="lora_max_results" type="number" min="1" max="500" step="1"></label>
+                <label><span>LoRA 工具环最大步数</span><input name="lora_tool_max_steps" type="number" min="1" max="12" step="1"></label>
+                <label><span>场景上下文条数</span><input name="scene_context_window" type="number" min="1" max="32" step="1"></label>
+                <label><span>场景记忆条数</span><input name="scene_extraction_max_memories" type="number" min="0" max="20" step="1"></label>
+                <label class="span-2"><span>场景提取模型（Provider ID，留空用导演模型）</span><input name="scene_extraction_model" type="text"></label>
+                <label><span>用户偏好保存时长（秒）</span><input name="user_picture_preferences_ttl" type="number" min="0" max="31536000" step="3600"></label>
+                <label><span>合并转发显示名</span><input name="forward_sender_name" type="text"></label>
+                <label class="span-3"><span>分群放行等级（每行 `群号=none|lite|full`）</span><textarea name="group_block_levels" rows="2" placeholder="123456789=full"></textarea></label>
+                <label class="toggle"><input name="show_llm_prompt" type="checkbox"><span>回显最终提示词</span></label>
+                <label class="toggle"><input name="enable_session_recipe_continuity" type="checkbox"><span>会话配方续画（追画沿用上次角色）</span></label>
+                <label class="toggle"><input name="invalidate_session_recipe_on_update" type="checkbox"><span>插件升级后清空旧会话配方</span></label>
+                <label class="toggle"><input name="enable_preset_manifest_gate" type="checkbox"><span>提交前强制校验预设清单（安全闸门）</span></label>
+                <label class="toggle"><input name="enable_parallel_preflight" type="checkbox"><span>并行执行安全的出图准备（预取 GPU/LoRA 等）</span></label>
+                <label class="toggle"><input name="allow_global_interrupt" type="checkbox"><span>取消任务时中断 ComfyUI 全局队列（谨慎）</span></label>
+                <label class="toggle"><input name="enable_visual_task_intent" type="checkbox"><span>视觉任务意图识别</span></label>
+                <label class="toggle"><input name="enable_user_picture_preferences" type="checkbox"><span>记住用户的图片偏好</span></label>
+                <label class="toggle"><input name="enable_lock_command" type="checkbox"><span>启用锁定命令</span></label>
+                <label class="toggle"><input name="enable_unet_switch" type="checkbox"><span>启用底模切换命令</span></label>
                 <div class="span-4 section-divider"><span>Prompt Composer v2</span></div>
                 <label class="toggle"><input name="enable_prompt_composer_v2" type="checkbox"><span>启用三层提示词整理</span></label>
                 <label><span>动态负面词策略</span><select name="adaptive_negative_mode"><option value="off">关闭</option><option value="conservative">保守</option><option value="standard">标准</option></select></label>

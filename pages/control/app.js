@@ -239,6 +239,20 @@ const numberFields = new Set([
   "sampler_cfg_override",
   "intent_judge_online_temperature",
   "intent_router_min_confidence",
+  "max_auto_images_per_reply",
+  "poll_interval",
+  "generation_timeout",
+  "request_timeout",
+  "max_prompt_length",
+  "max_image_size_mb",
+  "prompt_llm_timeout",
+  "router_timeout_before_agent",
+  "provider_max_concurrent_jobs",
+  "scene_context_window",
+  "scene_extraction_max_memories",
+  "user_picture_preferences_ttl",
+  "lora_max_results",
+  "lora_tool_max_steps",
 ]);
 
 const booleanFields = new Set([
@@ -278,6 +292,17 @@ const booleanFields = new Set([
   "enable_bot_character_binding",
   "suppress_intermediate_draw_text",
   "enable_local_intent_router",
+  "show_llm_prompt",
+  "enable_session_recipe_continuity",
+  "invalidate_session_recipe_on_update",
+  "enable_preset_manifest_gate",
+  "prompt_llm_fallback",
+  "enable_parallel_preflight",
+  "allow_global_interrupt",
+  "enable_visual_task_intent",
+  "enable_user_picture_preferences",
+  "enable_lock_command",
+  "enable_unet_switch",
 ]);
 
 async function refreshStickyNegatives() {
@@ -1305,18 +1330,21 @@ function collectSettings(form) {
         .split(/[\n,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
-    } else if (field.name === "bot_character_preset_scopes") {
-      // 每行 `scope=预设名`；非法行直接忽略，由后端做最终校验。
-      const scopes = {};
+    } else if (
+      field.name === "bot_character_preset_scopes" ||
+      field.name === "group_block_levels"
+    ) {
+      // 每行 `scope=预设名` / `群号=放行等级`；非法行忽略，由后端最终校验。
+      const entries = {};
       for (const line of field.value.split(/\n+/)) {
         const text = line.trim();
         const separator = text.indexOf("=");
         if (separator <= 0) continue;
         const key = text.slice(0, separator).trim();
         const value = text.slice(separator + 1).trim();
-        if (key && value) scopes[key] = value;
+        if (key && value) entries[key] = value;
       }
-      result[field.name] = scopes;
+      result[field.name] = entries;
     } else if (field.name === "lora_alias_rules") {
       result[field.name] = field.value
         .split(/\n+/)
