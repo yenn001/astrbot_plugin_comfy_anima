@@ -126,7 +126,15 @@ def adapt_lora_selections_for_target(
         else:
             adapted.append(sel)
 
-    return tuple(adapted), tuple(bypassed), tuple(audit_logs)
+    # 家族映射可能造成同名碰撞：legacy 名被提升为专属变体名，而栈里已经存在同名
+    # 条目时，两条会指向同一个 LoRA。此处必须再去重（保序，后出现的权重覆盖），
+    # 否则同一 LoRA 会被写进节点两次、权重被叠加（角色脸容易过拟合）。
+    deduped: dict[str, LoraSelection] = {}
+    for selection in adapted:
+        key = canonical_lora_name(selection.name).casefold()
+        if key:
+            deduped[key] = selection
+    return tuple(deduped.values()), tuple(bypassed), tuple(audit_logs)
 
 
 __all__ = [

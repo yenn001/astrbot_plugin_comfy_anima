@@ -2,6 +2,21 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.3] - 2026-10-01（构建 3.1.440）
+
+### 工具轮次不再逐轮刷屏 + 家族映射去重
+
+- **绘图链中间轮次可静默**（新配置 `suppress_intermediate_draw_text`，默认关）：
+  AstrBot 的 respond 阶段会投递 agent 每一轮的结果，绘图请求走多轮工具环时
+  一次会连出多条近似重复的话。开启后对 `intent=True` 的绘图链中间 decoration
+  丢弃 Plain 正文（该阶段对空链直接跳过、不发送也不触发 `after_message_sent`），
+  非文本组件保留；终稿 decoration 发生在 `on_agent_done` 消费 trace 之后，走
+  正式渲染路径不受影响。**默认关闭 = 保持既有设计约定**（每轮台词照常放行，
+  非绘图会话亦不受影响）。
+- **家族映射后去重**：`adapt_lora_selections_for_target` 把 legacy 名提升为
+  专属变体名时可能与栈内已有的同名条目碰撞，导致同一 LoRA 被写进节点两次、
+  权重叠加。现返回前按 canonical 名去重（保序，后出现的权重覆盖）。
+
 ## [2.4.3] - 2026-09-09（构建 3.1.433）
 
 ### 配方锚点经 event extra 传递（放行链激活，完成 3.1.431/432）

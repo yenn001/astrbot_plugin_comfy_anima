@@ -1752,5 +1752,11 @@
     "type": "dict",
     "hint": "键可为 unified_msg_origin（如 Bot:FriendMessage:719397082）、session:sender、self:session:sender 或平台段（如 Bot）；值为角色预设名。留空即只用全局绑定",
     "default": {}
+  },
+  "suppress_intermediate_draw_text": {
+    "description": "静默绘图链的中间工具轮次正文",
+    "type": "bool",
+    "hint": "开启后，一次出图请求期间的工具轮次不再逐轮发话（AstrBot 会投递每轮结果，多轮时会连出多条近似重复的话）；终稿（含图）不受影响。关闭 = 每轮台词照常放行",
+    "default": false
   }
 }

@@ -553,6 +553,9 @@ class PluginSettings:
     poll_interval: float = 2.0
     max_prompt_length: int = 2000
     max_image_size_mb: int = 50
+    # 绘图链中间工具轮次的正文是否静默：AstrBot 会逐轮投递 agent 每轮结果，
+    # 工具环多轮时会连出多条近似重复的话。关闭 = 保持原行为（每轮台词放行）。
+    suppress_intermediate_draw_text: bool = False
     # BOT 绑定角色预设组合：把「这个 BOT 是谁」变成配置事实，避免运行时
     # 取 persona（跨版本接口不稳定）。scopes 可选，键为 unified_msg_origin、
     # session:sender、self:session:sender 或平台段，精确优先。
@@ -1363,6 +1366,9 @@ class PluginSettings:
             poll_interval=_as_float(data.get("poll_interval"), 2.0, 0.25),
             max_prompt_length=_as_int(data.get("max_prompt_length"), 2000, 1),
             max_image_size_mb=_as_int(data.get("max_image_size_mb"), 50, 1),
+            suppress_intermediate_draw_text=_as_bool(
+                data.get("suppress_intermediate_draw_text"), False
+            ),
             enable_bot_character_binding=_as_bool(
                 data.get("enable_bot_character_binding"), False
             ),

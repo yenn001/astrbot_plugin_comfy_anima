@@ -4667,6 +4667,29 @@ class ComfyAnimaPlugin(Star):
         else:
             req.extra_user_content_parts.append({"type": "text", "text": text})
 
+    def _suppress_intermediate_draw_text_enabled(self) -> bool:
+        """是否静默绘图链中间工具轮次的正文（配置项，默认关闭）。"""
+
+        return bool(
+            getattr(self.settings, "suppress_intermediate_draw_text", False)
+        )
+
+    @staticmethod
+    def _suppress_intermediate_draw_text(result: Any) -> None:
+        """丢弃一次中间工具轮次的正文，只保留非文本组件。
+
+        AstrBot 的 respond 阶段会投递 agent 每一轮的结果，正文累积起来就是
+        一次出图请求连出多条近似重复的话。该阶段对**空链**直接返回、不发送也
+        不触发 ``after_message_sent``，因此移除 Plain 组件即可静默该轮；图片等
+        非文本组件原样保留。
+        """
+
+        result.chain = [
+            component
+            for component in result.chain
+            if not isinstance(component, Comp.Plain)
+        ]
+
     def _clean_intermediate_chat_draw_controls(
         self,
         event: AstrMessageEvent,
@@ -4744,8 +4767,17 @@ class ComfyAnimaPlugin(Star):
             # A still-present trace means on_agent_done has not consumed this
             # event yet: this decoration is an intermediate tool-loop result,
             # not the final assistant response. Intermediate results never
-            # repair, submit, or seal the terminal; they only get control tags
-            # scrubbed so roleplay text can pass through.
+            # repair, submit, or seal the terminal.
+            if bool(trace.get("intent")) and self._suppress_intermediate_draw_text_enabled():
+                # 绘图链的中间轮次（由 suppress_intermediate_draw_text 开启）：
+                # AstrBot 会逐轮投递该轮结果，一次出图请求因此可能连出多条近似
+                # 重复的话。清空 Plain 组件即可让 respond 阶段跳过投递（空链不发
+                # 送且不触发 after_message_sent），非文本组件保留；终稿 decoration
+                # 发生在 on_agent_done 消费 trace 之后，走正式渲染路径不受影响。
+                self._suppress_intermediate_draw_text(result)
+                return
+            # 默认行为（开关关闭）与非绘图会话（intent=False）：只清洁控制标签，
+            # 正文照常放行——这是沉浸链"边画边说话"的既有设计约定。
             self._clean_intermediate_chat_draw_controls(event, result)
             return
 
