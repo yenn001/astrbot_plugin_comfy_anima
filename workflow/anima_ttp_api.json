@@ -1,0 +1,864 @@
+{
+  "4": {
+    "inputs": {
+      "clip_name": "qwen_3_06b_base.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "5": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": "1girl, masterpiece, highres",
+      "clip": [
+        "462",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": "lowres, worst quality, low quality, bad anatomy, bad hands, text, watermark",
+      "clip": [
+        "462",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "8": {
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": 42,
+      "steps": 30,
+      "cfg": 5.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": 30,
+      "return_with_leftover_noise": "disable",
+      "preview_method": "latent2rgb",
+      "vae_decode": "false",
+      "model": [
+        "462",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "186",
+        0
+      ],
+      "optional_vae": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "KSampler Adv. (Efficient)",
+    "_meta": {
+      "title": "KSampler Adv. (Efficient)"
+    }
+  },
+  "19": {
+    "inputs": {
+      "samples": [
+        "8",
+        3
+      ],
+      "vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "186": {
+    "inputs": {
+      "width": [
+        "437",
+        0
+      ],
+      "height": [
+        "437",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空Latent图像"
+    }
+  },
+  "260": {
+    "inputs": {
+      "samples": [
+        "267",
+        3
+      ],
+      "vae": [
+        "267",
+        4
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "261": {
+    "inputs": {
+      "resize_type": "scale by multiplier",
+      "resize_type.scale": 1.3,
+      "quality": "ULTRA",
+      "images": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "RTXVideoSuperResolution",
+    "_meta": {
+      "title": "RTX Video Super Resolution"
+    }
+  },
+  "262": {
+    "inputs": {
+      "seed": 42
+    },
+    "class_type": "CR Seed",
+    "_meta": {
+      "title": "🌱 CR Seed"
+    }
+  },
+  "265": {
+    "inputs": {
+      "pixels": [
+        "287",
+        0
+      ],
+      "vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "267": {
+    "inputs": {
+      "seed": [
+        "262",
+        0
+      ],
+      "steps": 18,
+      "cfg": 5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 0.05,
+      "preview_method": "latent2rgb",
+      "vae_decode": "false",
+      "model": [
+        "8",
+        0
+      ],
+      "positive": [
+        "336",
+        0
+      ],
+      "negative": [
+        "8",
+        2
+      ],
+      "latent_image": [
+        "265",
+        0
+      ],
+      "optional_vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "KSampler (Efficient)",
+    "_meta": {
+      "title": "KSampler (Efficient)"
+    }
+  },
+  "269": {
+    "inputs": {
+      "width_factor": 2,
+      "height_factor": 2,
+      "overlap_rate": 0.3,
+      "image": [
+        "261",
+        0
+      ]
+    },
+    "class_type": "TTP_Tile_image_size",
+    "_meta": {
+      "title": "TTP_Tile_image_size"
+    }
+  },
+  "270": {
+    "inputs": {
+      "tile_width": [
+        "269",
+        0
+      ],
+      "tile_height": [
+        "269",
+        1
+      ],
+      "image": [
+        "261",
+        0
+      ]
+    },
+    "class_type": "TTP_Image_Tile_Batch",
+    "_meta": {
+      "title": "TTP_Image_Tile_Batch"
+    }
+  },
+  "277": {
+    "inputs": {
+      "seed": [
+        "262",
+        0
+      ],
+      "steps": 18,
+      "cfg": 5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 0.05,
+      "preview_method": "latent2rgb",
+      "vae_decode": "false",
+      "model": [
+        "8",
+        0
+      ],
+      "positive": [
+        "341",
+        0
+      ],
+      "negative": [
+        "8",
+        2
+      ],
+      "latent_image": [
+        "291",
+        0
+      ],
+      "optional_vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "KSampler (Efficient)",
+    "_meta": {
+      "title": "KSampler (Efficient)"
+    }
+  },
+  "278": {
+    "inputs": {
+      "seed": [
+        "262",
+        0
+      ],
+      "steps": 18,
+      "cfg": 5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 0.05,
+      "preview_method": "latent2rgb",
+      "vae_decode": "false",
+      "model": [
+        "8",
+        0
+      ],
+      "positive": [
+        "339",
+        0
+      ],
+      "negative": [
+        "8",
+        2
+      ],
+      "latent_image": [
+        "292",
+        0
+      ],
+      "optional_vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "KSampler (Efficient)",
+    "_meta": {
+      "title": "KSampler (Efficient)"
+    }
+  },
+  "279": {
+    "inputs": {
+      "seed": [
+        "262",
+        0
+      ],
+      "steps": 18,
+      "cfg": 5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 0.05,
+      "preview_method": "latent2rgb",
+      "vae_decode": "false",
+      "model": [
+        "8",
+        0
+      ],
+      "positive": [
+        "343",
+        0
+      ],
+      "negative": [
+        "8",
+        2
+      ],
+      "latent_image": [
+        "293",
+        0
+      ],
+      "optional_vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "KSampler (Efficient)",
+    "_meta": {
+      "title": "KSampler (Efficient)"
+    }
+  },
+  "280": {
+    "inputs": {
+      "samples": [
+        "277",
+        3
+      ],
+      "vae": [
+        "277",
+        4
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "281": {
+    "inputs": {
+      "padding": 128,
+      "tiles": [
+        "282",
+        0
+      ],
+      "positions": [
+        "270",
+        1
+      ],
+      "original_size": [
+        "270",
+        2
+      ],
+      "grid_size": [
+        "270",
+        3
+      ]
+    },
+    "class_type": "TTP_Image_Assy",
+    "_meta": {
+      "title": "TTP_Image_Assy"
+    }
+  },
+  "282": {
+    "inputs": {
+      "inputcount": 4,
+      "Update inputs": null,
+      "image_1": [
+        "260",
+        0
+      ],
+      "image_2": [
+        "280",
+        0
+      ],
+      "image_3": [
+        "283",
+        0
+      ],
+      "image_4": [
+        "284",
+        0
+      ]
+    },
+    "class_type": "ImageBatchMulti",
+    "_meta": {
+      "title": "Image Batch Multi"
+    }
+  },
+  "283": {
+    "inputs": {
+      "samples": [
+        "278",
+        3
+      ],
+      "vae": [
+        "278",
+        4
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "284": {
+    "inputs": {
+      "samples": [
+        "279",
+        3
+      ],
+      "vae": [
+        "279",
+        4
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "287": {
+    "inputs": {
+      "batch_index": 0,
+      "length": 1,
+      "image": [
+        "270",
+        0
+      ]
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "从批次获取图像"
+    }
+  },
+  "288": {
+    "inputs": {
+      "batch_index": 1,
+      "length": 1,
+      "image": [
+        "270",
+        0
+      ]
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "从批次获取图像"
+    }
+  },
+  "289": {
+    "inputs": {
+      "batch_index": 2,
+      "length": 1,
+      "image": [
+        "270",
+        0
+      ]
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "从批次获取图像"
+    }
+  },
+  "290": {
+    "inputs": {
+      "batch_index": 3,
+      "length": 1,
+      "image": [
+        "270",
+        0
+      ]
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "从批次获取图像"
+    }
+  },
+  "291": {
+    "inputs": {
+      "pixels": [
+        "288",
+        0
+      ],
+      "vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "292": {
+    "inputs": {
+      "pixels": [
+        "289",
+        0
+      ],
+      "vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "293": {
+    "inputs": {
+      "pixels": [
+        "290",
+        0
+      ],
+      "vae": [
+        "8",
+        4
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "335": {
+    "inputs": {
+      "model": "wd-v1-4-moat-tagger-v2",
+      "threshold": 0.35,
+      "character_threshold": 0.85,
+      "replace_underscore": false,
+      "trailing_comma": false,
+      "exclude_tags": "",
+      "tags": "1girl, solo, long_hair, looking_at_viewer, blush, smile, bangs, shirt, hair_between_eyes, jewelry, school_uniform, jacket, upper_body, hairband, earrings, green_hair, teeth, serafuku, choker, pointy_ears, sailor_collar, grin, black_jacket, neckerchief, orange_eyes, black_shirt, black_choker, halo, black_hairband, black_sailor_collar, white_neckerchief",
+      "image": [
+        "287",
+        0
+      ]
+    },
+    "class_type": "WD14Tagger|pysssss",
+    "_meta": {
+      "title": "WD14 Tagger 🐍"
+    }
+  },
+  "336": {
+    "inputs": {
+      "text": [
+        "335",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "338": {
+    "inputs": {
+      "model": "wd-v1-4-moat-tagger-v2",
+      "threshold": 0.35,
+      "character_threshold": 0.85,
+      "replace_underscore": false,
+      "trailing_comma": false,
+      "exclude_tags": "",
+      "tags": "1girl, solo, long_hair, skirt, shirt, long_sleeves, very_long_hair, school_uniform, jacket, pleated_skirt, green_hair, open_clothes, serafuku, black_skirt, sailor_collar, neckerchief, black_shirt, black_sailor_collar, black_serafuku, head_out_of_frame, white_neckerchief",
+      "image": [
+        "289",
+        0
+      ]
+    },
+    "class_type": "WD14Tagger|pysssss",
+    "_meta": {
+      "title": "WD14 Tagger 🐍"
+    }
+  },
+  "339": {
+    "inputs": {
+      "text": [
+        "338",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "340": {
+    "inputs": {
+      "model": "wd-v1-4-moat-tagger-v2",
+      "threshold": 0.35,
+      "character_threshold": 0.85,
+      "replace_underscore": false,
+      "trailing_comma": false,
+      "exclude_tags": "",
+      "tags": "1girl, solo, long_hair, looking_at_viewer, blush, smile, bangs, long_sleeves, hair_between_eyes, jewelry, school_uniform, jacket, yellow_eyes, upper_body, earrings, green_hair, teeth, serafuku, choker, pointy_ears, sailor_collar, grin, black_jacket, neckerchief, orange_eyes, black_choker, halo, ear_piercing, black_sailor_collar, black_serafuku, white_neckerchief",
+      "image": [
+        "288",
+        0
+      ]
+    },
+    "class_type": "WD14Tagger|pysssss",
+    "_meta": {
+      "title": "WD14 Tagger 🐍"
+    }
+  },
+  "341": {
+    "inputs": {
+      "text": [
+        "340",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "343": {
+    "inputs": {
+      "text": [
+        "446",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "429": {
+    "inputs": {
+      "unet_name": "Anima-2.9B-preview-v1.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "437": {
+    "inputs": {
+      "width": 832,
+      "height": 1216
+    },
+    "class_type": "ResolutionMasterSimplify",
+    "_meta": {
+      "title": "分辨率大师简化版 (Resolution Master Simplify)"
+    }
+  },
+  "446": {
+    "inputs": {
+      "model": "wd-v1-4-moat-tagger-v2",
+      "threshold": 0.35,
+      "character_threshold": 0.85,
+      "replace_underscore": false,
+      "trailing_comma": false,
+      "exclude_tags": "",
+      "tags": "1girl, solo, long_hair, skirt, shirt, long_sleeves, white_background, very_long_hair, school_uniform, tail, pleated_skirt, green_hair, open_clothes, serafuku, black_skirt, sailor_collar, coat, neckerchief, black_shirt, demon_tail, black_sailor_collar, black_serafuku, open_coat, head_out_of_frame, white_neckerchief",
+      "image": [
+        "290",
+        0
+      ]
+    },
+    "class_type": "WD14Tagger|pysssss",
+    "_meta": {
+      "title": "WD14 Tagger 🐍"
+    }
+  },
+  "462": {
+    "inputs": {
+      "__lm_autocomplete_meta_text": {
+        "version": 1,
+        "textWidgetName": "text",
+        "lastAccepted": {
+          "start": 46,
+          "end": 89,
+          "insertedText": "<lora:(画质)anima-highres-aesthetic-boost:1>,",
+          "textSnapshot": "<lora:(画质)anima-highres-aesthetic-boost_29b:1><lora:(画质)anima-highres-aesthetic-boost:1>,"
+        }
+      },
+      "text": "",
+      "loras": {
+        "__value__": [
+          {
+            "name": "29B/(画质)anima-highres-aesthetic-boost_29b",
+            "strength": 0.5,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/(美感细节)anima-rl-v0.1_29b",
+            "strength": 0.4,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/anima-base-1-masterpiece-v51_29b",
+            "strength": 0.5,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/p1ct01_v1_epoch20_29b",
+            "strength": 0.37,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/Eop_anima_anima_3253810_epoch_20_29b",
+            "strength": 0.66,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/real skin.baka.v1-000010_29b",
+            "strength": 0.66,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/(写真背景)anima3-photo-background-v3_29b",
+            "strength": 0.3,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          },
+          {
+            "name": "29B/anima-000040_29b",
+            "strength": 0.8,
+            "active": true,
+            "expanded": false,
+            "clipStrength": 1.0,
+            "locked": false
+          }
+        ]
+      },
+      "model": [
+        "429",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "Lora Loader (LoraManager)",
+    "_meta": {
+      "title": "1️⃣Lora堆放处（默认）"
+    }
+  },
+  "458": {
+    "inputs": {
+      "images": [
+        "281",
+        0
+      ],
+      "filename_prefix": "astrbot/anima_ttp"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "SaveImage"
+    }
+  },
+  "459": {
+    "inputs": {
+      "images": [
+        "261",
+        0
+      ],
+      "filename_prefix": "astrbot/anima_rtx"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "RTX直出终点"
+    }
+  },
+  "460": {
+    "inputs": {
+      "images": [
+        "19",
+        0
+      ],
+      "filename_prefix": "astrbot/anima_base"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "底图直出终点"
+    }
+  }
+}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Comfy Anima 登录</title>
+    <script src="/assets/theme.js"></script>
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body class="login-page">
+    <main class="login-card">
+      <div class="brand-mark">CA</div>
+      <p class="eyebrow">ASTRBOT PLUGIN CONTROL</p>
+      <h1>Comfy Anima</h1>
+      <p class="muted">登录局域网管理面板</p>
+      <form id="login-form" class="stack">
+        <label>
+          <span>用户名</span>
+          <input id="username" name="username" autocomplete="username" required>
+        </label>
+        <label>
+          <span>密码</span>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            required
+          >
+        </label>
+        <button class="primary" type="submit">进入控制台</button>
+        <p id="login-error" class="form-error" role="alert"></p>
+      </form>
+    </main>
+    <script src="/assets/login.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#25211d">
+    <title>Comfy Anima 工坊控制台</title>
+    <script src="./theme.js"></script>
+    <link rel="stylesheet" href="./app.css">
+      <script src="/api/plugin/page/bridge-sdk.js"></script>
+</head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到主要内容</a>
+    <div class="paper-glow" aria-hidden="true"></div>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div class="brand-mark small" aria-hidden="true">CA</div>
+          <div>
+            <strong>Comfy Anima</strong>
+            <span>Illustration Workshop</span>
+          </div>
+        </div>
+
+        <div class="side-ticket" aria-hidden="true">
+          <span>ANIMA</span><b>WORKSHOP / 01</b>
+        </div>
+
+        <nav id="nav" aria-label="功能导航">
+          <button class="nav-item active" data-panel="overview" aria-current="page"><span>01</span>运行概览</button>
+          <button class="nav-item" data-panel="settings"><span>02</span>插件设置</button>
+          <button class="nav-item" data-panel="loras"><span>03</span>LoRA 管理</button>
+          <button class="nav-item" data-panel="presets"><span>04</span>风格与角色串</button>
+          <button class="nav-item" data-panel="models"><span>05</span>UNET 模型</button>
+          <button class="nav-item" data-panel="tasks"><span>06</span>任务中心</button>
+          <button class="nav-item" data-panel="console"><span>07</span>运行控制台</button>
+          <button class="nav-item" data-panel="prompt"><span>08</span>提示词工坊</button>
+        </nav>
+
+        <div class="sidebar-orbit" aria-hidden="true">
+          <svg viewBox="0 0 120 120" role="presentation">
+            <circle cx="60" cy="60" r="47"></circle>
+            <path d="M60 7v16M60 97v16M7 60h16M97 60h16"></path>
+            <path class="spark" d="M60 43l4.5 12.5L77 60l-12.5 4.5L60 77l-4.5-12.5L43 60l12.5-4.5z"></path>
+          </svg>
+        </div>
+
+        <div class="sidebar-foot">
+          <span id="version-label">正在连接…</span>
+          <button id="logout-button" class="ghost compact">退出登录</button>
+        </div>
+      </aside>
+
+      <main id="workspace" class="main-area" tabindex="-1">
+        <header class="topbar">
+          <div class="title-lockup">
+            <p class="eyebrow">ANIMA WORKFLOW OPERATIONS</p>
+            <h1 id="page-title">运行概览</h1>
+            <svg class="title-wave" viewBox="0 0 280 14" preserveAspectRatio="none" aria-hidden="true">
+              <path d="M2 8c19-10 37 10 56 0s37 10 56 0 37 10 56 0 37 10 56 0 35 8 52-1"></path>
+            </svg>
+          </div>
+          <div class="top-actions">
+            <label class="theme-picker" for="theme-select">
+              <span>界面主题</span>
+              <select id="theme-select" aria-label="选择 WebUI 主题">
+                <option value="workshop">纸感工坊</option>
+                <option value="editorial">铅灰编辑部</option>
+                <option value="night">墨夜控制室</option>
+              </select>
+            </label>
+            <span id="service-state" class="status-pill" role="status">连接中</span>
+            <span class="secondary" aria-disabled="true" title="2.1.307 暂缓 2.9B 可执行路径">2.9B 控制台已暂缓</span>
+            <button id="reload-data" class="secondary">刷新当前页</button>
+          </div>
+        </header>
+
+        <div class="type-marquee" aria-hidden="true">
+          <div>DRAW · DIRECT · ARCHIVE · COMPOSE · ANIMA · DRAW · DIRECT · ARCHIVE · COMPOSE · ANIMA</div>
+        </div>
+
+        <section id="panel-overview" class="panel active" aria-labelledby="page-title">
+          <div class="metric-grid">
+            <article class="metric-card accent">
+              <span class="card-number">01 / VERSION</span>
+              <strong id="metric-version">—</strong>
+              <small>服务器实际运行版本</small>
+            </article>
+            <article class="metric-card">
+              <span class="card-number">02 / JOBS</span>
+              <strong id="metric-jobs">—</strong>
+              <small>当前绘图任务数量</small>
+            </article>
+            <article class="metric-card dark-card">
+              <span class="card-number">03 / STYLE</span>
+              <strong id="metric-style">—</strong>
+              <small>未显式指定时使用</small>
+            </article>
+            <article class="metric-card sand-card">
+              <span class="card-number">04 / UNET</span>
+              <strong id="metric-unet">—</strong>
+              <small>当前工作流档案的模型覆盖值</small>
+            </article>
+          </div>
+
+          <div class="content-grid two editorial-grid">
+            <article class="card connection-card">
+              <div class="card-head">
+                <div><p class="eyebrow">CONNECTION</p><h2>服务连接</h2></div>
+                <span class="ticket-tag">LIVE</span>
+              </div>
+              <dl class="detail-list">
+                <div><dt>ComfyUI</dt><dd id="detail-comfy">—</dd></div>
+                <div><dt>LoRA Manager</dt><dd id="detail-lora-manager">—</dd></div>
+                <div><dt>工作流</dt><dd id="detail-workflow">—</dd></div>
+                <div><dt>默认分辨率</dt><dd id="detail-resolution">—</dd></div>
+              </dl>
+            </article>
+
+            <article class="card safety-card dark-card">
+              <div class="card-head">
+                <div><p class="eyebrow">SAFETY GATE</p><h2>LoRA 安全门禁</h2></div>
+                <span class="spark-icon" aria-hidden="true">✦</span>
+              </div>
+              <p class="body-copy">
+                每一次 LoRA 查询、组合、下载和绘图注入都会先强制刷新 LoRA Manager，
+                并与 ComfyUI 当前可加载清单交叉校验。
+              </p>
+              <div class="callout success">刷新失败即停止操作，不使用跨操作旧缓存。</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="panel-settings" class="panel" aria-labelledby="page-title">
+          <article class="card profile-station">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">ENVIRONMENT PROFILES</p>
+                <h2>全局配置档案</h2>
+              </div>
+              <span id="profile-active-badge" class="ticket-tag">未读取</span>
+            </div>
+            <p class="body-copy compact-copy">保存不同局域网环境的 ComfyUI、LoRA Manager、工作流、UNET 与默认分辨率，一键来回切换。敏感凭据不会写入档案。</p>
+            <div class="profile-controls">
+              <label>
+                <span>已保存档案</span>
+                <select id="config-profile-select"><option value="">正在读取…</option></select>
+              </label>
+              <label>
+                <span>新档案名称</span>
+                <input id="config-profile-name" maxlength="64" placeholder="例如：192.168.1.50 / 家用 Comfy">
+              </label>
+              <div class="profile-buttons" aria-label="配置档案操作">
+                <button id="profile-save" class="primary" type="button">保存当前配置</button>
+                <button id="profile-activate" class="secondary" type="button">切换到所选</button>
+                <button id="profile-delete" class="danger" type="button">删除所选</button>
+              </div>
+            </div>
+            <p id="profile-status" class="muted live-line" role="status"></p>
+            <dl id="profile-capability-grid" class="profile-capability-grid" aria-live="polite">
+              <div><dt>MODEL FAMILY</dt><dd data-profile-field="model-family">—</dd></div>
+              <div><dt>LORA POLICY</dt><dd data-profile-field="lora-policy">—</dd></div>
+              <div><dt>PATCH CONTRACT</dt><dd data-profile-field="patch-contract">—</dd></div>
+              <div><dt>WORKFLOW FAMILY</dt><dd data-profile-field="workflow-family">—</dd></div>
+            </dl>
+            <p id="profile-capability-note" class="muted live-line" role="status"></p>
+          </article>
+
+          <form id="settings-form" class="stack large-gap">
+            <article class="card numbered-card" data-number="01">
+              <div class="card-head"><div><p class="eyebrow">CORE</p><h2>绘图与工作流</h2></div></div>
+              <div class="form-grid">
+                <label class="span-2"><span>ComfyUI 地址</span><input name="comfyui_url" required></label>
+                <label><span>默认宽度</span><input name="default_width" type="number" min="256" max="4096"></label>
+                <label><span>默认高度</span><input name="default_height" type="number" min="256" max="4096"></label>
+                <label><span>并发任务</span><input name="max_concurrent_jobs" type="number" min="1" max="16"></label>
+                <label><span>每用户等待队列</span><input name="max_queued_jobs_per_user" type="number" min="0" max="10"></label>
+                <label><span>用户冷却（秒）</span><input name="user_cooldown" type="number" min="0"></label>
+                <label><span>RTX 放大倍率</span><input name="rtx_scale" type="number" min="1" max="4" step="0.1"></label>
+                <label><span>RTX 质量</span><select name="rtx_quality"><option value="ULTRA">ULTRA</option><option value="HIGH">HIGH</option><option value="MEDIUM">MEDIUM</option><option value="LOW">LOW</option></select></label>
+                <label class="toggle"><input name="enable_ttp_detail" type="checkbox"><span>TTP 瓦片细节增强（切块低降噪重绘，耗时约为纯 RTX 的 3-5 倍）</span></label>
+                <label><span>CFG 覆盖（0=不覆盖）</span><input name="sampler_cfg_override" type="number" min="0" max="30" step="0.5"></label>
+                <label><span>采样器覆盖（留空=不覆盖）</span><input name="sampler_name_override" placeholder="euler / euler_ancestral / dpmpp_2m"></label>
+                <label><span>调度器覆盖（留空=不覆盖）</span><input name="sampler_scheduler_override" placeholder="simple / normal / karras"></label>
+                <label class="span-2"><span>全局附加正向词（每行一条，追加进每张图并过审计）</span><textarea name="global_extra_positive_tags" rows="2"></textarea></label>
+                <label class="span-2"><span>全局附加负面词（每行一条，追加进每张图负面并过审计）</span><textarea name="global_extra_negative_tags" rows="2"></textarea></label>
+                <label><span>默认生成管线</span><select name="default_generation_pipeline"><option value="base">Anima 原图</option><option value="rtx">Anima + RTX 放大</option><option value="iterative">Anima + 迭代放大</option></select></label>
+                <label><span>迭代目标倍率</span><input name="iterative_scale" type="number" min="1.1" max="2" step="0.1"></label>
+                <label><span>迭代轮数</span><input name="iterative_steps" type="number" min="1" max="4" step="1"></label>
+                <label><span>迭代重绘强度</span><input name="iterative_denoise" type="number" min="0.1" max="0.8" step="0.05"></label>
+                <label class="toggle"><input name="enable_inpaint" type="checkbox"><span>启用 Quick / LanPaint 遮罩重绘</span></label>
+                <label class="toggle"><input name="send_generation_notice" type="checkbox"><span>发送生成进度提示</span></label>
+                <label class="toggle"><input name="show_chat_generation_details" type="checkbox"><span>日常聊天显示生成明细</span></label>
+              </div>
+              <section class="workflow-sampler-station" aria-labelledby="workflow-sampler-title">
+                <div class="workflow-sampler-head">
+                  <div>
+                    <p class="eyebrow">LIVE WORKFLOW PROFILE</p>
+                    <h3 id="workflow-sampler-title">当前工作流采样器</h3>
+                  </div>
+                  <span id="workflow-profile-id" class="ticket-tag">等待读取</span>
+                </div>
+                <div class="workflow-selector-row">
+                  <label for="workflow-select">
+                    <span>生图管线（3 选 1）</span>
+                    <select id="workflow-select" aria-describedby="workflow-select-status">
+                      <option value="">正在扫描工作流目录…</option>
+                    </select>
+                  </label>
+                  <div class="button-row compact-actions">
+                    <button id="workflow-refresh" class="secondary" type="button">刷新清单</button>
+                    <button id="workflow-check" class="secondary" type="button">检查工作流依赖</button>
+                    <button id="workflow-activate" class="primary" type="button">热切换</button>
+                  </div>
+                </div>
+                <p id="workflow-select-status" class="muted live-line" role="status"></p>
+                <section class="workflow-tool-station" aria-labelledby="workflow-tool-title">
+                  <div class="workflow-tool-head">
+                    <div>
+                      <p class="eyebrow">IMAGE TOOLS</p>
+                      <h4 id="workflow-tool-title">独立工具能力</h4>
+                    </div>
+                    <span class="ticket-tag">不可切换为普通生图</span>
+                  </div>
+                  <p class="muted">以下能力读取各自专用工作流，只能通过对应图片指令调用，不会进入上方生图管线选择。</p>
+                  <div id="workflow-tool-list" class="workflow-tool-list" aria-live="polite">
+                    <p class="empty-state">正在读取整图改图、独立 RTX、Quick Inpaint 与 LanPaint 能力……</p>
+                  </div>
+                </section>
+                <div id="pipeline-health-list" class="workflow-sampler-list" aria-live="polite">
+                  <p class="empty-state">点击“检查工作流依赖”读取 ComfyUI 实时节点与模型状态。</p>
+                </div>
+                <div class="workflow-profile-strip">
+                  <div><span>配置档案</span><strong id="workflow-profile-name">—</strong></div>
+                  <div><span>工作流文件</span><code id="workflow-profile-file">—</code></div>
+                  <label class="sampler-override-field" for="sampler-steps-override">
+                    <span>采样步数覆盖</span>
+                    <input id="sampler-steps-override" name="sampler_steps_override" type="number" min="0" max="100" step="1" value="0" inputmode="numeric">
+                    <small>0 表示跟随工作流模板；1–100 会覆盖所有已登记采样器。</small>
+                  </label>
+                </div>
+                <div id="workflow-sampler-list" class="workflow-sampler-list" aria-live="polite">
+                  <p class="empty-state">正在读取当前工作流采样器…</p>
+                </div>
+                <p id="workflow-sampler-status" class="muted live-line" role="status"></p>
+              </section>
+            </article>
+
+            <article class="card numbered-card dark-card" data-number="02">
+              <div class="card-head"><div><p class="eyebrow">PROMPT DIRECTOR</p><h2>LLM 绘图导演</h2></div></div>
+              <div class="form-grid">
+                <div class="span-2 provider-field">
+                  <label for="provider-select"><span>绘图导演思考模型</span></label>
+                  <div class="provider-picker">
+                    <select id="provider-select" name="prompt_llm_provider_id"><option value="">跟随当前会话模型</option></select>
+                    <button id="provider-refresh" class="secondary inverse" type="button">读取 AstrBot 模型</button>
+                  </div>
+                  <input id="provider-manual" placeholder="手动填写 Provider ID" hidden>
+                  <small id="provider-note" class="muted">正在读取 AstrBot 已保存模型…</small>
+                </div>
+                <div class="span-2 provider-field">
+                  <label for="reverse-provider-select"><span>图片反推多模态模型</span></label>
+                  <select id="reverse-provider-select" name="reverse_prompt_provider_id"><option value="">自动复用导演/当前会话模型</option></select>
+                  <input id="reverse-provider-manual" placeholder="手动填写多模态 Provider ID" hidden>
+                  <small id="reverse-provider-note" class="muted">明确为纯文本的模型不可选；视觉能力未知的旧模型仍可选择。</small>
+                </div>
+                <label><span>Temperature</span><input name="prompt_llm_temperature" type="number" min="0" max="2" step="0.05"></label>
+                <div class="span-2 provider-field">
+                  <label for="intent-router-select"><span>普通聊天意图判断模型</span></label>
+                  <div class="provider-picker"><select id="intent-router-select" name="intent_router_model"><option value="">未配置，资产查询后禁止自动提交</option></select></div>
+                  <input id="intent-router-manual" placeholder="手动填写独立 Intent Router Provider ID" hidden>
+                  <small id="intent-router-note" class="muted">必须与绘图导演模型、图片反推模型不同；用于资产工具完成后的单次意图判断。</small>
+                </div>
+                <label><span>意图判断超时（秒）</span><input name="intent_router_timeout" type="number" min="3" max="120" step="1"></label>
+                <label><span>意图判断 Temperature</span><input name="intent_router_temperature" type="number" min="0" max="1" step="0.05"></label>
+                <div class="span-2 provider-field">
+                  <label><span>意图判断后端模式</span></label>
+                  <select name="intent_judge_backend">
+                    <option value="rule">Rule：本地关键词</option>
+                    <option value="local">Local：Embedding + Rerank</option>
+                    <option value="online">Online：独立 LLM</option>
+                    <option value="auto">Auto：本地优先</option>
+                    <option value="both">Both：双后端互相印证</option>
+                    <option value="off">Off：只允许显式命令</option>
+                  </select>
+                  <small class="muted">本地失败/不确定时按 Auto 或 Both 规则降级为 no_draw。</small>
+                </div>
+                <div class="provider-field">
+                  <label for="intent-judge-embedding-select"><span>意图判断 Embedding</span></label>
+                  <div class="provider-picker"><select id="intent-judge-embedding-select" name="intent_judge_embedding_provider_id"><option value="">未配置</option></select></div>
+                  <input id="intent-judge-embedding-manual" placeholder="手动填写 Embedding Provider ID" hidden>
+                  <small id="intent-judge-embedding-note" class="muted">从 AstrBot Embedding Provider 列表选择。</small>
+                </div>
+                <div class="provider-field">
+                  <label for="intent-judge-rerank-select"><span>意图判断 Rerank</span></label>
+                  <div class="provider-picker"><select id="intent-judge-rerank-select" name="intent_judge_rerank_provider_id"><option value="">未配置</option></select></div>
+                  <input id="intent-judge-rerank-manual" placeholder="手动填写 Rerank Provider ID" hidden>
+                  <small id="intent-judge-rerank-note" class="muted">从 AstrBot Rerank Provider 列表选择。</small>
+                </div>
+                <div class="provider-field">
+                  <label for="intent-judge-online-select"><span>意图判断在线模型</span></label>
+                  <div class="provider-picker"><select id="intent-judge-online-select" name="intent_judge_online_provider_id"><option value="">未配置</option></select></div>
+                  <input id="intent-judge-online-manual" placeholder="手动填写 Chat Provider ID" hidden>
+                  <small id="intent-judge-online-note" class="muted">不能与绘图导演、图片反推相同。</small>
+                </div>
+                <label><span>Embedding 差值阈值</span><input name="intent_judge_local_embedding_threshold" type="number" min="-1" max="1" step="0.01"></label>
+                <label><span>Rerank 差值阈值</span><input name="intent_judge_local_rerank_threshold" type="number" min="-1" max="1" step="0.01"></label>
+                <label><span>Auto 本地置信度下限</span><input name="intent_judge_auto_confidence_floor" type="number" min="0" max="1" step="0.05"></label>
+                <label><span>在线判断超时（秒）</span><input name="intent_judge_online_timeout" type="number" min="1" max="120" step="0.5"></label>
+                <label><span>普通聊天模式</span><select name="interaction_mode"><option value="smart">Smart：独立模型判断</option><option value="strict">Strict：命令/确认后提交</option></select></label>
+                <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
+                <label><span>换角分类总超时（秒）</span><input name="character_swap_timeout" type="number" min="30" max="600" step="1"></label>
+                <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
+                <label><span>自然语言绘图模式</span><select name="natural_draw_mode"><option value="off">关闭</option><option value="photo_only">仅照片/视觉请求</option><option value="full">完整自然绘图</option></select></label>
+                <label class="toggle"><input name="enable_time_context" type="checkbox"><span>出图同步现实时间（按时段补光影标签）</span></label>
+                <label><span>角色纯净模式</span><select name="character_purity_mode"><option value="smart">智能移除</option><option value="strict">严格询问</option><option value="off">关闭</option></select></label>
+                <label class="toggle"><input name="scene_extraction" type="checkbox"><span>启用场景提取（想看/你在干嘛）</span></label>
+                <label class="toggle"><input name="chinese_prompt_translation" type="checkbox"><span>启用 /画图 中文服饰/场景翻译</span></label>
+                <label class="toggle"><input name="enable_chat_draw_terminal_guard" type="checkbox" checked disabled><span>普通聊天绘图终止守卫（协议必需）</span></label>
+                <div class="span-4 section-divider"><span>Bot 回复意图续画（仅管理员会话）</span></div>
+                <label class="toggle"><input name="enable_bot_reply_draw" type="checkbox"><span>按 Bot 回复意图续画（图追加进同一条回复，无技术脚注；无成功配方不出图）</span></label>
+                <label><span>同会话冷却（秒）</span><input name="bot_reply_draw_cooldown_seconds" type="number" min="0" max="3600" step="1"></label>
+                <div class="span-2 provider-field">
+                  <label><span>Bot 回复判定后端</span></label>
+                  <select name="bot_reply_intent_backend">
+                    <option value="rule">Rule：本地关键词</option>
+                    <option value="local">Local：Embedding + Rerank</option>
+                    <option value="online">Online：独立 LLM</option>
+                    <option value="auto">Auto：本地优先</option>
+                    <option value="both">Both：双后端互相印证</option>
+                    <option value="off">Off：关闭判定</option>
+                  </select>
+                  <small class="muted">独立于上方用户消息闸门后端；管理员门禁跟随 AstrBot 平台主管理员列表，插件内不另设名单。</small>
+                </div>
+                <label class="span-3"><span>交付语词表（逗号或换行，仅作用于 Bot 回复判定）</span><textarea name="bot_reply_draw_delivery_phrases" rows="2"></textarea></label>
+                <div class="span-4 section-divider"><span>Prompt Composer v2</span></div>
+                <label class="toggle"><input name="enable_prompt_composer_v2" type="checkbox"><span>启用三层提示词整理</span></label>
+                <label><span>动态负面词策略</span><select name="adaptive_negative_mode"><option value="off">关闭</option><option value="conservative">保守</option><option value="standard">标准</option></select></label>
+                <label class="toggle"><input name="enable_prompt_diagnostics" type="checkbox"><span>保留内存诊断摘要</span></label>
+                <label class="toggle"><input name="prompt_diagnostics_include_content" type="checkbox"><span>诊断包含完整提示词</span></label>
+                <label><span>诊断保留数量</span><input name="prompt_diagnostics_capacity" type="number" min="10" max="500" step="1"></label>
+                <label><span>Danbooru 校验模式</span><select name="danbooru_validation_mode"><option value="off">关闭</option><option value="report">仅报告</option><option value="guarded">保护硬锚点</option></select></label>
+                <label class="span-2"><span>Danbooru 索引 URL</span><input name="danbooru_index_url" type="url" placeholder="HTTPS 或可信私网 HTTP JSON / CSV 地址"></label>
+                <label><span>索引超时（秒）</span><input name="danbooru_index_timeout" type="number" min="5" max="300" step="1"></label>
+                <label><span>索引上限（MB）</span><input name="danbooru_index_max_size_mb" type="number" min="1" max="512" step="1"></label>
+                <p class="span-4 muted">终止守卫会完整缓冲普通聊天回复，并检查本轮 LoRA、Danbooru 与 Prompt Plan 查询是否全部成功；明确绘图最终必须只有一个合法 pic，纯资产查询误出的 pic 会被移除。Composer 只做本地分层、去重、冲突检查与确定性负面词补充，不展示模型思维过程。Danbooru guarded 只约束 LLM 声明的角色、作品与画师硬锚点，不拦截用户原始 Tags 或 LoRA 触发词。</p>
+                <div class="span-4 section-divider"><span>Danbooru 官方 API 索引生成器</span></div>
+                <label class="span-2"><span>官方 API / 兼容镜像根地址</span><input name="danbooru_api_base_url" type="url" placeholder="https://danbooru.donmai.us"></label>
+                <label class="span-2"><span>HTTP 代理（可选）</span><input name="danbooru_api_proxy_url" type="url" placeholder="http://192.168.10.x:7890（不要填写凭据）"></label>
+                <label><span>生成模式</span><select name="danbooru_api_mode"><option value="identity">身份优先</option><option value="full">五类全量</option></select></label>
+                <label><span>General 最低帖子数</span><input name="danbooru_api_general_min_posts" type="number" min="0" max="1000000" step="1"></label>
+                <label><span>Meta 最低帖子数</span><input name="danbooru_api_meta_min_posts" type="number" min="0" max="1000000" step="1"></label>
+                <label class="toggle"><input name="danbooru_api_include_aliases" type="checkbox"><span>抓取 active Tag Alias</span></label>
+                <label><span>单页记录数</span><input name="danbooru_api_page_size" type="number" min="1" max="1000" step="1"></label>
+                <label><span>请求间隔（毫秒）</span><input name="danbooru_api_request_interval_ms" type="number" min="250" max="10000" step="1"></label>
+                <label><span>单次请求超时（秒）</span><input name="danbooru_api_timeout" type="number" min="10" max="300" step="1"></label>
+                <label><span>最大 canonical 数</span><input name="danbooru_api_max_records" type="number" min="1000" max="3000000" step="1"></label>
+                <label class="toggle"><input name="danbooru_auto_update_enabled" type="checkbox"><span>启用定期自动更新</span></label>
+                <label><span>自动更新周期（小时）</span><input name="danbooru_auto_update_interval_hours" type="number" min="24" max="2160" step="1"></label>
+                <p class="span-4 muted">身份优先模式会全量抓取 Character、Copyright 与 Artist，并按帖子数阈值筛选 General / Meta；五类全量模式耗时和磁盘占用更高。生成任务使用单并发、ID 游标、断点恢复和原子切换；服务器无法直连时请配置无凭据 HTTP 代理或可信局域网镜像。</p>
+                <label class="span-4"><span>System Prompt</span><textarea name="auto_draw_system_prompt" rows="9" placeholder="留空使用插件内置导演提示词"></textarea></label>
+                <div class="span-4 section-divider"><span>图片反推后端</span></div>
+                <label class="toggle"><input name="enable_reverse_prompt" type="checkbox"><span>启用 /反推 与 /反推画图</span></label>
+                  <label class="toggle"><input name="enable_workflow_reverse" type="checkbox"><span>启用本地 Mira WD Tagger 工作流</span></label>
+                <label><span>默认后端</span><select name="reverse_backend"><option value="workflow">本地工作流</option><option value="vision">视觉模型</option><option value="hybrid">显式混合回退</option></select></label>
+                <label class="span-2"><span>反推工作流</span><input name="reverse_workflow_file"></label>
+                <label><span>Tagger 模型</span><input name="reverse_tagger_model"></label>
+                <label><span>工作流超时（秒）</span><input name="reverse_workflow_timeout" type="number" min="10" max="300"></label>
+                  <label><span>General 阈值</span><input name="reverse_general_threshold" type="number" min="0.05" max="1" step="0.01"></label>
+                  <label><span>Character 阈值</span><input name="reverse_character_threshold" type="number" min="0.05" max="1" step="0.01"></label>
+                  <label><span>输出分类</span><input name="reverse_categories" placeholder="copyright,character,general"></label>
+                  <label><span>推理会话</span><select name="reverse_session_method"><option value="CPU">CPU</option><option value="GPU">GPU</option><option value="GPU Release">GPU Release</option></select></label>
+                  <p class="span-4 muted">本地工作流只返回扁平 Tags，不提供 OCR、人物位置或多人属性绑定；workflow 失败不会静默调用视觉模型，只有 hybrid 允许显式回退。</p>
+                  <div class="span-4 section-divider"><span>Anima Control Stack v2</span></div>
+                  <label class="toggle"><input name="enable_control_stack_v2" type="checkbox"><span>启用双图独立控制通道</span></label>
+                  <label><span>默认保真</span><select name="control_default_fidelity"><option value="strict">Strict 强约束</option><option value="balanced">Balanced 平衡</option><option value="loose">Loose 弱约束</option></select></label>
+                  <label><span>默认缩放</span><select name="control_default_resize_policy"><option value="fit">Fit 适配</option><option value="crop">Crop 居中裁切</option><option value="stretch">Stretch 拉伸</option></select></label>
+                  <label><span>Reference 范围</span><select name="control_default_reference_scope"><option value="appearance">外观</option><option value="style">画风</option><option value="color">配色</option></select></label>
+                  <p class="span-4 muted">回复图片固定为图1，当前消息附件按顺序成为图2。双图请求必须明确写出“姿势用图1，构图用图2”。Reference 是外观、画风或配色软影响，不是身份锁定。</p>
+                  <label class="toggle"><input name="enable_reverse_json_formatter" type="checkbox"><span>启用本地 JSON 格式整理器</span></label>
+                <label class="toggle"><input name="enable_reverse_json_repair_retry" type="checkbox"><span>格式校验失败时重做一次</span></label>
+                <p class="span-4 muted">整理器只在本地兼容代码围栏、说明文字、尾逗号和单引号字典，不会调用额外模型；关闭后仅接受一个完整的严格 JSON 对象。安全隔离与字段校验始终开启。</p>
+                <label><span>反推超时（秒）</span><input name="reverse_prompt_timeout" type="number" min="10" max="300"></label>
+                <label><span>反推 Temperature</span><input name="reverse_prompt_temperature" type="number" min="0" max="2" step="0.05"></label>
+                <label><span>反推最大 Tokens</span><input name="reverse_prompt_max_tokens" type="number" min="256" max="8000"></label>
+                <label><span>输入图片上限（MB）</span><input name="max_input_image_size_mb" type="number" min="1" max="100"></label>
+                <label><span>输入图片像素上限</span><input name="max_input_image_pixels" type="number" min="1000000" max="100000000" step="1000000"></label>
+                <label class="span-4"><span>反推 System Prompt</span><textarea name="reverse_prompt_system_prompt" rows="6" placeholder="留空使用安全的结构化 Anima 反推提示词"></textarea></label>
+              </div>
+            </article>
+
+            <article class="card numbered-card" data-number="03">
+              <div class="card-head"><div><p class="eyebrow">LORA POLICY</p><h2>LoRA 与默认风格</h2></div></div>
+              <div class="form-grid">
+                <label class="span-2"><span>LoRA Manager 地址</span><input name="lora_manager_url" placeholder="留空跟随 ComfyUI"></label>
+                <label><span>默认风格名称</span><input name="default_style_preset"></label>
+                <label><span>单次 LoRA 总上限</span><input name="max_total_dynamic_loras" type="number" min="1" max="64"></label>
+                <label><span>单个组合 LoRA 上限</span><input name="max_preset_loras" type="number" min="1" max="64"></label>
+                <label><span>LLM 额外 LoRA 上限</span><input name="max_dynamic_loras" type="number" min="0" max="32"></label>
+                <label class="toggle"><input name="enable_lora_tool" type="checkbox"><span>启用 LoRA 工具</span></label>
+                <label class="toggle"><input name="enable_lora_download" type="checkbox"><span>允许管理员下载 LoRA</span></label>
+                <label class="toggle"><input name="strict_lora_validation" type="checkbox"><span>严格校验 LoRA 文件</span></label>
+                <label class="toggle"><input name="enable_lora_hybrid_search" type="checkbox"><span>启用 Embedding + Rerank 搜索</span></label>
+                <div class="span-2 provider-field">
+                  <label for="embedding-provider-select"><span>LoRA Embedding Provider</span></label>
+                  <select id="embedding-provider-select" name="lora_embedding_provider_id"><option value="">停用向量召回</option></select>
+                  <input id="embedding-provider-manual" placeholder="手动填写 Embedding Provider ID" hidden>
+                  <small id="embedding-provider-note" class="muted">索引只覆盖本次刷新后仍可加载的 LoRA。</small>
+                </div>
+                <div class="span-2 provider-field">
+                  <label for="rerank-provider-select"><span>LoRA Rerank Provider</span></label>
+                  <select id="rerank-provider-select" name="lora_rerank_provider_id"><option value="">停用精排</option></select>
+                  <input id="rerank-provider-manual" placeholder="手动填写 Rerank Provider ID" hidden>
+                  <small id="rerank-provider-note" class="muted">精确名称与唯一别名保持优先，Rerank 不证明文件存在。</small>
+                </div>
+                <label><span>Embedding Top-K</span><input name="lora_embedding_top_k" type="number" min="4" max="100"></label>
+                <label><span>Rerank Top-N</span><input name="lora_rerank_top_n" type="number" min="1" max="50"></label>
+                <label><span>混合搜索超时（秒）</span><input name="lora_retrieval_timeout" type="number" min="3" max="120"></label>
+                <label><span>LoRA 目录缓存 TTL（秒）</span><input name="lora_cache_ttl" type="number" min="0" max="86400" step="1"></label>
+                <label><span>任务快照最长复用（秒）</span><input name="lora_snapshot_max_age" type="number" min="15" max="86400" step="1"></label>
+                <label class="toggle"><input name="enable_task_lora_snapshot" type="checkbox"><span>任务内复用 LoRA 规划快照</span></label>
+                <label class="toggle"><input name="auto_reload_after_style_save" type="checkbox"><span>保存风格后自动重载插件</span></label>
+                <label class="span-4"><span>LoRA 自定义别名（每行一条）</span><textarea name="lora_alias_rules" rows="5" placeholder="black deniav1-2=达妮娅,denia,鸣潮达妮娅"></textarea><small class="muted">格式：精确文件名=别名1,别名2。仅补充逻辑索引，不移动实际文件。</small></label>
+              </div>
+            </article>
+
+            <article class="card numbered-card sand-card" data-number="04">
+              <div class="card-head"><div><p class="eyebrow">ACCESS</p><h2>权限与风控</h2></div></div>
+              <div class="form-grid">
+                <label><span>默认违禁级别</span><select name="default_block_level"><option value="none">none</option><option value="lite">lite</option><option value="full">full</option></select></label>
+                <label class="span-3"><span>群白名单（逗号或换行）</span><textarea name="group_whitelist" rows="3"></textarea></label>
+                <label class="toggle"><input name="global_lock" type="checkbox"><span>全局锁定，仅管理员可用</span></label>
+                <label class="toggle"><input name="whitelist_only" type="checkbox"><span>仅白名单群生效</span></label>
+                <label class="toggle"><input name="admin_ignore_cooldown" type="checkbox"><span>管理员无视冷却</span></label>
+                <label class="toggle"><input name="admin_ignore_whitelist" type="checkbox"><span>管理员无视白名单</span></label>
+                <label class="toggle"><input name="admin_ignore_blocklist" type="checkbox"><span>管理员无视违禁词</span></label>
+                <small class="muted span-4">这里的"管理员"跟随 AstrBot 平台主管理员列表（主配置 admins_id），插件内不另设名单；Bot 回复意图续画的管理员门禁同源。</small>
+              </div>
+            </article>
+
+            <article class="card numbered-card" data-number="05">
+              <div class="card-head">
+                <div><p class="eyebrow">WEB UI</p><h2>端口面板</h2></div>
+                <span class="ticket-tag">保存后自动重载</span>
+              </div>
+              <div class="form-grid">
+                <label><span>监听地址</span><input name="web_ui_host" placeholder="0.0.0.0"></label>
+                <label><span>端口</span><input name="web_ui_port" type="number" min="1024" max="65535"></label>
+                <label><span>用户名</span><input name="web_ui_username" autocomplete="off"></label>
+                <label><span>会话时长（秒）</span><input name="web_ui_session_ttl" type="number" min="300" max="86400"></label>
+                <label class="span-2"><span>新密码</span><input name="web_ui_password" type="password" autocomplete="new-password" placeholder="留空保持当前密码；最少 8 位"></label>
+                <label class="toggle"><input name="enable_web_ui" type="checkbox"><span>启用端口 Web UI</span></label>
+              </div>
+            </article>
+
+            <div class="sticky-actions">
+              <span id="settings-note" class="muted" role="status"></span>
+              <button class="primary" type="submit">保存全局设置并重载</button>
+            </div>
+          </form>
+        </section>
+
+        <section id="panel-loras" class="panel" aria-labelledby="page-title">
+          <div class="lora-tool-grid">
+            <article class="card lora-search-card">
+              <div class="card-head">
+                <div><p class="eyebrow">LIVE CATALOG</p><h2>搜索最新 LoRA</h2></div>
+                <button id="lora-refresh" class="secondary" type="button">强制刷新 Manager</button>
+              </div>
+              <form id="lora-search-form" class="inline-form">
+                <label class="sr-only" for="lora-query">搜索 LoRA</label>
+                <input id="lora-query" placeholder="名称、角色、作品、画师、触发词…">
+                <button class="primary" type="submit">搜索最新清单</button>
+              </form>
+              <p id="lora-summary" class="muted live-line" role="status"></p>
+            </article>
+
+            <article class="card lora-download-card dark-card">
+              <div class="card-head"><div><p class="eyebrow">CIVITAI</p><h2>从 URL 下载</h2></div><span aria-hidden="true" class="spark-icon">✧</span></div>
+              <form id="lora-download-form" class="stack">
+                <label class="sr-only" for="lora-download-url">Civitai 模型网址</label>
+                <input id="lora-download-url" type="url" placeholder="https://civitai.com/models/…" required>
+                <button class="secondary inverse" type="submit">下载 → 获取元数据 → 刷新</button>
+              </form>
+              <p id="download-status" class="muted live-line" role="status"></p>
+            </article>
+          </div>
+
+          <article class="archive-studio dark-card">
+            <div class="archive-studio-head">
+              <div>
+                <p class="eyebrow">AI LIBRARY INDEXER</p>
+                <h2>为 LoRA 建立可搜索档案</h2>
+                <p>先读取最新库指纹；有变化时，把 Civitai 标题、模型说明、全部触发词与别名交给已选择的思考模型，建立带证据和待确认状态的角色 / 画师风格 / 混合索引。</p>
+              </div>
+              <div id="lora-change-badge" class="change-seal idle" role="status"><span>LIBRARY</span><strong>待检测</strong></div>
+            </div>
+            <div class="archive-settings-row">
+              <label class="toggle inverse-toggle"><input id="archive-auto-toggle" type="checkbox"><span>检测到变化后自动归档变化项</span></label>
+              <label class="toggle inverse-toggle"><input id="archive-fetch-first" type="checkbox" checked><span>归档前先从 Civitai 获取所选元数据</span></label>
+            </div>
+            <div class="archive-actions">
+              <button id="metadata-all" class="secondary inverse" type="button">获取全库元数据</button>
+              <button id="archive-changed" class="primary" type="button">AI 建档变化项</button>
+              <button id="archive-selected" class="secondary inverse" type="button">AI 建档所选</button>
+              <button id="archive-all" class="ghost inverse" type="button">AI 建档全部</button>
+            </div>
+            <p id="lora-archive-run-status" class="live-line" role="status">尚未运行 AI 建档。</p>
+            <div id="lora-archive-result" class="archive-result" hidden></div>
+          </article>
+
+          <article id="lora-archive-card" class="card" hidden>
+            <div class="card-head">
+              <div><p class="eyebrow">SEMANTIC INDEX</p><h2>LoRA AI 建档摘要</h2></div>
+              <span class="ticket-tag">不移动实际文件</span>
+            </div>
+            <div id="lora-archive-metrics" class="archive-metrics"></div>
+            <div class="digestion-progress-block">
+              <div class="digestion-progress-copy">
+                <div>
+                  <span class="mono-label">AI 建档可搜索进度</span>
+                  <strong id="digestion-progress-text">0 / 0</strong>
+                </div>
+                <span id="digestion-progress-percent" class="ticket-tag">0%</span>
+              </div>
+              <progress id="digestion-progress-track" class="digestion-progress-track" aria-label="AI 建档可搜索进度" max="100" value="0">0%</progress>
+              <div class="digestion-status-notes">
+                <span>可搜索 <b id="digestion-count-archived">0</b></span>
+                <span>待确认 <b id="digestion-count-review">0</b></span>
+                <span>资料就绪 <b id="digestion-count-metadata">0</b></span>
+                <span>失败 / 未建档 <b id="digestion-count-unarchived">0</b></span>
+              </div>
+            </div>
+            <div class="archive-work-row"><span class="muted mono-label">作品归档</span><div id="lora-work-list" class="chip-list"></div></div>
+          </article>
+
+          <article class="card catalog-card">
+            <div class="catalog-toolbar">
+              <div>
+                <p class="eyebrow">CATALOG FILTER</p>
+                <div id="lora-category-filters" class="filter-tabs" role="group" aria-label="LoRA 分类筛选">
+                  <button class="filter-tab active" data-category="all" type="button" aria-pressed="true">全部 <span id="filter-count-all">0</span></button>
+                  <button class="filter-tab" data-category="character" type="button" aria-pressed="false">角色 <span id="filter-count-character">0</span></button>
+                  <button class="filter-tab" data-category="artist_style" type="button" aria-pressed="false">画师 / 风格 <span id="filter-count-artist-style">0</span></button>
+                  <button class="filter-tab" data-category="speed_sampling" type="button" aria-pressed="false">加速 / 采样 <span id="filter-count-speed-sampling">0</span></button>
+                  <button class="filter-tab" data-category="quality_enhancement" type="button" aria-pressed="false">画质增强 <span id="filter-count-quality-enhancement">0</span></button>
+                  <button class="filter-tab" data-category="detail_restoration" type="button" aria-pressed="false">细节修复 <span id="filter-count-detail-restoration">0</span></button>
+                  <button class="filter-tab" data-category="composition_pose" type="button" aria-pressed="false">构图 / 姿势 <span id="filter-count-composition-pose">0</span></button>
+                  <button class="filter-tab" data-category="lighting_color" type="button" aria-pressed="false">光影 / 色彩 <span id="filter-count-lighting-color">0</span></button>
+                  <button class="filter-tab" data-category="background_environment" type="button" aria-pressed="false">背景 / 环境 <span id="filter-count-background-environment">0</span></button>
+                  <button class="filter-tab" data-category="clothing_concept" type="button" aria-pressed="false">服装 / 概念 <span id="filter-count-clothing-concept">0</span></button>
+                  <button class="filter-tab" data-category="mixed" type="button" aria-pressed="false">混合 <span id="filter-count-mixed">0</span></button>
+                  <button class="filter-tab" data-category="unclassified" type="button" aria-pressed="false">未分类 <span id="filter-count-unclassified">0</span></button>
+                </div>
+                <p class="eyebrow archive-state-label">AI INDEX STATUS</p>
+                <div id="lora-archive-state-filters" class="filter-tabs archive-state-tabs" role="group" aria-label="LoRA AI 建档状态筛选">
+                  <button class="filter-tab active" data-archive-state="all" type="button" aria-pressed="true">全部状态 <span id="archive-filter-count-all">0</span></button>
+                  <button class="filter-tab" data-archive-state="searchable" type="button" aria-pressed="false">可搜索 <span id="archive-filter-count-searchable">0</span></button>
+                  <button class="filter-tab" data-archive-state="analyzing" type="button" aria-pressed="false">建档中 <span id="archive-filter-count-analyzing">0</span></button>
+                  <button class="filter-tab" data-archive-state="review_needed" type="button" aria-pressed="false">待确认 <span id="archive-filter-count-review-needed">0</span></button>
+                  <button class="filter-tab" data-archive-state="stale" type="button" aria-pressed="false">资料变化 <span id="archive-filter-count-stale">0</span></button>
+                  <button class="filter-tab" data-archive-state="metadata_ready" type="button" aria-pressed="false">资料就绪 <span id="archive-filter-count-metadata-ready">0</span></button>
+                  <button class="filter-tab" data-archive-state="failed" type="button" aria-pressed="false">失败 <span id="archive-filter-count-failed">0</span></button>
+                  <button class="filter-tab" data-archive-state="unarchived" type="button" aria-pressed="false">未建档 <span id="archive-filter-count-unarchived">0</span></button>
+                </div>
+                <p class="eyebrow archive-state-label">MODEL FAMILY FILTER</p>
+                <div id="lora-family-filters" class="filter-tabs family-filter-tabs" role="group" aria-label="LoRA 模型族筛选">
+                  <button class="filter-tab active" data-family-filter="active" type="button" aria-pressed="true"><span id="lora-family-filter-active-label">当前预设可用</span> <span id="family-filter-count-active">0</span></button>
+                  <button class="filter-tab" data-family-filter="all" type="button" aria-pressed="false">全部 <span id="family-filter-count-all">0</span></button>
+                  <button class="filter-tab" data-family-filter="anima_legacy_28l" type="button" aria-pressed="false">Legacy 28-layer <span id="family-filter-count-legacy">0</span></button>
+                  <button class="filter-tab" data-family-filter="anima_29b_40l" type="button" aria-pressed="false">2.9B 40-layer <span id="family-filter-count-29b">0</span></button>
+                  <button class="filter-tab" data-family-filter="unknown" type="button" aria-pressed="false">未声明 <span id="family-filter-count-unknown">0</span></button>
+                </div>
+                <p id="lora-family-filter-note" class="muted family-filter-note">当前预设模型族读取中…</p>
+              </div>
+              <div class="selection-tools">
+                <span id="lora-selection-count" class="ticket-tag">已选 0</span>
+                <button id="lora-select-visible" class="ghost" type="button">全选当前筛选</button>
+                <button id="lora-clear-selection" class="ghost" type="button">清空全部选择</button>
+                <button id="metadata-selected" class="secondary" type="button">获取所选元数据</button>
+                <button id="batch-mark-29b" class="secondary" type="button">一键标记 29B 兼容</button>
+                <button id="archive-selected-inline" class="primary" type="button">AI 建档所选</button>
+              </div>
+            </div>
+
+            <div class="lora-visual-toolbar" aria-label="LoRA 视觉图库工具">
+              <div class="view-switch" role="group" aria-label="LoRA 展示方式">
+                <button id="lora-view-table" class="view-switch-button active" type="button" aria-pressed="true">表格</button>
+                <button id="lora-view-gallery" class="view-switch-button" type="button" aria-pressed="false">图库</button>
+              </div>
+              <div id="lora-gallery-filters" class="lora-gallery-filters" hidden>
+                <label><span>分类</span><select id="lora-gallery-category"><option value="">全部分类</option><option value="character">角色</option><option value="artist_style">画师 / 风格</option><option value="speed_sampling">加速 / 采样</option><option value="quality_enhancement">画质增强</option><option value="detail_restoration">细节修复</option><option value="composition_pose">构图 / 姿势</option><option value="lighting_color">光影 / 色彩</option><option value="background_environment">背景 / 环境</option><option value="clothing_concept">服装 / 概念</option><option value="mixed">混合</option><option value="unclassified">未分类</option></select></label>
+                <label><span>元数据</span><select id="lora-gallery-metadata"><option value="">全部状态</option><option value="complete">完整</option><option value="partial">部分</option><option value="missing">缺失</option><option value="stale">已变化</option></select></label>
+                <label><span>预览</span><select id="lora-gallery-preview"><option value="">全部预览</option><option value="cached">已缓存</option><option value="local">本地可用</option><option value="missing">缺失</option><option value="remote_only">Manager 预览（受限）</option></select></label>
+                <label class="toggle compact-toggle"><input id="lora-gallery-favorites" type="checkbox"><span>仅收藏</span></label>
+                <label><span>每页</span><select id="lora-gallery-page-size"><option value="24">24</option><option value="48" selected>48</option><option value="96">96</option><option value="200">200</option></select></label>
+              </div>
+              <div class="lora-cache-actions">
+                <span id="lora-gallery-fingerprint" class="ticket-tag">MANIFEST —</span>
+                <button id="lora-gallery-refresh" class="secondary" type="button">刷新图库</button>
+                <button id="lora-gallery-warm" class="secondary" type="button">预热当前预览</button>
+                <button id="lora-gallery-cache-status-refresh" class="ghost" type="button">缓存状态</button>
+                <button id="lora-gallery-cache-clear" class="ghost" type="button">清理缩略图缓存</button>
+              </div>
+              <p id="lora-gallery-cache-status" class="muted live-line" role="status">切换到图库后按需读取安全缩略图；不会暴露服务器路径或代理任意 URL。</p>
+            </div>
+
+            <div id="lora-table-view" class="table-wrap">
+              <table class="lora-table">
+                <thead>
+                  <tr>
+                    <th class="check-column"><label class="sr-only" for="lora-select-all">选择当前筛选全部 LoRA</label><input id="lora-select-all" type="checkbox"></th>
+                    <th>文件名</th><th>AI 建档</th><th>角色 / 作品</th><th>Civitai 信息</th><th>别名 / 触发词</th><th>动作</th>
+                  </tr>
+                </thead>
+                <tbody id="lora-table"></tbody>
+              </table>
+            </div>
+            <div id="lora-empty" class="empty-state">输入关键词或直接搜索全部最新 LoRA。</div>
+            <section id="lora-gallery-view" class="lora-gallery-view" aria-label="LoRA 缩略图库" hidden>
+              <div id="lora-gallery-grid" class="lora-gallery-grid"></div>
+              <div id="lora-gallery-empty" class="empty-state">没有符合条件的 LoRA 图库项。</div>
+              <nav class="pager" aria-label="LoRA 图库分页">
+                <button id="lora-gallery-prev" class="ghost" type="button">上一页</button>
+                <span id="lora-gallery-page" class="ticket-tag">第 1 / 1 页</span>
+                <button id="lora-gallery-next" class="ghost" type="button">下一页</button>
+              </nav>
+            </section>
+          </article>
+          <dialog id="lora-detail-dialog" class="lora-detail-dialog">
+            <div class="lora-detail-shell">
+              <header class="lora-detail-head">
+                <div><p class="eyebrow">LIVE LORA DOSSIER</p><h2 id="lora-detail-title">LoRA 资料档案</h2><code id="lora-detail-name"></code></div>
+                <button id="lora-detail-close" class="ghost" type="button" aria-label="关闭 LoRA 详情">关闭</button>
+              </header>
+              <p id="lora-detail-status" class="live-line" role="status">等待读取实时资料。</p>
+              <div id="lora-detail-content" class="lora-detail-grid"></div>
+              <form id="lora-semantic-form" class="lora-review-form stack">
+                <input name="name" type="hidden">
+                <fieldset class="prompt-check-fieldset lora-family-fieldset" aria-describedby="lora-compatibility-help">
+                  <legend>MODEL FAMILY CONTRACT</legend>
+                  <div class="form-grid compact-grid">
+                    <label><span>LoRA 模型族兼容模式</span><select name="compatibility_mode" aria-describedby="lora-compatibility-help"><option value="unknown">未确认（2.9B 禁用）</option><option value="legacy_only">仅 Legacy 28-layer</option><option value="native_29b">原生 2.9B 40-layer</option><option value="legacy_projection">Legacy LoRA + 已验证 2.9B 投影</option></select></label>
+                    <div class="family-check-grid">
+                      <label class="check-row"><input type="checkbox" name="compatible_model_families" value="anima_legacy_28l"><span>Legacy Anima · 28-layer</span></label>
+                      <label class="check-row"><input type="checkbox" name="compatible_model_families" value="anima_29b_40l"><span>Anima 2.9B · 40-layer</span></label>
+                    </div>
+                  </div>
+                  <p id="lora-compatibility-help" class="field-help">未确认资产会在 2.9B 预设下拒绝提交；跨族使用必须选择“Legacy LoRA + 已验证 2.9B 投影”，并且运行时 patch receipt 必须有效。</p>
+                </fieldset>
+                <div class="card-head"><div><p class="eyebrow">HUMAN REVIEW</p><h3>人工语义审核</h3></div><span class="ticket-tag">MANUAL WINS</span></div>
+                <div class="form-grid compact-grid">
+                  <label><span>分类</span><select name="category"><option value="character">角色</option><option value="artist_style">画师 / 风格</option><option value="speed_sampling">加速 / 采样</option><option value="quality_enhancement">画质增强</option><option value="detail_restoration">细节修复</option><option value="composition_pose">构图 / 姿势</option><option value="lighting_color">光影 / 色彩</option><option value="background_environment">背景 / 环境</option><option value="clothing_concept">服装 / 概念</option><option value="mixed">混合</option><option value="unclassified">未分类 / 待确认</option></select></label>
+                  <label><span>角色名（逗号或换行）</span><textarea name="character_names" rows="3"></textarea></label>
+                  <label><span>作品名（逗号或换行）</span><textarea name="source_works" rows="3"></textarea></label>
+                  <label><span>画师 / 风格名（逗号或换行）</span><textarea name="artist_style_names" rows="3"></textarea></label>
+                </div>
+                <label><span>共享 LoRA 激活词（每行一项，不作为角色身份）</span><textarea name="activation_terms" rows="3"></textarea></label>
+                <label><span>Danbooru exact 身份绑定（每行：角色 canonical | 作品 canonical | 专用激活词）</span><textarea name="identity_bindings" rows="4" placeholder="denia_(wuthering_waves) | wuthering_waves | black_denia"></textarea></label>
+                <label><span>自然语言别名、译名、简称</span><textarea name="aliases" rows="4"></textarea></label>
+                <div class="inline-actions"><button id="lora-semantic-save" class="primary" type="submit">保存人工审核</button><button id="lora-detail-reanalyze" class="secondary" type="button">重新 AI 建档</button></div>
+              </form>
+            </div>
+          </dialog>
+        </section>
+
+        <section id="panel-presets" class="panel" aria-labelledby="page-title">
+          <div class="content-grid preset-layout">
+            <article class="card numbered-card" data-number="A">
+              <div class="card-head"><div><p class="eyebrow">PRESET EDITOR</p><h2 id="preset-editor-title">新建组合</h2></div></div>
+              <form id="preset-form" class="stack">
+                <input name="identifier" type="hidden">
+                <div class="form-grid compact-grid">
+                  <label><span>显示名称</span><input name="name" placeholder="风格1011 kei / 达妮娅" required></label>
+                  <label><span>分类</span><select name="category"><option value="artist_style">画师/风格</option><option value="character">角色</option><option value="mixed">混合</option><option value="auto">自动判断</option></select></label>
+                </div>
+                <label><span>简称 / 别名（每行或逗号分隔）</span><textarea name="aliases" rows="3" placeholder="风格1011&#10;kei风格"></textarea></label>
+                <label><span>备注</span><textarea name="note" rows="2" placeholder="只用于管理和检索说明，不直接写进提示词"></textarea></label>
+                <label><span>LoRA 串（每行 name=weight）</span><textarea name="loras" rows="9" placeholder="anima-highres-aesthetic-boost=0.5&#10;black deniav1-2=1.0" required></textarea></label>
+                <label><span>手动补充触发词</span><textarea name="trigger_words" rows="3" placeholder="可留空；生成前仍会强刷 Manager 并合并最新元数据触发词"></textarea></label>
+                <div class="form-grid compact-grid">
+                  <label><span>角色 canonical</span><input name="character_canonical" placeholder="denia_(作品)"></label>
+                  <label><span>作品字段</span><input name="work_canonical" placeholder="作品 canonical"></label>
+                </div>
+                <label><span>身份锚点（角色预设必填）</span><textarea name="identity_anchor" rows="2" placeholder="用户可控的角色身份锚点"></textarea></label>
+                <label><span>必需触发词（角色预设必填，每行或逗号分隔）</span><textarea name="required_trigger_terms" rows="2" placeholder="denia&#10;denia trigger"></textarea></label>
+                <label><span>正面提示词 Tag 池</span><textarea name="positive_tags" rows="3" placeholder="可选 Tag，每行或逗号分隔"></textarea></label>
+                <label><span>负面提示词 Tag 池</span><textarea name="negative_tags" rows="3" placeholder="排除 Tag，每行或逗号分隔"></textarea></label>
+                <label><span>变体标识</span><input name="variant_id" value="default" placeholder="default / school / swimsuit"></label>
+                <label><span>说明</span><textarea name="description" rows="3"></textarea></label>
+                <label class="toggle"><input name="enabled" type="checkbox" checked><span>启用此组合</span></label>
+                <div class="inline-actions"><button id="preset-save" class="primary" type="submit">强制刷新并保存</button><button id="preset-cancel-edit" class="ghost" type="button" hidden>取消编辑</button></div>
+              </form>
+            </article>
+            <article class="card table-card numbered-card" data-number="B">
+              <div class="card-head">
+                <div><p class="eyebrow">SAVED PRESETS</p><h2>已保存组合</h2></div>
+                <button id="preset-refresh" class="secondary" type="button">刷新校验</button>
+              </div>
+              <div class="table-wrap">
+                <table><thead><tr><th>名称 / 简称</th><th>分类</th><th>LoRA</th><th>触发词</th><th>备注</th><th>状态</th><th>动作</th></tr></thead><tbody id="preset-table"></tbody></table>
+              </div>
+              <div id="preset-empty" class="empty-state">尚未读取组合。</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="panel-models" class="panel" aria-labelledby="page-title">
+          <article class="model-lead dark-card">
+            <div>
+              <p class="eyebrow">UNET LOADER · ACTIVE PROFILE</p>
+              <h2>实时模型列表</h2>
+              <p>每次切换前都会重新读取 ComfyUI 的 UNETLoader 清单。</p>
+            </div>
+            <button id="model-refresh" class="secondary inverse" type="button">读取最新模型</button>
+          </article>
+          <div id="model-grid" class="model-grid"></div>
+          <div id="model-empty" class="empty-state card">点击“读取最新模型”开始。</div>
+        </section>
+
+        <section id="panel-tasks" class="panel" aria-labelledby="page-title">
+          <div class="task-metric-grid" aria-label="任务统计">
+            <article class="task-metric active-task-metric"><span>ACTIVE</span><strong id="task-count-active">0</strong><small>排队 / 运行中</small></article>
+            <article class="task-metric"><span>SUCCEEDED</span><strong id="task-count-succeeded">0</strong><small>最近成功</small></article>
+            <article class="task-metric warning-task-metric"><span>NEEDS ATTENTION</span><strong id="task-count-warning">0</strong><small>部分完成 / 中断</small></article>
+            <article class="task-metric failed-task-metric"><span>FAILED</span><strong id="task-count-failed">0</strong><small>失败 / 超时</small></article>
+          </div>
+
+          <article class="task-workbench dark-card">
+            <div class="task-workbench-head">
+              <div>
+                <p class="eyebrow">PERSISTENT JOB LEDGER</p>
+                <h2>任务中心</h2>
+                <p>LoRA 元数据、AI 建档与后续后台工作会留下可恢复的阶段时间线。刷新页面或插件重载后，已完成记录仍可查看；异常退出的运行任务会标记为“已中断”。</p>
+              </div>
+              <button id="task-refresh" class="secondary inverse" type="button">刷新任务</button>
+            </div>
+            <div class="task-toolbar">
+              <label><span>任务类型</span><select id="task-type-filter"><option value="">全部类型</option><option value="lora_semantic_analysis">LoRA 语义建档</option><option value="lora_archive">旧版 LoRA 建档</option><option value="lora_metadata">LoRA 元数据</option><option value="lora_download">LoRA 下载</option><option value="danbooru_index_update">Danbooru 索引更新</option><option value="asset_delete">资产删除</option><option value="reverse_prompt">图片反推</option><option value="reverse_draw">反推画图</option><option value="rtx_upscale">RTX 放大</option><option value="inpaint">局部重绘</option></select></label>
+              <label><span>运行状态</span><select id="task-status-filter"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="succeeded">成功</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="timed_out">超时</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option></select></label>
+              <p id="task-list-status" class="task-list-status" role="status">等待读取持久任务记录…</p>
+            </div>
+          </article>
+
+          <article class="card" id="sticky-negatives-panel">
+            <div class="card-head"><div><p class="eyebrow">STICKY BANS</p><h2>粘性绘图禁令</h2></div><button id="sticky-negatives-refresh" class="secondary inverse" type="button">刷新</button></div>
+            <p class="muted">会话内通过"以后都别画X"/"/别画 X"登记的持久化排除词。这些词已并入每张图的负面提示词并参与清单审计。</p>
+            <div id="sticky-negatives-list" class="task-list" role="list"></div>
+            <div id="sticky-negatives-empty" class="empty-state">当前没有登记任何粘性禁令。</div>
+          </article>
+
+          <div class="task-center-grid">
+            <article class="card task-list-card">
+              <div class="card-head"><div><p class="eyebrow">RECENT RUNS</p><h2>最近任务</h2></div><span id="task-visible-count" class="ticket-tag">0 项</span></div>
+              <div id="task-list" class="task-list" role="list"></div>
+              <div id="task-list-empty" class="empty-state">暂无符合筛选条件的任务。</div>
+            </article>
+
+            <article class="card task-detail-card">
+              <div id="task-detail-empty" class="task-detail-empty">
+                <span class="task-detail-star" aria-hidden="true">✦</span>
+                <h2>选择一项任务</h2>
+                <p>查看当前阶段、处理进度、耗时，以及逐步成功、失败或无响应记录。</p>
+              </div>
+              <div id="task-detail" hidden>
+                <div class="task-detail-head">
+                  <div><p class="eyebrow">RUN DETAIL</p><h2 id="task-detail-title">任务详情</h2><code id="task-detail-id"></code></div>
+                  <div class="task-detail-actions"><span id="task-detail-status" class="task-status-badge">—</span><button id="task-cancel" class="console-clear-button compact" type="button" hidden>取消任务</button></div>
+                </div>
+                <div id="task-detail-metrics" class="task-detail-metrics"></div>
+                <div class="task-progress-block"><div><span id="task-progress-label">等待进度</span><strong id="task-progress-value">0%</strong></div><progress id="task-progress-track" max="100" value="0">0%</progress></div>
+                <div class="task-timeline-head">
+                  <div><p class="eyebrow">EVENT TIMELINE</p><h3>阶段时间线</h3></div>
+                  <div class="task-timeline-controls">
+                    <label><span class="sr-only">时间线排序</span><select id="task-event-order"><option value="desc" selected>最新在上</option><option value="asc">最早在上</option></select></label>
+                    <label><span class="sr-only">每页事件数量</span><select id="task-event-page-size"><option value="10">10 条 / 页</option><option value="20" selected>20 条 / 页</option><option value="50">50 条 / 页</option><option value="100">100 条 / 页</option><option value="200">200 条 / 页</option></select></label>
+                    <button id="task-event-prev" class="ghost compact" type="button">上一页</button>
+                    <span id="task-event-page" class="ticket-tag">1 / 1</span>
+                    <button id="task-event-next" class="ghost compact" type="button">下一页</button>
+                    <span id="task-event-cursor" class="ticket-tag">SEQ 0</span>
+                  </div>
+                </div>
+                <ol id="task-event-list" class="task-event-list"></ol>
+                <div id="task-event-empty" class="empty-state compact-empty">尚无阶段事件，任务可能仍在排队。</div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="panel-console" class="panel" aria-labelledby="page-title">
+          <div class="console-metric-grid" aria-label="日志统计">
+            <article class="console-metric paper-stat">
+              <span>PERSISTED / ALL</span>
+              <strong id="console-count-total">0</strong>
+              <small id="console-capacity-label">最多保留 1000 条</small>
+            </article>
+            <article class="console-metric info-stat">
+              <span>INFO</span>
+              <strong id="console-count-info">0</strong>
+              <small>正常运行记录</small>
+            </article>
+            <article class="console-metric warning-stat">
+              <span>WARNING</span>
+              <strong id="console-count-warning">0</strong>
+              <small>需要留意</small>
+            </article>
+            <article class="console-metric error-stat">
+              <span>ERROR / CRITICAL</span>
+              <strong id="console-count-error">0</strong>
+              <small>错误与异常</small>
+            </article>
+          </div>
+
+          <article class="console-workbench dark-card">
+            <div class="console-heading">
+              <div>
+                <p class="eyebrow">PLUGIN LOG PRESS</p>
+                <h2>Comfy Anima 专属控制台</h2>
+                <p>捕获并持久保存本插件日志，页面刷新与插件重载后可恢复最近记录；常见密钥、密码、Cookie 与会话字段会在写入前脱敏。</p>
+              </div>
+              <div id="console-live-seal" class="console-live-seal live" role="status">
+                <span class="console-live-dot" aria-hidden="true"></span>
+                <strong>LIVE</strong>
+                <small id="console-live-label">自动刷新</small>
+              </div>
+            </div>
+
+            <div class="console-toolbar">
+              <label class="console-search-field">
+                <span>搜索日志</span>
+                <input id="console-query" type="search" placeholder="错误、LoRA、文件名、来源…" autocomplete="off">
+              </label>
+              <label>
+                <span>级别</span>
+                <select id="console-level-filter">
+                  <option value="all">全部级别</option>
+                  <option value="DEBUG">DEBUG</option>
+                  <option value="INFO">INFO</option>
+                  <option value="WARNING">WARNING</option>
+                  <option value="ERROR">ERROR / CRITICAL</option>
+                </select>
+              </label>
+              <label>
+                <span>模块</span>
+                <select id="console-category-filter">
+                  <option value="all">全部模块</option>
+                  <option value="generation">绘图 / ComfyUI</option>
+                  <option value="lora">LoRA</option>
+                  <option value="llm">LLM / Provider</option>
+                  <option value="web">WebUI</option>
+                  <option value="plugin">插件运行</option>
+                </select>
+              </label>
+              <label class="toggle inverse-toggle console-follow-toggle">
+                <input id="console-follow" type="checkbox" checked>
+                <span>跟随最新</span>
+              </label>
+            </div>
+
+            <div class="console-actions">
+              <div>
+                <span id="console-visible-count" class="ticket-tag">显示 0 条</span>
+                <span id="console-status" class="console-status" role="status">等待读取插件日志…</span>
+              </div>
+              <div class="console-action-buttons">
+                <button id="console-pause" class="secondary inverse" type="button">暂停刷新</button>
+                <button id="console-copy" class="ghost inverse" type="button">复制可见日志</button>
+                <button id="console-clear" class="console-clear-button" type="button">清空持久视图</button>
+              </div>
+            </div>
+
+            <div id="console-viewport" class="console-viewport" tabindex="0" aria-label="插件实时日志">
+              <ol id="console-list" class="console-list"></ol>
+              <div id="console-empty" class="console-empty">当前筛选下没有日志。</div>
+            </div>
+
+            <div class="console-footnote">
+              <span>SQLITE LEDGER · 插件重载后恢复最近记录</span>
+              <span>清空只删除插件专属持久视图，不删除 AstrBot 文件日志或任务事件</span>
+            </div>
+          </article>
+        </section>
+
+        <section id="panel-prompt" class="panel" aria-labelledby="page-title">
+          <div class="prompt-metric-grid" aria-label="提示词工具状态">
+            <article class="prompt-metric paper-stat"><span>COMPOSER V2</span><strong id="prompt-composer-state">—</strong><small id="prompt-composer-detail">等待读取配置</small></article>
+            <article class="prompt-metric info-stat"><span>DANBOORU INDEX</span><strong id="prompt-index-state">—</strong><small id="prompt-index-detail">等待读取索引</small></article>
+            <article class="prompt-metric warning-stat"><span>MEMORY DIAGNOSTICS</span><strong id="prompt-diagnostic-count">0</strong><small id="prompt-diagnostic-capacity">仅保存在内存</small></article>
+            <article class="prompt-metric error-stat"><span>EXPERIMENTAL READY</span><strong id="prompt-experiment-count">0</strong><small>只读能力检查</small></article>
+          </div>
+
+          <div id="prompt-workbench-tabs" class="prompt-subnav" role="tablist" aria-label="提示词工坊子页面">
+            <button id="prompt-tab-composer" class="prompt-subnav-button active" type="button" role="tab" data-prompt-tab="composer" aria-controls="prompt-page-composer" aria-selected="true">01 构图台</button>
+            <button id="prompt-tab-assets" class="prompt-subnav-button" type="button" role="tab" data-prompt-tab="assets" aria-controls="prompt-page-assets" aria-selected="false">02 视觉素材库</button>
+            <button id="prompt-tab-lab" class="prompt-subnav-button" type="button" role="tab" data-prompt-tab="lab" aria-controls="prompt-page-lab" aria-selected="false">03 灵感卡组</button>
+            <button id="prompt-tab-diagnostics" class="prompt-subnav-button" type="button" role="tab" data-prompt-tab="diagnostics" aria-controls="prompt-page-diagnostics" aria-selected="false">04 诊断与索引</button>
+          </div>
+
+          <section id="prompt-page-composer" class="prompt-subpage active" role="tabpanel" aria-labelledby="prompt-tab-composer">
+            <div class="prompt-composer-layout">
+              <article class="card prompt-slot-studio">
+                <div class="card-head"><div><p class="eyebrow">LAYERED COMPOSITION</p><h2>分槽构图台</h2></div><span class="ticket-tag">DRAFT ONLY</span></div>
+                <p class="muted">每个槽位都可以独立锁定。组合只生成经过 Prompt Composer 校验的草稿，不会提交 ComfyUI。</p>
+                <form id="prompt-slot-form" class="stack">
+                  <div id="prompt-slot-grid" class="prompt-slot-grid">
+                    <article class="prompt-slot-card" data-slot="lora"><header><label for="prompt-slot-lora">LoRA 控制</label><label class="slot-lock"><input type="checkbox" data-slot-lock="lora"><span>锁定</span></label></header><textarea id="prompt-slot-lora" data-slot-input="lora" rows="3" maxlength="3000" placeholder="&lt;lora:exact-file:0.8&gt;"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="identity"><header><label for="prompt-slot-identity">角色身份</label><label class="slot-lock"><input type="checkbox" data-slot-lock="identity"><span>锁定</span></label></header><textarea id="prompt-slot-identity" data-slot-input="identity" rows="3" maxlength="2000" placeholder="1girl, character name, copyright"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="appearance"><header><label for="prompt-slot-appearance">外观特征</label><label class="slot-lock"><input type="checkbox" data-slot-lock="appearance"><span>锁定</span></label></header><textarea id="prompt-slot-appearance" data-slot-input="appearance" rows="3" maxlength="2000" placeholder="hair, eyes, body traits"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="clothing"><header><label for="prompt-slot-clothing">服装</label><label class="slot-lock"><input type="checkbox" data-slot-lock="clothing"><span>锁定</span></label></header><textarea id="prompt-slot-clothing" data-slot-input="clothing" rows="3" maxlength="2000" placeholder="alternate costume, white dress"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="pose"><header><label for="prompt-slot-pose">姿势动作</label><label class="slot-lock"><input type="checkbox" data-slot-lock="pose"><span>锁定</span></label></header><textarea id="prompt-slot-pose" data-slot-input="pose" rows="3" maxlength="2000" placeholder="standing, holding sparkler"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="camera"><header><label for="prompt-slot-camera">镜头构图</label><label class="slot-lock"><input type="checkbox" data-slot-lock="camera"><span>锁定</span></label></header><textarea id="prompt-slot-camera" data-slot-input="camera" rows="3" maxlength="2000" placeholder="full body, from below"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="background"><header><label for="prompt-slot-background">背景环境</label><label class="slot-lock"><input type="checkbox" data-slot-lock="background"><span>锁定</span></label></header><textarea id="prompt-slot-background" data-slot-input="background" rows="3" maxlength="2000" placeholder="beach, shallow water, night"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="lighting"><header><label for="prompt-slot-lighting">光影色彩</label><label class="slot-lock"><input type="checkbox" data-slot-lock="lighting"><span>锁定</span></label></header><textarea id="prompt-slot-lighting" data-slot-input="lighting" rows="3" maxlength="2000" placeholder="soft lighting, warm rim light"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="style"><header><label for="prompt-slot-style">画师 / 风格</label><label class="slot-lock"><input type="checkbox" data-slot-lock="style"><span>锁定</span></label></header><textarea id="prompt-slot-style" data-slot-input="style" rows="3" maxlength="2000" placeholder="artist tag, cinematic illustration"></textarea></article>
+                    <article class="prompt-slot-card" data-slot="visual_phrases"><header><label for="prompt-slot-visual-phrases">视觉短语</label><label class="slot-lock"><input type="checkbox" data-slot-lock="visual_phrases"><span>锁定</span></label></header><textarea id="prompt-slot-visual-phrases" data-slot-input="visual_phrases" rows="3" maxlength="2500" placeholder="sea foam washing over her feet"></textarea></article>
+                    <article class="prompt-slot-card wide" data-slot="relation"><header><label for="prompt-slot-relation">场景关系句</label><label class="slot-lock"><input type="checkbox" data-slot-lock="relation"><span>锁定</span></label></header><textarea id="prompt-slot-relation" data-slot-input="relation" rows="3" maxlength="2000" placeholder="One present-tense English sentence describing the scene relationship."></textarea></article>
+                    <article class="prompt-slot-card wide negative-slot" data-slot="negative"><header><label for="prompt-slot-negative">负面词</label><label class="slot-lock"><input type="checkbox" data-slot-lock="negative"><span>锁定</span></label></header><textarea id="prompt-slot-negative" data-slot-input="negative" rows="3" maxlength="2500" placeholder="watermark, malformed hands"></textarea></article>
+                  </div>
+                  <div class="prompt-action-row"><button id="prompt-compose-slots" class="primary" type="submit">组合并校验</button><button id="prompt-slots-clear" class="secondary" type="button">清空未锁定槽</button><button id="prompt-open-assets" class="ghost" type="button">打开素材库</button></div>
+                </form>
+                <p id="prompt-slot-status" class="muted live-line" role="status">等待编辑分槽草稿。</p>
+              </article>
+              <aside class="card dark-card prompt-compose-proof">
+                <div class="card-head"><div><p class="eyebrow">COMPOSER PROOF</p><h2>组合结果</h2></div><span id="prompt-compose-badge" class="ticket-tag">NOT COMPOSED</span></div>
+                <div id="prompt-compose-result" class="prompt-compact-result"><div class="empty-state compact-empty">组合后显示最终正面、负面、分层与诊断。此处没有“立即出图”入口。</div></div>
+              </aside>
+            </div>
+          </section>
+
+          <section id="prompt-page-assets" class="prompt-subpage" role="tabpanel" aria-labelledby="prompt-tab-assets" hidden>
+            <div class="asset-library-lead dark-card">
+              <div><p class="eyebrow">PROVENANCE-FIRST LIBRARY</p><h2>视觉提示词素材库</h2><p>支持管理员导入有来源信息的 JSON / CSV，也可维护自定义项。素材描述是不可信数据，只会以纯文本展示。</p><button id="prompt-assets-sync-local" class="secondary inverse asset-local-sync" type="button">同步 LoRA 与已保存预设</button></div>
+              <dl class="asset-library-stats"><div><dt>素材</dt><dd id="prompt-asset-count">0</dd></div><div><dt>收藏</dt><dd id="prompt-asset-favorite-count">0</dd></div><div><dt>自定义</dt><dd id="prompt-asset-custom-count">0</dd></div><div><dt>最近导入</dt><dd id="prompt-asset-imported-at">—</dd></div></dl>
+            </div>
+            <article class="card asset-browser-card">
+              <form id="prompt-asset-search-form" class="asset-search-toolbar">
+                <label><span>关键词</span><input id="prompt-asset-query" maxlength="256" placeholder="名称、别名、Tags、属性…"></label>
+                <label><span>类型</span><select id="prompt-asset-type"><option value="">全部类型</option><option value="character">角色</option><option value="clothing">服装</option><option value="pose">姿势</option><option value="background">背景</option><option value="artist">画师 / 风格</option><option value="__custom__">仅自定义</option></select></label>
+                <label><span>分组 / 分类</span><input id="prompt-asset-categories" list="prompt-asset-category-options" maxlength="256" placeholder="可逗号分隔"><datalist id="prompt-asset-category-options"></datalist></label>
+                <label><span>属性</span><input id="prompt-asset-traits" list="prompt-asset-trait-options" maxlength="256" placeholder="发色、瞳色、场景…"><datalist id="prompt-asset-trait-options"></datalist></label>
+                <label><span>标签</span><input id="prompt-asset-tags" maxlength="256" placeholder="逗号分隔"></label>
+                <label><span>来源</span><input id="prompt-asset-source" maxlength="256" placeholder="来源名称"></label>
+                <label class="toggle compact-toggle"><input id="prompt-asset-favorites-only" type="checkbox"><span>仅收藏</span></label>
+                <label><span>每页</span><select id="prompt-asset-page-size"><option value="24">24</option><option value="48" selected>48</option><option value="80">80</option></select></label>
+                <button class="primary" type="submit">筛选素材</button>
+              </form>
+              <p id="prompt-asset-status" class="muted live-line" role="status">素材库不会捆绑来源不明的外部数据。</p>
+              <div id="prompt-asset-grid" class="prompt-asset-grid"></div>
+              <div id="prompt-asset-empty" class="empty-state">当前筛选没有素材。</div>
+              <nav class="pager" aria-label="视觉素材库分页"><button id="prompt-asset-prev" class="ghost" type="button">上一页</button><span id="prompt-asset-page" class="ticket-tag">第 1 / 1 页</span><button id="prompt-asset-next" class="ghost" type="button">下一页</button></nav>
+            </article>
+            <div class="asset-maintenance-grid">
+              <article class="card numbered-card" data-number="A">
+                <div class="card-head"><div><p class="eyebrow">CUSTOM ASSET</p><h2>自定义素材</h2></div><span id="prompt-custom-mode" class="ticket-tag">NEW</span></div>
+                <form id="prompt-custom-form" class="stack">
+                  <input id="prompt-custom-id" type="hidden">
+                  <div class="form-grid compact-grid"><label><span>类型</span><select id="prompt-custom-type"><option value="character">角色</option><option value="clothing">服装</option><option value="pose">姿势</option><option value="background">背景</option><option value="artist">画师 / 风格</option></select></label><label><span>中文名称</span><input id="prompt-custom-name-zh" maxlength="160" required></label><label><span>英文名称</span><input id="prompt-custom-name-en" maxlength="160"></label><label><span>别名</span><input id="prompt-custom-aliases" maxlength="600" placeholder="逗号分隔"></label></div>
+                  <label><span>Tags</span><textarea id="prompt-custom-tags" rows="4" maxlength="2500" required placeholder="comma, separated, tags"></textarea></label>
+                  <label><span>属性 / 分类</span><textarea id="prompt-custom-traits" rows="3" maxlength="1200" placeholder="属性；分类可用 #category"></textarea></label>
+                  <div class="prompt-action-row"><button id="prompt-custom-save" class="primary" type="submit">保存自定义项</button><button id="prompt-custom-reset" class="secondary" type="button">退出编辑</button><button id="prompt-custom-delete" class="danger" type="button" hidden>删除此项</button></div>
+                </form>
+                <p id="prompt-custom-status" class="muted live-line" role="status"></p>
+              </article>
+              <article class="card sand-card">
+                <div class="card-head"><div><p class="eyebrow">SAFE IMPORT</p><h2>素材包导入</h2></div><span class="ticket-tag">JSON / CSV</span></div>
+                <form id="prompt-asset-import-form" class="stack"><div class="form-grid compact-grid"><label><span>格式</span><select id="prompt-asset-import-format"><option value="json">JSON</option><option value="csv">CSV</option></select></label><label><span>导入模式</span><select id="prompt-asset-import-mode"><option value="merge">合并更新</option><option value="replace_source">替换同来源</option><option value="replace">替换整个素材库</option></select></label></div><label><span>来源名称</span><input id="prompt-asset-import-source" maxlength="256" required placeholder="作者 / 数据集 / 自建包"></label><label><span>版本与许可</span><input id="prompt-asset-import-license" maxlength="256" required placeholder="版本；SPDX 或许可说明"></label><label><span>粘贴内容</span><textarea id="prompt-asset-import-content" rows="10" maxlength="1000000" required></textarea></label><button id="prompt-asset-import" class="primary" type="submit">校验并导入</button></form>
+                <hr class="newspaper-rule">
+                <form id="prompt-asset-url-form" class="stack"><label><span>安全 URL</span><input id="prompt-asset-url" type="url" maxlength="2048" placeholder="解析到公网地址的 HTTPS（不接受凭据或重定向）" required></label><label><span>来源 / 许可备注</span><input id="prompt-asset-url-source" maxlength="256" required></label><button id="prompt-asset-url-import" class="secondary" type="submit">从 URL 更新</button></form>
+                <p id="prompt-asset-import-status" class="muted live-line" role="status">后端会执行 SSRF、大小、格式、来源与凭据字段校验。</p>
+              </article>
+            </div>
+          </section>
+
+          <section id="prompt-page-lab" class="prompt-subpage" role="tabpanel" aria-labelledby="prompt-tab-lab" hidden>
+            <div class="prompt-lab-layout">
+              <article class="card prompt-lab-controls">
+                <div class="card-head"><div><p class="eyebrow">SEEDED IDEA DECK</p><h2>固定 Seed 灵感卡组</h2></div><span class="ticket-tag">NO AUTO DRAW</span></div>
+                <p class="muted">同一素材库指纹、算法版本与 Seed 可复现候选。生成只产生草稿；必须明确选择并确认，才会进入 Composer。</p>
+                <form id="prompt-lab-form" class="stack">
+                  <div class="form-grid compact-grid"><label><span>固定 Seed</span><input id="prompt-lab-seed" maxlength="128" value="1700" required></label><label><span>候选数量</span><input id="prompt-lab-count" type="number" min="2" max="6" value="4"></label></div>
+                  <fieldset class="prompt-check-fieldset"><legend>参与类别</legend><div id="prompt-lab-types" class="prompt-check-grid"><label><input type="checkbox" value="character" checked>角色</label><label><input type="checkbox" value="outfit" checked>服装</label><label><input type="checkbox" value="pose" checked>姿势</label><label><input type="checkbox" value="background" checked>背景</label><label><input type="checkbox" value="artist" checked>画师 / 风格</label></div></fieldset>
+                  <fieldset class="prompt-check-fieldset"><legend>锁定槽位</legend><div id="prompt-lab-locks" class="prompt-check-grid"><label><input type="checkbox" value="identity">身份</label><label><input type="checkbox" value="clothing">服装</label><label><input type="checkbox" value="pose">姿势</label><label><input type="checkbox" value="camera">镜头</label><label><input type="checkbox" value="background">背景</label><label><input type="checkbox" value="style">风格</label><label><input type="checkbox" value="relation">关系句</label><label><input type="checkbox" value="lora">LoRA</label></div></fieldset>
+                  <label><span>候选素材池（JSON，可选）</span><textarea id="prompt-lab-pools" rows="8" maxlength="40000" placeholder='{"pose":[{"asset_id":"custom:pose:1","label":"低角度","tags":["from below"]}]}'></textarea></label>
+                  <div class="prompt-plan-save-row"><label><span>方案名称</span><input id="prompt-plan-name" maxlength="80" placeholder="例如：雨夜霓虹肖像"></label><label class="compact-toggle prompt-plan-save-toggle"><input id="prompt-plan-save" type="checkbox" checked><span>确认时保存为 QQ 方案</span></label></div>
+                  <div class="prompt-action-row"><button id="prompt-lab-generate" class="primary" type="submit">生成候选卡</button><button id="prompt-lab-use-composer" class="secondary active" type="button">已读取构图台基础层</button></div>
+                </form>
+                <p id="prompt-lab-status" class="muted live-line" role="status">等待生成候选；不会调用 ComfyUI。</p>
+              </article>
+              <aside class="card dark-card prompt-lab-confirmation"><div class="card-head"><div><p class="eyebrow">EXPLICIT CONFIRMATION</p><h2>确认结果</h2></div><span id="prompt-lab-confirm-badge" class="ticket-tag">UNCONFIRMED</span></div><div id="prompt-lab-confirm-result" class="prompt-compact-result"><div class="empty-state compact-empty">先选中候选卡，再点击“确认并保存方案”。保存后可在 QQ 使用 /方案 ID 出图；确认本身不会自动出图。</div></div></aside>
+            </div>
+            <div id="prompt-lab-candidates" class="prompt-candidate-strip" aria-live="polite"><div class="empty-state">尚未生成候选卡。</div></div>
+            <article class="card prompt-plan-library"><div class="card-head"><div><p class="eyebrow">QQ PROMPT PLAN LIBRARY</p><h2>已保存方案</h2></div><div class="prompt-action-row"><span id="prompt-plan-count" class="ticket-tag">0 PLANS</span><button id="prompt-plans-refresh" class="secondary" type="button">刷新方案库</button></div></div><p class="muted">方案持久保存在插件数据目录。复制指令后可在 QQ 发送 <code>/方案 P-XXXXXX</code>；实际绘图仍会经过权限、风控、LoRA 实时刷新与提交前复核。</p><div id="prompt-plan-list" class="prompt-plan-grid" aria-live="polite"><div class="empty-state compact-empty">正在等待读取方案库。</div></div><p id="prompt-plan-status" class="muted live-line" role="status"></p></article>
+          </section>
+
+          <section id="prompt-page-diagnostics" class="prompt-subpage" role="tabpanel" aria-labelledby="prompt-tab-diagnostics" hidden>
+            <div class="prompt-workbench-grid">
+              <article class="card prompt-diagnostic-card">
+                <div class="card-head"><div><p class="eyebrow">PROMPT PRESS</p><h2>手工提示词诊断</h2></div><span class="ticket-tag">LOCAL ONLY</span></div>
+                <p class="muted">检查 LoRA 控制层、硬 Tags、视觉短语、场景关系句、重复冲突与自适应负面词。不会调用 LLM，也不会提交 ComfyUI。</p>
+                <form id="prompt-diagnostic-form" class="stack prompt-diagnostic-form"><label><span>正面提示词</span><textarea id="prompt-diagnostic-positive" rows="8" maxlength="6000" placeholder="1girl, beach, night. She stands in the shallow water under the moonlight." required></textarea></label><label><span>负面提示词（可选）</span><textarea id="prompt-diagnostic-negative" rows="3" maxlength="2000" placeholder="text, watermark"></textarea></label><div class="prompt-action-row"><button id="prompt-diagnose" class="primary" type="submit">开始本地诊断</button><button id="prompt-diagnostics-clear" class="secondary" type="button">清空内存诊断</button></div></form>
+                <p id="prompt-diagnostic-status" class="muted live-line" role="status">等待输入提示词。</p>
+              </article>
+              <article class="card dark-card prompt-index-card">
+                <div class="card-head"><div><p class="eyebrow">TAG LEDGER</p><h2>Danbooru 索引</h2></div><span id="prompt-index-badge" class="ticket-tag">NOT READ</span></div>
+                <dl class="prompt-index-facts"><div><dt>Tags</dt><dd id="prompt-index-tags">0</dd></div><div><dt>Alias 边</dt><dd id="prompt-index-aliases">0</dd></div><div><dt>唯一 Alias</dt><dd id="prompt-index-unique-aliases">0</dd></div><div><dt>歧义 / 冲突</dt><dd id="prompt-index-ambiguous-aliases">0 / 0</dd></div><div><dt>版本</dt><dd id="prompt-index-revision">—</dd></div><div><dt>导入时间</dt><dd id="prompt-index-updated">—</dd></div><div><dt>源数据更新</dt><dd id="prompt-index-source-updated">—</dd></div><div><dt>抓取截止</dt><dd id="prompt-index-source-cutoff">—</dd></div><div class="wide"><dt>本地化别名</dt><dd id="prompt-index-localized">—</dd></div><div class="wide"><dt>来源</dt><dd id="prompt-index-source">尚未配置或导入</dd></div><div class="wide"><dt>分类</dt><dd id="prompt-index-categories">—</dd></div></dl>
+                <div class="prompt-action-row"><button id="prompt-index-update" class="secondary inverse" type="button">从URL更新</button><button id="prompt-index-official-update" class="secondary inverse" type="button">从官方API生成</button><button id="prompt-index-task" class="ghost inverse" type="button" hidden>查看索引任务</button><button id="prompt-status-refresh" class="ghost inverse" type="button">刷新状态</button></div><p id="prompt-index-status" class="live-line" role="status">更新任务会进入任务中心；失败或取消时继续保留原有索引。</p>
+              </article>
+            </div>
+            <article class="card prompt-result-card"><div class="card-head"><div><p class="eyebrow">COMPOSITION PROOF</p><h2>三层诊断结果</h2></div><span id="prompt-result-id" class="ticket-tag">NO RESULT</span></div><div id="prompt-diagnostic-result" class="prompt-diagnostic-result"><div class="empty-state">提交一条提示词后，这里会展示可验证的分层结果与修订记录。</div></div></article>
+            <div class="prompt-lower-grid"><article class="card prompt-memory-card"><div class="card-head"><div><p class="eyebrow">VOLATILE LEDGER</p><h2>内存诊断</h2></div><span class="ticket-tag">RELOAD CLEARS</span></div><div id="prompt-diagnostic-history" class="prompt-diagnostic-history"><div class="empty-state compact-empty">暂无诊断记录。</div></div></article><article class="card sand-card prompt-experiment-card"><div class="card-head"><div><p class="eyebrow">OPTIONAL PROFILES</p><h2>实验能力检查</h2></div><button id="prompt-experiments-refresh" class="secondary" type="button">重新检查</button></div><p class="muted">只读取 ComfyUI 当前节点与调度器能力，不安装节点、不修改工作流，也不会自动启用实验管线。</p><div id="prompt-experiment-list" class="prompt-experiment-list"><div class="empty-state compact-empty">等待检查实验能力。</div></div><p id="prompt-experiment-status" class="muted live-line" role="status"></p></article></div>
+          </section>
+        </section>
+
+        <footer class="workshop-footer">
+          <span>COMFY ANIMA / ASTRBOT</span>
+          <svg viewBox="0 0 90 18" aria-hidden="true"><path d="M1 10c8-8 14 8 22 0s14 8 22 0 14 8 22 0 14 7 22-1"></path></svg>
+          <span>LOCAL ILLUSTRATION WORKSHOP</span>
+        </footer>
+      </main>
+    </div>
+
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-message">
+      <form method="dialog" class="confirm-dialog-shell">
+        <p class="eyebrow">OPERATOR CONFIRMATION</p>
+        <h2 id="confirm-dialog-title">请确认</h2>
+        <p id="confirm-dialog-message" class="confirm-dialog-message"></p>
+        <label id="confirm-dialog-input-wrap" class="confirm-dialog-input" hidden>
+          <span id="confirm-dialog-input-label">输入完整名称以确认</span>
+          <input id="confirm-dialog-input" type="text" spellcheck="false">
+        </label>
+        <div class="confirm-dialog-actions">
+          <button class="secondary" type="submit" value="cancel" formnovalidate>取消</button>
+          <button id="confirm-dialog-confirm" class="danger" type="submit" value="confirm">确认操作</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js" defer></script>
+  </body>
+</html>

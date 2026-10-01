@@ -1,0 +1,1738 @@
+{
+  "comfyui_url": {
+    "description": "ComfyUI 服务地址",
+    "type": "string",
+    "hint": "例如 http://127.0.0.1:8188；AstrBot 在容器内时不要填写容器自身的 127.0.0.1",
+    "default": "http://127.0.0.1:8188"
+  },
+  "api_token": {
+    "description": "反向代理认证 Token",
+    "type": "string",
+    "hint": "可选，将通过 Authorization: Bearer 发送；日志不会记录该值",
+    "default": ""
+  },
+  "enable_web_ui": {
+    "description": "启用独立端口 Web 设置面板",
+    "type": "bool",
+    "hint": "启用前必须设置至少 8 位密码；面板只建议在可信局域网中使用",
+    "default": false
+  },
+  "web_ui_host": {
+    "description": "Web UI 监听地址",
+    "type": "string",
+    "hint": "0.0.0.0 表示监听所有网卡；也可填写服务器私有局域网 IP，不允许公网地址或域名",
+    "default": "0.0.0.0"
+  },
+  "web_ui_port": {
+    "description": "Web UI 端口",
+    "type": "int",
+    "hint": "建议使用 1024 到 65535 之间未被占用的端口",
+    "default": 6198
+  },
+  "web_ui_username": {
+    "description": "Web UI 登录用户名",
+    "type": "string",
+    "default": "admin"
+  },
+  "web_ui_password": {
+    "description": "Web UI 登录密码",
+    "type": "string",
+    "hint": "至少 8 位；不会通过 Web UI 接口回显，请不要与 QQ、SSH 或 AstrBot 后台密码共用",
+    "default": ""
+  },
+  "web_ui_session_ttl": {
+    "description": "Web UI 登录会话时长（秒）",
+    "type": "int",
+    "hint": "范围 300 到 86400 秒，插件重载后需要重新登录",
+    "default": 43200
+  },
+  "workflow_file": {
+    "description": "工作流文件",
+    "type": "string",
+    "hint": "默认使用插件内置 API 工作流；相对路径以插件目录为基准",
+    "default": "workflow/anima_v2_api.json"
+  },
+  "upscale_workflow_file": {
+    "description": "RTX 独立放大工作流",
+    "type": "string",
+    "hint": "用于 /放大；Anima 生成后的 RTX 链仍由当前生图工作流控制",
+    "default": "workflow/rtx_upscale_api.json"
+  },
+  "base_workflow_file": {
+    "description": "Anima 原图管线工作流",
+    "type": "string",
+    "default": "workflow/anima_base_api.json"
+  },
+  "rtx_generation_workflow_file": {
+    "description": "Anima + RTX 管线工作流",
+    "type": "string",
+    "default": "workflow/anima_rtx_api.json"
+  },
+  "iterative_workflow_file": {
+    "description": "Anima + 迭代放大管线工作流",
+    "type": "string",
+    "default": "workflow/anima_iterative_api.json"
+  },
+  "inpaint_crop_workflow_file": {
+    "description": "Quick Inpaint Crop 重绘工作流",
+    "type": "string",
+    "default": "workflow/anima_inpaint_crop_api.json"
+  },
+  "lanpaint_workflow_file": {
+    "description": "LanPaint 精细重绘工作流",
+    "type": "string",
+    "default": "workflow/anima_lanpaint_api.json"
+  },
+  "control_workflow_file": {
+    "description": "底图控制工作流",
+    "type": "string",
+    "default": "workflow/anima_control_api.json"
+  },
+  "img2img_workflow_file": {
+    "description": "Anima img2img 工作流",
+    "type": "string",
+    "default": "workflow/anima_img2img_api.json"
+  },
+  "default_generation_pipeline": {
+    "description": "默认 Anima 生成管线",
+    "type": "string",
+    "options": [
+      "base",
+      "rtx",
+      "iterative"
+    ],
+    "hint": "base 仅原图；rtx 默认执行 RTX 放大；iterative 使用迭代采样放大",
+    "default": "rtx"
+  },
+  "model_profile_id": {
+    "description": "当前模型 Profile ID",
+    "type": "string",
+    "default": "anima_legacy"
+  },
+  "model_family": {
+    "description": "当前模型族",
+    "type": "string",
+    "default": "anima_legacy_28l"
+  },
+  "clip_model_name": {
+    "description": "当前 Anima CLIP 模型",
+    "type": "string",
+    "default": "qwen_3_06b_base.safetensors"
+  },
+  "vae_model_name": {
+    "description": "当前 Anima VAE 模型",
+    "type": "string",
+    "default": "qwen_image_vae.safetensors"
+  },
+  "lora_patch_required": {
+    "description": "当前模型是否要求旧版 LoRA 兼容补丁",
+    "type": "bool",
+    "default": false
+  },
+  "lora_patch_node_type": {
+    "description": "LoRA 兼容补丁节点类型",
+    "type": "string",
+    "default": ""
+  },
+  "lora_patch_contract_id": {
+    "description": "LoRA 兼容补丁合约标识",
+    "type": "string",
+    "default": ""
+  },
+  "iterative_scale": {
+    "description": "迭代放大目标倍率",
+    "type": "float",
+    "hint": "范围 1.1 到 2.0",
+    "default": 1.5
+  },
+  "iterative_steps": {
+    "description": "迭代放大轮数",
+    "type": "int",
+    "hint": "范围 1 到 4",
+    "default": 3
+  },
+  "iterative_denoise": {
+    "description": "迭代放大重绘强度",
+    "type": "float",
+    "hint": "范围 0.1 到 0.8；请求中的 --denoise 优先",
+    "default": 0.35
+  },
+  "enable_inpaint": {
+    "description": "启用遮罩局部重绘",
+    "type": "bool",
+    "hint": "支持 /重绘 --mode quick|lanpaint；白色或透明区域重绘",
+    "default": true
+  },
+  "workflow_dir": {
+    "description": "可切换工作流目录",
+    "type": "string",
+    "hint": "/comfy_ls 将扫描此目录内的 API Format JSON",
+    "default": "workflow"
+  },
+  "enable_unet_switch": {
+    "description": "启用 Anima UNET 模型切换",
+    "type": "bool",
+    "hint": "开放 /模型列表 与 /模型切换 管理命令；Anima 使用 UNETLoader，不是 checkpoint loader",
+    "default": true
+  },
+  "unet_catalog_url": {
+    "description": "局域网 UNET 模型清单地址",
+    "type": "string",
+    "hint": "留空实时读取 comfyui_url/object_info/UNETLoader；每次切换前都会重新请求最新完整清单",
+    "default": ""
+  },
+  "unet_catalog_timeout": {
+    "description": "UNET 模型清单超时（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "unet_lan_only": {
+    "description": "UNET 清单仅允许局域网 IP",
+    "type": "bool",
+    "hint": "开启时拒绝公网地址、域名、URL 凭据及重定向",
+    "default": true
+  },
+  "unet_loader_node_id": {
+    "description": "旧工作流 UNETLoader 节点 ID",
+    "type": "string",
+    "hint": "仅供没有 UNET 档案绑定的旧工作流回退；Anima V2 会自动使用档案声明的节点 44",
+    "default": "429"
+  },
+  "unet_model_input_name": {
+    "description": "UNET 模型输入字段",
+    "type": "string",
+    "hint": "标准 UNETLoader 使用 unet_name",
+    "default": "unet_name"
+  },
+  "unet_model_name": {
+    "description": "当前 Anima UNET 模型",
+    "type": "string",
+    "hint": "由 /模型切换 自动保存；留空时使用当前工作流档案声明的 UNET 节点内置模型",
+    "default": ""
+  },
+  "unet_model_root": {
+    "description": "UNET 模型目录分支",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/unet 的安全目录；2.9B 建议填写 2.9Bunet",
+    "default": ""
+  },
+  "clip_model_root": {
+    "description": "CLIP 模型目录分支",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/text_encoders 的安全目录；2.9B 建议填写 2.9Bclip",
+    "default": ""
+  },
+  "vae_model_root": {
+    "description": "VAE 模型目录分支",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/vae 的安全目录；2.9B 建议填写 2.9Bvae",
+    "default": ""
+  },
+  "enable_natural_draw": {
+    "description": "启用自然语言绘图（已废弃，见 natural_draw_mode）",
+    "type": "bool",
+    "deprecated": true,
+    "readonly": true,
+    "invisible": true,
+    "default": true
+  },
+  "director_primary": {
+    "description": "Director Primary（已废弃）",
+    "type": "bool",
+    "deprecated": true,
+    "readonly": true,
+    "invisible": true,
+    "default": false
+  },
+  "enable_llm_pic_trigger": {
+    "description": "启动 LLM 回复中的 pic 标签触发（已废弃，见 natural_draw_mode）",
+    "type": "bool",
+    "deprecated": true,
+    "readonly": true,
+    "invisible": true,
+    "default": true
+  },
+  "enable_chat_draw_terminal_guard": {
+    "description": "普通聊天绘图终止协议守卫（兼容字段）",
+    "type": "bool",
+    "hint": "兼容旧配置使用；只要启用 <pic> 解析就始终强制开启，不能单独关闭。普通聊天回复会先完整缓冲并验证最终协议，失败则停止且不会提交 ComfyUI。",
+    "default": true
+  },
+  "enable_reverse_prompt": {
+    "description": "启用图片反推",
+    "type": "bool",
+    "hint": "开放 /反推 与 /反推画图；实际后端由 reverse_backend 决定",
+    "default": true
+  },
+  "enable_workflow_reverse": {
+    "description": "启用本地工作流反推",
+    "type": "bool",
+    "hint": "workflow 后端需要 wd_tagger_mira、可用 ONNX、配套 selected_tags CSV 与文本输出节点；依赖缺失时明确报错，不静默调用视觉模型",
+    "default": true
+  },
+  "reverse_backend": {
+    "description": "图片反推后端",
+    "type": "string",
+    "options": [
+      "vision",
+      "workflow",
+      "hybrid"
+    ],
+    "hint": "vision 保留原多模态模型；workflow 只运行本地 Mira WD Tagger；hybrid 仅在显式选择时允许兼容回退",
+    "default": "workflow"
+  },
+  "reverse_workflow_file": {
+    "description": "本地反推 API 工作流",
+    "type": "string",
+    "hint": "必须是经过审核的 LoadImage -> wd_tagger_mira -> 文本输出最小工作流",
+    "default": "workflow/anima_reverse_tagger_api.json"
+  },
+  "reverse_workflow_timeout": {
+    "description": "本地反推工作流超时（秒）",
+    "type": "int",
+    "hint": "范围 10 到 300",
+    "default": 120
+  },
+  "reverse_tagger_model": {
+    "description": "Mira WD Tagger ONNX 模型",
+    "type": "string",
+    "hint": "相对于 ComfyUI models/onnx 的安全路径；对应 Tag Mapping 文件也必须存在",
+    "default": "wd-convnext-tagger-v3.onnx"
+  },
+  "reverse_general_threshold": {
+    "description": "WD Tagger General 阈值",
+    "type": "float",
+    "hint": "范围 0 到 1",
+    "default": 0.55
+  },
+  "reverse_character_threshold": {
+    "description": "WD Tagger Character 阈值",
+    "type": "float",
+    "hint": "范围 0 到 1",
+    "default": 0.6
+  },
+  "reverse_categories": {
+    "description": "WD Tagger 输出分类",
+    "type": "list",
+    "hint": "允许 rating、artist、general、character、copyright、meta、model、quality；默认只启用 Copyright、Character、General",
+    "default": [
+      "copyright",
+      "character",
+      "general"
+    ]
+  },
+  "reverse_session_method": {
+    "description": "WD Tagger 推理会话",
+    "type": "string",
+    "options": [
+      "CPU",
+      "GPU",
+      "GPU Release"
+    ],
+    "hint": "A佬原工作流使用 CPU；只有 ComfyUI 节点明确支持时才切换 GPU 模式",
+    "default": "CPU"
+  },
+  "enable_control_stack_v2": {
+    "description": "启用 Anima Control Stack v2",
+    "type": "bool",
+    "hint": "支持最多两张去重底图和 Pose、Depth、Lineart、Reference 四个独立通道；关闭后保留旧单图兼容行为",
+    "default": true
+  },
+  "control_default_fidelity": {
+    "description": "控制网默认保真强度",
+    "type": "string",
+    "options": [
+      "strict",
+      "balanced",
+      "loose"
+    ],
+    "hint": "strict 强约束，balanced 平衡，loose 弱约束",
+    "default": "balanced"
+  },
+  "control_default_resize_policy": {
+    "description": "控制图默认缩放策略",
+    "type": "string",
+    "options": [
+      "fit",
+      "crop",
+      "stretch"
+    ],
+    "hint": "每个通道在工作流计划中独立保存；当前设置作为未显式指定时的默认值",
+    "default": "fit"
+  },
+  "control_default_reference_scope": {
+    "description": "Reference 默认软约束范围",
+    "type": "string",
+    "options": [
+      "appearance",
+      "style",
+      "color"
+    ],
+    "hint": "Reference 只影响外观、画风或配色，不保证角色身份锁定",
+    "default": "appearance"
+  },
+  "enable_reverse_json_formatter": {
+    "description": "启用反推 JSON 格式整理器",
+    "type": "bool",
+    "hint": "推荐开启。本地兼容代码围栏、JSON 前后说明、尾逗号和单引号字典；关闭后只接受一个完整的严格 JSON 对象。安全隔离与字段校验不会关闭",
+    "default": true
+  },
+  "enable_reverse_json_repair_retry": {
+    "description": "反推 JSON 失败时重做一次",
+    "type": "bool",
+    "hint": "首次结果经严格校验及可选格式整理后仍不可用时，让同一多模态 Provider 重新查看原图并生成一次严格 JSON",
+    "default": true
+  },
+  "reverse_prompt_provider_id": {
+    "description": "在线反推多模态 Provider",
+    "type": "string",
+    "hint": "留空时依次使用绘图导演 Provider 和当前会话 Provider；所选模型必须支持图片输入",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "reverse_prompt_timeout": {
+    "description": "在线反推超时（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "reverse_prompt_temperature": {
+    "description": "在线反推温度",
+    "type": "float",
+    "default": 0.1
+  },
+  "reverse_prompt_max_tokens": {
+    "description": "在线反推最大输出 Tokens",
+    "type": "int",
+    "default": 1600
+  },
+  "reverse_prompt_system_prompt": {
+    "description": "在线反推 System Prompt",
+    "type": "text",
+    "hint": "留空使用插件内置规则；自定义内容只作为分析偏好叠加，不能覆盖强制 JSON 协议",
+    "default": ""
+  },
+  "max_input_image_size_mb": {
+    "description": "反推/放大输入图片上限（MB）",
+    "type": "int",
+    "default": 20
+  },
+  "max_input_image_pixels": {
+    "description": "反推/放大最大像素总量",
+    "type": "int",
+    "default": 40000000
+  },
+  "enable_prompt_llm": {
+    "description": "默认启用 LLM 分镜优化",
+    "type": "bool",
+    "hint": "用于自然语言绘图及 /anima draw；/画图 和 /画图no 默认直通 Tags，--llm/--l 使用 Standard，--llm u/--l u 使用 Ultra。显式文字换角仅由 /画图(no) 的 --llm c、--llmcc、--lcc 触发，不会从普通聊天自动推断",
+    "default": true
+  },
+  "prompt_llm_provider_id": {
+    "description": "绘图思考模型",
+    "type": "string",
+    "hint": "选择专门负责把自然语言转换为英文绘图提示词的模型；留空时使用当前会话模型",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "auto_draw_system_prompt": {
+    "description": "绘图 System Prompt（deprecated，仅作回滚源）",
+    "type": "text",
+    "hint": "307 起不再复制或使用此字段；旧内容只读保留供回滚。新的主 LLM 台词气质与 Director 创作偏好分别由下面两个字段控制，协议与工具规则由插件代码维护。",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "_deprecated": true
+  },
+  "chat_roleplay_draw_prompt": {
+    "description": "主 LLM 聊天出图提示词",
+    "type": "text",
+    "hint": "只负责何时主动出图与角色台词气质；不得包含 <pic>、JSON、工具调用步骤等协议内容（协议由插件代码统一注入）",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
+  "director_creative_preference": {
+    "description": "绘图导演创作偏好",
+    "type": "text",
+    "hint": "只负责画风、标签写法与镜头偏好；不得包含 <pic>、JSON、工具调用步骤等协议内容（协议由插件代码统一注入）",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
+  "director_extra_instruction": {
+    "description": "分镜模型附加要求",
+    "type": "text",
+    "hint": "附加在内置参考提示词后，例如固定画风或角色连续性要求；不能覆盖显式文字换角的旧身份清理、LoRA 可选降级和原创角色边界",
+    "default": ""
+  },
+  "prompt_llm_timeout": {
+    "description": "分镜模型超时（秒）",
+    "type": "int",
+    "hint": "基础 LLM 等待预算；启用 LoRA 工具时，插件会自动额外预留每一步 Manager 扫描和清单读取时间",
+    "default": 120
+  },
+  "character_swap_timeout": {
+    "description": "换角 Tags 分类超时（秒）",
+    "type": "int",
+    "hint": "整个换角 Tags 分类阶段的总预算，独立于图片反推超时；范围 30 到 600 秒，首次超时只会在剩余预算内重试一次",
+    "default": 240
+  },
+  "prompt_llm_temperature": {
+    "description": "分镜模型 Temperature",
+    "type": "float",
+    "default": 0.3
+  },
+  "prompt_llm_max_tokens": {
+    "description": "分镜模型最大输出 Tokens",
+    "type": "int",
+    "default": 1000
+  },
+  "prompt_llm_fallback": {
+    "description": "分镜模型失败时使用原始提示词",
+    "type": "bool",
+    "default": true
+  },
+  "show_llm_prompt": {
+    "description": "出图后显示最终 LLM 提示词",
+    "type": "bool",
+    "default": false
+  },
+  "max_auto_images_per_reply": {
+    "description": "单条 LLM 回复最多触发图片数",
+    "type": "int",
+    "default": 1
+  },
+  "conversation_draw_cooldown_seconds": {
+    "description": "会话出图冷却秒数",
+    "type": "float",
+    "default": 8.0
+  },
+  "follow_up_draw_priority": {
+    "description": "follow-up 出图优先级",
+    "type": "string",
+    "default": "after_delivery"
+  },
+  "intent_router_probe_plan": {
+    "description": "意图路由使用 probe plan",
+    "type": "bool",
+    "default": true
+  },
+  "show_command_progress": {
+    "description": "显示命令进度提示",
+    "type": "bool",
+    "default": true
+  },
+  "director_reference_file": {
+    "description": "内置分镜参考文件",
+    "type": "string",
+    "default": "prompts/director_creative_default.txt"
+  },
+  "enable_lora_tool": {
+    "description": "启用 Anima LoRA 查询工具",
+    "type": "bool",
+    "hint": "允许 LLM 按需查询局域网公开的 LoRA 清单，并将选中的 LoRA 注入工作流",
+    "default": true
+  },
+  "lora_catalog_url": {
+    "description": "局域网 LoRA 清单地址",
+    "type": "string",
+    "hint": "作为 ComfyUI 实际可加载文件的回退清单；留空时读取 comfyui_url/object_info",
+    "default": ""
+  },
+  "enable_lora_manager": {
+    "description": "接入 ComfyUI LoRA Manager",
+    "type": "bool",
+    "hint": "读取模型展示名、触发词、基础模型、标签、说明、预览和文件元数据，并与 object_info 合并",
+    "default": true
+  },
+  "lora_manager_url": {
+    "description": "LoRA Manager 地址",
+    "type": "string",
+    "hint": "留空自动使用 comfyui_url/api/lm/loras；也可填写 http://IP:8188/loras 或完整 API 地址",
+    "default": ""
+  },
+  "lora_model_root": {
+    "description": "LoRA 模型目录分支",
+    "type": "string",
+    "hint": "2.9B 建议填写 2.9BLora；Legacy 留空或使用原 lora 根目录",
+    "default": ""
+  },
+  "lora_manager_scan_on_refresh": {
+    "description": "刷新时让 LoRA Manager 重新扫描",
+    "type": "bool",
+    "hint": "兼容旧配置；当前版本的所有 LoRA 操作都会强制扫描，不受此开关影响",
+    "default": true
+  },
+  "lora_manager_scan_interval": {
+    "description": "LoRA Manager 最短扫描间隔（秒）",
+    "type": "int",
+    "hint": "仅供非强制内部刷新使用；所有用户 LoRA 操作会绕过此间隔读取最新数据",
+    "default": 60
+  },
+  "lora_manager_scan_timeout": {
+    "description": "LoRA Manager 扫描超时（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "lora_manager_page_size": {
+    "description": "LoRA Manager 每页读取数量",
+    "type": "int",
+    "default": 100
+  },
+  "enable_lora_download": {
+    "description": "启用 /lora下载 管理指令",
+    "type": "bool",
+    "hint": "仅管理员可用；通过 ComfyUI-Lora-Manager 从受信任的 Civitai 模型页下载 LoRA",
+    "default": true
+  },
+  "lora_download_timeout": {
+    "description": "单次 LoRA 下载超时（秒）",
+    "type": "int",
+    "hint": "下载接口会等待整个文件完成；大模型或慢速网络可适当提高",
+    "default": 3600
+  },
+  "lora_metadata_timeout": {
+    "description": "Civitai 元数据获取超时（秒）",
+    "type": "int",
+    "hint": "文件下载完成后，单独执行“从 Civitai 获取元数据”的等待时间",
+    "default": 300
+  },
+  "lora_download_max_concurrent": {
+    "description": "LoRA 同时下载数量",
+    "type": "int",
+    "hint": "建议保持 1，避免多个大文件同时占用 ComfyUI 网络和磁盘",
+    "default": 1
+  },
+  "lora_download_allowed_hosts": {
+    "description": "Civitai 下载网址域名白名单",
+    "type": "list",
+    "hint": "精确匹配域名，不支持通配符；默认仅允许 Civitai 官方站点",
+    "default": [
+      "civitai.com",
+      "www.civitai.com",
+      "civitai.red",
+      "www.civitai.red"
+    ]
+  },
+  "lora_lan_only": {
+    "description": "仅允许私有局域网 IP",
+    "type": "bool",
+    "hint": "开启时拒绝公网地址、域名、URL 凭据及重定向；建议保持开启",
+    "default": true
+  },
+  "lora_catalog_timeout": {
+    "description": "LoRA 清单请求超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "lora_cache_ttl": {
+    "description": "LoRA 清单缓存时间（秒）",
+    "type": "int",
+    "hint": "只在一次已完成强制刷新的操作内部复用；不会跨 LoRA 操作跳过 Manager 扫描",
+    "default": 300
+  },
+  "lora_max_results": {
+    "description": "LoRA 工具单次最多返回条目",
+    "type": "int",
+    "default": 50
+  },
+  "enable_lora_visual_gallery": {
+    "description": "启用 LoRA 视觉图库",
+    "type": "bool",
+    "hint": "从最新 LoRA 清单生成指纹化视觉清单；浏览清单不会取代生成前的 LoRA Manager 强制刷新",
+    "default": true
+  },
+  "lora_visual_roots": {
+    "description": "LoRA 视觉图库本地根目录",
+    "type": "list",
+    "hint": "可选本地白名单：只读与 LoRA 精确同名的 companion 图。容器无挂载时可改用当前 LoRA Manager 同源固定预览端点；前端不能提交 URL 或路径",
+    "default": []
+  },
+  "lora_visual_cache_mb": {
+    "description": "LoRA 缩略图缓存上限（MB）",
+    "type": "int",
+    "hint": "范围 0 到 8192 MB；0 禁用持久缩略图缓存，建议保持默认 256 MB 或更低",
+    "default": 256
+  },
+  "lora_visual_warmup_workers": {
+    "description": "LoRA 缩略图预热工作线程",
+    "type": "int",
+    "hint": "范围 1 到 4；过高会增加磁盘与图像解码压力",
+    "default": 2
+  },
+  "lora_visual_preview_max_mb": {
+    "description": "LoRA companion 预览图大小上限（MB）",
+    "type": "int",
+    "hint": "范围 1 到 32 MB；超限或解码失败的本地图片不会进入缓存",
+    "default": 4
+  },
+  "lora_visual_thumbnail_size": {
+    "description": "LoRA 缩略图最长边像素",
+    "type": "int",
+    "hint": "范围 128 到 1024 像素",
+    "default": 512
+  },
+  "lora_alias_rules": {
+    "description": "LoRA 自定义别名规则",
+    "type": "list",
+    "hint": "每行格式：精确LoRA文件名=别名1,别名2，例如 black deniav1-2=达妮娅,denia,鸣潮达妮娅；自动 Civitai 别名之外用于人工补充",
+    "default": []
+  },
+  "enable_lora_hybrid_search": {
+    "description": "启用 LoRA / Danbooru 角色 Embedding + Rerank 混合检索",
+    "type": "bool",
+    "hint": "LoRA 检索用 Embedding 召回与 Rerank 精排；Danbooru 角色检索只对本地 exact/prefix/keyword 得到的有限候选排序，模型分数永远不能直接授权角色身份。异常自动回退确定性检索",
+    "default": false
+  },
+  "lora_embedding_provider_id": {
+    "description": "语义检索 Embedding Provider ID",
+    "type": "string",
+    "hint": "供 LoRA 召回和 Danbooru 角色候选排序共用；选择 AstrBot 已保存的 Embedding Provider，留空则跳过向量召回",
+    "default": ""
+  },
+  "lora_rerank_provider_id": {
+    "description": "语义检索 Rerank Provider ID",
+    "type": "string",
+    "hint": "供 LoRA 与 Danbooru 角色候选排序共用；选择 AstrBot 已保存的 Rerank Provider，留空则跳过精排",
+    "default": ""
+  },
+  "lora_embedding_top_k": {
+    "description": "Embedding 候选数量",
+    "type": "int",
+    "hint": "范围 4-100；只从本次刷新后仍可加载的 LoRA 中召回",
+    "default": 20
+  },
+  "lora_rerank_top_n": {
+    "description": "Rerank 精排数量",
+    "type": "int",
+    "hint": "范围 1-50；LoRA 精确文件名、Danbooru canonical 和唯一别名始终优先，Rerank 不会覆盖 exact 结果",
+    "default": 8
+  },
+  "lora_retrieval_timeout": {
+    "description": "LoRA 混合搜索超时（秒）",
+    "type": "int",
+    "hint": "范围 3-120；超时自动回退现有词法搜索，不阻止绘图",
+    "default": 30
+  },
+  "lora_tool_max_steps": {
+    "description": "分镜 Agent 最大工具步骤",
+    "type": "int",
+    "default": 4
+  },
+  "enable_task_lora_snapshot": {
+    "description": "任务内复用 LoRA 规划快照",
+    "type": "bool",
+    "hint": "同一任务的多次 LoRA 工具查询只强制刷新一次；提交前仍会再次强刷并校验已选文件",
+    "default": true
+  },
+  "lora_snapshot_max_age": {
+    "description": "LoRA 规划快照最长复用时间（秒）",
+    "type": "int",
+    "default": 300
+  },
+  "enable_layered_lora_retrieval": {
+    "description": "启用 LoRA 分层检索",
+    "type": "bool",
+    "hint": "优先精确路径、文件名和唯一可信别名；只有歧义时才调用 Embedding 与 Rerank",
+    "default": true
+  },
+  "lora_loader_node_id": {
+    "description": "动态 LoRA 注入节点 ID",
+    "type": "string",
+    "hint": "此 Anima 工作流的 LoraManager 节点为 462",
+    "default": "462"
+  },
+  "dynamic_lora_mode": {
+    "description": "动态 LoRA 注入方式",
+    "type": "string",
+    "options": [
+      "append",
+      "replace"
+    ],
+    "hint": "未使用风格预设时的默认策略；画师/风格预设始终自动 replace，随后再追加角色 LoRA",
+    "default": "append"
+  },
+  "max_dynamic_loras": {
+    "description": "LLM 自行挑选 LoRA 建议上限",
+    "type": "int",
+    "hint": "完整风格预设不受此建议值截断，最终仍受动态 LoRA 总上限约束",
+    "default": 3
+  },
+  "max_preset_loras": {
+    "description": "单个 LoRA 组合最多 LoRA 数量",
+    "type": "int",
+    "hint": "后台组合编辑与 /lora组合保存 都受此限制；还不能超过下方的单次任务动态 LoRA 总上限",
+    "default": 12
+  },
+  "max_total_dynamic_loras": {
+    "description": "单次任务动态 LoRA 总上限",
+    "type": "int",
+    "hint": "组合预设、提示词内 LoRA 和其他动态选择合计不能超过此数量",
+    "default": 12
+  },
+  "default_style_preset": {
+    "description": "默认风格栈名称",
+    "type": "string",
+    "hint": "未指定风格时自动使用此画师/风格组合；留空则保留工作流节点 462 的原始 LoRA",
+    "default": "风格001"
+  },
+  "auto_reload_after_style_save": {
+    "description": "保存风格后自动重载插件",
+    "type": "bool",
+    "hint": "管理员通过 /保存风格 或 /lora组合保存 保存画师/风格组合后，延迟约 2 秒只重载本插件；默认关闭，保存后下次查询/绘图直接使用最新数据",
+    "default": false
+  },
+  "lora_presets": {
+    "description": "可复用 LoRA 串组合",
+    "type": "template_list",
+    "hint": "画师/风格组合会作为完整底座替换节点 462 原风格栈，角色 LoRA 会在其后独立追加",
+    "templates": {
+      "character_combo": {
+        "name": "角色 LoRA 组合",
+        "hint": "用于固定角色身份、服装或角色变体",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "组合名称",
+            "type": "string",
+            "hint": "填写数字会规范为角色N并保留前导零，也可以使用自定义名称",
+            "default": ""
+          },
+          "aliases": {
+            "description": "组合简称 / 别名",
+            "type": "list",
+            "hint": "每行一个。用于“风格1011”这类稳定简称；重复或歧义简称会拒绝自动命中",
+            "default": []
+          },
+          "note": {
+            "description": "管理备注",
+            "type": "text",
+            "hint": "只用于管理、搜索和说明，不会直接写入生成提示词",
+            "default": ""
+          },
+          "loras": {
+            "description": "LoRA 串",
+            "type": "list",
+            "hint": "每行一个：精确名称=权重，例如 Denia_Wuwa=0.85",
+            "default": []
+          },
+          "trigger_words": {
+            "description": "角色触发词",
+            "type": "text",
+            "hint": "手动补充项；生成前仍会强刷 LoRA Manager，并按角色规则合并最新身份触发词",
+            "default": ""
+          },
+          "description": {
+            "description": "用途说明",
+            "type": "text",
+            "default": ""
+          },
+          "enabled": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          }
+        }
+      },
+      "artist_style_combo": {
+        "name": "画师/风格 LoRA 组合",
+        "hint": "用于画师风格、材质、光影或统一画风",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "组合名称",
+            "type": "string",
+            "hint": "填写 001 会规范为风格001并保留前导零，也可以直接填写自定义名称",
+            "default": ""
+          },
+          "aliases": {
+            "description": "组合简称 / 别名",
+            "type": "list",
+            "hint": "例如显示名称为“风格1011 kei”时，可填写“风格1011”；安全数字前缀也会自动派生",
+            "default": []
+          },
+          "note": {
+            "description": "管理备注",
+            "type": "text",
+            "hint": "可记录画师、用途或版本，不会直接写入生成提示词",
+            "default": ""
+          },
+          "loras": {
+            "description": "LoRA 串",
+            "type": "list",
+            "hint": "每行一个：精确名称=权重，例如 748cm_TA_EP4=0.8",
+            "default": []
+          },
+          "trigger_words": {
+            "description": "画师/风格触发词",
+            "type": "text",
+            "hint": "手动补充项，例如 @748cm_style；生成前仍会强刷 Manager 并合并最新风格触发词",
+            "default": ""
+          },
+          "description": {
+            "description": "风格说明",
+            "type": "text",
+            "default": ""
+          },
+          "enabled": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          }
+        }
+      },
+      "mixed_combo": {
+        "name": "混合 LoRA 组合",
+        "hint": "角色 LoRA 与画师/风格 LoRA 的成套组合",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "组合名称",
+            "type": "string",
+            "hint": "填写数字会规范为组合N并保留前导零，也可以使用自定义名称",
+            "default": ""
+          },
+          "aliases": {
+            "description": "组合简称 / 别名",
+            "type": "list",
+            "hint": "每行一个；仅唯一命中时才会自动选择",
+            "default": []
+          },
+          "note": {
+            "description": "管理备注",
+            "type": "text",
+            "hint": "只用于管理和检索，不会直接写入生成提示词",
+            "default": ""
+          },
+          "loras": {
+            "description": "LoRA 串",
+            "type": "list",
+            "hint": "每行一个：精确名称=权重",
+            "default": []
+          },
+          "trigger_words": {
+            "description": "组合触发词",
+            "type": "text",
+            "hint": "手动补充项；生成前仍会按最新 Manager 元数据和每个 LoRA 的实际分类合并触发词",
+            "default": ""
+          },
+          "description": {
+            "description": "组合说明",
+            "type": "text",
+            "default": ""
+          },
+          "enabled": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    },
+    "default": [
+      {
+        "__template_key": "artist_style_combo",
+        "name": "风格001",
+        "loras": [
+          "(画质)anima-highres-aesthetic-boost=0.5",
+          "(美感细节)anima-rl-v0.1=0.4",
+          "anima-base-1-masterpiece-v51=0.5",
+          "748cm_v2_anima=0.3",
+          "hanaru_epoch24=0.31",
+          "nekoya_v1_epoch21=0.3",
+          "real skin.baka.v1-000010=0.65",
+          "(写真背景)anima3-photo-background-v3=0.3"
+        ],
+        "trigger_words": "",
+        "description": "默认画质、美感、画师、皮肤与写真背景风格栈",
+        "enabled": true
+      }
+    ]
+  },
+  "strict_lora_validation": {
+    "description": "严格校验 LLM 选择的 LoRA",
+    "type": "bool",
+    "hint": "开启后只允许注入局域网清单中实际存在的名称",
+    "default": true
+  },
+  "enable_upscale": {
+    "description": "默认启用工作流二次放大",
+    "type": "bool",
+    "hint": "关闭后只执行首轮出图，可用 --upscale 为单次任务重新开启",
+    "default": true
+  },
+  "enable_ttp_detail": {
+    "description": "TTP 瓦片细节增强",
+    "type": "bool",
+    "hint": "仅在放大链路生效：RTX 预放大后 2×2 切块、逐块 WD14 反推并以低降噪重绘细节，再拼合（耗时约为纯 RTX 的 3-5 倍）；需要工作流模板声明 ttp 变体",
+    "default": false
+  },
+  "global_extra_positive_tags": {
+    "description": "全局附加正向词",
+    "type": "list",
+    "hint": "追加进每一次出图的最终正向提示词末尾（进清单审计），如固定画风词；每行一条",
+    "default": []
+  },
+  "global_extra_negative_tags": {
+    "description": "全局附加负面词",
+    "type": "list",
+    "hint": "追加进每一次出图的最终负面提示词（进清单审计），如永远不想出现的元素；每行一条",
+    "default": []
+  },
+  "rtx_scale": {
+    "description": "RTX 默认放大倍率",
+    "type": "float",
+    "hint": "支持 1.0 到 4.0，默认 2 倍；TTP 链路中该值同时是切块前的预放大倍率",
+    "default": 2.0
+  },
+  "rtx_quality": {
+    "description": "RTX 默认画质",
+    "type": "string",
+    "options": [
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "ULTRA"
+    ],
+    "default": "ULTRA"
+  },
+  "max_concurrent_jobs": {
+    "description": "插件最大并发生成数",
+    "type": "int",
+    "hint": "显存有限时建议保持 1",
+    "default": 1
+  },
+  "max_queued_jobs_per_user": {
+    "description": "每位用户最多等待的图片任务数",
+    "type": "int",
+    "hint": "已有任务时自动进入个人 FIFO 队列；0 表示关闭排队并恢复直接拒绝",
+    "default": 3
+  },
+  "provider_max_concurrent_jobs": {
+    "description": "LLM/反推模型最大并发准备数",
+    "type": "int",
+    "hint": "只限制反推、分镜与分类模型；不会占用 ComfyUI 生成并发槽",
+    "default": 4
+  },
+  "enable_parallel_preflight": {
+    "description": "并行执行安全的出图准备步骤",
+    "type": "bool",
+    "hint": "并行预取 GPU 信息，并在底图控制中并行上传图片与反推",
+    "default": true
+  },
+  "enable_local_intent_router": {
+    "description": "启用本地优先绘图意图解析",
+    "type": "bool",
+    "hint": "普通绘图不再无条件进入 LoRA 工具循环；明确角色、未知风格或 LoRA 请求才查询资产",
+    "default": true
+  },
+  "intent_router_model": {
+    "description": "独立普通聊天意图判断模型",
+    "type": "string",
+    "hint": "必须与绘图导演模型和图片反推模型分开配置；为空时不启用语义路由",
+    "default": ""
+  },
+  "intent_router_timeout": {
+    "description": "意图判断模型超时（秒）",
+    "type": "int",
+    "hint": "仅用于资产工具完成后的单次轻量判断",
+    "min": 3,
+    "max": 120,
+    "default": 20
+  },
+  "intent_router_temperature": {
+    "description": "意图判断模型温度",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "default": 0
+  },
+  "intent_router_min_confidence": {
+    "description": "意图判断最低置信度",
+    "type": "float",
+    "hint": "低于该置信度时改为询问用户，不直接提交 ComfyUI",
+    "min": 0,
+    "max": 1,
+    "default": 0.7
+  },
+  "intent_judge_backend": {
+    "description": "普通聊天意图判断后端模式",
+    "type": "string",
+    "hint": "off/rule/local/online/auto/both；off 只允许显式命令。用户消息带明确绘图指令（画出来/画一张等，无否定/推迟）时直接放行，本地向量判断不会否决。",
+    "default": "auto"
+  },
+  "intent_judge_embedding_provider_id": {
+    "description": "意图判断 Embedding Provider",
+    "type": "string",
+    "hint": "从 AstrBot Provider 列表选择，禁止手写",
+    "default": ""
+  },
+  "intent_judge_rerank_provider_id": {
+    "description": "意图判断 Rerank Provider",
+    "type": "string",
+    "hint": "从 AstrBot Provider 列表选择，禁止手写",
+    "default": ""
+  },
+  "intent_judge_online_provider_id": {
+    "description": "意图判断在线 LLM Provider",
+    "type": "string",
+    "hint": "从 AstrBot Provider 列表选择；可任意选用，含与导演/反推相同模型",
+    "default": ""
+  },
+  "intent_judge_positive_anchors": {
+    "description": "意图判断正向锚点（每行一条）",
+    "type": "list",
+    "hint": "Bot 即将生成并发送图片的语义锚点",
+    "default": []
+  },
+  "intent_judge_negative_anchors": {
+    "description": "意图判断负向锚点（每行一条）",
+    "type": "list",
+    "hint": "Bot 不画、以后画或普通聊天的语义锚点",
+    "default": []
+  },
+  "intent_judge_local_embedding_threshold": {
+    "description": "本地意图判断 Embedding 差值阈值",
+    "type": "float",
+    "min": -1,
+    "max": 1,
+    "default": 0.1
+  },
+  "intent_judge_local_rerank_threshold": {
+    "description": "本地意图判断 Rerank 差值阈值",
+    "type": "float",
+    "min": -1,
+    "max": 1,
+    "default": 0.05
+  },
+  "intent_judge_auto_confidence_floor": {
+    "description": "Auto 模式本地结果直接采用的最低置信度",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "default": 0.7
+  },
+  "intent_judge_online_timeout": {
+    "description": "在线意图判断超时（秒）",
+    "type": "float",
+    "min": 1,
+    "max": 120,
+    "default": 10
+  },
+  "intent_judge_online_temperature": {
+    "description": "在线意图判断温度",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "default": 0
+  },
+  "intent_judge_fallback": {
+    "description": "意图判断失败时的兜底决策",
+    "type": "string",
+    "hint": "no_draw 或 await",
+    "default": "no_draw"
+  },
+  "enable_session_recipe_continuity": {
+    "description": "允许会话续接复用上次绘图配方",
+    "type": "bool",
+    "hint": "关闭后“再拍一张/现在发给我”不会再自动复用上次设置",
+    "default": true
+  },
+  "invalidate_session_recipe_on_update": {
+    "description": "插件更新后自动清空旧会话配方",
+    "type": "bool",
+    "hint": "版本变化时在 initialize 阶段清空，防止旧预设/LoRA 配置被续接",
+    "default": true
+  },
+  "enable_preset_manifest_gate": {
+    "description": "提交前强制校验预设清单",
+    "type": "bool",
+    "hint": "角色预设、LoRA 栈或负面池与预期不一致时停止提交；仅供诊断时临时关闭",
+    "default": true
+  },
+  "interaction_mode": {
+    "description": "普通聊天交互模式",
+    "type": "string",
+    "options": [
+      "smart",
+      "strict"
+    ],
+    "hint": "smart 使用独立意图模型；strict 只接受命令、按钮或一次性确认",
+    "default": "smart"
+  },
+  "structured_director_mode": {
+    "description": "绘图导演结构化输出模式",
+    "type": "string",
+    "options": [
+      "auto",
+      "function_call",
+      "json",
+      "legacy"
+    ],
+    "hint": "auto 优先 Function Calling 并兼容 JSON/<pic>；function_call 为严格模式",
+    "default": "auto"
+  },
+  "enable_prompt_composer_v2": {
+    "description": "启用 Prompt Composer v2",
+    "type": "bool",
+    "hint": "在本地把 LLM 输出整理为 LoRA/硬 Tags、视觉短语和末尾场景关系句；不会增加模型调用",
+    "default": true
+  },
+  "enable_chinese_prompt_translation": {
+    "description": "启用 /画图 中文服饰/场景提示词翻译（已废弃，见 chinese_prompt_translation）",
+    "type": "bool",
+    "deprecated": true,
+    "readonly": true,
+    "invisible": true,
+    "default": true
+  },
+  "adaptive_negative_mode": {
+    "description": "动态负面词策略",
+    "type": "string",
+    "options": [
+      "off",
+      "conservative",
+      "standard"
+    ],
+    "hint": "conservative 仅按多人接触、手持物、全身和极端透视等实际风险补词；standard 额外加入通用质量负面词",
+    "default": "conservative"
+  },
+  "enable_prompt_diagnostics": {
+    "description": "启用提示词诊断",
+    "type": "bool",
+    "hint": "保存有界的内存诊断摘要供 WebUI 查看；插件重载后自动清空",
+    "default": true
+  },
+  "prompt_diagnostics_include_content": {
+    "description": "诊断中显示完整分层内容",
+    "type": "bool",
+    "hint": "关闭时只显示数量、冲突、风险与哈希；不会把完整提示词写入持久日志",
+    "default": false
+  },
+  "prompt_diagnostics_capacity": {
+    "description": "内存提示词诊断保留数量",
+    "type": "int",
+    "hint": "范围 10 到 500；这些记录不会进入发布包或任务 SQLite",
+    "default": 50
+  },
+  "danbooru_validation_mode": {
+    "description": "本地 Danbooru 硬锚点校验模式",
+    "type": "string",
+    "options": [
+      "off",
+      "report",
+      "guarded"
+    ],
+    "hint": "report 只报告；guarded 为未来结构化身份锚点预留，本版普通绘图路径会安全降级为 report。用户原始 Tags 与 LoRA 触发词永不被拦截",
+    "default": "report"
+  },
+  "danbooru_index_url": {
+    "description": "Danbooru 本地索引数据源 URL",
+    "type": "string",
+    "hint": "插件不附带第三方标签库。仅在管理员点击更新时读取此 HTTPS 或私网 HTTP JSON/CSV 地址",
+    "default": ""
+  },
+  "danbooru_index_timeout": {
+    "description": "Danbooru 索引更新超时（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "danbooru_index_max_size_mb": {
+    "description": "Danbooru 索引下载大小上限（MB）",
+    "type": "int",
+    "hint": "范围 1 到 512 MB；大型索引建议使用 CSV，下载和 SQLite 构建使用临时文件并在成功后原子替换",
+    "default": 256
+  },
+  "danbooru_api_base_url": {
+    "description": "Danbooru 官方 API 或兼容镜像根地址",
+    "type": "string",
+    "hint": "默认使用 https://danbooru.donmai.us；也可填写可信局域网 HTTP 镜像。禁止凭据、查询参数、片段与重定向",
+    "default": "https://danbooru.donmai.us"
+  },
+  "danbooru_api_proxy_url": {
+    "description": "Danbooru API HTTP 代理（可选）",
+    "type": "string",
+    "hint": "用于无法直连 Danbooru 的服务器，例如 http://192.168.10.x:7890。不要在 URL 中写入账号或密码",
+    "default": ""
+  },
+  "danbooru_api_mode": {
+    "description": "Danbooru 官方 API 生成模式",
+    "type": "string",
+    "options": [
+      "identity",
+      "full"
+    ],
+    "hint": "identity：角色、作品、画师全量，General/Meta 按帖子阈值；full：五类全部抓取，耗时与磁盘占用明显更高",
+    "default": "identity"
+  },
+  "danbooru_api_general_min_posts": {
+    "description": "Identity 模式 General 最低帖子数",
+    "type": "int",
+    "default": 10
+  },
+  "danbooru_api_meta_min_posts": {
+    "description": "Identity 模式 Meta 最低帖子数",
+    "type": "int",
+    "default": 10
+  },
+  "danbooru_api_page_size": {
+    "description": "Danbooru API 单页记录数",
+    "type": "int",
+    "hint": "范围 1 到 1000；使用 ID 游标和检查点恢复，不使用受限的数字页码",
+    "default": 1000
+  },
+  "danbooru_api_request_interval_ms": {
+    "description": "Danbooru API 请求间隔（毫秒）",
+    "type": "int",
+    "hint": "建议保持 500 到 1000 毫秒且并发为 1；429 会遵循 Retry-After 后有限重试",
+    "default": 750
+  },
+  "danbooru_api_timeout": {
+    "description": "Danbooru API 单次请求超时（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "danbooru_api_max_records": {
+    "description": "Danbooru API 生成最大 canonical 数",
+    "type": "int",
+    "hint": "范围 1000 到 3000000；超过时保留旧索引和断点，不激活不完整快照",
+    "default": 2000000
+  },
+  "danbooru_api_include_aliases": {
+    "description": "生成时抓取 active Tag Alias",
+    "type": "bool",
+    "hint": "建议开启。歧义别名只返回候选，不会取得 exact 授权",
+    "default": true
+  },
+  "danbooru_auto_update_enabled": {
+    "description": "定期自动生成 Danbooru 本地索引",
+    "type": "bool",
+    "hint": "默认关闭。开启后使用上面的官方 API/兼容镜像设置；到期会在插件启动后补跑，已有任务会复用，失败保留旧库",
+    "default": false
+  },
+  "danbooru_auto_update_interval_hours": {
+    "description": "Danbooru 自动更新周期（小时）",
+    "type": "int",
+    "hint": "范围 24 到 2160 小时，默认每 7 天更新一次；失败后最早 6 小时重试",
+    "default": 168
+  },
+  "enable_prompt_asset_library": {
+    "description": "启用视觉提示词资产库",
+    "type": "bool",
+    "hint": "管理员可导入带来源、版本和导入时间的 JSON/CSV；安装包不捆绑外部提示词数据",
+    "default": true
+  },
+  "prompt_asset_remote_import_enabled": {
+    "description": "允许视觉资产库远程导入",
+    "type": "bool",
+    "hint": "默认关闭。开启后仍只允许解析到公网地址的 HTTPS；禁止私网/回环 HTTP、重定向、URL 凭据和未经验证的地址。局域网素材请直接粘贴 JSON/CSV",
+    "default": false
+  },
+  "prompt_asset_max_download_mb": {
+    "description": "视觉资产库远程导入上限（MB）",
+    "type": "int",
+    "hint": "范围 1 到 16 MB；还会同时限制记录数、字段数、文本长度和列表项数。该值只用于远程 HTTPS 下载",
+    "min": 1,
+    "max": 16,
+    "default": 16
+  },
+  "enable_prompt_lab": {
+    "description": "启用 Prompt Lab 候选实验室",
+    "type": "bool",
+    "hint": "Prompt Lab 只保存有界草稿并支持固定 Seed、锁定分层和重新组合；不会自动提交 ComfyUI",
+    "default": true
+  },
+  "prompt_lab_batch_capacity": {
+    "description": "Prompt Lab 草稿批次保留上限",
+    "type": "int",
+    "hint": "范围 4 到 128；超出容量的旧批次会被清理",
+    "default": 32
+  },
+  "prompt_lab_ttl_seconds": {
+    "description": "Prompt Lab 草稿有效期（秒）",
+    "type": "int",
+    "hint": "范围 60 到 86400 秒；默认 30 分钟，过期候选不能被确认",
+    "default": 1800
+  },
+  "user_cooldown": {
+    "description": "用户冷却时间（秒）",
+    "type": "int",
+    "hint": "从任务被接受时开始计算",
+    "default": 30
+  },
+  "generation_timeout": {
+    "description": "单次生成等待上限（秒）",
+    "type": "int",
+    "hint": "Anima 二次放大耗时较长，默认 20 分钟",
+    "default": 1200
+  },
+  "request_timeout": {
+    "description": "单次 HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "poll_interval": {
+    "description": "历史记录轮询间隔（秒）",
+    "type": "float",
+    "default": 2.0
+  },
+  "max_prompt_length": {
+    "description": "提示词最大字符数",
+    "type": "int",
+    "default": 2000
+  },
+  "max_image_size_mb": {
+    "description": "单张回传图片大小上限（MB）",
+    "type": "int",
+    "default": 50
+  },
+  "send_generation_notice": {
+    "description": "接收任务后发送等待提示",
+    "type": "bool",
+    "default": true
+  },
+  "show_chat_generation_details": {
+    "description": "日常聊天自动绘图显示 Seed、耗时与 GPU 明细",
+    "type": "bool",
+    "hint": "关闭后，普通 Bot 对话调用绘图工具时只保留 Bot 文本和图片；显式绘图命令仍显示完整生成信息",
+    "default": true
+  },
+  "allow_global_interrupt": {
+    "description": "取消任务时允许调用 ComfyUI 全局中断",
+    "type": "bool",
+    "hint": "多人共用 ComfyUI 时建议关闭，避免中断其他来源正在运行的任务",
+    "default": false
+  },
+  "whitelist_only": {
+    "description": "仅允许白名单群使用绘图",
+    "type": "bool",
+    "default": false
+  },
+  "group_whitelist": {
+    "description": "绘图群白名单",
+    "type": "list",
+    "hint": "填写 QQ 群号；私聊不受群白名单限制",
+    "default": []
+  },
+  "global_lock": {
+    "description": "全局锁定",
+    "type": "bool",
+    "hint": "开启后仅 AstrBot 管理员可以绘图",
+    "default": false
+  },
+  "enable_lock_command": {
+    "description": "启用 /comfy_lock 管理指令",
+    "type": "bool",
+    "default": true
+  },
+  "admin_ignore_cooldown": {
+    "description": "管理员无视冷却",
+    "type": "bool",
+    "default": true
+  },
+  "admin_ignore_whitelist": {
+    "description": "管理员无视群白名单",
+    "type": "bool",
+    "default": true
+  },
+  "admin_ignore_blocklist": {
+    "description": "管理员无视违禁词",
+    "type": "bool",
+    "hint": "高风险内容环境不建议开启",
+    "default": false
+  },
+  "default_block_level": {
+    "description": "默认违禁词等级",
+    "type": "string",
+    "options": [
+      "none",
+      "lite",
+      "full"
+    ],
+    "default": "lite"
+  },
+  "group_block_levels": {
+    "description": "群级违禁词策略",
+    "type": "list",
+    "hint": "由 /违禁级别 动态维护；手动格式为 群号=none/lite/full，例如 123456=full",
+    "default": []
+  },
+  "forward_sender_name": {
+    "description": "合并转发节点昵称",
+    "type": "string",
+    "default": "ComfyUI 绘图"
+  },
+  "prompt_node_id": {
+    "description": "旧工作流正面内容节点 ID",
+    "type": "string",
+    "hint": "仅供没有正面提示词档案绑定的 legacy 工作流回退；Anima V2 使用 manifest 节点 11",
+    "default": "210"
+  },
+  "negative_node_id": {
+    "description": "旧工作流负面提示词节点 ID",
+    "type": "string",
+    "hint": "仅供没有负面提示词档案绑定的 legacy 工作流回退；Anima V2 使用 manifest 节点 12",
+    "default": "13"
+  },
+  "workflow_positive_node_overrides": {
+    "description": "各工作流正向提示词节点 ID 覆盖（每行一条：工作流名=节点ID，如 anima_rtx_api=11）",
+    "type": "list",
+    "hint": "留空使用对应 manifest 预设；每个工作流只能有一条",
+    "default": []
+  },
+  "workflow_negative_node_overrides": {
+    "description": "各工作流负向提示词节点 ID 覆盖（每行一条：工作流名=节点ID，如 anima_rtx_api=12）",
+    "type": "list",
+    "hint": "留空使用对应 manifest 预设；每个工作流只能有一条",
+    "default": []
+  },
+  "primary_seed_node_id": {
+    "description": "旧工作流首轮随机种节点 ID",
+    "type": "string",
+    "hint": "仅供没有 seed 档案绑定的 legacy 工作流回退",
+    "default": "8"
+  },
+  "secondary_seed_node_id": {
+    "description": "旧工作流二次采样随机种节点 ID",
+    "type": "string",
+    "hint": "仅供没有 seed 档案绑定的 legacy 工作流回退",
+    "default": "262"
+  },
+  "resolution_node_id": {
+    "description": "旧工作流分辨率节点 ID",
+    "type": "string",
+    "hint": "仅供没有分辨率档案绑定的 legacy 工作流回退；Anima V2 使用 manifest 节点 28",
+    "default": "437"
+  },
+  "default_width": {
+    "description": "默认出图宽度",
+    "type": "int",
+    "hint": "用户没有指定分辨率时写入当前工作流档案声明的分辨率 binding",
+    "default": 832
+  },
+  "default_height": {
+    "description": "默认出图高度",
+    "type": "int",
+    "hint": "用户没有指定分辨率时写入当前工作流档案声明的分辨率 binding",
+    "default": 1216
+  },
+  "sampler_node_ids": {
+    "description": "旧工作流允许覆盖步数与 CFG 的采样节点",
+    "type": "list",
+    "hint": "仅供没有 sampler 档案绑定的 legacy 工作流回退；档案工作流使用 manifest 中的 sampler bindings",
+    "default": [
+      "8"
+    ]
+  },
+  "sampler_steps_override": {
+    "description": "WebUI 采样步数覆盖",
+    "type": "int",
+    "hint": "0 表示读取并使用当前工作流原始步数；1-100 会覆盖档案中全部采样器",
+    "default": 0
+  },
+  "sampler_cfg_override": {
+    "description": "WebUI CFG 覆盖",
+    "type": "float",
+    "hint": "0 表示使用工作流原始 CFG；1-30 会覆盖档案中全部采样器（请求显式指定时优先）",
+    "default": 0.0
+  },
+  "sampler_name_override": {
+    "description": "WebUI 采样器名覆盖",
+    "type": "string",
+    "hint": "留空使用工作流原始采样器；填 euler/euler_ancestral/dpmpp_2m 等覆盖档案中全部采样器",
+    "default": ""
+  },
+  "sampler_scheduler_override": {
+    "description": "WebUI 调度器覆盖",
+    "type": "string",
+    "hint": "留空使用工作流原始调度器；填 simple/normal/karras 等覆盖档案中全部采样器",
+    "default": ""
+  },
+  "output_node_ids": {
+    "description": "旧工作流图片输出节点优先级",
+    "type": "list",
+    "hint": "仅供没有输出档案绑定的 legacy 工作流回退；Anima V2 输出由 manifest 的 base/rtx variants 决定",
+    "default": [
+      "285",
+      "20"
+    ]
+  },
+  "upscale_output_node_id": {
+    "description": "旧工作流二次放大输出节点 ID",
+    "type": "string",
+    "hint": "仅供没有 upscale 输出档案绑定的 legacy 工作流回退",
+    "default": "285"
+  },
+  "draw_pipeline_mode": {
+    "description": "普通聊天绘图管线模式",
+    "type": "string",
+    "options": [
+      "auto",
+      "base",
+      "rtx",
+      "iterative",
+      "legacy"
+    ],
+    "hint": "auto 使用 default_generation_pipeline；legacy 保留旧命令直通路径",
+    "default": "auto"
+  },
+  "intent_router_gate_mode": {
+    "description": "Agent 前置意图路由闸门模式",
+    "type": "string",
+    "options": [
+      "off",
+      "on"
+    ],
+    "hint": "on 强制 Agent 前置意图判断，自然消息必须带 draw_now 结果才能进绘图主链",
+    "default": "on"
+  },
+  "enable_visual_task_intent": {
+    "description": "启用角色预设 + 视觉动作/场景词意图识别",
+    "type": "bool",
+    "hint": "识别“角色预设 + 在厨房做饭的样子”等用户视觉任务消息为 draw_new",
+    "default": true
+  },
+  "enable_user_picture_preferences": {
+    "description": "启用用户图片偏好持久化",
+    "type": "bool",
+    "hint": "保存/使用/取消用户图片偏好；默认关闭，开启后写入 user_picture_preferences_v1.json",
+    "default": false
+  },
+  "user_picture_preferences_ttl": {
+    "description": "用户图片偏好有效期（秒）",
+    "type": "int",
+    "hint": "0 表示不过期；到期后读取视为不存在",
+    "default": 0
+  },
+  "router_timeout_before_agent": {
+    "description": "Agent 前意图路由超时预算（秒）",
+    "type": "float",
+    "min": 0,
+    "max": 120,
+    "hint": "0 表示不单独限制，使用 intent_router_timeout",
+    "default": 0
+  },
+  "natural_draw_mode": {
+    "description": "自然语言出图模式",
+    "type": "string",
+    "options": [
+      {
+        "label": "关闭",
+        "value": "off"
+      },
+      {
+        "label": "仅照片/视觉请求",
+        "value": "photo_only"
+      },
+      {
+        "label": "完整自然出图",
+        "value": "full"
+      }
+    ],
+    "default": "full"
+  },
+  "character_purity_mode": {
+    "description": "角色纯净模式",
+    "type": "string",
+    "options": [
+      {
+        "label": "智能移除",
+        "value": "smart"
+      },
+      {
+        "label": "严格询问",
+        "value": "strict"
+      },
+      {
+        "label": "关闭",
+        "value": "off"
+      }
+    ],
+    "default": "smart"
+  },
+  "scene_extraction": {
+    "description": "场景提取（独立开关）",
+    "type": "bool",
+    "hint": "Scene Bridge 使用会话历史、人格名和记忆来源构建上下文；默认开启",
+    "default": true
+  },
+  "chinese_prompt_translation": {
+    "description": "中文服装/场景词翻译",
+    "type": "bool",
+    "hint": "A2→A1→B 管线；默认开启",
+    "default": true
+  },
+  "config_migration_version": {
+    "description": "配置迁移版本",
+    "type": "int",
+    "min": 2,
+    "max": 2,
+    "default": 2
+  },
+  "config_migrated_utc": {
+    "description": "配置迁移完成 UTC 时间",
+    "type": "string",
+    "default": ""
+  },
+  "enable_scene_extraction": {
+    "description": "启用场景提取（已废弃，见 scene_extraction）",
+    "type": "bool",
+    "deprecated": true,
+    "readonly": true,
+    "invisible": true,
+    "default": true
+  },
+  "scene_extraction_model": {
+    "description": "场景提取模型",
+    "type": "string",
+    "hint": "留空时使用意图路由模型；未配置时回退最近上下文",
+    "default": ""
+  },
+  "scene_context_window": {
+    "description": "场景提取最近消息条数",
+    "type": "int",
+    "min": 1,
+    "max": 32,
+    "default": 8
+  },
+  "scene_extraction_max_memories": {
+    "description": "场景提取最大记忆条数",
+    "type": "int",
+    "min": 0,
+    "max": 20,
+    "default": 5
+  },
+  "enable_time_context": {
+    "description": "生图同步现实时间",
+    "type": "bool",
+    "hint": "开启后按当前时段自动补充 morning/day/sunset/night 光影标签；提示词已写明时间或用户指定时间时不覆盖",
+    "default": true
+  },
+  "enable_bot_reply_draw": {
+    "description": "Bot 回复意图续画（仅管理员会话）",
+    "type": "bool",
+    "hint": "开启后：会话对象为 AstrBot 管理员且会话存在成功出图配方时，对 Bot 回复做意图判定；draw_now 时以配方身份续画并把图片追加进同一条回复（无技术脚注）；无配方不出图",
+    "default": false
+  },
+  "bot_reply_draw_cooldown_seconds": {
+    "description": "Bot 回复续画冷却秒数",
+    "type": "float",
+    "hint": "同一会话两次 Bot 回复续画之间的最小间隔",
+    "default": 30.0
+  },
+  "bot_reply_intent_backend": {
+    "description": "Bot 回复意图判定后端",
+    "type": "string",
+    "hint": "off/rule/local/online/auto/both；独立于用户消息闸门后端 intent_judge_backend",
+    "default": "auto"
+  },
+  "bot_reply_draw_delivery_phrases": {
+    "description": "Bot 交付语词表（每行一条）",
+    "type": "list",
+    "hint": "规则后端识别的 Bot 交付语（如“给你看”）；只作用于 Bot 回复判定，否定/推迟句式仍被拦",
+    "default": ["给你看", "给你瞧瞧", "快看", "拍给你看", "穿给你看", "我给你看"]
+  }
+}

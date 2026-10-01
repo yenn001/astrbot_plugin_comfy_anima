@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "profile_id": "anima_ttp",
+  "display_name": "Anima + RTX + TTP 细节增强",
+  "workflow_file": "anima_ttp_api.json",
+  "task_type": "text_to_image",
+  "bindings": {
+    "positive_prompt": {"node_id": "6", "input": "text"},
+    "negative_prompt": {"node_id": "7", "input": "text"},
+    "unet": {"node_id": "429", "input": "unet_name"},
+    "clip": {"node_id": "4", "input": "clip_name"},
+    "vae": {"node_id": "5", "input": "vae_name"},
+    "lora": {"node_id": "462"},
+    "seed": [
+      {"node_id": "8", "input": "noise_seed"},
+      {"node_id": "262", "input": "seed"}
+    ],
+    "samplers": [
+      {"node_id": "8", "steps_input": "steps", "cfg_input": "cfg", "denoise_input": "", "sampler_input": "sampler_name", "scheduler_input": "scheduler"}
+    ],
+    "resolution": {"node_id": "437", "width_input": "width", "height_input": "height"},
+    "upscale": {"node_id": "261", "scale_input": "resize_type.scale", "quality_input": "quality"}
+  },
+  "output_variants": {
+    "base": {"preferred_node_ids": ["460"], "prune_node_ids": ["458", "459"]},
+    "rtx": {"preferred_node_ids": ["459"], "prune_node_ids": ["458", "460"]},
+    "ttp": {"preferred_node_ids": ["458"], "prune_node_ids": ["459", "460"]}
+  },
+  "default_output_variant": "ttp",
+  "defaults": {"pipeline": "rtx", "width": 832, "height": 1216, "steps": 30, "cfg": 5.0, "rtx_scale": 1.3, "rtx_quality": "ULTRA"},
+  "model_contract": {
+    "model_family": "anima_29b_40l",
+    "verification_status": "verified",
+    "lora_patch_required": false
+  }
+}

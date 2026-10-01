@@ -1,0 +1,1391 @@
+"""Authenticated LAN Web UI for the Comfy Anima plugin."""
+
+from __future__ import annotations
+
+from email.utils import formatdate
+import hmac
+import ipaddress
+import json
+import math
+import re
+import secrets
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any, Protocol
+
+from aiohttp import web
+
+from astrbot.api import logger
+
+from ..constants import PLUGIN_NAME
+from ..models import PluginSettings
+from .plugin_page import (
+    V170ApiPayloadTooLargeError,
+    V170ApiValidationError,
+    validate_danbooru_update_payload,
+    validate_lora_preview_query,
+    validate_lora_preview_response,
+    validate_prompt_asset_facets_query,
+    validate_v170_api_payload,
+)
+from .task_store import TASK_STATUSES
+
+
+SESSION_COOKIE = "comfy_anima_session"
+_request_key_factory = getattr(web, "RequestKey", None)
+if _request_key_factory is None:
+    REQUEST_SESSION_KEY = "comfy_anima_session_token"
+    REQUEST_CSRF_KEY = "comfy_anima_csrf_token"
+else:
+    REQUEST_SESSION_KEY = _request_key_factory(
+        "comfy_anima_session_token",
+        str,
+    )
+    REQUEST_CSRF_KEY = _request_key_factory(
+        "comfy_anima_csrf_token",
+        str,
+    )
+MAX_LOGIN_ATTEMPTS = 8
+LOGIN_WINDOW_SECONDS = 60
+ASSET_CONTENT_TYPES = {
+    "app.css": "text/css",
+    "app.js": "application/javascript",
+    "theme.js": "application/javascript",
+    "login.js": "application/javascript",
+}
+ANIMA_29B_ASSET_CONTENT_TYPES = {
+    "index.html": "text/html",
+    "app.css": "text/css",
+    "app.js": "application/javascript",
+}
+
+_STRING_BOOL_TRUE = {"1", "true", "yes", "on"}
+_STRING_BOOL_FALSE = {"0", "false", "no", "off"}
+
+
+def _normalize_web_setting_value(
+    key: str,
+    value: Any,
+    spec: dict[str, Any],
+) -> tuple[Any, bool]:
+    """Validate one WebUI setting against the plugin schema.
+
+    Returns ``(normalized_value, changed)``.  Values outside schema bounds or
+    enum options raise :class:`WebUiActionError` instead of being silently
+    clamped by later model parsing.
+    """
+    field_type = str(spec.get("type") or "")
+    if field_type == "bool":
+        if isinstance(value, bool):
+            return value, False
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value in (0, 1):
+                return bool(value), True
+            raise WebUiActionError(f"{key} 必须是布尔值")
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in _STRING_BOOL_TRUE:
+                return True, True
+            if normalized in _STRING_BOOL_FALSE:
+                return False, True
+        raise WebUiActionError(f"{key} 必须是布尔值")
+    if field_type == "int":
+        if isinstance(value, bool):
+            raise WebUiActionError(f"{key} 必须是整数")
+        if isinstance(value, int):
+            normalized = value
+        elif isinstance(value, float) and value.is_integer():
+            normalized = int(value)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not re.fullmatch(r"[+-]?\d+", stripped):
+                raise WebUiActionError(f"{key} 必须是整数")
+            normalized = int(stripped)
+        else:
+            raise WebUiActionError(f"{key} 必须是整数")
+        minimum = spec.get("min")
+        maximum = spec.get("max")
+        if minimum is not None and normalized < int(minimum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        if maximum is not None and normalized > int(maximum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        return normalized, value != normalized
+    if field_type == "float":
+        if isinstance(value, bool):
+            raise WebUiActionError(f"{key} 必须是数字")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise WebUiActionError(f"{key} 必须是数字") from exc
+        if not math.isfinite(normalized):
+            raise WebUiActionError(f"{key} 必须是有限数字")
+        minimum = spec.get("min")
+        maximum = spec.get("max")
+        if minimum is not None and normalized < float(minimum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        if maximum is not None and normalized > float(maximum):
+            raise WebUiActionError(f"{key} 超出允许范围")
+        return normalized, value != normalized
+    if field_type == "string":
+        if not isinstance(value, str):
+            raise WebUiActionError(f"{key} 必须是字符串")
+        options = spec.get("options")
+        if options:
+            def _extract_opt_val(opt: Any) -> str:
+                if isinstance(opt, dict):
+                    return str(opt.get("value", ""))
+                return str(opt)
+
+            target_val = value.strip().casefold()
+            canonical = next(
+                (
+                    _extract_opt_val(option)
+                    for option in options
+                    if _extract_opt_val(option).casefold() == target_val
+                ),
+                None,
+            )
+            if canonical is None:
+                raise WebUiActionError(f"{key} 不是受支持的选项")
+            return str(canonical), value != canonical
+        return value, False
+    if field_type in {"list", "list<string>"}:
+        if isinstance(value, str):
+            cleaned = [
+                item.strip()
+                for item in re.split(r"[\n,，]+", value)
+                if item.strip()
+            ]
+            return cleaned, True
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise WebUiActionError(f"{key} 必须是字符串数组")
+        return value, False
+    return value, False
+
+
+class WebUiError(RuntimeError):
+    """Web UI configuration or startup failure."""
+
+
+class WebUiActionError(RuntimeError):
+    """A safe, user-facing Web UI operation error."""
+
+
+class WebUiController(Protocol):
+    """Operations exposed by the plugin to the HTTP layer."""
+
+    async def web_ui_bootstrap(self) -> dict[str, Any]: ...
+    async def web_ui_list_user_negatives(self) -> dict[str, Any]: ...
+    async def web_ui_add_user_negative(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def web_ui_delete_user_negative(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_save_settings(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_save_29b_settings(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_list_providers(self) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_status(self) -> dict[str, Any]: ...
+
+    async def web_ui_diagnose_prompt(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_clear_prompt_diagnostics(self) -> dict[str, Any]: ...
+
+    async def web_ui_update_danbooru_index(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_check_experimental_profiles(self) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_status(self) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_search(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_facets(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_import(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_update_url(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_assets_sync_local(
+        self, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_create(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_update(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_delete(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_asset_favorite(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_compose_prompt_slots(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_lab_generate(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_prompt_lab_confirm(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_list_prompt_plans(self) -> dict[str, Any]: ...
+
+    async def web_ui_delete_prompt_plan(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_search_loras(self, keyword: str, limit: int) -> dict[str, Any]: ...
+
+    async def web_ui_refresh_loras(self) -> dict[str, Any]: ...
+
+    async def web_ui_download_lora(self, url: str) -> dict[str, Any]: ...
+
+    async def web_ui_fetch_lora_metadata(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_get_lora_detail(self, name: str) -> dict[str, Any]: ...
+
+    async def web_ui_save_lora_semantic(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_batch_set_lora_family(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_get_lora_archive(self) -> dict[str, Any]: ...
+
+    async def web_ui_archive_loras(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_lora_gallery(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_lora_visual_warm(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_lora_visual_status(self) -> dict[str, Any]: ...
+
+    async def web_ui_lora_visual_prune(self) -> dict[str, Any]: ...
+
+    async def web_ui_lora_preview(
+        self, key: str, fingerprint: str
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_list_presets(self) -> dict[str, Any]: ...
+
+    async def web_ui_save_preset(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_delete_preset(self, identifier: str) -> dict[str, Any]: ...
+
+    async def web_ui_delete_lora(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_delete_unet(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def web_ui_list_workflows(self) -> dict[str, Any]: ...
+
+    async def web_ui_check_workflows(self) -> dict[str, Any]: ...
+
+    async def web_ui_select_workflow(self, identifier: str) -> dict[str, Any]: ...
+
+    async def web_ui_list_unet(self) -> dict[str, Any]: ...
+
+    async def web_ui_select_unet(self, identifier: str) -> dict[str, Any]: ...
+
+    async def web_ui_list_config_profiles(self) -> dict[str, Any]: ...
+
+    async def web_ui_save_config_profile(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_switch_config_profile(self, identifier: str) -> dict[str, Any]: ...
+
+    async def web_ui_delete_config_profile(self, identifier: str) -> dict[str, Any]: ...
+
+    async def web_ui_get_logs(
+        self,
+        after_id: int,
+        limit: int,
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_clear_logs(self) -> dict[str, Any]: ...
+
+    async def web_ui_list_tasks(
+        self,
+        limit: int,
+        task_type: str,
+        status: str,
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_get_task(self, run_id: str) -> dict[str, Any]: ...
+
+    async def web_ui_get_task_events(
+        self,
+        run_id: str,
+        after_seq: int,
+        limit: int,
+    ) -> dict[str, Any]: ...
+
+    async def web_ui_cancel_task(self, run_id: str) -> dict[str, Any]: ...
+
+
+class WebUiService:
+    """Serve the plugin management UI on a dedicated configurable port."""
+
+    def __init__(
+        self,
+        settings: PluginSettings,
+        plugin_dir: Path,
+        controller: WebUiController,
+    ) -> None:
+        self._settings = settings
+        self._plugin_dir = plugin_dir
+        self._controller = controller
+        self._runner: web.AppRunner | None = None
+        self._site: web.TCPSite | None = None
+        self._sessions: dict[str, tuple[float, str]] = {}
+        self._login_attempts: dict[str, deque[float]] = defaultdict(deque)
+
+    @property
+    def address(self) -> str:
+        return f"http://{self._settings.web_ui_host}:{self._settings.web_ui_port}"
+
+    def create_app(self) -> web.Application:
+        app = web.Application(
+            middlewares=[self._security_headers, self._authenticate],
+            client_max_size=1024 * 1024,
+        )
+        app.add_routes(
+            [
+                web.get("/", self._index),
+                web.get("/anima-29b", self._anima_29b_disabled_index),
+                web.get("/anima-29b/", self._anima_29b_disabled_index),
+                web.get("/login", self._login_page),
+                web.get("/favicon.ico", self._favicon),
+                web.get("/assets/{name}", self._asset),
+                web.get(
+                    "/anima-29b/assets/{name}",
+                    self._anima_29b_disabled_asset,
+                ),
+                web.post("/api/login", self._login),
+                web.post("/api/logout", self._logout),
+                web.get("/api/bootstrap", self._bootstrap),
+                web.put(
+                    "/api/anima-29b/settings",
+                    self._save_29b_disabled_settings,
+                ),
+                web.get("/api/providers", self._list_providers),
+                web.put("/api/settings", self._save_settings),
+                web.get("/api/prompt/status", self._prompt_status),
+                web.post("/api/prompt/diagnose", self._diagnose_prompt),
+                web.delete(
+                    "/api/prompt/diagnostics",
+                    self._clear_prompt_diagnostics,
+                ),
+                web.post("/api/danbooru/update", self._update_danbooru_index),
+                web.get(
+                    "/api/experiments/check",
+                    self._check_experimental_profiles,
+                ),
+                web.get(
+                    "/api/prompt-assets/status",
+                    self._prompt_assets_status,
+                ),
+                web.post(
+                    "/api/prompt-assets/search",
+                    self._prompt_assets_search,
+                ),
+                web.get(
+                    "/api/prompt-assets/facets",
+                    self._prompt_assets_facets,
+                ),
+                web.post(
+                    "/api/prompt-assets/facets",
+                    self._prompt_assets_facets,
+                ),
+                web.post(
+                    "/api/prompt-assets/import",
+                    self._prompt_assets_import,
+                ),
+                web.post(
+                    "/api/prompt-assets/update-url",
+                    self._prompt_assets_update_url,
+                ),
+                web.post(
+                    "/api/prompt-assets/sync-local",
+                    self._prompt_assets_sync_local,
+                ),
+                web.post(
+                    "/api/prompt-assets/custom",
+                    self._prompt_asset_create,
+                ),
+                web.put(
+                    "/api/prompt-assets/custom",
+                    self._prompt_asset_update,
+                ),
+                web.delete(
+                    "/api/prompt-assets/custom",
+                    self._prompt_asset_delete,
+                ),
+                web.put(
+                    "/api/prompt-assets/favorite",
+                    self._prompt_asset_favorite,
+                ),
+                web.post(
+                    "/api/prompt/compose-slots",
+                    self._compose_prompt_slots,
+                ),
+                web.post(
+                    "/api/prompt-lab/generate",
+                    self._prompt_lab_generate,
+                ),
+                web.post(
+                    "/api/prompt-lab/confirm",
+                    self._prompt_lab_confirm,
+                ),
+                web.get(
+                    "/api/prompt-plans",
+                    self._prompt_plans,
+                ),
+                web.post(
+                    "/api/prompt-plans/delete",
+                    self._prompt_plan_delete,
+                ),
+                web.get("/api/loras", self._search_loras),
+                web.post("/api/loras/refresh", self._refresh_loras),
+                web.post("/api/loras/download", self._download_lora),
+                web.post("/api/loras/metadata", self._fetch_lora_metadata),
+                web.post("/api/lora/metadata-fetch", self._fetch_lora_metadata),
+                web.get("/api/loras/detail", self._get_lora_detail),
+                web.post("/api/loras/delete", self._delete_lora),
+                web.put("/api/loras/semantic", self._save_lora_semantic),
+                web.post("/api/loras/batch-family", self._batch_set_lora_family),
+                web.get("/api/loras/archive", self._get_lora_archive),
+                web.post("/api/loras/archive", self._archive_loras),
+                web.post("/api/lora/archive", self._archive_loras),
+                web.get("/api/lora/archive/status", self._get_lora_archive_status),
+                web.get("/api/lora/archive/index", self._get_lora_archive_index),
+                web.post("/api/lora/archive/run", self._archive_loras),
+                web.post("/api/loras/gallery", self._lora_gallery),
+                web.post(
+                    "/api/loras/thumbnails/warm",
+                    self._lora_visual_warm,
+                ),
+                web.get(
+                    "/api/loras/thumbnails/status",
+                    self._lora_visual_status,
+                ),
+                web.delete(
+                    "/api/loras/thumbnails/cache",
+                    self._lora_visual_prune,
+                ),
+                web.get("/api/loras/preview", self._lora_preview),
+                web.get("/api/presets", self._list_presets),
+                web.get("/api/user-negatives", self._list_user_negatives),
+                web.post("/api/user-negatives/add", self._add_user_negative),
+                web.post("/api/user-negatives/delete", self._delete_user_negative),
+                web.post("/api/presets", self._save_preset),
+                web.delete(
+                    "/api/presets/{identifier}",
+                    self._delete_preset,
+                ),
+                web.get("/api/workflows", self._list_workflows),
+                web.get("/api/workflows/check", self._check_workflows),
+                web.post("/api/workflows/select", self._select_workflow),
+                web.get("/api/unet", self._list_unet),
+                web.post("/api/unet/select", self._select_unet),
+                web.post("/api/unet/delete", self._delete_unet),
+                web.get("/api/config-profiles", self._list_config_profiles),
+                web.post("/api/config-profiles", self._save_config_profile),
+                web.post(
+                    "/api/config-profiles/switch",
+                    self._switch_config_profile,
+                ),
+                web.post(
+                    "/api/config-profiles/{identifier}/activate",
+                    self._activate_config_profile,
+                ),
+                web.delete(
+                    "/api/config-profiles/{identifier}",
+                    self._delete_config_profile,
+                ),
+                web.get("/api/logs", self._get_logs),
+                web.delete("/api/logs", self._clear_logs),
+                web.get("/api/tasks", self._list_tasks),
+                web.get("/api/tasks/{run_id}", self._get_task),
+                web.get(
+                    "/api/tasks/{run_id}/events",
+                    self._get_task_events,
+                ),
+                web.post(
+                    "/api/tasks/{run_id}/cancel",
+                    self._cancel_task,
+                ),
+            ]
+        )
+        return app
+
+    async def start(self) -> None:
+        self.validate()
+        if self._runner is not None:
+            return
+        runner = web.AppRunner(self.create_app(), access_log=None)
+        await runner.setup()
+        site = web.TCPSite(
+            runner,
+            host=self._settings.web_ui_host,
+            port=self._settings.web_ui_port,
+        )
+        try:
+            await site.start()
+        except Exception:
+            await runner.cleanup()
+            raise
+        self._runner = runner
+        self._site = site
+        logger.info(f"[{PLUGIN_NAME}] Web UI started at {self.address}")
+
+    async def close(self) -> None:
+        self._sessions.clear()
+        self._login_attempts.clear()
+        if self._runner is not None:
+            await self._runner.cleanup()
+        self._runner = None
+        self._site = None
+
+    def validate(self) -> None:
+        host = self._settings.web_ui_host.strip()
+        if host != "0.0.0.0":
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise WebUiError(
+                    "Web UI host must be 0.0.0.0 or a LAN IP address"
+                ) from exc
+            if not (address.is_private or address.is_loopback or address.is_link_local):
+                raise WebUiError("Web UI may only bind to a private LAN address")
+        if not self._settings.web_ui_username.strip():
+            raise WebUiError("Web UI username cannot be empty")
+        if len(self._settings.web_ui_password) < 8:
+            raise WebUiError(
+                "Web UI password must contain at least 8 characters before enabling it"
+            )
+        asset_dir = self._plugin_dir / "web"
+        for filename in ("index.html", "login.html", *ASSET_CONTENT_TYPES):
+            if not (asset_dir / filename).is_file():
+                raise WebUiError(f"Web UI asset is missing: {filename}")
+        anima_29b_dir = asset_dir / "anima_29b"
+        for filename in ANIMA_29B_ASSET_CONTENT_TYPES:
+            if not (anima_29b_dir / filename).is_file():
+                raise WebUiError(f"2.9B Web UI asset is missing: {filename}")
+
+    @web.middleware
+    async def _security_headers(
+        self,
+        request: web.Request,
+        handler: Any,
+    ) -> web.StreamResponse:
+        response = await handler(request)
+        is_static_asset = request.path.startswith("/assets/") or request.path.startswith(
+            "/anima-29b/assets/"
+        )
+        response.headers["Cache-Control"] = "no-cache" if is_static_asset else "no-store"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        )
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
+
+    @web.middleware
+    async def _authenticate(
+        self,
+        request: web.Request,
+        handler: Any,
+    ) -> web.StreamResponse:
+        path = request.path
+        if path in {"/login", "/api/login", "/favicon.ico"} or path.startswith(
+            "/assets/"
+        ):
+            return await handler(request)
+
+        session = self._read_session(request)
+        if session is None:
+            if path.startswith("/api/"):
+                return self._json_error("登录已失效，请重新登录", status=401)
+            raise web.HTTPFound("/login")
+
+        token, csrf = session
+        request[REQUEST_SESSION_KEY] = token
+        request[REQUEST_CSRF_KEY] = csrf
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            supplied = request.headers.get("X-CSRF-Token", "")
+            if not hmac.compare_digest(supplied, csrf):
+                return self._json_error("安全校验失败，请刷新页面后重试", status=403)
+        return await handler(request)
+
+    def _read_session(self, request: web.Request) -> tuple[str, str] | None:
+        now = time.monotonic()
+        token = request.cookies.get(SESSION_COOKIE, "")
+        record = self._sessions.get(token)
+        if record is None:
+            return None
+        expires_at, csrf = record
+        if expires_at <= now:
+            self._sessions.pop(token, None)
+            return None
+        self._sessions[token] = (
+            now + self._settings.web_ui_session_ttl,
+            csrf,
+        )
+        return token, csrf
+
+    def _asset_path(self, filename: str) -> Path:
+        return self._plugin_dir / "web" / filename
+
+    @staticmethod
+    def _static_file_response(
+        request: web.Request,
+        path: Path,
+        content_type: str,
+    ) -> web.StreamResponse:
+        stat = path.stat()
+        etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+        last_modified = formatdate(stat.st_mtime, usegmt=True)
+        if_none_match = request.headers.get("If-None-Match", "")
+        if if_none_match == etag or if_none_match == "*":
+            raise web.HTTPNotModified(
+                headers={
+                    "Cache-Control": "no-cache",
+                    "ETag": etag,
+                    "Last-Modified": last_modified,
+                }
+            )
+        if request.headers.get("If-Modified-Since", "") == last_modified:
+            raise web.HTTPNotModified(
+                headers={
+                    "Cache-Control": "no-cache",
+                    "ETag": etag,
+                    "Last-Modified": last_modified,
+                }
+            )
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": f"{content_type}; charset=utf-8",
+                "ETag": etag,
+                "Last-Modified": last_modified,
+            },
+        )
+
+    async def _index(self, _request: web.Request) -> web.FileResponse:
+        return web.FileResponse(self._asset_path("index.html"))
+
+    def _anima_29b_asset_path(self, filename: str) -> Path:
+        return self._plugin_dir / "web" / "anima_29b" / filename
+
+    async def _anima_29b_disabled_index(
+        self, _request: web.Request
+    ) -> web.Response:
+        """Return the deferred-scope page; no 2.9B console is served."""
+
+        page = (
+            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            "<title>Comfy Anima · 2.9B 控制台已暂缓</title></head><body>"
+            "<h1>Anima 2.9B 控制台已暂缓</h1>"
+            "<p>2.1.307 Deferred Scope：所有 2.9B 可执行路径均已禁用。</p>"
+            "<a href=\"/\">返回 Legacy 控制台</a></body></html>"
+        )
+        return web.Response(text=page, content_type="text/html")
+
+    async def _anima_29b_disabled_asset(
+        self, _request: web.Request
+    ) -> web.Response:
+        raise web.HTTPNotFound()
+
+    async def _save_29b_disabled_settings(
+        self, _request: web.Request
+    ) -> web.Response:
+        return web.json_response(
+            {"ok": False, "error": "2.9B settings are deferred in 2.1.307"},
+            status=423,
+        )
+
+    async def _anima_29b_index(self, _request: web.Request) -> web.FileResponse:
+        return web.FileResponse(self._anima_29b_asset_path("index.html"))
+
+    async def _anima_29b_asset(self, request: web.Request) -> web.StreamResponse:
+        filename = request.match_info["name"]
+        content_type = ANIMA_29B_ASSET_CONTENT_TYPES.get(filename)
+        if content_type is None:
+            raise web.HTTPNotFound()
+        path = self._anima_29b_asset_path(filename)
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return self._static_file_response(request, path, content_type)
+
+    async def _login_page(self, request: web.Request) -> web.StreamResponse:
+        if self._read_session(request) is not None:
+            raise web.HTTPFound("/")
+        return web.FileResponse(self._asset_path("login.html"))
+
+    async def _favicon(self, _request: web.Request) -> web.Response:
+        return web.Response(status=204)
+
+    async def _asset(self, request: web.Request) -> web.StreamResponse:
+        filename = request.match_info["name"]
+        content_type = ASSET_CONTENT_TYPES.get(filename)
+        if content_type is None:
+            raise web.HTTPNotFound()
+        path = self._asset_path(filename)
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return self._static_file_response(request, path, content_type)
+
+    async def _login(self, request: web.Request) -> web.Response:
+        remote = request.remote or "unknown"
+        if self._login_is_limited(remote):
+            return self._json_error("登录尝试过多，请稍后再试", status=429)
+        payload = await self._read_json(request)
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        valid = hmac.compare_digest(username, self._settings.web_ui_username)
+        valid = valid and hmac.compare_digest(
+            password,
+            self._settings.web_ui_password,
+        )
+        if not valid:
+            self._login_attempts[remote].append(time.monotonic())
+            return self._json_error("用户名或密码错误", status=401)
+
+        self._login_attempts.pop(remote, None)
+        token = secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(24)
+        self._sessions[token] = (
+            time.monotonic() + self._settings.web_ui_session_ttl,
+            csrf,
+        )
+        response = web.json_response({"ok": True})
+        response.set_cookie(
+            SESSION_COOKIE,
+            token,
+            max_age=self._settings.web_ui_session_ttl,
+            httponly=True,
+            samesite="Strict",
+            path="/",
+        )
+        return response
+
+    def _login_is_limited(self, remote: str) -> bool:
+        attempts = self._login_attempts[remote]
+        cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+        while attempts and attempts[0] < cutoff:
+            attempts.popleft()
+        return len(attempts) >= MAX_LOGIN_ATTEMPTS
+
+    async def _logout(self, request: web.Request) -> web.Response:
+        token = request.get(REQUEST_SESSION_KEY, "")
+        self._sessions.pop(token, None)
+        response = web.json_response({"ok": True})
+        response.del_cookie(SESSION_COOKIE, path="/")
+        return response
+
+    async def _bootstrap(self, request: web.Request) -> web.Response:
+        payload = await self._controller.web_ui_bootstrap()
+        payload["csrf_token"] = request[REQUEST_CSRF_KEY]
+        return web.json_response({"ok": True, "data": payload})
+
+    def _normalize_settings_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        schema_path = self._plugin_dir / "_conf_schema.json"
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise WebUiActionError("配置 Schema 无法读取") from exc
+        if not isinstance(schema, dict):
+            raise WebUiActionError("配置 Schema 格式无效")
+        normalized_payload = dict(payload)
+        normalized_fields: list[str] = []
+        for key, value in payload.items():
+            spec = schema.get(key)
+            if not isinstance(spec, dict):
+                continue
+            normalized_value, changed = _normalize_web_setting_value(
+                key,
+                value,
+                spec,
+            )
+            normalized_payload[key] = normalized_value
+            if changed:
+                normalized_fields.append(key)
+        return normalized_payload, sorted(normalized_fields)
+
+    async def _save_settings(self, request: web.Request) -> web.Response:
+        async def save() -> dict[str, Any]:
+            payload, normalized_fields = self._normalize_settings_payload(
+                await self._read_json(request)
+            )
+            if "sampler_steps_override" in payload:
+                raw_value = payload["sampler_steps_override"]
+                if isinstance(raw_value, bool):
+                    raise WebUiActionError("采样步数覆盖必须是 0–100 的整数")
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise WebUiActionError(
+                        "采样步数覆盖必须是 0–100 的整数"
+                    ) from exc
+                if str(raw_value).strip() != str(value) or not 0 <= value <= 100:
+                    raise WebUiActionError("采样步数覆盖必须是 0–100 的整数")
+                payload["sampler_steps_override"] = value
+            result = await self._controller.web_ui_save_settings(payload)
+            if normalized_fields:
+                result["normalized"] = normalized_fields
+            return result
+
+        return await self._controller_response(save())
+
+    async def _save_29b_settings(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_save_29b_settings(payload)
+        )
+
+    async def _list_providers(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(self._controller.web_ui_list_providers())
+
+    async def _prompt_status(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(self._controller.web_ui_prompt_status())
+
+    async def _diagnose_prompt(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        prompt = str(payload.get("prompt") or "")
+        negative = str(payload.get("negative_prompt") or "")
+        if not prompt.strip() or len(prompt) > 6000:
+            return self._json_error("提示词必须为 1–6000 个字符", status=400)
+        if len(negative) > 2000:
+            return self._json_error("负面提示词不能超过 2000 个字符", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_diagnose_prompt(
+                {"prompt": prompt, "negative_prompt": negative}
+            )
+        )
+
+    async def _clear_prompt_diagnostics(
+        self, _request: web.Request
+    ) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_clear_prompt_diagnostics()
+        )
+
+    async def _update_danbooru_index(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = await self._read_json(request) if request.can_read_body else {}
+            return await self._controller.web_ui_update_danbooru_index(
+                validate_danbooru_update_payload(payload)
+            )
+
+        return await self._controller_response(operation())
+
+    async def _check_experimental_profiles(
+        self, _request: web.Request
+    ) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_check_experimental_profiles()
+        )
+
+    async def _prompt_assets_status(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_prompt_assets_status()
+        )
+
+    async def _prompt_assets_search(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_assets_search", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_assets_search(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_facets(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = (
+                validate_prompt_asset_facets_query(request.query)
+                if request.method == "GET"
+                else validate_v170_api_payload(
+                    "prompt_assets_facets", await self._read_json(request)
+                )
+            )
+            return await self._controller.web_ui_prompt_assets_facets(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_import(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_assets_import", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_assets_import(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_update_url(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_assets_update_url", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_assets_update_url(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_assets_sync_local(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            raw_payload = (
+                {}
+                if request.content_length in (None, 0) and not request.can_read_body
+                else await self._read_json(request)
+            )
+            payload = validate_v170_api_payload(
+                "prompt_assets_sync_local", raw_payload
+            )
+            return await self._controller.web_ui_prompt_assets_sync_local(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_create(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_create", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_create(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_update(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_update", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_update(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_delete(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_delete", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_delete(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_asset_favorite(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_asset_favorite", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_asset_favorite(payload)
+
+        return await self._controller_response(operation())
+
+    async def _compose_prompt_slots(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "compose_prompt_slots", await self._read_json(request)
+            )
+            return await self._controller.web_ui_compose_prompt_slots(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_lab_generate(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_lab_generate", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_lab_generate(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_lab_confirm(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_lab_confirm", await self._read_json(request)
+            )
+            return await self._controller.web_ui_prompt_lab_confirm(payload)
+
+        return await self._controller_response(operation())
+
+    async def _prompt_plans(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_prompt_plans()
+        )
+
+    async def _prompt_plan_delete(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "prompt_plan_delete", await self._read_json(request)
+            )
+            return await self._controller.web_ui_delete_prompt_plan(payload)
+
+        return await self._controller_response(operation())
+
+    async def _search_loras(self, request: web.Request) -> web.Response:
+        keyword = request.query.get("q", "").strip()
+        try:
+            limit = min(1000, max(1, int(request.query.get("limit", "50"))))
+        except ValueError:
+            return self._json_error("LoRA 数量限制必须是整数", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_search_loras(keyword, limit)
+        )
+
+    async def _refresh_loras(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(self._controller.web_ui_refresh_loras())
+
+    async def _download_lora(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_download_lora(str(payload.get("url") or ""))
+        )
+
+    async def _fetch_lora_metadata(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_fetch_lora_metadata(
+                await self._read_json(request)
+            )
+        )
+
+    async def _get_lora_detail(self, request: web.Request) -> web.Response:
+        name = request.query.get("name", "").strip()
+        if not name or len(name) > 500:
+            return self._json_error("LoRA 名称无效", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_get_lora_detail(name)
+        )
+
+    async def _delete_lora(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_lora(await self._read_json(request))
+        )
+
+    async def _save_lora_semantic(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_save_lora_semantic(
+                await self._read_json(request)
+            )
+        )
+
+    async def _batch_set_lora_family(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_batch_set_lora_family(
+                await self._read_json(request)
+            )
+        )
+
+    async def _get_lora_archive(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_get_lora_archive()
+        )
+
+    async def _get_lora_archive_status(self, _request: web.Request) -> web.Response:
+        async def status_only() -> dict[str, Any]:
+            result = await self._controller.web_ui_get_lora_archive()
+            return dict(result.get("status") or {})
+
+        return await self._controller_response(status_only())
+
+    async def _get_lora_archive_index(self, _request: web.Request) -> web.Response:
+        async def index_only() -> dict[str, Any]:
+            result = await self._controller.web_ui_get_lora_archive()
+            return {"items": list(result.get("items") or [])}
+
+        return await self._controller_response(index_only())
+
+    async def _archive_loras(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_archive_loras(await self._read_json(request))
+        )
+
+    async def _lora_gallery(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "lora_gallery", await self._read_json(request)
+            )
+            return await self._controller.web_ui_lora_gallery(payload)
+
+        return await self._controller_response(operation())
+
+    async def _lora_visual_warm(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            payload = validate_v170_api_payload(
+                "lora_visual_warm", await self._read_json(request)
+            )
+            return await self._controller.web_ui_lora_visual_warm(payload)
+
+        return await self._controller_response(operation())
+
+    async def _lora_visual_status(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_lora_visual_status()
+        )
+
+    async def _lora_visual_prune(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_lora_visual_prune()
+        )
+
+    async def _lora_preview(self, request: web.Request) -> web.Response:
+        async def operation() -> dict[str, Any]:
+            key, fingerprint = validate_lora_preview_query(
+                request.query.get("key"), request.query.get("fingerprint")
+            )
+            result = await self._controller.web_ui_lora_preview(key, fingerprint)
+            return validate_lora_preview_response(
+                result,
+                key=key,
+                fingerprint=fingerprint,
+            )
+
+        return await self._controller_response(operation())
+
+    async def _list_presets(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(self._controller.web_ui_list_presets())
+
+    async def _list_user_negatives(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_user_negatives()
+        )
+
+    async def _add_user_negative(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_add_user_negative(await self._read_json(request))
+        )
+
+    async def _delete_user_negative(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_user_negative(await self._read_json(request))
+        )
+
+    async def _save_preset(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_save_preset(await self._read_json(request))
+        )
+
+    async def _delete_preset(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_preset(request.match_info["identifier"])
+        )
+
+    async def _list_workflows(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_workflows()
+        )
+
+    async def _check_workflows(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_check_workflows()
+        )
+
+    async def _select_workflow(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_select_workflow(
+                str(payload.get("identifier") or payload.get("filename") or "")
+            )
+        )
+
+    async def _list_unet(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(self._controller.web_ui_list_unet())
+
+    async def _select_unet(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_select_unet(str(payload.get("identifier") or ""))
+        )
+
+    async def _delete_unet(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_unet(await self._read_json(request))
+        )
+
+    async def _list_config_profiles(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_list_config_profiles()
+        )
+
+    async def _save_config_profile(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_save_config_profile(await self._read_json(request))
+        )
+
+    async def _switch_config_profile(self, request: web.Request) -> web.Response:
+        payload = await self._read_json(request)
+        return await self._controller_response(
+            self._controller.web_ui_switch_config_profile(
+                str(payload.get("identifier") or payload.get("name") or "")
+            )
+        )
+
+    async def _activate_config_profile(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_switch_config_profile(
+                request.match_info["identifier"]
+            )
+        )
+
+    async def _delete_config_profile(self, request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_delete_config_profile(
+                request.match_info["identifier"]
+            )
+        )
+
+    async def _get_logs(self, request: web.Request) -> web.Response:
+        try:
+            after_id = max(0, int(request.query.get("after", "0")))
+            limit = min(1000, max(1, int(request.query.get("limit", "500"))))
+        except ValueError:
+            return self._json_error("日志游标和数量限制必须是整数", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_get_logs(after_id, limit)
+        )
+
+    async def _clear_logs(self, _request: web.Request) -> web.Response:
+        return await self._controller_response(
+            self._controller.web_ui_clear_logs()
+        )
+
+    async def _list_tasks(self, request: web.Request) -> web.Response:
+        try:
+            limit = min(500, max(1, int(request.query.get("limit", "50"))))
+        except ValueError:
+            return self._json_error("任务数量限制必须是整数", status=400)
+        task_type = request.query.get("type", "").strip()
+        if len(task_type) > 100:
+            return self._json_error("任务类型过长", status=400)
+        status = request.query.get("status", "").strip().casefold()
+        if status and status not in TASK_STATUSES:
+            return self._json_error("任务状态不受支持", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_list_tasks(limit, task_type, status)
+        )
+
+    async def _get_task(self, request: web.Request) -> web.Response:
+        run_id = self._validated_run_id(request)
+        if run_id is None:
+            return self._json_error("任务 ID 格式无效", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_get_task(run_id)
+        )
+
+    async def _get_task_events(self, request: web.Request) -> web.Response:
+        run_id = self._validated_run_id(request)
+        if run_id is None:
+            return self._json_error("任务 ID 格式无效", status=400)
+        try:
+            after_seq = max(0, int(request.query.get("after", "0")))
+            limit = min(2000, max(1, int(request.query.get("limit", "500"))))
+        except ValueError:
+            return self._json_error("事件游标和数量限制必须是整数", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_get_task_events(run_id, after_seq, limit)
+        )
+
+    async def _cancel_task(self, request: web.Request) -> web.Response:
+        run_id = self._validated_run_id(request)
+        if run_id is None:
+            return self._json_error("任务 ID 格式无效", status=400)
+        return await self._controller_response(
+            self._controller.web_ui_cancel_task(run_id)
+        )
+
+    async def _controller_response(self, awaitable: Any) -> web.Response:
+        try:
+            result = await awaitable
+        except web.HTTPRequestEntityTooLarge:
+            return self._json_error("请求体超过 1 MiB 限制", status=413)
+        except V170ApiPayloadTooLargeError as exc:
+            return self._json_error(str(exc), status=413)
+        except web.HTTPBadRequest as exc:
+            return self._json_error(exc.text or "请求必须是有效 JSON", status=400)
+        except V170ApiValidationError as exc:
+            return self._json_error(str(exc), status=400)
+        except WebUiActionError as exc:
+            return self._json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.error(
+                f"[{PLUGIN_NAME}] Web UI operation failed: {exc}",
+                exc_info=True,
+            )
+            return self._json_error("操作失败，请查看 AstrBot 日志", status=500)
+        return web.json_response({"ok": True, "data": result})
+
+    @staticmethod
+    async def _read_json(request: web.Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except Exception as exc:
+            raise web.HTTPBadRequest(text="请求必须是有效 JSON") from exc
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="JSON 顶层必须是对象")
+        return payload
+
+    @staticmethod
+    def _validated_run_id(request: web.Request) -> str | None:
+        run_id = request.match_info.get("run_id", "").strip()
+        if not run_id or len(run_id) > 128:
+            return None
+        if not all(character.isalnum() or character in "-_" for character in run_id):
+            return None
+        return run_id
+
+    @staticmethod
+    def _json_error(message: str, *, status: int) -> web.Response:
+        return web.json_response(
+            {"ok": False, "error": message},
+            status=status,
+        )
+
+
+__all__ = [
+    "WebUiActionError",
+    "WebUiController",
+    "WebUiError",
+    "WebUiService",
+]

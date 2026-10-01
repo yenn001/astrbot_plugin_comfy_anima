@@ -1,0 +1,1543 @@
+"""
+AstrBot Comfy Anima 插件 v1.7.0
+
+功能描述：
+- 定义插件配置、生成参数和任务数据模型
+
+作者: Yen
+版本: 1.7.0
+日期: 2026-07-26
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+from .constants import (
+    DEFAULT_DIRECTOR_REFERENCE_FILE,
+    DEFAULT_NEGATIVE_NODE_ID,
+    DEFAULT_PREVIEW_OUTPUT_NODE_ID,
+    DEFAULT_PRIMARY_SAMPLER_NODE_ID,
+    DEFAULT_PRIMARY_SEED_NODE_ID,
+    DEFAULT_PROMPT_NODE_ID,
+    DEFAULT_RESOLUTION_NODE_ID,
+    DEFAULT_SECONDARY_SEED_NODE_ID,
+    DEFAULT_UPSCALE_OUTPUT_NODE_ID,
+    DEFAULT_WORKFLOW_FILE,
+    MAX_IMAGE_SIDE,
+    MAX_STEPS,
+    MIN_IMAGE_SIDE,
+)
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """将配置值安全转换为布尔值。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _as_int(value: Any, default: int, minimum: int = 0) -> int:
+    """将配置值安全转换为有下限的整数。"""
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float, minimum: float = 0.0) -> float:
+    """将配置值安全转换为有下限的浮点数。"""
+    try:
+        return max(minimum, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_enum(value: str, allowed: tuple[str, ...], default: str) -> str:
+    """将配置枚举值规范化到允许集合。"""
+    normalized = str(value or "").strip().casefold()
+    if normalized in allowed:
+        return normalized
+    return default
+
+
+def _as_string_list(value: Any, default: list[str]) -> list[str]:
+    """将列表或逗号分隔字符串转换为字符串列表。"""
+    if isinstance(value, list):
+        result = [str(item).strip() for item in value if str(item).strip()]
+        return result or list(default)
+    if isinstance(value, str):
+        result = [item.strip() for item in value.split(",") if item.strip()]
+        return result or list(default)
+    return list(default)
+
+
+_REVERSE_TAGGER_DEFAULT_CATEGORIES = ["copyright", "character", "general"]
+_REVERSE_TAGGER_CATEGORIES = frozenset(
+    {
+        "rating",
+        "artist",
+        "general",
+        "character",
+        "copyright",
+        "meta",
+        "model",
+        "quality",
+    }
+)
+
+
+def _as_reverse_backend(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    return normalized if normalized in {"vision", "workflow", "hybrid"} else "workflow"
+
+
+def _as_reverse_tagger_model(value: Any) -> str:
+    default = "wd-convnext-tagger-v3.onnx"
+    normalized = str(value or "").strip().replace("\\", "/")
+    path = Path(normalized)
+    if (
+        not normalized
+        or len(normalized) > 255
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.suffix.casefold() != ".onnx"
+        or normalized.startswith("~")
+        or any(character in normalized for character in ":\0\r\n")
+    ):
+        return default
+    return normalized
+
+
+def _as_reverse_tagger_categories(value: Any) -> list[str]:
+    raw = _as_string_list(value, _REVERSE_TAGGER_DEFAULT_CATEGORIES)
+    result: list[str] = []
+    for item in raw:
+        normalized = str(item or "").strip().casefold()
+        if normalized in _REVERSE_TAGGER_CATEGORIES and normalized not in result:
+            result.append(normalized)
+    return result or list(_REVERSE_TAGGER_DEFAULT_CATEGORIES)
+
+
+def _as_reverse_tagger_session(value: Any) -> str:
+    normalized = " ".join(str(value or "").strip().split()).casefold()
+    return {
+        "cpu": "CPU",
+        "gpu": "GPU",
+        "gpu release": "GPU Release",
+    }.get(normalized, "CPU")
+
+
+def _as_mapping_list(value: Any) -> list[dict[str, Any]]:
+    """保留 template_list 中的字典项并复制，避免修改原配置对象。"""
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _default_lora_presets() -> list[dict[str, Any]]:
+    """返回此 Anima 工作流随包提供的默认风格栈。"""
+    return [
+        {
+            "__template_key": "artist_style_combo",
+            "name": "风格001",
+            "loras": [
+                "(画质)anima-highres-aesthetic-boost=0.5",
+                "(美感细节)anima-rl-v0.1=0.4",
+                "anima-base-1-masterpiece-v51=0.5",
+                "748cm_v2_anima=0.3",
+                "hanaru_epoch24=0.31",
+                "nekoya_v1_epoch21=0.3",
+                "real skin.baka.v1-000010=0.65",
+                "(写真背景)anima3-photo-background-v3=0.3",
+            ],
+            "trigger_words": "",
+            "description": "默认画质、美感、画师、皮肤与写真背景风格栈",
+            "enabled": True,
+        }
+    ]
+
+
+def _as_group_levels(value: Any) -> dict[str, str]:
+    """解析群号到 none/lite/full 的映射，兼容旧字典与列表格式。"""
+    result: dict[str, str] = {}
+    if isinstance(value, Mapping):
+        items = value.items()
+    else:
+        raw_items = value if isinstance(value, list) else []
+        parsed_items: list[tuple[str, str]] = []
+        for raw_item in raw_items:
+            text = str(raw_item).strip()
+            separator = "=" if "=" in text else ":" if ":" in text else ""
+            if not separator:
+                continue
+            group_id, level = text.split(separator, 1)
+            parsed_items.append((group_id, level))
+        items = parsed_items
+    for raw_group_id, raw_level in items:
+        group_id = str(raw_group_id).strip()
+        level = str(raw_level).strip().lower()
+        if group_id and level in {"none", "lite", "full"}:
+            result[group_id] = level
+    return result
+
+
+def migrate_legacy_auto_draw_prompt(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a config copy with the 307 prompt fields present.
+
+    The legacy ``auto_draw_system_prompt`` value is deliberately NOT copied:
+    it stays available as a rollback source only. Empty new fields make the
+    runtime fall back to the curated 307 prompt resources.
+    """
+
+    migrated = dict(config)
+    migrated.setdefault("chat_roleplay_draw_prompt", "")
+    migrated.setdefault("director_creative_preference", "")
+    return migrated
+
+
+def migrate_legacy_consolidated_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate legacy natural-draw flags into the consolidated fields.
+
+    Runs once and stamps ``config_migration_version=2``. After migration,
+    runtime code must not read the legacy fields.
+    """
+    import time as _time
+
+    migrated = dict(config)
+    try:
+        migration_version = int(migrated.get("config_migration_version") or 0)
+    except (TypeError, ValueError):
+        # Policy: non-integer migration version is treated as 0, so the
+        # migration runs once and stamps a valid version=2.
+        migration_version = 0
+    if migration_version >= 2:
+        if not str(migrated.get("config_migrated_utc") or "").strip():
+            migrated["config_migrated_utc"] = _time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
+            )
+        return migrated
+    if "natural_draw_mode" not in migrated:
+        legacy_enabled = migrated.get("enable_natural_draw")
+        pic_trigger_enabled = migrated.get("enable_llm_pic_trigger")
+        if legacy_enabled is False:
+            migrated["natural_draw_mode"] = "off"
+        elif legacy_enabled is True and pic_trigger_enabled is False:
+            migrated["natural_draw_mode"] = "photo_only"
+        else:
+            migrated["natural_draw_mode"] = "full"
+    if "scene_extraction" not in migrated and "enable_scene_extraction" in migrated:
+        migrated["scene_extraction"] = migrated["enable_scene_extraction"]
+    if (
+        "chinese_prompt_translation" not in migrated
+        and "enable_chinese_prompt_translation" in migrated
+    ):
+        migrated["chinese_prompt_translation"] = migrated[
+            "enable_chinese_prompt_translation"
+        ]
+    migrated.setdefault("character_purity_mode", "smart")
+    if str(migrated.get("intent_judge_backend", "")).strip().casefold() in {
+        "",
+        "rule",
+    }:
+        migrated["intent_judge_backend"] = "auto"
+    if str(migrated.get("intent_router_gate_mode", "")).strip().casefold() in {
+        "",
+        "off",
+    }:
+        migrated["intent_router_gate_mode"] = "on"
+    migrated["config_migration_version"] = 2
+    if not str(migrated.get("config_migrated_utc") or "").strip():
+        migrated["config_migrated_utc"] = _time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
+        )
+    return migrated
+
+
+@dataclass(frozen=True)
+class PluginSettings:
+    """插件运行配置。"""
+
+    comfyui_url: str = "http://127.0.0.1:8188"
+    api_token: str = ""
+    enable_web_ui: bool = False
+    enable_time_context: bool = True
+    web_ui_host: str = "0.0.0.0"
+    web_ui_port: int = 6198
+    web_ui_username: str = "admin"
+    web_ui_password: str = ""
+    web_ui_session_ttl: int = 43200
+    workflow_file: str = DEFAULT_WORKFLOW_FILE
+    upscale_workflow_file: str = "workflow/rtx_upscale_api.json"
+    base_workflow_file: str = "workflow/anima_base_api.json"
+    rtx_generation_workflow_file: str = "workflow/anima_rtx_api.json"
+    iterative_workflow_file: str = "workflow/anima_iterative_api.json"
+    inpaint_crop_workflow_file: str = "workflow/anima_inpaint_crop_api.json"
+    lanpaint_workflow_file: str = "workflow/anima_lanpaint_api.json"
+    control_workflow_file: str = "workflow/anima_control_api.json"
+    img2img_workflow_file: str = "workflow/anima_img2img_api.json"
+    default_generation_pipeline: str = "rtx"
+    model_profile_id: str = "anima_legacy"
+    model_family: str = "anima_legacy_28l"
+    unet_model_root: str = ""
+    clip_model_name: str = "qwen_3_06b_base.safetensors"
+    clip_model_root: str = ""
+    vae_model_name: str = "qwen_image_vae.safetensors"
+    vae_model_root: str = ""
+    lora_patch_required: bool = False
+    lora_patch_node_type: str = ""
+    lora_patch_contract_id: str = ""
+    enable_prompt_llm: bool = True
+    prompt_llm_provider_id: str = ""
+    prompt_llm_timeout: int = 120
+    character_swap_timeout: int = 240
+    prompt_llm_temperature: float = 0.3
+    prompt_llm_max_tokens: int = 1000
+    prompt_llm_fallback: bool = True
+    show_llm_prompt: bool = False
+    director_reference_file: str = DEFAULT_DIRECTOR_REFERENCE_FILE
+    director_extra_instruction: str = ""
+    enable_natural_draw: bool = True
+    director_primary: bool = False
+    enable_llm_pic_trigger: bool = True
+    enable_chat_draw_terminal_guard: bool = True
+    # Deprecated rollback source only. 307 resolves
+    # chat_roleplay_draw_prompt / director_creative_preference instead and
+    # never copies this field into the new fields.
+    auto_draw_system_prompt: str = ""
+    chat_roleplay_draw_prompt: str = ""
+    director_creative_preference: str = ""
+    max_auto_images_per_reply: int = 1
+    conversation_draw_cooldown_seconds: float = 8.0
+    follow_up_draw_priority: str = "after_delivery"
+    intent_router_probe_plan: bool = True
+    show_command_progress: bool = True
+    enable_reverse_prompt: bool = True
+    enable_workflow_reverse: bool = True
+    reverse_backend: str = "workflow"
+    reverse_workflow_file: str = "workflow/anima_reverse_tagger_api.json"
+    reverse_workflow_timeout: int = 120
+    reverse_tagger_model: str = "wd-convnext-tagger-v3.onnx"
+    reverse_general_threshold: float = 0.55
+    reverse_character_threshold: float = 0.6
+    reverse_categories: list[str] = field(
+        default_factory=lambda: list(_REVERSE_TAGGER_DEFAULT_CATEGORIES)
+    )
+    reverse_session_method: str = "CPU"
+    enable_reverse_json_formatter: bool = True
+    enable_reverse_json_repair_retry: bool = True
+    reverse_prompt_provider_id: str = ""
+    reverse_prompt_timeout: int = 120
+    reverse_prompt_temperature: float = 0.1
+    reverse_prompt_max_tokens: int = 1600
+    reverse_prompt_system_prompt: str = ""
+    enable_control_stack_v2: bool = True
+    control_default_fidelity: str = "balanced"
+    control_default_resize_policy: str = "fit"
+    control_default_reference_scope: str = "appearance"
+    max_input_image_size_mb: int = 20
+    max_input_image_pixels: int = 40_000_000
+    workflow_dir: str = "workflow"
+    enable_unet_switch: bool = True
+    unet_catalog_url: str = ""
+    unet_catalog_timeout: int = 20
+    unet_lan_only: bool = True
+    unet_loader_node_id: str = "429"
+    unet_model_input_name: str = "unet_name"
+    unet_model_name: str = ""
+    whitelist_only: bool = False
+    group_whitelist: list[str] = field(default_factory=list)
+    global_lock: bool = False
+    enable_lock_command: bool = True
+    admin_ignore_cooldown: bool = True
+    admin_ignore_whitelist: bool = True
+    admin_ignore_blocklist: bool = False
+    default_block_level: str = "lite"
+    group_block_levels: dict[str, str] = field(default_factory=dict)
+    forward_sender_name: str = "ComfyUI 绘图"
+    enable_lora_tool: bool = True
+    lora_catalog_url: str = ""
+    enable_lora_manager: bool = True
+    lora_manager_url: str = ""
+    lora_model_root: str = ""
+    lora_manager_scan_on_refresh: bool = True
+    lora_manager_scan_interval: int = 60
+    lora_manager_scan_timeout: int = 180
+    lora_manager_page_size: int = 100
+    enable_lora_download: bool = True
+    lora_download_timeout: int = 3600
+    lora_metadata_timeout: int = 300
+    lora_download_max_concurrent: int = 1
+    lora_download_allowed_hosts: list[str] = field(
+        default_factory=lambda: [
+            "civitai.com",
+            "www.civitai.com",
+            "civitai.red",
+            "www.civitai.red",
+        ]
+    )
+    lora_lan_only: bool = True
+    lora_catalog_timeout: int = 15
+    lora_cache_ttl: int = 300
+    lora_max_results: int = 50
+    enable_lora_visual_gallery: bool = True
+    lora_visual_roots: list[str] = field(default_factory=list)
+    lora_visual_cache_mb: int = 256
+    lora_visual_warmup_workers: int = 2
+    lora_visual_preview_max_mb: int = 4
+    lora_visual_thumbnail_size: int = 512
+    lora_alias_rules: list[str] = field(default_factory=list)
+    enable_lora_hybrid_search: bool = False
+    lora_embedding_provider_id: str = ""
+    lora_rerank_provider_id: str = ""
+    lora_embedding_top_k: int = 20
+    lora_rerank_top_n: int = 8
+    lora_retrieval_timeout: int = 30
+    lora_tool_max_steps: int = 4
+    enable_task_lora_snapshot: bool = True
+    lora_snapshot_max_age: int = 300
+    enable_parallel_preflight: bool = True
+    provider_max_concurrent_jobs: int = 4
+    enable_local_intent_router: bool = True
+    intent_router_model: str = ""
+    intent_router_timeout: int = 20
+    intent_router_temperature: float = 0.0
+    intent_router_min_confidence: float = 0.7
+    intent_judge_backend: str = "auto"
+    enable_bot_reply_draw: bool = False
+    bot_reply_draw_cooldown_seconds: float = 30.0
+    bot_reply_intent_backend: str = "auto"
+    bot_reply_draw_delivery_phrases: list[str] = field(
+        default_factory=lambda: [
+            "给你看",
+            "给你瞧瞧",
+            "快看",
+            "拍给你看",
+            "穿给你看",
+            "我给你看",
+        ]
+    )
+    intent_judge_embedding_provider_id: str = ""
+    intent_judge_rerank_provider_id: str = ""
+    intent_judge_online_provider_id: str = ""
+    intent_judge_positive_anchors: list[str] = field(default_factory=list)
+    intent_judge_negative_anchors: list[str] = field(default_factory=list)
+    intent_judge_local_embedding_threshold: float = 0.10
+    intent_judge_local_rerank_threshold: float = 0.05
+    intent_judge_auto_confidence_floor: float = 0.70
+    intent_judge_online_timeout: float = 10.0
+    intent_judge_online_temperature: float = 0.0
+    intent_judge_fallback: str = "no_draw"
+    draw_pipeline_mode: str = "auto"
+    intent_router_gate_mode: str = "on"
+    enable_visual_task_intent: bool = True
+    enable_user_picture_preferences: bool = False
+    user_picture_preferences_ttl: int = 0
+    router_timeout_before_agent: float = 0.0
+    enable_scene_extraction: bool = True
+    scene_extraction_model: str = ""
+    scene_context_window: int = 8
+    scene_extraction_max_memories: int = 5
+    natural_draw_mode: str = "full"
+    character_purity_mode: str = "smart"
+    scene_extraction: bool = True
+    chinese_prompt_translation: bool = True
+    config_migration_version: int = 2
+    config_migrated_utc: str = ""
+    enable_session_recipe_continuity: bool = True
+    invalidate_session_recipe_on_update: bool = True
+    enable_preset_manifest_gate: bool = True
+    interaction_mode: str = "smart"
+    structured_director_mode: str = "auto"
+    enable_prompt_composer_v2: bool = True
+    enable_chinese_prompt_translation: bool = True
+    adaptive_negative_mode: str = "conservative"
+    enable_prompt_diagnostics: bool = True
+    prompt_diagnostics_include_content: bool = False
+    prompt_diagnostics_capacity: int = 50
+    danbooru_validation_mode: str = "report"
+    danbooru_index_url: str = ""
+    danbooru_index_timeout: int = 30
+    danbooru_index_max_size_mb: int = 256
+    danbooru_api_base_url: str = "https://danbooru.donmai.us"
+    danbooru_api_proxy_url: str = ""
+    danbooru_api_mode: str = "identity"
+    danbooru_api_general_min_posts: int = 10
+    danbooru_api_meta_min_posts: int = 10
+    danbooru_api_page_size: int = 1000
+    danbooru_api_request_interval_ms: int = 750
+    danbooru_api_timeout: int = 60
+    danbooru_api_max_records: int = 2_000_000
+    danbooru_api_include_aliases: bool = True
+    danbooru_auto_update_enabled: bool = False
+    danbooru_auto_update_interval_hours: int = 168
+    enable_prompt_asset_library: bool = True
+    prompt_asset_remote_import_enabled: bool = False
+    prompt_asset_max_download_mb: int = 16
+    enable_prompt_lab: bool = True
+    prompt_lab_batch_capacity: int = 32
+    prompt_lab_ttl_seconds: int = 1800
+    enable_layered_lora_retrieval: bool = True
+    lora_loader_node_id: str = "462"
+    dynamic_lora_mode: str = "append"
+    max_dynamic_loras: int = 3
+    max_preset_loras: int = 12
+    max_total_dynamic_loras: int = 12
+    default_style_preset: str = "风格001"
+    auto_reload_after_style_save: bool = False
+    lora_presets: list[dict[str, Any]] = field(default_factory=_default_lora_presets)
+    strict_lora_validation: bool = True
+    prompt_node_id: str = DEFAULT_PROMPT_NODE_ID
+    negative_node_id: str = DEFAULT_NEGATIVE_NODE_ID
+    workflow_positive_node_overrides: list[str] = field(default_factory=list)
+    workflow_negative_node_overrides: list[str] = field(default_factory=list)
+    primary_seed_node_id: str = DEFAULT_PRIMARY_SEED_NODE_ID
+    secondary_seed_node_id: str = DEFAULT_SECONDARY_SEED_NODE_ID
+    resolution_node_id: str = DEFAULT_RESOLUTION_NODE_ID
+    default_width: int = 832
+    default_height: int = 1216
+    sampler_node_ids: list[str] = field(
+        default_factory=lambda: [DEFAULT_PRIMARY_SAMPLER_NODE_ID]
+    )
+    sampler_steps_override: int = 0
+    # 全局采样覆写（0/空 = 不覆写；请求级显式值优先于这些默认）
+    sampler_cfg_override: float = 0.0
+    sampler_name_override: str = ""
+    sampler_scheduler_override: str = ""
+    # TTP 瓦片细节增强：仅在放大链路（rtx/ttp 变体）生效，关=纯 RTX 插值
+    enable_ttp_detail: bool = False
+    # 全局附加正/负词：追加进每一次出图的组装末尾，随清单闸门审计
+    global_extra_positive_tags: list[str] = field(default_factory=list)
+    global_extra_negative_tags: list[str] = field(default_factory=list)
+    output_node_ids: list[str] = field(
+        default_factory=lambda: [
+            DEFAULT_UPSCALE_OUTPUT_NODE_ID,
+            DEFAULT_PREVIEW_OUTPUT_NODE_ID,
+        ]
+    )
+    upscale_output_node_id: str = DEFAULT_UPSCALE_OUTPUT_NODE_ID
+    enable_upscale: bool = True
+    rtx_scale: float = 2.0
+    rtx_quality: str = "ULTRA"
+    iterative_scale: float = 1.5
+    iterative_steps: int = 3
+    iterative_denoise: float = 0.35
+    enable_inpaint: bool = True
+    send_generation_notice: bool = True
+    show_chat_generation_details: bool = True
+    allow_global_interrupt: bool = False
+    max_concurrent_jobs: int = 1
+    max_queued_jobs_per_user: int = 3
+    user_cooldown: int = 30
+    request_timeout: int = 30
+    generation_timeout: int = 1200
+    poll_interval: float = 2.0
+    max_prompt_length: int = 2000
+    max_image_size_mb: int = 50
+
+    @classmethod
+    def from_mapping(cls, config: Optional[Mapping[str, Any]]) -> "PluginSettings":
+        """从 AstrBot 配置对象创建配置实例。
+
+        Args:
+            config: 字典兼容的 AstrBot 插件配置。
+
+        Returns:
+            经过类型清洗的插件配置。
+        """
+        data = config or {}
+        natural_mode_value = str(
+            data.get("natural_draw_mode", "full")
+        ).strip().casefold()
+        return cls(
+            comfyui_url=str(data.get("comfyui_url", cls.comfyui_url)).strip(),
+            api_token=str(data.get("api_token", "")).strip(),
+            enable_web_ui=_as_bool(data.get("enable_web_ui"), False),
+        enable_time_context=_as_bool(data.get("enable_time_context"), True),
+            web_ui_host=(str(data.get("web_ui_host", "0.0.0.0")).strip() or "0.0.0.0"),
+            web_ui_port=min(
+                65535,
+                _as_int(data.get("web_ui_port"), 6198, 1024),
+            ),
+            web_ui_username=(
+                str(data.get("web_ui_username", "admin")).strip() or "admin"
+            ),
+            web_ui_password=str(data.get("web_ui_password", "")),
+            web_ui_session_ttl=min(
+                86400,
+                _as_int(data.get("web_ui_session_ttl"), 43200, 300),
+            ),
+            workflow_file=str(data.get("workflow_file", DEFAULT_WORKFLOW_FILE)).strip(),
+            upscale_workflow_file=str(
+                data.get("upscale_workflow_file", "workflow/rtx_upscale_api.json")
+            ).strip()
+            or "workflow/rtx_upscale_api.json",
+            base_workflow_file=str(
+                data.get("base_workflow_file", "workflow/anima_base_api.json")
+            ).strip()
+            or "workflow/anima_base_api.json",
+            rtx_generation_workflow_file=str(
+                data.get(
+                    "rtx_generation_workflow_file",
+                    "workflow/anima_rtx_api.json",
+                )
+            ).strip()
+            or "workflow/anima_rtx_api.json",
+            iterative_workflow_file=str(
+                data.get(
+                    "iterative_workflow_file",
+                    "workflow/anima_iterative_api.json",
+                )
+            ).strip()
+            or "workflow/anima_iterative_api.json",
+            inpaint_crop_workflow_file=str(
+                data.get(
+                    "inpaint_crop_workflow_file",
+                    "workflow/anima_inpaint_crop_api.json",
+                )
+            ).strip()
+            or "workflow/anima_inpaint_crop_api.json",
+            lanpaint_workflow_file=str(
+                data.get("lanpaint_workflow_file", "workflow/anima_lanpaint_api.json")
+            ).strip()
+            or "workflow/anima_lanpaint_api.json",
+            control_workflow_file=str(
+                data.get("control_workflow_file", "workflow/anima_control_api.json")
+            ).strip()
+            or "workflow/anima_control_api.json",
+            img2img_workflow_file=str(
+                data.get("img2img_workflow_file", "workflow/anima_img2img_api.json")
+            ).strip()
+            or "workflow/anima_img2img_api.json",
+            default_generation_pipeline=(
+                str(data.get("default_generation_pipeline")).strip().lower()
+                if str(data.get("default_generation_pipeline", "")).strip().lower()
+                in {"base", "rtx", "iterative"}
+                else (
+                    "rtx" if _as_bool(data.get("enable_upscale"), True) else "base"
+                )
+            ),
+            model_profile_id=(
+                str(data.get("model_profile_id", "anima_legacy")).strip()
+                or "anima_legacy"
+            ),
+            model_family=(
+                str(data.get("model_family", "anima_legacy_28l")).strip()
+                or "anima_legacy_28l"
+            ),
+            unet_model_root=str(data.get("unet_model_root", "")).strip().strip("/\\"),
+            clip_model_name=(
+                str(data.get("clip_model_name", "qwen_3_06b_base.safetensors")).strip()
+                or "qwen_3_06b_base.safetensors"
+            ),
+            clip_model_root=str(data.get("clip_model_root", "")).strip().strip("/\\"),
+            vae_model_name=(
+                str(data.get("vae_model_name", "qwen_image_vae.safetensors")).strip()
+                or "qwen_image_vae.safetensors"
+            ),
+            vae_model_root=str(data.get("vae_model_root", "")).strip().strip("/\\"),
+            lora_patch_required=_as_bool(data.get("lora_patch_required"), False),
+            lora_patch_node_type=str(data.get("lora_patch_node_type", "")).strip(),
+            lora_patch_contract_id=str(
+                data.get("lora_patch_contract_id", "")
+            ).strip(),
+            enable_prompt_llm=_as_bool(data.get("enable_prompt_llm"), True),
+            prompt_llm_provider_id=str(data.get("prompt_llm_provider_id", "")).strip(),
+            prompt_llm_timeout=_as_int(data.get("prompt_llm_timeout"), 120, 10),
+            character_swap_timeout=min(
+                600,
+                _as_int(data.get("character_swap_timeout"), 240, 30),
+            ),
+            prompt_llm_temperature=_as_float(data.get("prompt_llm_temperature"), 0.3),
+            prompt_llm_max_tokens=_as_int(data.get("prompt_llm_max_tokens"), 1000, 128),
+            prompt_llm_fallback=_as_bool(data.get("prompt_llm_fallback"), True),
+            show_llm_prompt=_as_bool(data.get("show_llm_prompt"), False),
+            director_reference_file=(
+                DEFAULT_DIRECTOR_REFERENCE_FILE
+                if str(
+                    data.get("director_reference_file", "")
+                ).strip()
+                == "prompts/director_reference.txt"
+                else str(
+                    data.get("director_reference_file", DEFAULT_DIRECTOR_REFERENCE_FILE)
+                ).strip()
+            ),
+            director_extra_instruction=str(
+                data.get("director_extra_instruction", "")
+            ).strip(),
+            enable_natural_draw=True,
+            director_primary=False,
+            enable_llm_pic_trigger=True,
+            # The terminal guard follows the consolidated natural-draw mode,
+            # never the legacy pic trigger flag.
+            enable_chat_draw_terminal_guard=natural_mode_value != "off",
+            auto_draw_system_prompt=str(
+                data.get("auto_draw_system_prompt", "")
+            ).strip(),
+            chat_roleplay_draw_prompt=str(
+                data.get("chat_roleplay_draw_prompt", "")
+            ).strip(),
+            director_creative_preference=str(
+                data.get("director_creative_preference", "")
+            ).strip(),
+            max_auto_images_per_reply=_as_int(
+                data.get("max_auto_images_per_reply"), 1, 1
+            ),
+            conversation_draw_cooldown_seconds=_as_float(
+                data.get("conversation_draw_cooldown_seconds"),
+                8.0,
+            ),
+            follow_up_draw_priority=str(
+                data.get("follow_up_draw_priority", "after_delivery")
+            ).strip(),
+            intent_router_probe_plan=_as_bool(
+                data.get("intent_router_probe_plan"), True
+            ),
+            show_command_progress=_as_bool(
+                data.get("show_command_progress"), True
+            ),
+            enable_reverse_prompt=_as_bool(data.get("enable_reverse_prompt"), True),
+            enable_workflow_reverse=_as_bool(
+                data.get("enable_workflow_reverse"),
+                True,
+            ),
+            reverse_backend=_as_reverse_backend(data.get("reverse_backend")),
+            reverse_workflow_file=(
+                str(
+                    data.get(
+                        "reverse_workflow_file",
+                        "workflow/anima_reverse_tagger_api.json",
+                    )
+                ).strip()
+                or "workflow/anima_reverse_tagger_api.json"
+            ),
+            reverse_workflow_timeout=min(
+                300,
+                _as_int(data.get("reverse_workflow_timeout"), 120, 10),
+            ),
+            reverse_tagger_model=_as_reverse_tagger_model(
+                data.get("reverse_tagger_model")
+            ),
+            reverse_general_threshold=min(
+                1.0,
+                _as_float(
+                    data.get(
+                        "reverse_general_threshold",
+                        data.get("reverse_tagger_general_threshold"),
+                    ),
+                    0.55,
+                ),
+            ),
+            reverse_character_threshold=min(
+                1.0,
+                _as_float(
+                    data.get(
+                        "reverse_character_threshold",
+                        data.get("reverse_tagger_character_threshold"),
+                    ),
+                    0.6,
+                ),
+            ),
+            reverse_categories=_as_reverse_tagger_categories(
+                data.get("reverse_categories", data.get("reverse_tagger_categories"))
+            ),
+            reverse_session_method=_as_reverse_tagger_session(
+                data.get("reverse_session_method", data.get("reverse_tagger_session"))
+            ),
+            enable_reverse_json_formatter=_as_bool(
+                data.get("enable_reverse_json_formatter"),
+                True,
+            ),
+            enable_reverse_json_repair_retry=_as_bool(
+                data.get("enable_reverse_json_repair_retry"),
+                True,
+            ),
+            reverse_prompt_provider_id=str(
+                data.get("reverse_prompt_provider_id", "")
+            ).strip(),
+            reverse_prompt_timeout=min(
+                300,
+                _as_int(data.get("reverse_prompt_timeout"), 120, 10),
+            ),
+            reverse_prompt_temperature=min(
+                2.0,
+                max(0.0, _as_float(data.get("reverse_prompt_temperature"), 0.1)),
+            ),
+            reverse_prompt_max_tokens=min(
+                8000,
+                _as_int(data.get("reverse_prompt_max_tokens"), 1600, 256),
+            ),
+            reverse_prompt_system_prompt=str(
+                data.get("reverse_prompt_system_prompt", "")
+            ).strip(),
+            enable_control_stack_v2=_as_bool(
+                data.get("enable_control_stack_v2"), True
+            ),
+            control_default_fidelity=(
+                str(data.get("control_default_fidelity") or "balanced")
+                .strip()
+                .casefold()
+                if str(data.get("control_default_fidelity") or "balanced")
+                .strip()
+                .casefold()
+                in {"strict", "balanced", "loose"}
+                else "balanced"
+            ),
+            control_default_resize_policy=(
+                str(data.get("control_default_resize_policy") or "fit")
+                .strip()
+                .casefold()
+                if str(data.get("control_default_resize_policy") or "fit")
+                .strip()
+                .casefold()
+                in {"fit", "crop", "stretch"}
+                else "fit"
+            ),
+            control_default_reference_scope=(
+                str(data.get("control_default_reference_scope") or "appearance")
+                .strip()
+                .casefold()
+                if str(data.get("control_default_reference_scope") or "appearance")
+                .strip()
+                .casefold()
+                in {"appearance", "style", "color"}
+                else "appearance"
+            ),
+            max_input_image_size_mb=min(
+                100,
+                _as_int(data.get("max_input_image_size_mb"), 20, 1),
+            ),
+            max_input_image_pixels=min(
+                100_000_000,
+                _as_int(data.get("max_input_image_pixels"), 40_000_000, 1_000_000),
+            ),
+            workflow_dir=str(data.get("workflow_dir", "workflow")).strip()
+            or "workflow",
+            enable_unet_switch=_as_bool(data.get("enable_unet_switch"), True),
+            unet_catalog_url=str(data.get("unet_catalog_url", "")).strip(),
+            unet_catalog_timeout=_as_int(data.get("unet_catalog_timeout"), 20, 1),
+            unet_lan_only=_as_bool(data.get("unet_lan_only"), True),
+            unet_loader_node_id=str(data.get("unet_loader_node_id", "429")).strip()
+            or "429",
+            unet_model_input_name=str(
+                data.get("unet_model_input_name", "unet_name")
+            ).strip()
+            or "unet_name",
+            unet_model_name=str(data.get("unet_model_name", "")).strip(),
+            whitelist_only=_as_bool(data.get("whitelist_only"), False),
+            group_whitelist=(
+                _as_string_list(data.get("group_whitelist"), [])
+                if data.get("group_whitelist")
+                else []
+            ),
+            global_lock=_as_bool(data.get("global_lock"), False),
+            enable_lock_command=_as_bool(data.get("enable_lock_command"), True),
+            admin_ignore_cooldown=_as_bool(data.get("admin_ignore_cooldown"), True),
+            admin_ignore_whitelist=_as_bool(data.get("admin_ignore_whitelist"), True),
+            admin_ignore_blocklist=_as_bool(data.get("admin_ignore_blocklist"), False),
+            default_block_level=(
+                str(data.get("default_block_level", "lite")).strip().lower()
+                if str(data.get("default_block_level", "lite")).strip().lower()
+                in {"none", "lite", "full"}
+                else "lite"
+            ),
+            group_block_levels=_as_group_levels(data.get("group_block_levels", [])),
+            forward_sender_name=(
+                str(data.get("forward_sender_name", "ComfyUI 绘图")).strip()
+                or "ComfyUI 绘图"
+            ),
+            enable_lora_tool=_as_bool(data.get("enable_lora_tool"), True),
+            lora_catalog_url=str(data.get("lora_catalog_url", "")).strip(),
+            enable_lora_manager=_as_bool(data.get("enable_lora_manager"), True),
+            lora_manager_url=str(data.get("lora_manager_url", "")).strip(),
+            lora_model_root=str(data.get("lora_model_root", "")).strip().strip("/\\"),
+            lora_manager_scan_on_refresh=_as_bool(
+                data.get("lora_manager_scan_on_refresh"), True
+            ),
+            lora_manager_scan_interval=_as_int(
+                data.get("lora_manager_scan_interval"), 60, 0
+            ),
+            lora_manager_scan_timeout=_as_int(
+                data.get("lora_manager_scan_timeout"), 180, 10
+            ),
+            lora_manager_page_size=_as_int(data.get("lora_manager_page_size"), 100, 10),
+            enable_lora_download=_as_bool(data.get("enable_lora_download"), True),
+            lora_download_timeout=_as_int(data.get("lora_download_timeout"), 3600, 60),
+            lora_metadata_timeout=_as_int(data.get("lora_metadata_timeout"), 300, 10),
+            lora_download_max_concurrent=_as_int(
+                data.get("lora_download_max_concurrent"), 1, 1
+            ),
+            lora_download_allowed_hosts=_as_string_list(
+                data.get("lora_download_allowed_hosts"),
+                [
+                    "civitai.com",
+                    "www.civitai.com",
+                    "civitai.red",
+                    "www.civitai.red",
+                ],
+            ),
+            lora_lan_only=_as_bool(data.get("lora_lan_only"), True),
+            lora_catalog_timeout=_as_int(data.get("lora_catalog_timeout"), 15, 1),
+            lora_cache_ttl=_as_int(data.get("lora_cache_ttl"), 300, 0),
+            lora_max_results=_as_int(data.get("lora_max_results"), 50, 1),
+            enable_lora_visual_gallery=_as_bool(
+                data.get("enable_lora_visual_gallery"), True
+            ),
+            lora_visual_roots=_as_string_list(data.get("lora_visual_roots"), []),
+            lora_visual_cache_mb=min(
+                8192,
+                _as_int(data.get("lora_visual_cache_mb"), 256, 0),
+            ),
+            lora_visual_warmup_workers=min(
+                4,
+                _as_int(data.get("lora_visual_warmup_workers"), 2, 1),
+            ),
+            lora_visual_preview_max_mb=min(
+                32,
+                _as_int(data.get("lora_visual_preview_max_mb"), 4, 1),
+            ),
+            lora_visual_thumbnail_size=min(
+                1024,
+                _as_int(data.get("lora_visual_thumbnail_size"), 512, 128),
+            ),
+            lora_alias_rules=_as_string_list(
+                data.get("lora_alias_rules"),
+                [],
+            ),
+            enable_lora_hybrid_search=_as_bool(
+                data.get("enable_lora_hybrid_search"), False
+            ),
+            lora_embedding_provider_id=str(
+                data.get("lora_embedding_provider_id", "")
+            ).strip(),
+            lora_rerank_provider_id=str(
+                data.get("lora_rerank_provider_id", "")
+            ).strip(),
+            lora_embedding_top_k=min(
+                100,
+                _as_int(data.get("lora_embedding_top_k"), 20, 4),
+            ),
+            lora_rerank_top_n=min(
+                50,
+                _as_int(data.get("lora_rerank_top_n"), 8, 1),
+            ),
+            lora_retrieval_timeout=min(
+                120,
+                _as_int(data.get("lora_retrieval_timeout"), 30, 3),
+            ),
+            lora_tool_max_steps=_as_int(data.get("lora_tool_max_steps"), 4, 1),
+            enable_task_lora_snapshot=_as_bool(
+                data.get("enable_task_lora_snapshot"), True
+            ),
+            lora_snapshot_max_age=min(
+                1800,
+                _as_int(data.get("lora_snapshot_max_age"), 300, 15),
+            ),
+            enable_parallel_preflight=_as_bool(
+                data.get("enable_parallel_preflight"), True
+            ),
+            provider_max_concurrent_jobs=min(
+                32,
+                _as_int(data.get("provider_max_concurrent_jobs"), 4, 1),
+            ),
+            enable_local_intent_router=_as_bool(
+                data.get("enable_local_intent_router"), True
+            ),
+            intent_router_model=str(data.get("intent_router_model", "")).strip(),
+            intent_router_timeout=min(
+                120,
+                _as_int(data.get("intent_router_timeout"), 20, 3),
+            ),
+            intent_router_temperature=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_router_temperature"), 0.0)),
+            ),
+            intent_router_min_confidence=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_router_min_confidence"), 0.7)),
+            ),
+            intent_judge_backend=str(
+                data.get("intent_judge_backend", "auto")
+            ).strip().casefold(),
+            enable_bot_reply_draw=_as_bool(data.get("enable_bot_reply_draw"), False),
+            bot_reply_draw_cooldown_seconds=_as_float(
+                data.get("bot_reply_draw_cooldown_seconds"), 30.0
+            ),
+            bot_reply_intent_backend=str(
+                data.get("bot_reply_intent_backend", "auto")
+            ).strip().casefold(),
+            bot_reply_draw_delivery_phrases=_as_string_list(
+                data.get("bot_reply_draw_delivery_phrases"),
+                [
+                    "给你看",
+                    "给你瞧瞧",
+                    "快看",
+                    "拍给你看",
+                    "穿给你看",
+                    "我给你看",
+                ],
+            ),
+            intent_judge_embedding_provider_id=str(
+                data.get("intent_judge_embedding_provider_id", "")
+            ).strip(),
+            intent_judge_rerank_provider_id=str(
+                data.get("intent_judge_rerank_provider_id", "")
+            ).strip(),
+            intent_judge_online_provider_id=str(
+                data.get("intent_judge_online_provider_id", "")
+            ).strip(),
+            intent_judge_positive_anchors=_as_string_list(
+                data.get("intent_judge_positive_anchors"), []
+            ),
+            intent_judge_negative_anchors=_as_string_list(
+                data.get("intent_judge_negative_anchors"), []
+            ),
+            intent_judge_local_embedding_threshold=min(
+                1.0,
+                max(-1.0, _as_float(data.get("intent_judge_local_embedding_threshold"), 0.10)),
+            ),
+            intent_judge_local_rerank_threshold=min(
+                1.0,
+                max(-1.0, _as_float(data.get("intent_judge_local_rerank_threshold"), 0.05)),
+            ),
+            intent_judge_auto_confidence_floor=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_judge_auto_confidence_floor"), 0.70)),
+            ),
+            intent_judge_online_timeout=min(
+                120.0,
+                max(1.0, _as_float(data.get("intent_judge_online_timeout"), 10.0)),
+            ),
+            intent_judge_online_temperature=min(
+                1.0,
+                max(0.0, _as_float(data.get("intent_judge_online_temperature"), 0.0)),
+            ),
+            intent_judge_fallback=str(
+                data.get("intent_judge_fallback", "no_draw")
+            ).strip().casefold(),
+            draw_pipeline_mode=(
+                str(data.get("draw_pipeline_mode", "auto")).strip().casefold()
+                if str(data.get("draw_pipeline_mode", "auto")).strip().casefold()
+                in {"auto", "base", "rtx", "iterative", "legacy"}
+                else "auto"
+            ),
+            intent_router_gate_mode=(
+                str(data.get("intent_router_gate_mode", "on")).strip().casefold()
+                if str(data.get("intent_router_gate_mode", "on")).strip().casefold()
+                in {"off", "on"}
+                else "on"
+            ),
+            enable_visual_task_intent=_as_bool(
+                data.get("enable_visual_task_intent"), True
+            ),
+            enable_user_picture_preferences=_as_bool(
+                data.get("enable_user_picture_preferences"), False
+            ),
+            user_picture_preferences_ttl=max(
+                0,
+                _as_int(data.get("user_picture_preferences_ttl"), 0, 0),
+            ),
+            router_timeout_before_agent=min(
+                120.0,
+                max(0.0, _as_float(data.get("router_timeout_before_agent"), 0.0)),
+            ),
+            enable_scene_extraction=True,
+            scene_extraction_model=str(
+                data.get("scene_extraction_model", "")
+            ).strip(),
+            scene_context_window=min(
+                32,
+                _as_int(data.get("scene_context_window"), 8, 1),
+            ),
+            scene_extraction_max_memories=min(
+                20,
+                _as_int(data.get("scene_extraction_max_memories"), 5, 0),
+            ),
+            natural_draw_mode=_normalize_enum(
+                str(data.get("natural_draw_mode", "full")).strip().casefold(),
+                ("off", "photo_only", "full"),
+                "full",
+            ),
+            character_purity_mode=_normalize_enum(
+                str(
+                    data.get("character_purity_mode", "smart")
+                ).strip().casefold(),
+                ("smart", "strict", "off"),
+                "smart",
+            ),
+            scene_extraction=_as_bool(
+                data.get("scene_extraction"),
+                True,
+            ),
+            chinese_prompt_translation=_as_bool(
+                data.get("chinese_prompt_translation"),
+                True,
+            ),
+            config_migration_version=_as_int(
+                data.get("config_migration_version"), 2, 0
+            ),
+            config_migrated_utc=str(
+                data.get("config_migrated_utc", "") or ""
+            ).strip(),
+            enable_session_recipe_continuity=_as_bool(
+                data.get("enable_session_recipe_continuity"), True
+            ),
+            invalidate_session_recipe_on_update=_as_bool(
+                data.get("invalidate_session_recipe_on_update"), True
+            ),
+            enable_preset_manifest_gate=_as_bool(
+                data.get("enable_preset_manifest_gate"), True
+            ),
+            interaction_mode=(
+                str(data.get("interaction_mode", "smart")).strip().lower()
+                if str(data.get("interaction_mode", "smart")).strip().lower()
+                in {"smart", "strict"}
+                else "smart"
+            ),
+            structured_director_mode=(
+                str(data.get("structured_director_mode", "auto")).strip().lower()
+                if str(data.get("structured_director_mode", "auto")).strip().lower()
+                in {"auto", "function_call", "json", "legacy"}
+                else "auto"
+            ),
+            enable_prompt_composer_v2=_as_bool(
+                data.get("enable_prompt_composer_v2"), True
+            ),
+            enable_chinese_prompt_translation=True,
+            adaptive_negative_mode=(
+                str(data.get("adaptive_negative_mode", "conservative"))
+                .strip()
+                .lower()
+                if str(data.get("adaptive_negative_mode", "conservative"))
+                .strip()
+                .lower()
+                in {"off", "conservative", "standard"}
+                else "conservative"
+            ),
+            enable_prompt_diagnostics=_as_bool(
+                data.get("enable_prompt_diagnostics"), True
+            ),
+            prompt_diagnostics_include_content=_as_bool(
+                data.get("prompt_diagnostics_include_content"), False
+            ),
+            prompt_diagnostics_capacity=min(
+                500,
+                _as_int(data.get("prompt_diagnostics_capacity"), 50, 10),
+            ),
+            danbooru_validation_mode=(
+                str(data.get("danbooru_validation_mode", "report")).strip().lower()
+                if str(data.get("danbooru_validation_mode", "report")).strip().lower()
+                in {"off", "report", "guarded"}
+                else "report"
+            ),
+            danbooru_index_url=str(data.get("danbooru_index_url", "")).strip(),
+            danbooru_index_timeout=min(
+                300,
+                _as_int(data.get("danbooru_index_timeout"), 30, 5),
+            ),
+            danbooru_index_max_size_mb=min(
+                512,
+                _as_int(data.get("danbooru_index_max_size_mb"), 256, 1),
+            ),
+            danbooru_api_base_url=(
+                str(
+                    data.get(
+                        "danbooru_api_base_url",
+                        "https://danbooru.donmai.us",
+                    )
+                ).strip()
+                or "https://danbooru.donmai.us"
+            ),
+            danbooru_api_proxy_url=str(
+                data.get("danbooru_api_proxy_url", "")
+            ).strip(),
+            danbooru_api_mode=(
+                str(data.get("danbooru_api_mode", "identity")).strip().casefold()
+                if str(data.get("danbooru_api_mode", "identity")).strip().casefold()
+                in {"identity", "full"}
+                else "identity"
+            ),
+            danbooru_api_general_min_posts=min(
+                1_000_000,
+                _as_int(data.get("danbooru_api_general_min_posts"), 10, 0),
+            ),
+            danbooru_api_meta_min_posts=min(
+                1_000_000,
+                _as_int(data.get("danbooru_api_meta_min_posts"), 10, 0),
+            ),
+            danbooru_api_page_size=min(
+                1000,
+                _as_int(data.get("danbooru_api_page_size"), 1000, 1),
+            ),
+            danbooru_api_request_interval_ms=min(
+                10_000,
+                _as_int(data.get("danbooru_api_request_interval_ms"), 750, 250),
+            ),
+            danbooru_api_timeout=min(
+                300,
+                _as_int(data.get("danbooru_api_timeout"), 60, 10),
+            ),
+            danbooru_api_max_records=min(
+                3_000_000,
+                _as_int(data.get("danbooru_api_max_records"), 2_000_000, 1_000),
+            ),
+            danbooru_api_include_aliases=_as_bool(
+                data.get("danbooru_api_include_aliases"), True
+            ),
+            danbooru_auto_update_enabled=_as_bool(
+                data.get("danbooru_auto_update_enabled"), False
+            ),
+            danbooru_auto_update_interval_hours=min(
+                2160,
+                _as_int(
+                    data.get("danbooru_auto_update_interval_hours"),
+                    168,
+                    24,
+                ),
+            ),
+            enable_prompt_asset_library=_as_bool(
+                data.get("enable_prompt_asset_library"), True
+            ),
+            prompt_asset_remote_import_enabled=_as_bool(
+                data.get("prompt_asset_remote_import_enabled"), False
+            ),
+            prompt_asset_max_download_mb=min(
+                16,
+                _as_int(data.get("prompt_asset_max_download_mb"), 16, 1),
+            ),
+            enable_prompt_lab=_as_bool(data.get("enable_prompt_lab"), True),
+            prompt_lab_batch_capacity=min(
+                128,
+                _as_int(data.get("prompt_lab_batch_capacity"), 32, 4),
+            ),
+            prompt_lab_ttl_seconds=min(
+                86400,
+                _as_int(data.get("prompt_lab_ttl_seconds"), 1800, 60),
+            ),
+            enable_layered_lora_retrieval=_as_bool(
+                data.get("enable_layered_lora_retrieval"), True
+            ),
+            lora_loader_node_id=str(data.get("lora_loader_node_id", "462")).strip()
+            or "462",
+            dynamic_lora_mode=(
+                str(data.get("dynamic_lora_mode", "append")).strip().lower()
+                if str(data.get("dynamic_lora_mode", "append")).strip().lower()
+                in {"append", "replace"}
+                else "append"
+            ),
+            max_dynamic_loras=_as_int(data.get("max_dynamic_loras"), 3, 0),
+            max_preset_loras=_as_int(data.get("max_preset_loras"), 12, 1),
+            max_total_dynamic_loras=_as_int(data.get("max_total_dynamic_loras"), 12, 1),
+            default_style_preset=str(
+                data.get("default_style_preset", "风格001")
+            ).strip(),
+            auto_reload_after_style_save=_as_bool(
+                data.get("auto_reload_after_style_save"), False
+            ),
+            lora_presets=_as_mapping_list(
+                data.get("lora_presets", _default_lora_presets())
+            ),
+            strict_lora_validation=_as_bool(data.get("strict_lora_validation"), True),
+            prompt_node_id=str(
+                data.get("prompt_node_id", DEFAULT_PROMPT_NODE_ID)
+            ).strip(),
+            negative_node_id=str(
+                data.get("negative_node_id", DEFAULT_NEGATIVE_NODE_ID)
+            ).strip(),
+            workflow_positive_node_overrides=_as_string_list(
+                data.get("workflow_positive_node_overrides"), []
+            ),
+            workflow_negative_node_overrides=_as_string_list(
+                data.get("workflow_negative_node_overrides"), []
+            ),
+            primary_seed_node_id=str(
+                data.get("primary_seed_node_id", DEFAULT_PRIMARY_SEED_NODE_ID)
+            ).strip(),
+            secondary_seed_node_id=str(
+                data.get("secondary_seed_node_id", DEFAULT_SECONDARY_SEED_NODE_ID)
+            ).strip(),
+            resolution_node_id=str(
+                data.get("resolution_node_id", DEFAULT_RESOLUTION_NODE_ID)
+            ).strip(),
+            default_width=min(
+                MAX_IMAGE_SIDE,
+                _as_int(data.get("default_width"), 832, MIN_IMAGE_SIDE),
+            ),
+            default_height=min(
+                MAX_IMAGE_SIDE,
+                _as_int(data.get("default_height"), 1216, MIN_IMAGE_SIDE),
+            ),
+            sampler_node_ids=_as_string_list(
+                data.get("sampler_node_ids"), [DEFAULT_PRIMARY_SAMPLER_NODE_ID]
+            ),
+            sampler_steps_override=min(
+                MAX_STEPS,
+                _as_int(data.get("sampler_steps_override"), 0, 0),
+            ),
+            sampler_cfg_override=min(
+                30.0,
+                max(0.0, _as_float(data.get("sampler_cfg_override"), 0.0)),
+            ),
+            sampler_name_override=str(
+                data.get("sampler_name_override", "")
+            ).strip(),
+            sampler_scheduler_override=str(
+                data.get("sampler_scheduler_override", "")
+            ).strip(),
+            enable_ttp_detail=_as_bool(data.get("enable_ttp_detail"), False),
+            global_extra_positive_tags=_as_string_list(
+                data.get("global_extra_positive_tags"), []
+            ),
+            global_extra_negative_tags=_as_string_list(
+                data.get("global_extra_negative_tags"), []
+            ),
+            output_node_ids=_as_string_list(
+                data.get("output_node_ids"),
+                [DEFAULT_UPSCALE_OUTPUT_NODE_ID, DEFAULT_PREVIEW_OUTPUT_NODE_ID],
+            ),
+            upscale_output_node_id=str(
+                data.get("upscale_output_node_id", DEFAULT_UPSCALE_OUTPUT_NODE_ID)
+            ).strip(),
+            enable_upscale=_as_bool(data.get("enable_upscale"), True),
+            rtx_scale=min(
+                4.0,
+                max(1.0, _as_float(data.get("rtx_scale"), 2.0)),
+            ),
+            rtx_quality=(
+                str(data.get("rtx_quality", "ULTRA")).strip().upper()
+                if str(data.get("rtx_quality", "ULTRA")).strip().upper()
+                in {"LOW", "MEDIUM", "HIGH", "ULTRA"}
+                else "ULTRA"
+            ),
+            iterative_scale=min(
+                2.0,
+                max(1.1, _as_float(data.get("iterative_scale"), 1.5)),
+            ),
+            iterative_steps=min(
+                4,
+                _as_int(data.get("iterative_steps"), 3, 1),
+            ),
+            iterative_denoise=min(
+                0.8,
+                max(0.1, _as_float(data.get("iterative_denoise"), 0.35)),
+            ),
+            enable_inpaint=_as_bool(data.get("enable_inpaint"), True),
+            send_generation_notice=_as_bool(data.get("send_generation_notice"), True),
+            show_chat_generation_details=_as_bool(
+                data.get("show_chat_generation_details"), True
+            ),
+            allow_global_interrupt=_as_bool(data.get("allow_global_interrupt"), False),
+            max_concurrent_jobs=_as_int(data.get("max_concurrent_jobs"), 1, 1),
+            max_queued_jobs_per_user=min(
+                10,
+                _as_int(data.get("max_queued_jobs_per_user"), 3, 0),
+            ),
+            user_cooldown=_as_int(data.get("user_cooldown"), 30),
+            request_timeout=_as_int(data.get("request_timeout"), 30, 1),
+            generation_timeout=_as_int(data.get("generation_timeout"), 1200, 10),
+            poll_interval=_as_float(data.get("poll_interval"), 2.0, 0.25),
+            max_prompt_length=_as_int(data.get("max_prompt_length"), 2000, 1),
+            max_image_size_mb=_as_int(data.get("max_image_size_mb"), 50, 1),
+        )
+
+    def resolve_workflow_path(self, plugin_dir: Path) -> Path:
+        """解析并返回工作流路径。"""
+        path = Path(self.workflow_file).expanduser()
+        return path if path.is_absolute() else plugin_dir / path
+
+    def resolve_asset_name(self, kind: str) -> str:
+        """Return a ComfyUI model name scoped to the active asset branch."""
+        field = {"unet": "unet_model_name", "clip": "clip_model_name", "vae": "vae_model_name"}.get(kind)
+        root_field = {"unet": "unet_model_root", "clip": "clip_model_root", "vae": "vae_model_root"}.get(kind)
+        if field is None or root_field is None:
+            raise ValueError(f"unknown asset kind: {kind}")
+        name = str(getattr(self, field, "") or "").replace("\\", "/").strip("/")
+        root = str(getattr(self, root_field, "") or "").replace("\\", "/").strip("/")
+        if root and name and name.casefold() != root.casefold() and not name.casefold().startswith(root.casefold() + "/"):
+            return f"{root}/{name}"
+        return name
+
+    def resolve_upscale_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the standalone RTX workflow path."""
+        path = Path(self.upscale_workflow_file).expanduser()
+        return path if path.is_absolute() else plugin_dir / path
+
+    def resolve_reverse_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the dedicated local reverse-analysis workflow path."""
+        return self._resolve_plugin_path(plugin_dir, self.reverse_workflow_file)
+
+    @staticmethod
+    def _resolve_plugin_path(plugin_dir: Path, value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else plugin_dir / path
+
+    def resolve_pipeline_workflow_path(
+        self,
+        plugin_dir: Path,
+        pipeline: str,
+    ) -> Path:
+        """Resolve one explicit per-request generation pipeline."""
+        value = {
+            "base": self.base_workflow_file,
+            "rtx": self.rtx_generation_workflow_file,
+            "iterative": self.iterative_workflow_file,
+        }.get(str(pipeline or "").strip().lower())
+        if value is None:
+            raise ValueError("未知生成管线")
+        return self._resolve_plugin_path(plugin_dir, value)
+
+    def resolve_inpaint_workflow_path(
+        self,
+        plugin_dir: Path,
+        mode: str,
+    ) -> Path:
+        """Resolve the quick or LanPaint redraw workflow."""
+        value = {
+            "quick": self.inpaint_crop_workflow_file,
+            "lanpaint": self.lanpaint_workflow_file,
+        }.get(str(mode or "").strip().lower())
+        if value is None:
+            raise ValueError("未知重绘模式")
+        return self._resolve_plugin_path(plugin_dir, value)
+
+    def resolve_control_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the control-generation workflow for the active profile."""
+        return self._resolve_plugin_path(plugin_dir, self.control_workflow_file)
+
+    def resolve_img2img_workflow_path(self, plugin_dir: Path) -> Path:
+        """Resolve the img2img workflow for the active profile."""
+        return self._resolve_plugin_path(plugin_dir, self.img2img_workflow_file)
+
+    def resolve_director_reference_path(self, plugin_dir: Path) -> Path:
+        """解析并返回分镜导演参考提示词路径。"""
+        path = Path(self.director_reference_file).expanduser()
+        return path if path.is_absolute() else plugin_dir / path
+
+
+@dataclass(frozen=True)
+class LoraIdentityExpectation:
+    """One LoRA identity captured before a safety-critical rewrite."""
+
+    name: str
+    sha256: str = ""
+    source_fingerprint: str = ""
+
+
+@dataclass(frozen=True)
+class GenerationOptions:
+    """单次生成使用的动态参数。"""
+
+    prompt: str
+    negative_prompt: str = ""
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    cfg: Optional[float] = None
+    enable_upscale: Optional[bool] = None
+    use_prompt_llm: Optional[bool] = None
+    prompt_expansion_mode: str = "standard"
+    prompt_edit_mode: str = ""
+    character_swap_preview: bool = False
+    character_swap_mode: str = ""
+    character_swap_use_target_lora: Optional[bool] = None
+    character_swap_target_lora_strength: Optional[float] = None
+    dynamic_loras: tuple["LoraSelection", ...] = ()
+    lora_preset: str = ""
+    lora_injection_mode: Optional[str] = None
+    suppress_default_style: bool = False
+    suppressed_prompt_terms: tuple[str, ...] = ()
+    lora_identity_expectations: tuple["LoraIdentityExpectation", ...] = ()
+    lora_activation_overrides: tuple[tuple[str, str], ...] = ()
+    character_swap_target_lora: str = ""
+    character_swap_preserved_character_loras: tuple[str, ...] = ()
+    character_swap_forbid_character_loras: bool = False
+    pipeline: str = ""
+    inpaint_mode: str = ""
+    semantic_redraw_mode: str = ""
+    denoise: Optional[float] = None
+    control_modes: tuple[str, ...] = ()
+    semantic_required_positive_alias_groups: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ] = ()
+    semantic_forbidden_positive_terms: tuple[str, ...] = ()
+    semantic_preserved_positive_terms: tuple[str, ...] = ()
+    validate_llm_characters: bool = False
+    llm_character_queries: tuple[str, ...] = ()
+    llm_character_user_request: str = ""
+    llm_prompt_source: str = ""
+    preset_manifest: Any = None
+
+
+@dataclass(frozen=True)
+class LoraSelection:
+    """LLM 或高级用户为单次任务选择的 LoRA。"""
+
+    name: str
+    strength: float = 0.8
+
+
+@dataclass(frozen=True)
+class ImageReference:
+    """ComfyUI 历史记录中的图片引用。"""
+
+    filename: str
+    subfolder: str = ""
+    image_type: str = "output"
+    node_id: str = ""
+
+
+@dataclass(frozen=True)
+class UploadedImageReference:
+    """A validated ComfyUI input-image reference."""
+
+    name: str
+    subfolder: str = ""
+    image_type: str = "input"
+
+    @property
+    def workflow_value(self) -> str:
+        return f"{self.subfolder.rstrip('/')}/{self.name}" if self.subfolder else self.name
+
+
+class GeneratedImagePaths(list[Path]):
+    """Generated files plus safe execution metadata for the reply layer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.elapsed_seconds: float = 0.0
+        self.llm_elapsed_seconds: float = 0.0
+        self.llm_call_count: int = 0
+        self.comfy_elapsed_seconds: float = 0.0
+        self.gpu_name: str = "未知 GPU"
+        self.output_sha256s: dict[str, str] = {}
+
+
+@dataclass
+class GenerationJob:
+    """正在执行或排队中的生成任务。"""
+
+    user_id: str
+    prompt_preview: str
+    created_at: float
+    task: Any = None
+    ready_event: Any = None
+    prompt_id: Optional[str] = None
+    state: str = "queued"
+    task_type: str = "generation"
+    was_queued: bool = False
+    queue_position: int = 0
+    task_run_id: str = ""
+    failed_stage: str = ""
+    lora_snapshot: Any = None
+    prefetched_gpu_name: str = ""
+    llm_elapsed_seconds: float = 0.0
+    llm_call_count: int = 0
+    llm_external_character_authorities: dict[str, str] = field(default_factory=dict)
+    danbooru_revision_signature: str = ""

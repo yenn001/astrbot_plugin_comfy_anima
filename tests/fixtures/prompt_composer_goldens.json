@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "roxy_beach_sparkler_hybrid",
+      "description": "High-quality Danbooru anchors, one visual phrase layer, and one relationship sentence.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "1girl, solo, roxy migurdia, mushoku tensei, blue eyes, blue hair, very long hair, twin braids, hair between eyes, crossed bangs, ahoge, small breasts, petite, pear-shaped figure, toes, legs, alternate costume, see-through clothes, open front, single bare shoulder, white bikini, frilled bikini, white sandals, squatting, holding sparkler in one hand, watching sparkler, full body, looking at viewer, beach, shallow water, sea foam, night, soft lighting, she squats in the shallow water at the beach at night wearing a sheer open-front robe over her bikini, holding a sparkler in one hand, watching the glittering sparks with a soft smile as the sea foam washes over her feet",
+        "visual_phrases": [
+          "warm sparkler light across her face"
+        ],
+        "source": "golden:directed_draw"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "1girl",
+          "solo",
+          "roxy migurdia",
+          "mushoku tensei",
+          "blue eyes",
+          "blue hair",
+          "very long hair",
+          "twin braids",
+          "hair between eyes",
+          "crossed bangs",
+          "ahoge",
+          "small breasts",
+          "petite",
+          "pear-shaped figure",
+          "toes",
+          "legs",
+          "alternate costume",
+          "see-through clothes",
+          "open front",
+          "single bare shoulder",
+          "white bikini",
+          "frilled bikini",
+          "white sandals",
+          "squatting",
+          "holding sparkler in one hand",
+          "watching sparkler",
+          "full body",
+          "looking at viewer",
+          "beach",
+          "shallow water",
+          "sea foam",
+          "night",
+          "soft lighting"
+        ],
+        "visual_phrases": [
+          "warm sparkler light across her face"
+        ],
+        "scene_sentence": "she squats in the shallow water at the beach at night wearing a sheer open-front robe over her bikini, holding a sparkler in one hand, watching the glittering sparks with a soft smile as the sea foam washes over her feet",
+        "adaptive_negative_added": [
+          "bad hands",
+          "malformed hands",
+          "extra fingers",
+          "missing fingers",
+          "bad feet",
+          "malformed feet",
+          "extra toes"
+        ],
+        "negative_prompt": "bad hands, malformed hands, extra fingers, missing fingers, bad feet, malformed feet, extra toes",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad perspective"
+        ],
+        "assert_three_layers": true,
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "extreme_low_angle_apostrophe",
+      "description": "Apostrophes and escaped character qualifiers survive an extreme low-angle prompt.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "<lora:characters/kei.v1.2:0.75>, 1girl, kei \\(blue archive\\), worm's eye view, from below, foot focus, looking at viewer. She looms above the camera while one shoe dominates the foreground and the school rooftop recedes behind her.",
+        "source": "golden:direct_draw"
+      },
+      "expected": {
+        "lora_tags": [
+          "<lora:characters/kei.v1.2:0.75>"
+        ],
+        "hard_tags": [
+          "1girl",
+          "kei \\(blue archive\\)",
+          "worm's eye view",
+          "from below",
+          "foot focus",
+          "looking at viewer"
+        ],
+        "visual_phrases": [],
+        "scene_sentence": "She looms above the camera while one shoe dominates the foreground and the school rooftop recedes behind her.",
+        "adaptive_negative_added": [
+          "bad feet",
+          "malformed feet",
+          "extra toes",
+          "bad perspective",
+          "distorted perspective"
+        ],
+        "negative_prompt": "bad feet, malformed feet, extra toes, bad perspective, distorted perspective",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad hands"
+        ],
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "multiple_people_contact",
+      "description": "Two-person contact retains relational facts and gets only contact-specific negatives.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "2girls, holding hands, facing each other, close embrace, eye contact. Two girls hold hands at the center of the frame while their shoulders touch and their gazes meet.",
+        "visual_phrases": [
+          "interlocked fingers between both characters"
+        ],
+        "source": "golden:directed_draw"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "2girls",
+          "holding hands",
+          "facing each other",
+          "close embrace",
+          "eye contact"
+        ],
+        "visual_phrases": [
+          "interlocked fingers between both characters"
+        ],
+        "scene_sentence": "Two girls hold hands at the center of the frame while their shoulders touch and their gazes meet.",
+        "adaptive_negative_added": [
+          "bad hands",
+          "malformed hands",
+          "extra fingers",
+          "missing fingers",
+          "fused bodies",
+          "duplicated person",
+          "extra limbs"
+        ],
+        "negative_prompt": "bad hands, malformed hands, extra fingers, missing fingers, fused bodies, duplicated person, extra limbs",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad feet",
+          "bad perspective"
+        ],
+        "assert_three_layers": true,
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "custom_outfit_change_negative",
+      "description": "Requested replacement outfit stays positive while incompatible source garments stay negative.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "1girl, roxy migurdia, blue hair, twin braids, alternate costume, black evening dress, bare shoulders, standing. She wears the requested black evening dress while her blue hair and twin braids remain unchanged.",
+        "negative_prompt": "white bikini, frilled bikini, school uniform, sailor collar, necktie, original outfit",
+        "source": "golden:outfit_edit"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "1girl",
+          "roxy migurdia",
+          "blue hair",
+          "twin braids",
+          "alternate costume",
+          "black evening dress",
+          "bare shoulders",
+          "standing"
+        ],
+        "visual_phrases": [],
+        "scene_sentence": "She wears the requested black evening dress while her blue hair and twin braids remain unchanged.",
+        "adaptive_negative_added": [],
+        "negative_prompt": "white bikini, frilled bikini, school uniform, sailor collar, necktie, original outfit",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad hands",
+          "bad feet",
+          "bad perspective"
+        ],
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "control_pose_and_depth",
+      "description": "Pose and depth control instructions keep composition relationships in the final sentence.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "1girl, contrapposto, arms raised, from side, foreground railing, distant city, depth of field",
+        "visual_phrases": [
+          "foreground railing cutting across lower frame",
+          "distant city receding behind the subject"
+        ],
+        "scene_sentence": "She preserves the source silhouette and pose while the foreground railing and distant city retain the original depth layout.",
+        "source": "golden:control_pose_depth",
+        "pipeline": "control"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "1girl",
+          "contrapposto",
+          "arms raised",
+          "from side",
+          "foreground railing",
+          "distant city",
+          "depth of field"
+        ],
+        "visual_phrases": [
+          "foreground railing cutting across lower frame",
+          "distant city receding behind the subject"
+        ],
+        "scene_sentence": "She preserves the source silhouette and pose while the foreground railing and distant city retain the original depth layout.",
+        "adaptive_negative_added": [],
+        "negative_prompt": "",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad hands",
+          "bad feet",
+          "bad perspective"
+        ],
+        "assert_three_layers": true,
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "whole_image_edit",
+      "description": "Whole-image editing carries the requested delta and preserved framing in one sentence.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "1girl, red coat, rainy street, medium shot, looking at viewer",
+        "negative_prompt": "old blue coat",
+        "visual_phrases": [
+          "wet reflections spreading across the pavement"
+        ],
+        "scene_sentence": "She now wears a red coat on the same rainy street while the camera distance and framing remain unchanged.",
+        "source": "golden:whole_image_edit",
+        "pipeline": "img2img"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "1girl",
+          "red coat",
+          "rainy street",
+          "medium shot",
+          "looking at viewer"
+        ],
+        "visual_phrases": [
+          "wet reflections spreading across the pavement"
+        ],
+        "scene_sentence": "She now wears a red coat on the same rainy street while the camera distance and framing remain unchanged.",
+        "adaptive_negative_added": [],
+        "negative_prompt": "old blue coat",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad hands",
+          "bad feet",
+          "bad perspective"
+        ],
+        "assert_three_layers": true,
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "masked_local_edit_without_scene",
+      "description": "A local masked edit must not invent an unrelated whole-image relationship sentence.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "red brooch, gold filigree, centered on collar",
+        "negative_prompt": "blue brooch",
+        "visual_phrases": [
+          "warm metal glint around the brooch"
+        ],
+        "source": "golden:masked_edit",
+        "pipeline": "inpaint"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "red brooch",
+          "gold filigree",
+          "centered on collar"
+        ],
+        "visual_phrases": [
+          "warm metal glint around the brooch"
+        ],
+        "scene_sentence": "",
+        "adaptive_negative_added": [],
+        "negative_prompt": "blue brooch",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad hands",
+          "bad feet",
+          "bad perspective"
+        ],
+        "assert_no_scene": true
+      }
+    },
+    {
+      "id": "lora_versions_and_decimal_weights",
+      "description": "Periods inside LoRA names, version tags, and decimal weights are not sentence boundaries.",
+      "composer": {
+        "adaptive_negative_mode": "conservative",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "<lora:styles/anima.highres.v1.2:0.50>, <lora:characters/roxy.v2.1:0.65>, 1girl, roxy migurdia, (sparkler glow:1.15), version 2.1, beach. She watches the sparkler at night while sea foam reaches her sandals.",
+        "source": "golden:lora_versions"
+      },
+      "expected": {
+        "lora_tags": [
+          "<lora:styles/anima.highres.v1.2:0.50>",
+          "<lora:characters/roxy.v2.1:0.65>"
+        ],
+        "hard_tags": [
+          "1girl",
+          "roxy migurdia",
+          "(sparkler glow:1.15)",
+          "version 2.1",
+          "beach"
+        ],
+        "visual_phrases": [],
+        "scene_sentence": "She watches the sparkler at night while sea foam reaches her sandals.",
+        "adaptive_negative_added": [],
+        "negative_prompt": "",
+        "forbidden_negative_tags": [
+          "lowres",
+          "worst quality",
+          "low quality",
+          "bad anatomy",
+          "bad hands",
+          "bad feet",
+          "bad perspective"
+        ],
+        "assert_single_scene": true
+      }
+    },
+    {
+      "id": "raw_tags_exact_passthrough",
+      "description": "Exact direct Tags remain unchanged when no generated layers or adaptive negatives are requested.",
+      "composer": {
+        "adaptive_negative_mode": "off",
+        "validation_mode": "off"
+      },
+      "input": {
+        "positive_prompt": "kei \\(blue archive\\), kei \\(student\\) \\(blue archive\\), 1girl, worm's eye view, hair between eyes, from below, white hair",
+        "negative_prompt": "bad anatomy, extra fingers",
+        "source": "golden:raw_tags"
+      },
+      "expected": {
+        "lora_tags": [],
+        "hard_tags": [
+          "kei \\(blue archive\\)",
+          "kei \\(student\\) \\(blue archive\\)",
+          "1girl",
+          "worm's eye view",
+          "hair between eyes",
+          "from below",
+          "white hair"
+        ],
+        "visual_phrases": [],
+        "scene_sentence": "",
+        "adaptive_negative_added": [],
+        "negative_prompt": "bad anatomy, extra fingers",
+        "forbidden_negative_tags": [],
+        "assert_no_scene": true,
+        "assert_raw_unchanged": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,9935 @@
+"""使用轻量 AstrBot 桩验证主模块可导入及基础辅助逻辑。"""
+
+import asyncio
+import importlib
+import io
+import json
+import sys
+import tempfile
+import time
+import types
+import unittest
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from PIL import Image
+
+from ..models import GeneratedImagePaths, LoraIdentityExpectation, LoraSelection
+from ..services.character_prompt_compiler import CharacterPromptCompileError
+from ..services.danbooru_character_profile import CharacterAppearanceProfile
+from ..services.danbooru_index import (
+    DanbooruIndexError,
+    DanbooruTagIndex,
+    TagLookup,
+    normalize_tag,
+)
+from ..services.lora_catalog import LoraRecord as _CatalogLoraRecord
+from ..services.lora_semantic import (
+    LoraIdentityBinding,
+    LoraSemanticIndex,
+    SemanticEntry,
+    SemanticFact,
+    semantic_identity_key,
+    semantic_source_fingerprint,
+)
+from ..services.reverse_prompt import ReversePromptResult
+from ..services.reverse_evidence import ReverseEvidence
+from ..services.reverse_workflow import ReverseWorkflowError
+from ._stubs import (
+    Plain as _Plain,
+    _install_ledger_fallback,
+    install_astrbot_stubs,
+    make_gate_payload,
+)
+
+
+@dataclass(frozen=True)
+class LoraRecord(_CatalogLoraRecord):
+    compatible_model_families: tuple[str, ...] = ("anima_legacy_28l",)
+    compatibility_mode: str = "legacy_only"
+
+
+def _install_astrbot_stubs() -> None:
+    """Install the shared minimal AstrBot stubs used by the whole test suite."""
+    install_astrbot_stubs()
+
+
+class _ExactCharacterIndex:
+    """Small exact Character/Copyright index for pre-submit validation tests."""
+
+    _rows = {
+        "rio": ("rio_(blue_archive)", "character"),
+        "rio_(blue_archive)": ("rio_(blue_archive)", "character"),
+        "blue_archive": ("blue_archive", "copyright"),
+        "honkai:_star_rail": ("honkai:_star_rail", "copyright"),
+    }
+
+    @staticmethod
+    def status() -> dict[str, object]:
+        return {"ready": True}
+
+    def lookup_many(
+        self,
+        values: object,
+        category: str = "",
+    ) -> tuple[TagLookup, ...]:
+        results = []
+        for value in values:  # type: ignore[union-attr]
+            query = str(value or "")
+            normalized = normalize_tag(query)
+            canonical, row_category = self._rows.get(normalized, ("", ""))
+            if category and row_category != category:
+                canonical = ""
+                row_category = ""
+            results.append(
+                TagLookup(
+                    query=query,
+                    normalized_query=normalized,
+                    tag=canonical,
+                    canonical_tag=canonical,
+                    category=row_category,
+                    match_type="exact" if canonical else "none",
+                    verified=bool(canonical),
+                    provenance={},
+                )
+            )
+        return tuple(results)
+
+    def lookup(self, value: str, category: str = "") -> TagLookup:
+        return self.lookup_many((value,), category)[0]
+
+
+class MainCompatibilityTests(unittest.TestCase):
+    """主插件定义及纯辅助方法测试。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        # ledger fallback 只能在 main 导入后挂载；单独运行本文件时
+        # install_astrbot_stubs 的首次安装先于导入，必须在此补装。
+        _install_ledger_fallback()
+
+    def test_main_module_imports_with_documented_api_surface(self) -> None:
+        self.assertTrue(hasattr(self.main, "ComfyAnimaPlugin"))
+
+    def test_webui_bootstrap_exports_consolidated_draw_switches(self) -> None:
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        for field in (
+            "natural_draw_mode",
+            "character_purity_mode",
+            "scene_extraction",
+            "chinese_prompt_translation",
+        ):
+            with self.subTest(field=field):
+                self.assertRegex(
+                    source,
+                    rf'"{field}":\s*(?:\(\s*)?settings\.{field}',
+                )
+        for legacy in ("enable_natural_draw", "enable_llm_pic_trigger"):
+            with self.subTest(legacy=legacy):
+                self.assertNotRegex(
+                    source,
+                    rf'"{legacy}":\s*settings\.{legacy}',
+                )
+
+    def test_decorating_hook_is_render_not_intermediate_cleaner(self) -> None:
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        render_index = source.index("    async def render_llm_picture_tags")
+        render_previous = source[:render_index].splitlines()[-1].strip()
+        self.assertEqual(
+            render_previous,
+            "@filter.on_decorating_result(priority=20)",
+        )
+        helper_index = source.index(
+            "    def _clean_intermediate_chat_draw_controls"
+        )
+        helper_previous = source[:helper_index].splitlines()[-1].strip()
+        self.assertNotEqual(
+            helper_previous,
+            "@filter.on_decorating_result(priority=20)",
+        )
+        self.assertIn(
+            "self._clean_intermediate_chat_draw_controls(event, result)",
+            source,
+        )
+
+    def test_director_output_tool_is_request_local_not_globally_registered(self) -> None:
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(
+            '@filter.llm_tool(name="emit_anima_plan_v1")',
+            source,
+        )
+
+        class FunctionTool:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class ToolSet:
+            def __init__(self, tools):
+                self.tools = list(tools)
+
+        core_module = types.ModuleType("astrbot.core")
+        agent_module = types.ModuleType("astrbot.core.agent")
+        tool_module = types.ModuleType("astrbot.core.agent.tool")
+        tool_module.FunctionTool = FunctionTool
+        tool_module.ToolSet = ToolSet
+        module_names = (
+            "astrbot.core",
+            "astrbot.core.agent",
+            "astrbot.core.agent.tool",
+        )
+        previous = {name: sys.modules.get(name) for name in module_names}
+        sys.modules.update(
+            {
+                "astrbot.core": core_module,
+                "astrbot.core.agent": agent_module,
+                "astrbot.core.agent.tool": tool_module,
+            }
+        )
+        try:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(structured_director_mode="auto")
+            plugin.context = types.SimpleNamespace(
+                get_llm_tool_manager=lambda: self.fail(
+                    "request-local output schema must not read the global tool manager"
+                )
+            )
+
+            tool_set = plugin._get_director_output_tool_set()
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertEqual(len(tool_set.tools), 1)
+        tool = tool_set.tools[0]
+        self.assertEqual(tool.name, "emit_anima_plan_v1")
+        self.assertIsNone(tool.handler)
+        self.assertEqual(tool.parameters["required"], ["positive_tags"])
+        self.assertFalse(tool.parameters["additionalProperties"])
+        self.assertIn(
+            "natural-language scene sentence",
+            tool.parameters["properties"]["positive_tags"]["description"],
+        )
+
+    def test_visible_pic_result_reaches_generation_job(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            max_auto_images_per_reply=1,
+            enable_inpaint=False,
+            show_chat_generation_details=False,
+        )
+        plugin._director = types.SimpleNamespace(
+            parse_picture_response=lambda *_args, **_kwargs: types.SimpleNamespace(
+                text="",
+                prompts=("1girl, portrait",),
+                negative_prompts=("lowres",),
+                pipelines=("base",),
+                edits=(),
+            )
+        )
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+        calls = []
+
+        async def run_job(event, options, *, notify_queue=True):
+            calls.append((event, options))
+            return [Path("generated.png")], 123, options.prompt, "", "base"
+
+        plugin._run_job = run_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<pic prompt="1girl, portrait" pipeline="base">')]
+        )
+        event = types.SimpleNamespace(
+            message_str="请画一张肖像",
+            get_result=lambda: result,
+            get_extra=lambda key, default=None: {
+                "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                    self.main,
+                    self.main.DRAW_NOW,
+                    "请画一张肖像",
+                )
+            }.get(key, default),
+        )
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1].prompt, "1girl, portrait")
+        self.assertEqual(calls[0][1].negative_prompt, "lowres")
+        self.assertEqual(calls[0][1].pipeline, "base")
+        self.assertIn(("image", "generated.png"), result.chain)
+        self.assertFalse(
+            any(
+                isinstance(component, _Plain) and "Seed:" in component.text
+                for component in result.chain
+            )
+        )
+
+    def test_visible_edit_result_hides_generation_details_when_disabled(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            enable_prompt_composer_v2=False,
+            max_auto_images_per_reply=1,
+            enable_inpaint=True,
+            show_chat_generation_details=False,
+        )
+        plugin._director = types.SimpleNamespace(
+            parse_picture_response=lambda *_args, **_kwargs: types.SimpleNamespace(
+                text="",
+                prompts=(),
+                negative_prompts=(),
+                pipelines=(),
+                edits=(
+                    types.SimpleNamespace(
+                        prompt="red dress",
+                        negative_prompt="blue dress",
+                        mode="quick",
+                    ),
+                ),
+            )
+        )
+        plugin._client = object()
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+        plugin._execute_inpaint_job = AsyncMock()
+
+        async def run_auxiliary_job(event, operation_type, operation):
+            self.assertEqual(operation_type, "inpaint")
+            return [Path("edited.png")], 456, "red dress", "blue dress", "quick"
+
+        plugin._run_auxiliary_job = run_auxiliary_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<edit prompt="red dress" mode="quick">')]
+        )
+        event = types.SimpleNamespace(
+            message_str="change the dress",
+            get_result=lambda: result,
+            get_extra=lambda key, default=None: {
+                "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                    self.main,
+                    self.main.DRAW_NOW,
+                    "change the dress",
+                )
+            }.get(key, default),
+        )
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertIn(("image", "edited.png"), result.chain)
+        self.assertFalse(
+            any(
+                isinstance(component, _Plain) and "Seed:" in component.text
+                for component in result.chain
+            )
+        )
+
+
+class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
+    """Ordinary Agent asset lookups must end in one buffered picture terminal."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _event(message: str, decision: str | None = None):
+        decision = decision or ChatDrawTerminalGuardTests.main.DRAW_NOW
+        payload = make_gate_payload(
+            ChatDrawTerminalGuardTests.main,
+            decision,
+            message,
+        )
+
+        class Event:
+            message_str = message
+
+            def __init__(self) -> None:
+                self.extras = {
+                    "_llm_reasoning_content": "hidden",
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": payload,
+                }
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        return Event()
+
+    def _plugin(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            enable_chat_draw_terminal_guard=True,
+        )
+        plugin._director = self.main.PromptDirector
+        plugin._director_error = ""
+        plugin._internal_llm_events = set()
+        plugin._internal_llm_event_counts = {}
+        plugin._chat_draw_terminal_states = {}
+        plugin._lora_operation_snapshots = {}
+        plugin._lora_snapshot_locks = {}
+        cleared = []
+        plugin._clear_lora_operation_snapshot = lambda event: cleared.append(id(event))
+        return plugin, cleared
+
+    @staticmethod
+    def _run_context(text: str = "draft"):
+        return types.SimpleNamespace(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": text,
+                    "reasoning_content": "hidden",
+                }
+            ]
+        )
+
+    @staticmethod
+    def _response(text: str):
+        return types.SimpleNamespace(
+            completion_text=text,
+            reasoning_content="hidden",
+            reasoning_signature="signature",
+        )
+
+    async def test_guard_forces_full_buffering_before_main_agent_build(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时自拍")
+
+        await plugin.buffer_chat_draw_protocol_response(event)
+
+        self.assertIs(event.extras["enable_streaming"], False)
+
+    async def test_unrelated_chat_is_buffered_when_picture_protocol_is_enabled(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("今天天气怎么样？")
+
+        await plugin.buffer_chat_draw_protocol_response(event)
+
+        self.assertIs(event.extras["enable_streaming"], False)
+
+    async def test_disabled_terminal_repair_still_buffers_picture_protocol(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_chat_draw_terminal_guard = False
+        event = self._event("再出一遍 cos")
+
+        await plugin.buffer_chat_draw_protocol_response(event)
+
+        self.assertIs(event.extras["enable_streaming"], False)
+        self.assertTrue(plugin._chat_draw_terminal_guard_enabled())
+
+    async def test_explicit_photo_request_without_asset_tools_is_repaired(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_chat_draw_terminal_guard = False
+        plugin._auto_draw_system_prompt = ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            _remove_think_content = staticmethod(
+                self.main.PromptDirector._remove_think_content
+            )
+            extract_pic_instructions = staticmethod(
+                self.main.PromptDirector.extract_pic_instructions
+            )
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="1girl, reverse bunny suit, portrait">'
+        )
+        event = self._event(
+            "\u6211\u8981\u770b\u9006\u5154\u5973\u90ce\uff01\u770b\u770b\u7167\u7247\u3002"
+        )
+        request = types.SimpleNamespace(system_prompt="base")
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertFalse(trace["called"])
+
+        response = self._response("\u884c\uff0c\u7a7f\u7ed9\u4f60\u770b\u3002")
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_awaited_once()
+        self.assertIn("<pic", response.completion_text)
+
+    async def test_intermediate_decoration_never_repairs_draw_intent(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("再出一遍 cos 吧")
+        plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+        plugin._repair_chat_draw_terminal = AsyncMock(return_value="still prose")
+        result = types.SimpleNamespace(chain=[_Plain("行，马上穿给你看。")])
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertEqual(result.chain[0].text, "行，马上穿给你看。")
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertFalse(trace["repair_attempted"])
+        self.assertFalse(trace["blocked"])
+
+    async def test_no_tool_negated_request_cannot_submit_picture(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin._auto_draw_system_prompt = ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="must not run">'
+        )
+        event = self._event("不要给我看图，只查逆兔女郎 LoRA", self.main.NO_DRAW)
+        request = types.SimpleNamespace(system_prompt="base")
+
+        await plugin.inject_auto_draw_prompt(event, request)
+        response = self._response('<pic prompt="must not run">')
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("ComfyUI", response.completion_text)
+
+    async def test_follow_up_never_downgrades_active_drawing_trace(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        event = self._event("画一张达妮娅自拍")
+        trace = plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+        trace["terminal_state"] = "draw_new"
+
+        class ToolSet:
+            def __init__(self) -> None:
+                self.removed: list[str] = []
+
+            def remove_tool(self, name: str) -> None:
+                self.removed.append(name)
+
+            def get_tool(self, _name: str) -> None:
+                return None
+
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        tool_set = ToolSet()
+        request = types.SimpleNamespace(
+            prompt=(
+                "[SYSTEM NOTICE] User sent follow-up messages while tool "
+                "execution was in progress. Prioritize these follow-up "
+                "instructions in your next actions.\n1. 检查一下日志看看怎么回事"
+            ),
+            system_prompt="base",
+            func_tool=tool_set,
+        )
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertEqual(trace["terminal_state"], "draw_new")
+        self.assertEqual(request.system_prompt, "base")
+        self.assertIsNone(request.func_tool)
+        self.assertEqual(tool_set.removed, [])
+
+    async def test_director_primary_visual_intent_injects_immersive_contract(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.director_primary = True
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._auto_draw_system_prompt = ""
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+        event = self._event("画一张达妮娅自拍")
+        request = types.SimpleNamespace(system_prompt="base")
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+        self.assertTrue(request.system_prompt.startswith("base"))
+        self.assertGreater(len(request.system_prompt), len("base"))
+
+        response = self._response('<pic prompt="must not run">')
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("ComfyUI", response.completion_text)
+
+    async def test_director_primary_decorator_strips_pic_without_submit(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.director_primary = True
+        plugin._access_error = lambda *_args, **_kwargs: None
+        event = self._event("普通聊天")
+        trace = plugin._ensure_chat_draw_terminal_trace(event, intent=False)
+        trace["blocked"] = True
+        trace["blocked_message"] = (
+            f"{self.main.MessageEmoji.INFO} Director Primary 已启用，本次未提交绘图"
+        )
+        result = types.SimpleNamespace(chain=[_Plain('<pic prompt="leak">')])
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        plain_texts = [
+            component.text
+            for component in result.chain
+            if isinstance(component, _Plain)
+        ]
+        self.assertTrue(all("<pic" not in text for text in plain_texts))
+
+    async def test_active_drawing_session_isolates_follow_up_requests(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        event = self._event("画一张达妮娅自拍")
+        event.unified_msg_origin = "Bot:FriendMessage:719397082"
+        plugin._get_drawing_orchestrator().begin_umo_drawing(
+            event.unified_msg_origin
+        )
+
+        class ToolSet:
+            def __init__(self) -> None:
+                self.removed: list[str] = []
+
+            def remove_tool(self, name: str) -> None:
+                self.removed.append(name)
+
+            def get_tool(self, _name: str) -> None:
+                return None
+
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        tool_set = ToolSet()
+        request = types.SimpleNamespace(
+            prompt="follow-up notice",
+            system_prompt="base",
+            func_tool=tool_set,
+        )
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        self.assertIsNone(request.func_tool)
+        self.assertEqual(tool_set.removed, [])
+        self.assertEqual(request.system_prompt, "base")
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+    async def test_director_primary_isolates_even_without_active_drawing_session(
+        self,
+    ) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.director_primary = True
+        plugin.settings.enable_session_recipe_continuity = False
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._auto_draw_system_prompt = ""
+
+        class Director:
+            @staticmethod
+            def danbooru_runtime_context():
+                return ""
+
+            clean_response_text = staticmethod(
+                self.main.PromptDirector.clean_response_text
+            )
+
+        plugin._director = Director()
+
+        class ToolSet:
+            def __init__(self) -> None:
+                self.removed: list[str] = []
+
+            def remove_tool(self, name: str) -> None:
+                self.removed.append(name)
+
+            def get_tool(self, _name: str) -> None:
+                return None
+
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        tool_set = ToolSet()
+        event = self._event("画一套jk制服")
+        request = types.SimpleNamespace(
+            prompt="画一套jk制服",
+            system_prompt="base",
+            func_tool=tool_set,
+        )
+
+        await plugin.inject_auto_draw_prompt(event, request)
+
+        self.assertIsNone(request.func_tool)
+        self.assertEqual(tool_set.removed, [])
+        self.assertGreater(len(request.system_prompt), len("base"))
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["intent"])
+
+    async def test_disabled_picture_trigger_never_starts_terminal_trace(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.natural_draw_mode = "off"
+        event = self._event("用 LoRA 画飞鸟马时")
+
+        await plugin.track_chat_draw_asset_tool_start(
+            event,
+            types.SimpleNamespace(name="list_anima_loras"),
+            {},
+        )
+
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+    async def test_failure_string_blocks_even_a_valid_pic(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用风格006画一个角色")
+        tool = types.SimpleNamespace(name="list_anima_loras")
+        await plugin.track_chat_draw_asset_tool_start(event, tool, {})
+        result = types.SimpleNamespace(
+            isError=False,
+            content=[
+                types.SimpleNamespace(
+                    text=(
+                        "LoRA Manager refresh failed: timeout. "
+                        "Do not select any LoRA; stop the drawing request."
+                    )
+                )
+            ],
+        )
+        await plugin.track_chat_draw_asset_tool_result(event, tool, {}, result)
+        run_context = self._run_context()
+        response = self._response('<pic prompt="1girl, portrait">')
+
+        await plugin.enforce_chat_draw_terminal(event, run_context, response)
+
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("未提交 ComfyUI", response.completion_text)
+        self.assertIsNone(response.reasoning_content)
+        self.assertEqual(event.extras["_llm_reasoning_content"], "")
+        self.assertEqual(run_context.messages[-1]["content"], response.completion_text)
+        self.assertEqual(cleared, [id(event)])
+
+    async def test_bare_tags_are_repaired_with_exact_asset_evidence(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用角色 LoRA 画飞鸟马时自拍")
+        tool = types.SimpleNamespace(name="list_anima_loras")
+        await plugin.track_chat_draw_asset_tool_start(event, tool, {})
+        result = types.SimpleNamespace(
+            isError=False,
+            content=[
+                types.SimpleNamespace(
+                    text=(
+                        "Available Anima LoRAs.\n"
+                        "- toki_character | category: character | "
+                        "character: Toki | work: Blue Archive"
+                    )
+                )
+            ],
+        )
+        await plugin.track_chat_draw_asset_tool_result(event, tool, {}, result)
+        repair_calls = 0
+
+        async def repair(_event):
+            nonlocal repair_calls
+            repair_calls += 1
+            trace = plugin._chat_draw_terminal_trace(event)
+            self.assertEqual(
+                trace["evidence"][0]["records"][0]["name"],
+                "toki_character",
+            )
+            return (
+                '<pic prompt="<lora:toki_character:0.8>, 1girl, '
+                'toki_\\(blue_archive\\), selfie" '
+                'characters="toki|Blue Archive">'
+            )
+
+        plugin._repair_chat_draw_terminal = repair
+        run_context = self._run_context("画好了，1girl, toki")
+        response = self._response("画好了，1girl, toki")
+
+        await plugin.enforce_chat_draw_terminal(event, run_context, response)
+
+        self.assertEqual(repair_calls, 1)
+        self.assertIn("<lora:toki_character:0.8>", response.completion_text)
+        self.assertIn("<pic", response.completion_text)
+        self.assertEqual(cleared, [])
+        self.assertIsNone(response.reasoning_content)
+        self.assertEqual(run_context.messages[-1]["content"], response.completion_text)
+
+    async def test_query_only_wrong_pic_is_removed_and_never_repaired(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("列出能画 Toki 的 LoRA")
+        tool = types.SimpleNamespace(name="list_anima_loras")
+        await plugin.track_chat_draw_asset_tool_start(event, tool, {})
+        result = types.SimpleNamespace(
+            isError=False,
+            content=[types.SimpleNamespace(text="Available Anima LoRAs.\n- toki")],
+        )
+        await plugin.track_chat_draw_asset_tool_result(event, tool, {}, result)
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="should not run">'
+        )
+        run_context = self._run_context()
+        response = self._response('查询结果如下。<pic prompt="1girl, toki">')
+
+        await plugin.enforce_chat_draw_terminal(event, run_context, response)
+
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertEqual(response.completion_text, "查询结果如下。")
+        self.assertEqual(cleared, [id(event)])
+
+    async def test_multiple_terminals_trigger_one_bounded_repair(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("画两次也只允许提交一张")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=True,
+        )
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="1girl, repaired portrait">'
+        )
+        response = self._response(
+            '<pic prompt="first"><pic prompt="second"><edit prompt="third">'
+        )
+
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_awaited_once()
+        self.assertEqual(
+            response.completion_text,
+            '<pic prompt="1girl, repaired portrait">',
+        )
+
+    async def test_asset_failure_is_sticky_across_later_success(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("用方案和 LoRA 画一张图")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_prompt_plans")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_prompt_plans",
+            successful=False,
+        )
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=True,
+        )
+        trace = plugin._chat_draw_terminal_trace(event)
+
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["successful"])
+        self.assertEqual(trace["started_count"], 2)
+        self.assertEqual(trace["completed_count"], 2)
+
+    def test_empty_or_json_error_tool_results_are_failures(self) -> None:
+        empty = types.SimpleNamespace(isError=False, content=[])
+        json_error = types.SimpleNamespace(
+            isError=False,
+            content=[types.SimpleNamespace(text='{"ok":false,"code":"DENIED"}')],
+        )
+
+        self.assertFalse(
+            self.main.ComfyAnimaPlugin._chat_draw_asset_result_ok(
+                "list_anima_loras",
+                {},
+                empty,
+                self.main.ComfyAnimaPlugin._llm_tool_result_text(empty),
+            )
+        )
+        self.assertFalse(
+            self.main.ComfyAnimaPlugin._chat_draw_asset_result_ok(
+                "list_anima_prompt_plans",
+                {"keyword": "P-123456"},
+                json_error,
+                self.main.ComfyAnimaPlugin._llm_tool_result_text(json_error),
+            )
+        )
+
+    def test_empty_named_preset_and_prompt_plan_are_failures(self) -> None:
+        empty_preset = types.SimpleNamespace(
+            isError=False,
+            content=[
+                types.SimpleNamespace(
+                    text="No matching saved LoRA presets were found."
+                )
+            ],
+        )
+        empty_plan = types.SimpleNamespace(
+            isError=False,
+            content=[types.SimpleNamespace(text='{"ok":true,"count":0,"plans":[]}')],
+        )
+
+        self.assertFalse(
+            self.main.ComfyAnimaPlugin._chat_draw_asset_result_ok(
+                "list_anima_lora_presets",
+                {"keyword": "风格不存在"},
+                empty_preset,
+                self.main.ComfyAnimaPlugin._llm_tool_result_text(empty_preset),
+            )
+        )
+        self.assertFalse(
+            self.main.ComfyAnimaPlugin._chat_draw_asset_result_ok(
+                "list_anima_prompt_plans",
+                {"keyword": "P-000000"},
+                empty_plan,
+                self.main.ComfyAnimaPlugin._llm_tool_result_text(empty_plan),
+            )
+        )
+
+    async def test_cancelled_agent_response_is_never_repaired_into_picture(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=True,
+        )
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="must not run">'
+        )
+        response = self._response("Request interrupted by user.")
+        response.role = "aborted"
+
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context("previous assistant text"),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertEqual(response.completion_text, "Request interrupted by user.")
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+        self.assertEqual(cleared, [id(event)])
+
+    async def test_real_tool_loop_stop_flag_blocks_terminal_repair(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时")
+        event.extras["agent_stop_requested"] = True
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=True,
+        )
+        plugin._repair_chat_draw_terminal = AsyncMock(
+            return_value='<pic prompt="must not run">'
+        )
+        response = self._response("")
+        response.role = "assistant"
+
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context("partial assistant text"),
+            response,
+        )
+
+        plugin._repair_chat_draw_terminal.assert_not_awaited()
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+        self.assertEqual(cleared, [id(event)])
+
+    def test_intermediate_decoration_preserves_trace_and_snapshot(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        result = types.SimpleNamespace(chain=[_Plain("正在查询 LoRA")])
+        event.get_result = lambda: result
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertIsNotNone(plugin._chat_draw_terminal_trace(event))
+        self.assertEqual(cleared, [])
+
+    async def test_intermediate_pic_with_pending_tool_is_sanitized_not_rendered(
+        self,
+    ) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("照片发给我看看")
+        plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+        plugin._run_job = AsyncMock(side_effect=AssertionError("must not submit"))
+        result = types.SimpleNamespace(
+            chain=[_Plain('照片这就来 <pic prompt="1girl, portrait">')]
+        )
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn("照片这就来", result.chain[0].text)
+        self.assertNotIn("<pic", result.chain[0].text)
+        plugin._run_job.assert_not_awaited()
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertFalse(trace["blocked"])
+        self.assertFalse(trace["repair_attempted"])
+
+    async def test_final_pic_renders_after_on_agent_done_clears_trace(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.show_chat_generation_details = False
+        plugin.settings.max_auto_images_per_reply = 1
+        plugin.settings.enable_prompt_composer_v2 = False
+        event = self._event("照片发给我看看")
+        plugin._ensure_chat_draw_terminal_trace(event, intent=True)
+
+        response = self._response('<pic prompt="1girl, portrait">')
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+
+        async def run_job(event_, options, *, notify_queue=True):
+            self.assertEqual(options.prompt, "1girl, portrait")
+            return [Path("generated.png")], 123, options.prompt, "", "base"
+
+        plugin._run_job = run_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<pic prompt="1girl, portrait">')]
+        )
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn(("image", "generated.png"), result.chain)
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+
+    async def test_terminal_run_keeps_clean_text_and_never_resubmits(self) -> None:
+        plugin, _cleared = self._plugin()
+        plugin.settings.show_chat_generation_details = False
+        event = self._event("照片发给我看看")
+        orchestrator = plugin._get_drawing_orchestrator()
+        state = orchestrator.begin_submission(event)
+        orchestrator.mark_running(event, state.run_id)
+        orchestrator.mark_completed(event, state.run_id)
+        orchestrator.mark_delivered(event, state.run_id)
+        plugin._run_job = AsyncMock(side_effect=AssertionError("must not submit"))
+        result = types.SimpleNamespace(
+            chain=[_Plain('照片这就来 <pic prompt="1girl, portrait">')]
+        )
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn("照片这就来", result.chain[0].text)
+        self.assertNotIn("<pic", result.chain[0].text)
+        plugin._run_job.assert_not_awaited()
+
+    async def test_failed_asset_lookup_keeps_intermediate_roleplay_and_trace(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=False,
+        )
+        result = types.SimpleNamespace(chain=[_Plain("画好了，1girl, toki")])
+        event.get_result = lambda: result
+
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertEqual(result.chain[0].text, "画好了，1girl, toki")
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["blocked"])
+        self.assertFalse(trace["repair_attempted"])
+        self.assertEqual(cleared, [])
+
+        response = self._response("画好了，1girl, toki")
+        await plugin.enforce_chat_draw_terminal(
+            event,
+            self._run_context(response.completion_text),
+            response,
+        )
+        self.assertIn("绘图资产查询失败", response.completion_text)
+        self.assertIn("未提交 ComfyUI", response.completion_text)
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+        self.assertEqual(cleared, [id(event)])
+
+    async def test_failed_decoration_sticky_seal_blocks_later_pic_submission(self) -> None:
+        plugin, cleared = self._plugin()
+        event = self._event("用 LoRA 画飞鸟马时")
+        plugin._begin_chat_draw_asset_trace(event, "list_anima_loras")
+        plugin._finish_chat_draw_asset_trace(
+            event,
+            "list_anima_loras",
+            successful=False,
+        )
+        plugin._run_job = AsyncMock(side_effect=AssertionError("blocked request submitted"))
+
+        first_result = types.SimpleNamespace(chain=[_Plain("资产查询失败")])
+        event.get_result = lambda: first_result
+        await plugin.render_llm_picture_tags(event)
+
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["blocked"])
+
+        second_result = types.SimpleNamespace(
+            chain=[_Plain("照片这就来 <pic prompt=\"1girl, portrait\">")]
+        )
+        event.get_result = lambda: second_result
+        await plugin.render_llm_picture_tags(event)
+
+        self.assertIn("照片这就来", second_result.chain[0].text)
+        self.assertNotIn("<pic", second_result.chain[0].text)
+        plugin._run_job.assert_not_awaited()
+        trace = plugin._chat_draw_terminal_trace(event)
+        self.assertIsNotNone(trace)
+        self.assertTrue(trace["failed"])
+        self.assertFalse(trace["blocked"])
+
+        response = self._response('<pic prompt="1girl, portrait">')
+        await plugin.enforce_chat_draw_terminal(event, self._run_context(), response)
+        self.assertNotIn("<pic", response.completion_text)
+        self.assertIn("未提交 ComfyUI", response.completion_text)
+        self.assertIsNone(plugin._chat_draw_terminal_trace(event))
+        self.assertEqual(cleared, [id(event)])
+
+    def test_internal_request_guard_is_reference_counted(self) -> None:
+        plugin, _cleared = self._plugin()
+        event = self._event("draw")
+
+        plugin._enter_internal_llm_event(event)
+        plugin._enter_internal_llm_event(event)
+        plugin._leave_internal_llm_event(event)
+        self.assertIn(id(event), plugin._internal_llm_events)
+        self.assertEqual(plugin._internal_llm_event_counts[id(event)], 1)
+
+        plugin._leave_internal_llm_event(event)
+        self.assertNotIn(id(event), plugin._internal_llm_events)
+        self.assertNotIn(id(event), plugin._internal_llm_event_counts)
+
+    def test_visible_pic_runs_prompt_composer_exactly_once(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_llm_pic_trigger=True,
+            enable_prompt_composer_v2=True,
+            max_auto_images_per_reply=1,
+            enable_inpaint=False,
+        )
+        compose_calls = []
+
+        class Director:
+            @staticmethod
+            def parse_picture_response(*_args, **_kwargs):
+                return types.SimpleNamespace(
+                    text="",
+                    prompts=("1girl, portrait",),
+                    negative_prompts=("",),
+                    pipelines=("base",),
+                    edits=(),
+                )
+
+            @staticmethod
+            def compose_picture_instruction(instruction, **kwargs):
+                compose_calls.append((instruction, kwargs))
+                return self.main.PictureInstruction(
+                    prompt=f"{instruction.prompt}. A girl faces the viewer.",
+                    negative_prompt="bad anatomy",
+                    pipeline=instruction.pipeline,
+                    diagnostic_id="diagnostic-once",
+                )
+
+        plugin._director = Director()
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (512, 512)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._schedule_cleanup = lambda _paths: None
+        calls = []
+
+        async def run_job(event, options, *, notify_queue=True):
+            calls.append((event, options))
+            return [Path("generated.png")], 123, options.prompt, "", "base"
+
+        plugin._run_job = run_job
+        result = types.SimpleNamespace(
+            chain=[_Plain('<pic prompt="1girl, portrait" pipeline="base">')]
+        )
+        event = types.SimpleNamespace(
+            message_str="draw a portrait",
+            get_result=lambda: result,
+            get_extra=lambda key, default=None: {
+                "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                    self.main,
+                    self.main.DRAW_NOW,
+                    "draw a portrait",
+                )
+            }.get(key, default),
+        )
+
+        asyncio.run(plugin.render_llm_picture_tags(event))
+
+        self.assertEqual(len(compose_calls), 1)
+        self.assertEqual(compose_calls[0][1]["source"], "conversation_pic")
+        self.assertEqual(calls[0][1].prompt.count("faces the viewer"), 1)
+        self.assertEqual(calls[0][1].negative_prompt, "bad anatomy")
+
+    def test_prompt_workbench_is_private_by_default_and_can_be_cleared(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_composer_v2": True,
+                "enable_prompt_diagnostics": True,
+                "prompt_diagnostics_include_content": False,
+                "prompt_diagnostics_capacity": 10,
+            }
+        )
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "danbooru.sqlite3"
+        )
+        plugin._prompt_diagnostics_store = self.main.PromptDiagnosticsStore(
+            capacity=10
+        )
+        plugin._prompt_composer = self.main.PromptComposer(
+            adaptive_negative_mode=plugin.settings.adaptive_negative_mode,
+            diagnostics_store=plugin._prompt_diagnostics_store,
+            tag_index=plugin._danbooru_index,
+            validation_mode=plugin.settings.danbooru_validation_mode,
+            include_content=False,
+        )
+        plugin._danbooru_update_state = {
+            "id": "",
+            "status": "idle",
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "error": "",
+        }
+
+        diagnosed = asyncio.run(
+            plugin.web_ui_diagnose_prompt(
+                {
+                    "prompt": "1girl, holding cup. A girl holds a cup.",
+                    "negative_prompt": "lowres",
+                }
+            )
+        )
+        status = asyncio.run(plugin.web_ui_prompt_status())
+
+        self.assertEqual(diagnosed["composed"]["positive_prompt"], "")
+        self.assertEqual(diagnosed["composed"]["negative_prompt"], "")
+        self.assertEqual(diagnosed["layers"], {})
+        self.assertEqual(diagnosed["diagnostics"]["adaptive_negative_added"], ())
+        self.assertGreater(
+            diagnosed["diagnostics"]["adaptive_negative_count"],
+            0,
+        )
+        self.assertEqual(len(status["diagnostics"]), 1)
+        self.assertEqual(status["diagnostics"][0]["positive_prompt"], "")
+        self.assertEqual(status["diagnostics"][0]["negative_prompt"], "")
+        cleared = asyncio.run(plugin.web_ui_clear_prompt_diagnostics())
+        self.assertEqual(cleared["cleared"], 1)
+        self.assertEqual(len(plugin._prompt_diagnostics_store), 0)
+
+    def test_danbooru_llm_tool_returns_bounded_verified_and_candidate_results(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "danbooru.sqlite3"
+        )
+        plugin._danbooru_index.import_bytes(
+            json.dumps(
+                {
+                    "source": "must-not-leak",
+                    "revision": "tool-r1",
+                    "tags": [
+                        {
+                            "tag": "kei_(blue_archive)",
+                            "category": "character",
+                            "aliases": ["kei student"],
+                            "count": 123,
+                            "provenance": {"private": "must-not-leak"},
+                        },
+                        {
+                            "tag": "roxy_migurdia",
+                            "category": "character",
+                            "aliases": ["roxy"],
+                            "count": 456,
+                        },
+                        {
+                            "tag": "shared_character",
+                            "category": "character",
+                            "aliases": ["shared_identity"],
+                            "count": 100,
+                        },
+                        {
+                            "tag": "shared_artist",
+                            "category": "artist",
+                            "aliases": ["shared_identity"],
+                            "count": 200,
+                        },
+                    ],
+                }
+            ).encode(),
+            content_type="json",
+        )
+
+        exact = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="kei student",
+                    mode="exact",
+                    category="character",
+                )
+            )
+        )
+        self.assertTrue(exact["ok"])
+        self.assertTrue(exact["queries"][0]["verified"])
+        self.assertEqual(
+            exact["queries"][0]["results"][0]["canonical_tag"],
+            "kei_(blue_archive)",
+        )
+        self.assertEqual(
+            exact["queries"][0]["results"][0]["prompt_tag"],
+            r"kei_\(blue_archive\)",
+        )
+        serialized = json.dumps(exact, ensure_ascii=False)
+        self.assertNotIn("must-not-leak", serialized)
+        self.assertNotIn("provenance", serialized)
+        self.assertNotIn("sha256", serialized)
+
+        prefix = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="rox",
+                    mode="prefix",
+                    category="4",
+                    limit=20,
+                )
+            )
+        )
+        self.assertFalse(prefix["queries"][0]["verified"])
+        self.assertFalse(prefix["queries"][0]["results"][0]["verified"])
+        self.assertLessEqual(len(prefix["queries"][0]["results"]), 12)
+
+        batch = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="roxy | missing | kei student",
+                    mode="batch",
+                    category="character",
+                )
+            )
+        )
+        self.assertEqual(len(batch["queries"]), 3)
+        self.assertTrue(batch["queries"][0]["verified"])
+        self.assertFalse(batch["queries"][1]["verified"])
+        self.assertTrue(batch["queries"][2]["verified"])
+
+        ambiguous_batch = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="shared_identity",
+                    mode="batch",
+                    category="character",
+                )
+            )
+        )
+        self.assertFalse(ambiguous_batch["queries"][0]["verified"])
+        self.assertEqual(
+            {
+                item["canonical_tag"]
+                for item in ambiguous_batch["queries"][0]["results"]
+            },
+            {"shared_character", "shared_artist"},
+        )
+
+        invalid_limit = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="roxy",
+                    limit="many",
+                )
+            )
+        )
+        self.assertEqual(invalid_limit["code"], "DANBOORU_INVALID_LIMIT")
+
+    def test_danbooru_llm_tool_fails_closed_when_index_is_unavailable(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "missing.sqlite3"
+        )
+        result = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="roxy",
+                )
+            )
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DANBOORU_INDEX_UNAVAILABLE")
+
+    def test_danbooru_llm_tool_translates_localized_character_with_work(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "localized.sqlite3"
+        )
+        plugin._danbooru_index.import_bytes(
+            json.dumps(
+                {
+                    "source": "fixture",
+                    "license": "fixture-only",
+                    "revision": "localized-tool-r1",
+                    "tags": [
+                        {
+                            "tag": "phoebe_(wuthering_waves)",
+                            "category": "character",
+                            "aliases": [],
+                            "count": 3100,
+                        },
+                        {
+                            "tag": "wuthering_waves",
+                            "category": "copyright",
+                            "aliases": [],
+                            "count": 12000,
+                        },
+                    ],
+                }
+            ).encode(),
+            content_type="json",
+        )
+        plugin._localized_character_aliases = self.main.LocalizedCharacterAliasIndex()
+
+        result = json.loads(
+            asyncio.run(
+                plugin.search_anima_danbooru_tags(
+                    object(),
+                    query="《鸣潮》的菲比",
+                    mode="exact",
+                    category="character",
+                )
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["localized_alias_lookup"])
+        self.assertTrue(result["queries"][0]["verified"])
+        candidate = result["queries"][0]["results"][0]
+        self.assertEqual(candidate["canonical_tag"], "phoebe_(wuthering_waves)")
+        self.assertEqual(candidate["prompt_tag"], r"phoebe_\(wuthering_waves\)")
+        self.assertEqual(candidate["match_type"], "localized_alias_exact")
+
+    def test_localized_work_character_phrase_routes_danbooru_tool(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = types.SimpleNamespace(
+            status=lambda: {"ready": True},
+        )
+
+        self.assertTrue(plugin._scene_needs_danbooru_tools("《鸣潮》的菲比，女仆装"))
+
+    def test_llm_character_compiler_uses_localized_alias_exact(self) -> None:
+        async def run_case() -> None:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = self.main.DanbooruTagIndex(
+                Path(tempfile.mkdtemp()) / "localized-compile.sqlite3"
+            )
+            plugin._danbooru_index.import_bytes(
+                json.dumps(
+                    {
+                        "source": "fixture",
+                        "license": "fixture-only",
+                        "revision": "localized-compile-r1",
+                        "tags": [
+                            {
+                                "tag": "phoebe_(wuthering_waves)",
+                                "category": "character",
+                                "aliases": [],
+                                "count": 3100,
+                            },
+                            {
+                                "tag": "wuthering_waves",
+                                "category": "copyright",
+                                "aliases": [],
+                                "count": 12000,
+                            },
+                        ],
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._localized_character_aliases = (
+                self.main.LocalizedCharacterAliasIndex()
+            )
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda _job, _phase, _message, code, **_kwargs: phases.append(code)
+            )
+
+            async def no_profile(_job, _canonical):
+                return None
+
+            plugin._resolve_character_appearance_profile = no_profile
+            prompt, negative = await plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("tester", "draw", 0.0),
+                prompt=(
+                    "phoebe \\(wuthering waves\\), 1girl, maid, selfie. "
+                    "Phoebe takes a selfie in a maid outfit."
+                ),
+                negative_prompt="",
+                character_queries=("菲比|鸣潮",),
+                user_request="《鸣潮》的菲比，女仆装，自拍",
+                records=(),
+                source="unit",
+            )
+
+            self.assertIn(r"phoebe_\(wuthering_waves\)", prompt)
+            self.assertEqual(negative, "")
+            self.assertIn("localized_alias_exact_used", phases)
+            self.assertIn("llm_character_prompt_compiled", phases)
+
+        asyncio.run(run_case())
+
+    def test_danbooru_background_failure_keeps_existing_status(self) -> None:
+        async def run_case() -> None:
+            task_module = importlib.import_module(
+                "astrbot_plugin_comfy_anima.services.task_store"
+            )
+
+            class Index:
+                @staticmethod
+                def status():
+                    return {"ready": True, "revision": "old-revision"}
+
+                @staticmethod
+                async def update_from_url(*_args, **_kwargs):
+                    raise self.main.DanbooruIndexError("network unavailable")
+
+            with tempfile.TemporaryDirectory() as directory:
+                plugin = object.__new__(self.main.ComfyAnimaPlugin)
+                plugin.settings = types.SimpleNamespace(
+                    danbooru_index_url="https://example.test/tags.json",
+                    danbooru_index_timeout=5,
+                    danbooru_index_max_size_mb=1,
+                )
+                plugin._danbooru_index = Index()
+                plugin._danbooru_update_task = None
+                plugin._danbooru_update_state = {
+                    "id": "",
+                    "status": "idle",
+                    "started_at": 0.0,
+                    "finished_at": 0.0,
+                    "error": "",
+                }
+                plugin._task_store = task_module.TaskStore(
+                    Path(directory) / "tasks.sqlite3"
+                )
+                plugin._task_store_error = ""
+                plugin._danbooru_cancel_events = {}
+                plugin._background_task_runs = {}
+
+                response = await plugin.web_ui_update_danbooru_index()
+                self.assertIn(response["task"]["status"], {"queued", "running"})
+                await plugin._danbooru_update_task
+                stored = plugin._task_store.get_task(response["run_id"])
+                self.assertEqual(stored["status"], "failed")
+                self.assertEqual(
+                    plugin._danbooru_update_state["status"], "failed"
+                )
+                self.assertEqual(
+                    plugin._danbooru_index.status()["revision"], "old-revision"
+                )
+                plugin._task_store.close()
+
+        asyncio.run(run_case())
+
+    def test_guarded_status_explicitly_reports_safe_degradation(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "danbooru_validation_mode": "guarded",
+                "enable_prompt_diagnostics": True,
+            }
+        )
+        plugin._prompt_diagnostics_store = self.main.PromptDiagnosticsStore(
+            capacity=10
+        )
+        plugin._prompt_composer = self.main.PromptComposer(
+            validation_mode="report",
+            diagnostics_store=plugin._prompt_diagnostics_store,
+        )
+        plugin._danbooru_index = self.main.DanbooruTagIndex(
+            Path(tempfile.mkdtemp()) / "danbooru.sqlite3"
+        )
+        plugin._danbooru_update_state = {"status": "idle"}
+
+        status = asyncio.run(plugin.web_ui_prompt_status())
+
+        self.assertEqual(status["composer"]["validation_mode"], "guarded")
+        self.assertEqual(
+            status["composer"]["effective_validation_mode"],
+            "report",
+        )
+        self.assertTrue(status["composer"]["guarded_degraded_to_report"])
+
+    def test_direct_draw_llm_flag_reaches_generation_job(self) -> None:
+        async def run_case(
+            command_text: str,
+            expected: bool,
+            expected_mode: str = "standard",
+        ) -> None:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=6000,
+                send_generation_notice=False,
+                show_llm_prompt=False,
+            )
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = (
+                lambda _event, _paths, _seed, *, forward: ("image", forward)
+            )
+            captured = []
+
+            async def run_job(_event, options, *, notify_queue=True):
+                captured.append(options)
+                return (
+                    [Path("generated.png")],
+                    123,
+                    "1girl, beach. She stands beside the sea.",
+                    "director" if options.use_prompt_llm else "",
+                    None,
+                )
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(plain_result=lambda text: text)
+
+            replies = [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    command_text,
+                    forward=False,
+                )
+            ]
+
+            self.assertEqual(len(captured), 1)
+            self.assertIs(captured[0].use_prompt_llm, expected)
+            self.assertEqual(captured[0].prompt_expansion_mode, expected_mode)
+            self.assertEqual(replies[-1], ("image", False))
+
+        asyncio.run(run_case("蓝发少女在海边看烟花 --llm", True))
+        asyncio.run(run_case("华丽双人海报 --l u", True, "ultra"))
+        asyncio.run(run_case("1girl, blue hair, beach", False))
+
+    def test_direct_draw_explicit_llm_requires_director(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+        plugin._director = None
+        plugin._director_error = "provider missing"
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "画一名少女 --llm",
+                    forward=True,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("LLM 提示词优化不可用", replies[0])
+        self.assertIn("provider missing", replies[0])
+
+    def test_direct_draw_character_change_routes_to_swap_pipeline(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+        plugin._director = object()
+        plugin._director_error = ""
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: "风格GZC"
+        captured = []
+
+        async def handle_swap(_event, request, *, forward=False):
+            captured.append((request, forward))
+            yield "swap-complete"
+
+        plugin._handle_character_swap = handle_swap
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "1girl, roxy, blue hair, standing，把角色换成甘雨 --lcc u",
+                    forward=True,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(replies, ["swap-complete"])
+        self.assertEqual(len(captured), 1)
+        request, forward = captured[0]
+        self.assertEqual(request.target_query, "甘雨")
+        self.assertIn("blue hair", request.tags)
+        self.assertEqual(request.preset, "风格GZC")
+        self.assertEqual(request.prompt_expansion_mode, "ultra")
+        self.assertTrue(forward)
+
+    def test_direct_draw_no_character_change_keeps_direct_delivery(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+        plugin._director = object()
+        plugin._director_error = ""
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        captured = []
+
+        async def handle_swap(_event, request, *, forward=False):
+            captured.append((request, forward))
+            yield "swap-complete"
+
+        plugin._handle_character_swap = handle_swap
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "1girl, roxy, blue hair，把角色换成甘雨 --llm c",
+                    forward=False,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(replies, ["swap-complete"])
+        self.assertEqual(len(captured), 1)
+        _request, forward = captured[0]
+        self.assertFalse(forward)
+
+    def test_draw_commands_forward_real_character_change_preview_without_submit(
+        self,
+    ) -> None:
+        real_prompt = (
+            "风格007\n"
+            "masterpiece, best quality, ultra-detailed, 1girl, teenage girl, "
+            "solo, silver hair, white hair, long hair, twin tails, "
+            "waist-length hair, messy hair, angel, profile, side view, "
+            "closed eyes, half-closed eyes, serene expression, glowing skin, "
+            "bare shoulders, white camisole, beach, seaside, ocean, sunlight, "
+            "lens flare, iridescent, rainbow reflection in hair, sparkling, "
+            "bokeh, depth of field, summer, holy, ethereal, dreamy atmosphere, "
+            "soft lighting, anime style, illustration "
+            "把角色替换为目标角色鸣潮今汐 --llmcc --preview"
+        )
+
+        async def run_case(command: str, expected_forward: bool) -> None:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(max_prompt_length=6000)
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._find_requested_style_preset = (
+                lambda text: "风格007" if "风格007" in text else ""
+            )
+            plugin._run_job = AsyncMock(
+                side_effect=AssertionError("preview must not submit ComfyUI")
+            )
+            captured = []
+
+            async def handle_swap(_event, request, *, forward=False):
+                captured.append((request, forward))
+                self.assertTrue(request.preview)
+                yield "preview-only"
+
+            plugin._handle_character_swap = handle_swap
+            event = types.SimpleNamespace(
+                message_str=f"/{command} {real_prompt}",
+                plain_result=lambda text: text,
+            )
+            handler = (
+                plugin.cmd_draw_forward
+                if expected_forward
+                else plugin.cmd_draw_direct
+            )
+            replies = [item async for item in handler(event, "")]
+
+            self.assertEqual(replies, ["preview-only"])
+            self.assertEqual(len(captured), 1)
+            request, forward = captured[0]
+            self.assertEqual(request.target_query, "鸣潮今汐")
+            self.assertEqual(request.preset, "风格007")
+            self.assertIn("silver hair", request.tags)
+            self.assertNotIn("--preview", request.tags)
+            self.assertEqual(forward, expected_forward)
+            plugin._run_job.assert_not_awaited()
+
+        asyncio.run(run_case("画图", True))
+        asyncio.run(run_case("画图no", False))
+
+    def test_character_swap_optional_lora_errors_use_semantic_fallback(self) -> None:
+        request = self.main.CharacterSwapRequest("", "冷门角色")
+        checker = self.main.ComfyAnimaPlugin._character_swap_semantic_retry_allowed
+
+        for code in (
+            "character_not_found",
+            "ambiguous_character",
+            "semantic_target_tags_missing",
+            "missing_target_trigger",
+            "character_variant_lora_requires_semantic",
+        ):
+            with self.subTest(code=code):
+                self.assertTrue(checker(request, code))
+        self.assertFalse(checker(request, "character_suggestion"))
+        self.assertFalse(
+            checker(
+                self.main.CharacterSwapRequest(
+                    "",
+                    "characters/exact-target.safetensors",
+                ),
+                "character_not_found",
+            )
+        )
+
+        required_request = self.main.CharacterSwapRequest(
+            "",
+            "凯伊",
+            require_target_lora=True,
+        )
+        for code in (
+            "character_not_found",
+            "ambiguous_character",
+            "semantic_target_tags_missing",
+            "missing_target_trigger",
+            "character_variant_lora_requires_semantic",
+        ):
+            with self.subTest(required_code=code):
+                self.assertFalse(checker(required_request, code))
+
+    def test_resolved_style_selector_is_consumed_before_swap_prompt(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        registry.save(
+            name="风格006",
+            category="artist_style",
+            selections=(LoraSelection("style/example.safetensors", 0.8),),
+            aliases=("masterpiece", "anime"),
+        )
+        plugin._lora_presets = registry
+
+        cleaned = plugin._strip_resolved_style_reference(
+            "用风格006画图，masterpiece, anime style, best quality, 1girl, solo",
+            "风格006",
+        )
+
+        self.assertEqual(
+            cleaned,
+            "masterpiece, anime style, best quality, 1girl, solo",
+        )
+        self.assertNotIn("风格006", cleaned)
+
+    def test_named_style_selector_consumes_context_without_touching_visual_tags(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        registry.save(
+            name="GZC",
+            category="artist_style",
+            selections=(LoraSelection("style/example.safetensors", 0.8),),
+            aliases=("masterpiece",),
+        )
+        plugin._lora_presets = registry
+
+        cleaned = plugin._strip_resolved_style_reference(
+            "使用风格 GZC 绘图，masterpiece, 1girl",
+            "GZC",
+        )
+
+        self.assertEqual(cleaned, "masterpiece, 1girl")
+
+    def test_session_recipe_roundtrips_character_lora_name(self) -> None:
+        from ..services.preset_manifest import PresetManifest
+        from ..services.session_picture_recipe import SessionPictureRecipe
+
+        manifest = PresetManifest.build(
+            preset_name="conversation_pic",
+            positive_terms=("1girl", "bare neck"),
+            negative_terms=("necklace",),
+            lora_entries=[{"name": "29B/anima-000040_29b", "weight": 0.9}],
+            identity_anchor="denia_(wuthering_waves)",
+            required_triggers=("denia",),
+        )
+        recipe = SessionPictureRecipe.from_success(
+            bot_id="bot",
+            session_id="session",
+            user_id="user",
+            run_id="run-1",
+            preset_name="conversation_pic",
+            pipeline="rtx",
+            width=1024,
+            height=1536,
+            prompt_recipe="<pic>...</pic>",
+            manifest=manifest,
+            content_fingerprint="fp",
+            character_lora_name="29B/anima-000040_29b.safetensors",
+        )
+        self.assertEqual(
+            recipe.character_lora_name,
+            "29B/anima-000040_29b.safetensors",
+        )
+        self.assertEqual(recipe.identity_anchor, "denia_(wuthering_waves)")
+        self.assertEqual(recipe.required_triggers, ("denia",))
+
+        restored = SessionPictureRecipe.from_mapping(recipe.to_mapping())
+        self.assertEqual(
+            restored.character_lora_name,
+            "29B/anima-000040_29b.safetensors",
+        )
+        self.assertEqual(restored.identity_anchor, "denia_(wuthering_waves)")
+
+    def test_session_recipe_without_character_lora_defaults_empty(self) -> None:
+        from ..services.session_picture_recipe import SessionPictureRecipe
+
+        payload = json.loads(json.dumps({
+            "schema_version": 1,
+            "bot_id": "bot",
+            "session_id": "session",
+            "user_id": "user",
+            "last_run_id": "run",
+            "preset_name": "conversation_pic",
+            "pipeline": "rtx",
+            "prompt_recipe": "<pic>...</pic>",
+            "positive_pool": ["1girl"],
+            "negative_pool": [],
+            "lora_manifest": [],
+            "manifest_hash": "hash",
+        }))
+        restored = SessionPictureRecipe.from_mapping(payload)
+        self.assertEqual(restored.character_lora_name, "")
+
+    def test_subject_appearance_anchors_from_bound_profile(self) -> None:
+        import types
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Store:
+            def get(self, canonical_tag):
+                return {
+                    "denia_(wuthering_waves)": types.SimpleNamespace(
+                        appearance_tags=(
+                            "pink hair",
+                            "long hair",
+                            "hair ornament",
+                            "ahoge",
+                        )
+                    )
+                }.get(canonical_tag)
+
+        plugin._character_appearance_profiles = Store()
+        binding = types.SimpleNamespace(canonical="denia_(wuthering_waves)")
+        anchors = plugin._subject_appearance_anchors(binding, user_text="")
+        self.assertEqual(
+            anchors,
+            ("pink hair", "long hair", "hair ornament", "ahoge"),
+        )
+        self.assertEqual(
+            plugin._subject_appearance_anchors(binding, user_text="红色头发"),
+            ("ahoge",),
+        )
+        self.assertEqual(
+            plugin._subject_appearance_anchors(
+                types.SimpleNamespace(canonical="unknown_character"),
+                user_text="",
+            ),
+            (),
+        )
+        self.assertEqual(plugin._subject_appearance_anchors(None), ())
+
+    def test_unique_archive_character_record_matches_name_and_work(self) -> None:
+        import types
+
+        records = (
+            types.SimpleNamespace(
+                name="29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+                character_name="remielle dan",
+                aliases=(),
+                source_work="绝区零 / Zenless Zone Zero",
+                companion_variant="remielle-dan-zzz-anima-Tanger.safetensors",
+            ),
+            types.SimpleNamespace(
+                name="remielle-dan-zzz-anima-Tanger.safetensors",
+                character_name="remielle-dan-zzz-anima-Tanger",
+                aliases=("remielle dan",),
+                source_work="绝区零 / Zenless Zone Zero",
+                companion_variant="29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+            ),
+        )
+        found = self.main.ComfyAnimaPlugin._unique_archive_character_record(
+            "Remielle Dan",
+            records,
+            work_hints=("Zenless Zone Zero",),
+        )
+        self.assertEqual(
+            found.name,
+            "29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+        )
+        # 同名但属于其他作品，必须按作品过滤掉。
+        other = types.SimpleNamespace(
+            name="remielle-dan-alt.safetensors",
+            character_name="remielle dan",
+            aliases=(),
+            source_work="some other anime",
+            companion_variant="",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._unique_archive_character_record(
+                "Remielle Dan",
+                (*records, other),
+                work_hints=("Zenless Zone Zero",),
+            ).name,
+            "29B/remielle-dan-zzz-anima-Tanger_29b.safetensors",
+        )
+        # 同作品同名但根身份不同，必须拒绝（歧义）。
+        conflicting = types.SimpleNamespace(
+            name="remielle-dan-alternate.safetensors",
+            character_name="remielle dan",
+            aliases=(),
+            source_work="Zenless Zone Zero",
+            companion_variant="",
+        )
+        self.assertIsNone(
+            self.main.ComfyAnimaPlugin._unique_archive_character_record(
+                "Remielle Dan",
+                (*records, conflicting),
+                work_hints=("Zenless Zone Zero",),
+            )
+        )
+        self.assertIsNone(
+            self.main.ComfyAnimaPlugin._unique_archive_character_record(
+                "Nobody",
+                records,
+                work_hints=("Zenless Zone Zero",),
+            )
+        )
+
+    def test_explicit_target_appearance_override_suppresses_default_profile_slot(
+        self,
+    ) -> None:
+        filtered = self.main.ComfyAnimaPlugin._filter_character_appearance_overrides(
+            ("black hair", "red eyes", "long hair", "halo"),
+            "把头发改成白色，眼睛改成金色",
+        )
+
+        self.assertEqual(filtered, ("halo",))
+
+    def test_danbooru_target_appearance_override_suppresses_default_profile_slot(
+        self,
+    ) -> None:
+        filtered = self.main.ComfyAnimaPlugin._filter_character_appearance_overrides(
+            ("black hair", "red eyes", "long hair", "halo"),
+            "white_hair, blue_eyes",
+        )
+
+        self.assertEqual(filtered, ("halo",))
+
+    def test_compact_chinese_target_override_suppresses_matching_profile_slots(
+        self,
+    ) -> None:
+        filtered = self.main.ComfyAnimaPlugin._filter_character_appearance_overrides(
+            (
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+                "animal ears",
+                "glasses",
+                "tail",
+            ),
+            "改成白发金瞳和短发猫耳，并去掉光环、眼镜和尾巴",
+        )
+
+        self.assertEqual(filtered, ())
+
+    def test_known_style_does_not_hide_character_lora_lookup(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_lora_tool=True,
+            enable_local_intent_router=True,
+        )
+        plugin._find_requested_style_preset = (
+            lambda text: "风格GZC" if "GZC" in text else ""
+        )
+        plugin._lora_presets = types.SimpleNamespace(
+            presets=(
+                types.SimpleNamespace(
+                    category=self.main.PRESET_CATEGORY_CHARACTER,
+                    name="甘雨",
+                ),
+            )
+        )
+        plugin._semantic_index = types.SimpleNamespace(entries={})
+
+        self.assertFalse(plugin._scene_needs_lora_tools("风格GZC，JK制服"))
+        self.assertTrue(plugin._scene_needs_lora_tools("风格GZC，原神甘雨"))
+        self.assertTrue(plugin._scene_needs_lora_tools("风格使用 UNKNOWN，JK制服"))
+
+    def test_danbooru_auto_update_status_is_due_after_success_interval(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            danbooru_auto_update_enabled=True,
+            danbooru_auto_update_interval_hours=168,
+        )
+        plugin._danbooru_update_task = None
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.main.TaskStore(Path(directory) / "tasks.sqlite3")
+            try:
+                created_at = time.time() - 8 * 24 * 3600
+                run_id = store.create_task(
+                    "danbooru_index_update",
+                    mode="official_api",
+                    requested_by="scheduler",
+                    timestamp=created_at,
+                )
+                store.start_task(run_id, timestamp=created_at + 1)
+                store.finish_task(
+                    run_id,
+                    "succeeded",
+                    timestamp=created_at + 2,
+                )
+                plugin._task_store = store
+
+                status = plugin._danbooru_auto_update_status()
+            finally:
+                store.close()
+
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["due"])
+        self.assertEqual(status["interval_hours"], 168)
+        self.assertEqual(status["last_status"], "succeeded")
+
+    def test_failed_danbooru_auto_update_uses_six_hour_retry_backoff(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            danbooru_auto_update_enabled=True,
+            danbooru_auto_update_interval_hours=168,
+        )
+        plugin._danbooru_update_task = None
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.main.TaskStore(Path(directory) / "tasks.sqlite3")
+            try:
+                created_at = time.time() - 7 * 3600
+                run_id = store.create_task(
+                    "danbooru_index_update",
+                    mode="official_api",
+                    requested_by="scheduler",
+                    timestamp=created_at,
+                )
+                store.start_task(run_id, timestamp=created_at + 1)
+                store.finish_task(
+                    run_id,
+                    "failed",
+                    error_code="network_error",
+                    timestamp=created_at + 2,
+                )
+                plugin._task_store = store
+
+                status = plugin._danbooru_auto_update_status()
+            finally:
+                store.close()
+
+        self.assertTrue(status["due"])
+        self.assertEqual(status["last_status"], "failed")
+
+    def test_direct_draw_reports_prompt_protocol_failure_without_handler_crash(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_prompt_length=6000,
+            send_generation_notice=False,
+            show_llm_prompt=False,
+        )
+        plugin._director = object()
+        plugin._director_error = ""
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+
+        async def run_job(_event, _options, *, notify_queue=True):
+            raise self.main.PromptDirectorError(
+                "绘图模型连续两次没有返回可用的 <pic> 提示词，已停止且不会提交 ComfyUI",
+                "invalid_picture_protocol",
+                fatal=True,
+            )
+
+        plugin._run_job = run_job
+        event = types.SimpleNamespace(plain_result=lambda text: text)
+
+        async def collect():
+            return [
+                item
+                async for item in plugin._handle_direct_draw(
+                    event,
+                    "画一名少女 --llm",
+                    forward=True,
+                )
+            ]
+
+        replies = asyncio.run(collect())
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("提示词优化失败", replies[0])
+        self.assertIn("连续两次", replies[0])
+        self.assertNotIn("invalid_picture_protocol", replies[0])
+
+    def test_natural_draw_detection_is_conservative(self) -> None:
+        detector = self.main.ComfyAnimaPlugin._looks_like_draw_request
+        self.assertTrue(detector("帮我画一个雨夜里的猫娘"))
+        self.assertTrue(detector("帮我画一个戴帽子的女孩"))
+        self.assertTrue(detector("生成一张赛博朋克城市图片"))
+        self.assertTrue(detector("画一套jk情趣制服给我看看"))
+        self.assertTrue(detector("想看你的自拍"))
+        self.assertTrue(detector("画一张你在干嘛的图"))
+        self.assertFalse(detector("我想看你在干嘛"))
+        self.assertFalse(detector("帮我写一个 Python 列表"))
+
+    def test_image_operation_intent_routing_understands_colloquial_requests(self) -> None:
+        inpaint = self.main.ComfyAnimaPlugin._looks_like_inpaint_request
+        semantic = self.main.ComfyAnimaPlugin._looks_like_semantic_redraw_request
+        semantic_mode = self.main.ComfyAnimaPlugin._extract_semantic_redraw_mode_request
+        mode = self.main.ComfyAnimaPlugin._extract_inpaint_mode_request
+        standalone = self.main.ComfyAnimaPlugin._looks_like_standalone_upscale_request
+
+        for message in (
+            "把遮罩区域的衣服换成红裙",
+            "请局部修复透明区域里的手",
+            "这里重画成一束白色百合",
+            "把那块区域擦掉",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(inpaint(message))
+        self.assertFalse(inpaint("帮我画她穿一条红裙"))
+        for message in (
+            "把这张图里的衣服换成红裙",
+            "换个背景",
+            "参考原图重新画一张",
+            "整张图改成雨夜版本",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(semantic(message))
+        self.assertFalse(semantic("把遮罩区域的衣服换成红裙"))
+        self.assertEqual(semantic_mode("只换衣服，其他保持不变"), "preserve")
+        self.assertEqual(semantic_mode("参考原图重新画一张"), "free")
+        self.assertEqual(
+            semantic_mode("重新画一张，但保留角色和构图"),
+            "balanced",
+        )
+        self.assertEqual(mode("精细修复图中的手指"), "lanpaint")
+        self.assertEqual(mode("快速改一下这块小范围区域"), "quick")
+
+        self.assertTrue(standalone("把这张图放大到2倍"))
+        self.assertTrue(standalone("高清化一下", has_image=True))
+        self.assertFalse(
+            standalone("参考这张图画一张并用 RTX 放大", has_image=True)
+        )
+
+    def test_generation_pipeline_intent_handles_colloquial_variants(self) -> None:
+        extract = self.main.ComfyAnimaPlugin._extract_pipeline_request
+
+        self.assertEqual(extract("只出 Anima 底图，不要放大"), "base")
+        self.assertEqual(extract("用 RTX 画一张高清大图"), "rtx")
+        self.assertEqual(extract("使用迭代二次采样放大"), "iterative")
+        self.assertEqual(extract("不要 RTX，用迭代放大"), "iterative")
+        with self.assertRaisesRegex(ValueError, "多个互斥管线"):
+            extract("只出底图，但同时还要 RTX 放大")
+
+    def test_natural_rtx_scale_parser_is_bounded(self) -> None:
+        extract = self.main.ComfyAnimaPlugin._extract_rtx_scale_request
+
+        self.assertEqual(extract("把这张图放大到2.5倍"), 2.5)
+        self.assertEqual(extract("进行 3x 高清化"), 3.0)
+        self.assertEqual(extract("把图片高清化", default=1.75), 1.75)
+        with self.assertRaisesRegex(ValueError, "1 到 4"):
+            extract("把这张图放大到5倍")
+
+    def test_chinese_command_keeps_multiword_tags(self) -> None:
+        extractor = self.main.ComfyAnimaPlugin._extract_command_text
+        self.assertEqual(
+            extractor("/画图 1girl, white hair, blue eyes", "1girl", "画图"),
+            "1girl, white hair, blue eyes",
+        )
+
+    def test_runtime_global_lock_allows_only_admin(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {"global_lock": True}
+        )
+        plugin._global_locked = plugin.settings.global_lock
+        plugin._access_controller = self.main.AccessController(
+            self.main.AccessPolicy(
+                global_locked=plugin._global_locked,
+                whitelist_enabled=plugin.settings.whitelist_only,
+                whitelist_groups=set(plugin.settings.group_whitelist),
+                default_filter_level=self.main.FilterLevel(
+                    plugin.settings.default_block_level
+                ),
+                group_filter_levels={},
+            )
+        )
+
+        class Event:
+            @staticmethod
+            def get_group_id():
+                return "123"
+
+            def __init__(self, admin):
+                self._admin = admin
+
+            def is_admin(self):
+                return self._admin
+
+        self.assertIsNotNone(plugin._access_error(Event(False), "cat"))
+        self.assertIsNone(plugin._access_error(Event(True), "cat"))
+
+    def _llm_character_validation_plugin(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = _ExactCharacterIndex()
+        plugin._danbooru_index_ready = lambda: True
+        plugin._runtime_semantic_index = LoraSemanticIndex.empty
+        events = []
+        plugin._record_image_task_phase = (
+            lambda *args, **kwargs: events.append((*args, kwargs))
+        )
+
+        async def profile(_job, canonical):
+            if canonical != "rio_(blue_archive)":
+                return None
+            return CharacterAppearanceProfile(
+                canonical_tag=canonical,
+                appearance_tags=("black hair", "red eyes", "long hair", "halo"),
+                support=(
+                    ("black hair", 0.99),
+                    ("red eyes", 0.98),
+                    ("long hair", 0.95),
+                    ("halo", 0.9),
+                ),
+                sample_count=80,
+                fetched_at=time.time(),
+            )
+
+        plugin._resolve_character_appearance_profile = profile
+        return plugin, events
+
+    def test_llm_character_prompt_is_exact_corrected_before_submit(self) -> None:
+        plugin, events = self._llm_character_validation_plugin()
+        prompt, negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt=(
+                    "1girl, rio, honkai:_star_rail, white hair, blue eyes, "
+                    "school uniform, stage"
+                ),
+                negative_prompt="red eyes, bad hands",
+                character_queries=("Rio|Blue Archive",),
+                user_request="画碧蓝档案的调月莉音穿校服",
+                records=(),
+                source="test",
+            )
+        )
+
+        self.assertIn(r"rio_\(blue_archive\)", prompt)
+        self.assertNotIn(", rio,", f", {prompt},")
+        self.assertIn("black hair", prompt)
+        self.assertIn("red eyes", prompt)
+        self.assertNotIn("white hair", prompt)
+        self.assertNotIn("blue eyes", prompt)
+        self.assertNotIn("honkai:_star_rail", prompt)
+        self.assertNotIn("red eyes", negative)
+        self.assertIn("bad hands", negative)
+        self.assertTrue(
+            any("llm_character_prompt_compiled" in event for event in events)
+        )
+
+    def test_llm_prompt_without_character_is_left_unchanged(self) -> None:
+        plugin, _events = self._llm_character_validation_plugin()
+        prompt, negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt="1girl, original character, green hair, forest",
+                negative_prompt="bad hands",
+                character_queries=(),
+                user_request="画一个原创角色",
+                records=(),
+                source="test",
+            )
+        )
+
+        self.assertEqual(prompt, "1girl, original character, green hair, forest")
+        self.assertEqual(negative, "bad hands")
+
+    def test_undeclared_unknown_qualified_character_cannot_pass_through(self) -> None:
+        async def run_case() -> None:
+            plugin, _events = self._llm_character_validation_plugin()
+
+            async def no_external(*_args, **_kwargs):
+                return self.main.CharacterIdentityResolution(), None
+
+            plugin._resolve_current_lora_gallery_identity = no_external
+            with self.assertRaises(self.main.CharacterPromptCompileError) as caught:
+                await plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, viola_\(bang_dream!\), maid, selfie",
+                    negative_prompt="",
+                    character_queries=(),
+                    user_request="画一个女仆自拍",
+                    records=(),
+                    source="test",
+                )
+
+            self.assertEqual(caught.exception.code, "character_resolution_unverified")
+
+        asyncio.run(run_case())
+
+    def test_character_validation_retries_once_after_index_revision_change(self) -> None:
+        async def run_case() -> None:
+            plugin, events = self._llm_character_validation_plugin()
+
+            class ChangingIndex(_ExactCharacterIndex):
+                def __init__(self):
+                    self.status_calls = 0
+
+                def status(self):
+                    self.status_calls += 1
+                    revision = "old" if self.status_calls == 1 else "new"
+                    return {
+                        "ready": True,
+                        "schema_version": "2",
+                        "revision": revision,
+                        "sha256": revision,
+                    }
+
+            plugin._danbooru_index = ChangingIndex()
+            job = self.main.GenerationJob("user", "draw", 0.0)
+            prompt, _negative = await plugin._compile_llm_character_prompt(
+                job,
+                prompt="1girl, original character, forest",
+                negative_prompt="",
+                character_queries=(),
+                user_request="画一个原创角色",
+                records=(),
+                source="test",
+            )
+
+            self.assertEqual(prompt, "1girl, original character, forest")
+            self.assertEqual(job.danbooru_revision_signature, "2|new|new")
+            self.assertTrue(
+                any(
+                    "llm_character_validation_revision_retry" in event
+                    for event in events
+                )
+            )
+
+        asyncio.run(run_case())
+
+    def test_final_character_gate_rejects_revision_drift(self) -> None:
+        async def run_case() -> None:
+            plugin, _events = self._llm_character_validation_plugin()
+            with self.assertRaisesRegex(self.main.LoraWorkflowError, "发生变化"):
+                await plugin._verified_prompt_character_canonicals(
+                    r"1girl, rio_\(blue_archive\)",
+                    expected_revision_signature="2|older|older",
+                )
+
+        asyncio.run(run_case())
+
+    def test_inferred_base_character_wins_over_unrequested_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "toki_(blue_archive)", "category": "character"},
+                            {
+                                "tag": "toki_(armed)_(blue_archive)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, _events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            prompt, _negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=(
+                        r"1girl, toki_\(blue_archive\), "
+                        r"toki_\(armed\)_\(blue_archive\), selfie"
+                    ),
+                    negative_prompt="",
+                    character_queries=(),
+                    user_request="画飞鸟马时自拍",
+                    records=(),
+                    source="test",
+                )
+            )
+
+        self.assertIn(r"toki_\(blue_archive\)", prompt)
+        self.assertNotIn(r"toki_\(armed\)_\(blue_archive\)", prompt)
+
+    def test_declared_qualifierless_character_uses_prompt_work_and_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "remielle_dan",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "remielle_dan_(past)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "remielle_dan_(dreamland_fest)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "zenless_zone_zero",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, _events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            prompt, _negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=(
+                        "1girl, zenless_zone_zero, remielle_dan, "
+                        "remielle_dan_(past), "
+                        "remielle_dan_(dreamland_fest), black wings"
+                    ),
+                    negative_prompt="",
+                    character_queries=("remielle dan",),
+                    user_request="draw Remielle Dan from Zenless Zone Zero",
+                    records=(),
+                    source="test",
+                )
+            )
+
+        self.assertIn("remielle_dan", prompt)
+        self.assertIn("zenless_zone_zero", prompt)
+        self.assertNotIn("remielle_dan_(past)", prompt)
+        self.assertNotIn("remielle_dan_(dreamland_fest)", prompt)
+
+    def test_inferred_variants_without_base_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(armed)_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "toki_(bunny)_(blue_archive)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, _events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            with self.assertRaises(CharacterPromptCompileError) as raised:
+                asyncio.run(
+                    plugin._compile_llm_character_prompt(
+                        self.main.GenerationJob("user", "draw", 0.0),
+                        prompt=(
+                            r"1girl, toki_\(armed\)_\(blue_archive\), "
+                            r"toki_\(bunny\)_\(blue_archive\), selfie"
+                        ),
+                        negative_prompt="",
+                        character_queries=(),
+                        user_request="画飞鸟马时自拍",
+                        records=(),
+                        source="test",
+                    )
+                )
+
+        self.assertEqual(raised.exception.code, "character_variant_unconfirmed")
+
+    def test_director_invented_work_is_demoted_to_creative_description(self) -> None:
+        plugin, events = self._llm_character_validation_plugin()
+        prompt, _negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt="1girl, invented_person, portrait",
+                negative_prompt="",
+                character_queries=("Invented Person|Unknown Work",),
+                user_request="draw an invented person",
+                records=(),
+                source="test",
+            )
+        )
+        self.assertIn("invented_person", prompt)
+        self.assertTrue(
+            any("llm_character_advisory_unverified_kept" in event for event in events)
+        )
+
+    def test_user_explicit_unknown_work_still_fails_closed(self) -> None:
+        plugin, _events = self._llm_character_validation_plugin()
+        with self.assertRaises(CharacterPromptCompileError) as raised:
+            asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt="1girl, invented_person, portrait",
+                    negative_prompt="",
+                    character_queries=("Invented Person|Unknown Work",),
+                    user_request="draw 《Unknown Work》 character: Invented Person",
+                    records=(),
+                    source="test",
+                )
+            )
+        self.assertEqual(raised.exception.code, "character_resolution_unverified")
+
+    def test_unverified_bare_llm_character_declaration_is_kept_as_original(self) -> None:
+        plugin, events = self._llm_character_validation_plugin()
+        prompt, negative = asyncio.run(
+            plugin._compile_llm_character_prompt(
+                self.main.GenerationJob("user", "draw", 0.0),
+                prompt="1girl, deepseek whale girl, blue hair, portrait",
+                negative_prompt="bad hands",
+                character_queries=("deepseek whale girl",),
+                user_request="deepseek personification in a bedroom",
+                records=(),
+                source="test",
+            )
+        )
+
+        self.assertIn("deepseek whale girl", prompt)
+        self.assertEqual(negative, "bad hands")
+        self.assertTrue(
+            any("llm_character_advisory_unverified_kept" in event for event in events)
+        )
+
+    def test_gallery_exact_authorizes_locally_missing_unique_current_character_lora(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "bang_dream!", "category": "copyright"},
+                            {
+                                "tag": "viola_(pokemon)",
+                                "category": "character",
+                                "aliases": ["viola"],
+                            },
+                        ],
+                        "aliases": [
+                            {"alias": "bang!dream!", "tag": "bang_dream!"}
+                        ],
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            class Client:
+                autocomplete_calls = 0
+
+                @staticmethod
+                async def danbooru_gallery_health():
+                    return {"connected": True, "source": "danbooru"}
+
+                @classmethod
+                async def danbooru_character_autocomplete(cls, query, *, limit=20):
+                    del limit
+                    cls.autocomplete_calls += 1
+                    if cls.autocomplete_calls == 1:
+                        return []
+                    if query == "viola_(bang_dream!)":
+                        return [
+                            {
+                                "name": "viola_(bang_dream!)",
+                                "category": 4,
+                                "is_deprecated": False,
+                                "post_count": 167,
+                            }
+                        ]
+                    return []
+
+            plugin, events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            plugin._client = Client()
+            record = LoraRecord(
+                "viola-000020.safetensors",
+                sha256="viola-sha",
+                category="character",
+                character_name="Viola / 薇欧拉",
+                source_work="BanG Dream! / 梦限大Mewtype",
+                trigger_words=(),
+                aliases=("viola",),
+                from_civitai=True,
+            )
+            job = self.main.GenerationJob("user", "draw", 0.0)
+            prompt, negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    job,
+                    prompt="1girl, viola, maid, selfie",
+                    negative_prompt="bad hands",
+                    character_queries=("薇欧拉|Bang！Dream！",),
+                    user_request="画《Bang！Dream！》薇欧拉穿女仆装自拍",
+                    records=(record,),
+                    source="test",
+                )
+            )
+            key = self.main.canonical_lora_name(record.name).casefold()
+            selection = LoraSelection(record.name, 0.65)
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    job,
+                    prompt=prompt + ", viola",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                    strict_keys=frozenset({key}),
+                )
+            )
+            self.assertEqual(bound_overrides, {key: ("viola",)})
+
+            english_job = self.main.GenerationJob("user", "draw", 0.0)
+            english_prompt, _ = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    english_job,
+                    prompt="1girl, viola, maid, selfie",
+                    negative_prompt="",
+                    character_queries=("Viola",),
+                    user_request="draw Viola in a maid outfit",
+                    records=(record,),
+                    source="test",
+                )
+            )
+            wrong_llm_job = self.main.GenerationJob("user", "draw", 0.0)
+            corrected_prompt, _ = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    wrong_llm_job,
+                    prompt=r"1girl, viola_\(pokemon\), maid, selfie",
+                    negative_prompt="",
+                    character_queries=("Viola",),
+                    user_request="draw Viola in a maid outfit",
+                    records=(record,),
+                    source="test",
+                )
+            )
+            pokemon_job = self.main.GenerationJob("user", "draw", 0.0)
+            pokemon_prompt, _ = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    pokemon_job,
+                    prompt=r"1girl, viola_\(pokemon\), portrait",
+                    negative_prompt="",
+                    character_queries=("Viola|Pokemon",),
+                    user_request="draw Pokemon Viola",
+                    records=(record,),
+                    source="test",
+                )
+            )
+
+        self.assertIn(r"viola_\(bang_dream!\)", prompt)
+        self.assertEqual(negative, "bad hands")
+        self.assertEqual(
+            job.llm_external_character_authorities,
+            {"viola_(bang_dream!)": key},
+        )
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(overrides, {})
+        trigger_plan = self.main.build_lora_trigger_plan(
+            prompt=prompt,
+            negative_prompt=negative,
+            selections=kept,
+            records_by_name={key: record},
+            bound_character_activation_terms=bound_overrides,
+        )
+        self.assertIn("viola", trigger_plan.prompt)
+        self.assertEqual(filtered, ())
+        self.assertIn(r"viola_\(bang_dream!\)", english_prompt)
+        self.assertEqual(
+            english_job.llm_external_character_authorities,
+            {"viola_(bang_dream!)": key},
+        )
+        self.assertIn(r"viola_\(bang_dream!\)", corrected_prompt)
+        self.assertNotIn(r"viola_\(pokemon\)", corrected_prompt)
+        self.assertIn(r"viola_\(pokemon\)", pokemon_prompt)
+        self.assertEqual(pokemon_job.llm_external_character_authorities, {})
+        self.assertTrue(
+            any("llm_character_external_exact_authorized" in row for row in events)
+        )
+        self.assertTrue(
+            any("llm_character_gallery_retry_recovered" in row for row in events)
+        )
+        self.assertTrue(
+            any(
+                "llm_character_bare_alias_collision_overridden" in row
+                for row in events
+            )
+        )
+        self.assertTrue(any("llm_character_lora_metadata_bound" in row for row in events))
+        self.assertTrue(
+            any("llm_character_lora_identity_anchor_used" in row for row in events)
+        )
+
+    def test_bind_accepts_unique_file_binding_without_declared_character(self) -> None:
+        """追画未声明角色：唯一文件绑定即身份声明，不得误判失效。"""
+        import types
+
+        plugin, _events = self._llm_character_validation_plugin()
+        record = LoraRecord(
+            "29B/anima-000040_29b.safetensors",
+            sha256="denia-sha",
+            category="character",
+            character_name="anima-000040_29b",
+            aliases=("娅娅", "达妮娅"),
+        )
+        binding = types.SimpleNamespace(
+            character_canonical="denia_(wuthering_waves)",
+            copyright_canonical="wuthering_waves",
+            activation_terms=(),
+            compatible_model_families=("anima_29b_40l",),
+        )
+        plugin._runtime_semantic_index = lambda: types.SimpleNamespace(
+            entry_for=lambda _record: types.SimpleNamespace(
+                present=True,
+                sha256="denia-sha",
+                identity_bindings=(binding,),
+                effective_values=lambda _key: (),
+            )
+        )
+
+        class _ReadyIndex:
+            def lookup_many(self, values, _category):
+                return tuple(
+                    types.SimpleNamespace(
+                        verified=True,
+                        canonical_tag=value,
+                        tag=value,
+                        aliases=(),
+                    )
+                    for value in values
+                )
+
+            def lookup(self, value, _category):
+                return types.SimpleNamespace(
+                    verified=True,
+                    canonical_tag=value,
+                    tag=value,
+                    aliases=(),
+                )
+
+        plugin._danbooru_index = _ReadyIndex()
+        plugin._danbooru_index_ready = lambda: True
+        plugin._verified_prompt_character_canonicals = AsyncMock(return_value=())
+
+        job = self.main.GenerationJob("user", "draw", 0.0)
+        key = self.main.canonical_lora_name(record.name).casefold()
+        selection = LoraSelection(record.name, 0.9)
+        kept, _overrides, bound_overrides, filtered = asyncio.run(
+            plugin._bind_llm_character_loras(
+                job,
+                prompt="1girl, lingerie, bedroom",
+                selections=(selection,),
+                resolved_records={key: record},
+                strict_keys=frozenset({key}),
+            )
+        )
+        self.assertEqual(filtered, ())
+        self.assertEqual(kept[0].name, record.name)
+        self.assertEqual(
+            bound_overrides,
+            {key: ("denia",)},
+        )
+        self.assertEqual(
+            job.character_identity["canonical"],
+            "denia_(wuthering_waves)",
+        )
+        self.assertEqual(
+            job.character_identity["lora_name"],
+            "29B/anima-000040_29b.safetensors",
+        )
+
+    def test_bound_lora_uses_activation_without_treating_it_as_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "revision": "denia-r1",
+                        "tags": [
+                            {
+                                "tag": "denia_(wuthering_waves)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "wuthering_waves",
+                                "category": "copyright",
+                            },
+                            {
+                                "tag": "black_denia_(other_work)",
+                                "category": "character",
+                            },
+                            {"tag": "other_work", "category": "copyright"},
+                        ],
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            record = LoraRecord(
+                "black deniav1-2.safetensors",
+                sha256="ab" * 32,
+                category="character",
+                character_name="black denia",
+                source_work="other work",
+                trigger_words=("black_denia",),
+            )
+            entry = SemanticEntry(
+                identity_key=semantic_identity_key(record.name, record.sha256),
+                canonical_name=record.name,
+                sha256=record.sha256,
+                analysis_status="searchable",
+                category=(SemanticFact("character", "manual"),),
+                activation_terms=(SemanticFact("black_denia", "manual"),),
+                identity_bindings=(
+                    LoraIdentityBinding(
+                        character_canonical="denia_(wuthering_waves)",
+                        copyright_canonical="wuthering_waves",
+                        activation_terms=("black_denia",),
+                    ),
+                ),
+                source_fingerprint="stale-manager-metadata",
+            )
+            semantic = LoraSemanticIndex(entries={entry.identity_key: entry})
+            plugin, events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            plugin._runtime_semantic_index = lambda: semantic
+            selection = LoraSelection(record.name, 0.85)
+            key = self.main.canonical_lora_name(record.name).casefold()
+            job = self.main.GenerationJob("user", "draw", 0.0)
+
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    job,
+                    prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                    strict_keys=frozenset({key}),
+                )
+            )
+            trigger_plan = self.main.build_lora_trigger_plan(
+                prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+                negative_prompt="",
+                selections=kept,
+                records_by_name={key: record},
+                verified_character_triggers=overrides,
+                bound_character_activation_terms=bound_overrides,
+            )
+            final_canonicals = asyncio.run(
+                plugin._verified_prompt_character_canonicals(
+                    trigger_plan.prompt,
+                    non_identity_activation_terms=tuple(
+                        term
+                        for terms in bound_overrides.values()
+                        for term in terms
+                    ),
+                )
+            )
+
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(overrides, {})
+        self.assertEqual(bound_overrides, {key: ("black_denia",)})
+        self.assertEqual(filtered, ())
+        self.assertIn("black_denia", trigger_plan.prompt)
+        self.assertIn(r"denia_\(wuthering_waves\)", trigger_plan.prompt)
+        self.assertEqual(final_canonicals, ("denia_(wuthering_waves)",))
+        self.assertTrue(
+            any("llm_character_lora_identity_binding_used" in row for row in events)
+        )
+
+    def test_character_swap_submission_preserves_all_bound_activation_terms(
+        self,
+    ) -> None:
+        record = LoraRecord(
+            "black deniav1-2.safetensors",
+            sha256="ab" * 32,
+            category="character",
+            character_name="black denia",
+            trigger_words=("legacy_wrong_trigger",),
+        )
+        plan = self.main.CharacterSwapPlan(
+            prompt=r"1girl, denia_\(wuthering_waves\), jiangshi",
+            negative_prompt="",
+            loras=(LoraSelection(record.name, 0.65),),
+            expectations=(),
+            target_record=record,
+            source_record=None,
+            target_identity_trigger="denia_(wuthering_waves)",
+            removed_terms=(),
+            kept_terms=("1girl", "jiangshi"),
+            added_terms=("denia_(wuthering_waves)",),
+            suppressed_terms=(),
+            suppress_default_style=False,
+            target_activation_terms=("black_denia", "denia_variant"),
+        )
+
+        pairs = self.main._character_swap_activation_overrides(plan)
+
+        self.assertEqual(
+            pairs,
+            (
+                (record.name, "black_denia"),
+                (record.name, "denia_variant"),
+            ),
+        )
+        self.assertEqual(
+            self.main._group_lora_activation_overrides(pairs),
+            {
+                self.main.canonical_lora_name(record.name).casefold(): (
+                    "black_denia",
+                    "denia_variant",
+                )
+            },
+        )
+
+    def test_gallery_fallback_rejects_offline_wrong_category_and_ambiguous_loras(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {"tags": [{"tag": "bang_dream!", "category": "copyright"}]}
+                ).encode(),
+                content_type="json",
+            )
+            base_record = LoraRecord(
+                "viola-a.safetensors",
+                category="character",
+                character_name="Viola / 薇欧拉",
+                source_work="BanG Dream!",
+                trigger_words=("viola",),
+            )
+
+            async def run_case(client, records):
+                plugin, _events = self._llm_character_validation_plugin()
+                plugin._danbooru_index = index
+                plugin._client = client
+                with self.assertRaises(CharacterPromptCompileError) as raised:
+                    await plugin._compile_llm_character_prompt(
+                        self.main.GenerationJob("user", "draw", 0.0),
+                        prompt="1girl, viola, maid, selfie",
+                        negative_prompt="",
+                        character_queries=("Viola|BanG Dream!",),
+                        user_request="draw Viola from BanG Dream!",
+                        records=records,
+                        source="test",
+                    )
+                self.assertEqual(raised.exception.code, "character_resolution_unverified")
+
+            class OfflineClient:
+                @staticmethod
+                async def danbooru_gallery_health():
+                    return {"connected": False, "source": "danbooru"}
+
+            class WrongCategoryClient:
+                @staticmethod
+                async def danbooru_gallery_health():
+                    return {"connected": True, "source": "danbooru"}
+
+                @staticmethod
+                async def danbooru_character_autocomplete(_query, *, limit=20):
+                    del limit
+                    return [
+                        {
+                            "name": "viola_(bang_dream!)",
+                            "category": 3,
+                            "is_deprecated": False,
+                        }
+                    ]
+
+            class DeprecatedClient(WrongCategoryClient):
+                @staticmethod
+                async def danbooru_character_autocomplete(_query, *, limit=20):
+                    del limit
+                    return [
+                        {
+                            "name": "viola_(bang_dream!)",
+                            "category": 4,
+                            "is_deprecated": True,
+                        }
+                    ]
+
+            asyncio.run(run_case(OfflineClient(), (base_record,)))
+            asyncio.run(run_case(WrongCategoryClient(), (base_record,)))
+            asyncio.run(run_case(DeprecatedClient(), (base_record,)))
+            asyncio.run(
+                run_case(
+                    WrongCategoryClient(),
+                    (
+                        base_record,
+                        replace(base_record, name="viola-b.safetensors", sha256="other"),
+                    ),
+                )
+            )
+
+    def test_llm_character_adjacent_toki_alias_needs_no_character_lora(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki"],
+                                "count": 10652,
+                            },
+                            {
+                                "tag": "toki_(bunny)_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki_(bunny)"],
+                                "count": 5539,
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                                "count": 200000,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            prompt, negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=(
+                        r"1girl, toki_\(blue_archive\), playboy bunny, "
+                        "selfie, looking at viewer"
+                    ),
+                    negative_prompt="bad hands",
+                    character_queries=("飞鸟马时",),
+                    user_request="画兔女郎飞鸟马时（toki）自拍",
+                    records=(),
+                    source="test",
+                )
+            )
+
+        self.assertIn(r"toki_\(blue_archive\)", prompt)
+        self.assertNotIn(r"toki_\(bunny\)_\(blue_archive\)", prompt)
+        self.assertIn("playboy bunny", prompt)
+        self.assertEqual(negative, "bad hands")
+        self.assertTrue(
+            any("llm_character_adjacent_alias_used" in event for event in events)
+        )
+
+    def test_llm_character_alias_embedded_in_declaration_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki"],
+                            },
+                            {
+                                "tag": "toki_(bunny)_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            prompt, negative = asyncio.run(
+                plugin._compile_llm_character_prompt(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, toki_\(blue_archive\), selfie",
+                    negative_prompt="bad hands",
+                    character_queries=("飞鸟马时(toki)|Blue Archive",),
+                    user_request="画飞鸟马时自拍",
+                    records=(),
+                    source="test",
+                )
+            )
+
+        self.assertIn(r"toki_\(blue_archive\)", prompt)
+        self.assertEqual(negative, "bad hands")
+        self.assertTrue(
+            any("llm_character_adjacent_alias_used" in event for event in events)
+        )
+
+    def test_optional_armed_pack_is_removed_before_workflow_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "toki_(blue_archive)", "category": "character"},
+                            {
+                                "tag": "toki_(armed)_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "rio_(armed)_(blue_archive)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda *args, **kwargs: phases.append((*args, kwargs))
+            )
+            style = LoraRecord("style.safetensors", category="artist_style")
+            armed = LoraRecord(
+                "baarmed_4in1_v1.safetensors",
+                category="character",
+                character_name="Rio / Toki",
+                trigger_words=(
+                    r"rio \(armed\) \(blue archive\)",
+                    r"toki \(armed\) \(blue archive\)",
+                ),
+            )
+            selections = (
+                LoraSelection(style.name, 0.5),
+                LoraSelection(armed.name, 0.8),
+            )
+            records = {
+                self.main.canonical_lora_name(style.name).casefold(): style,
+                self.main.canonical_lora_name(armed.name).casefold(): armed,
+            }
+
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, toki_\(blue_archive\), playboy bunny, selfie",
+                    selections=selections,
+                    resolved_records=records,
+                )
+            )
+            self.assertEqual(bound_overrides, {})
+
+        self.assertEqual(kept, (LoraSelection(style.name, 0.5),))
+        self.assertEqual(overrides, {})
+        self.assertEqual(filtered, (armed.name,))
+        self.assertTrue(any("llm_character_lora_filtered" in row for row in phases))
+
+    def test_mislabeled_style_lora_with_character_trigger_is_filtered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "toki_(blue_archive)", "category": "character"},
+                            {
+                                "tag": "toki_(armed)_(blue_archive)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+            disguised = LoraRecord(
+                "style/disguised.safetensors",
+                category="artist_style",
+                trigger_words=(
+                    r"toki \(armed\) \(blue archive\)",
+                    "masterpiece",
+                ),
+            )
+            selection = LoraSelection(disguised.name, 0.8)
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, toki_\(blue_archive\), selfie",
+                    selections=(selection,),
+                    resolved_records={
+                        self.main.canonical_lora_name(disguised.name).casefold(): disguised
+                    },
+                )
+            )
+            self.assertEqual(bound_overrides, {})
+
+        self.assertEqual(kept, ())
+        self.assertEqual(overrides, {})
+        self.assertEqual(filtered, (disguised.name,))
+
+    def test_exact_base_character_lora_is_kept_with_verified_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {"tag": "toki_(blue_archive)", "category": "character"}
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+            record = LoraRecord(
+                "toki_base.safetensors",
+                category="character",
+                character_name="Toki",
+                trigger_words=(r"toki \(blue archive\)",),
+            )
+            selection = LoraSelection(record.name, 0.75)
+            key = self.main.canonical_lora_name(record.name).casefold()
+
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, toki_\(blue_archive\), selfie",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                )
+            )
+            self.assertEqual(bound_overrides, {})
+
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(overrides, {key: "toki (blue archive)"})
+        self.assertEqual(filtered, ())
+
+    def test_exact_bound_lora_without_trigger_uses_canonical_base_anchor(self) -> None:
+        record = LoraRecord(
+            "toki_no_trigger.safetensors",
+            category="character",
+            character_name="Asuma Toki",
+            source_work="Blue Archive",
+            trigger_words=(),
+        )
+
+        anchor = self.main.ComfyAnimaPlugin._identity_anchor_activation_trigger(
+            record,
+            "toki_(blue_archive)",
+        )
+
+        self.assertEqual(anchor, "toki")
+
+    def test_chinese_only_lora_metadata_binds_through_localized_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "phoebe_(wuthering_waves)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "wuthering_waves",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            plugin._localized_character_aliases = (
+                self.main.LocalizedCharacterAliasIndex()
+            )
+            plugin._runtime_semantic_index = LoraSemanticIndex.empty
+            record = LoraRecord(
+                "phoebe.safetensors",
+                category="character",
+                character_name="菲比",
+                source_work="鸣潮",
+                trigger_words=(),
+            )
+
+            canonicals = asyncio.run(
+                plugin._verified_record_character_canonicals(record)
+            )
+
+        self.assertEqual(canonicals, ("phoebe_(wuthering_waves)",))
+
+    def test_variant_trigger_binds_through_exact_character_and_work_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "kei_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._danbooru_index = index
+            plugin._danbooru_index_ready = lambda: True
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda *args, **kwargs: phases.append((*args, kwargs))
+            )
+            record = LoraRecord(
+                "kei_student_blue_archive.safetensors",
+                category="character",
+                character_name="Kei / ケイ / 凯伊",
+                source_work="Blue Archive；碧蓝档案",
+                trigger_words=(r"kei \(student\) \(blue archive\)",),
+            )
+            selection = LoraSelection(record.name, 0.65)
+            key = self.main.canonical_lora_name(record.name).casefold()
+
+            kept, overrides, bound_overrides, filtered = asyncio.run(
+                plugin._bind_llm_character_loras(
+                    self.main.GenerationJob("user", "draw", 0.0),
+                    prompt=r"1girl, kei_\(blue_archive\), maid, selfie",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                )
+            )
+            self.assertEqual(bound_overrides, {})
+
+        self.assertEqual(kept, (selection,))
+        self.assertEqual(
+            overrides,
+            {key: "kei (student) (blue archive)"},
+        )
+        self.assertEqual(filtered, ())
+        self.assertTrue(
+            any("llm_character_lora_metadata_bound" in row for row in phases)
+        )
+
+    def test_adjacent_alias_lookup_error_uses_character_compile_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin, _events = self._llm_character_validation_plugin()
+            plugin._danbooru_index = index
+            with patch.object(
+                self.main,
+                "resolve_user_adjacent_character_alias",
+                side_effect=DanbooruIndexError("broken index"),
+            ):
+                with self.assertRaises(CharacterPromptCompileError) as raised:
+                    asyncio.run(
+                        plugin._compile_llm_character_prompt(
+                            self.main.GenerationJob("user", "draw", 0.0),
+                            prompt=r"1girl, toki_\(blue_archive\), selfie",
+                            negative_prompt="",
+                            character_queries=("飞鸟马时",),
+                            user_request="画一张飞鸟马时(toki)自拍",
+                            records=(),
+                            source="test",
+                        )
+                    )
+
+        self.assertEqual(raised.exception.code, "character_resolution_failed")
+
+    def test_adjacent_character_alias_extraction_is_bounded_to_the_name(self) -> None:
+        extract = self.main.ComfyAnimaPlugin._adjacent_ascii_character_aliases
+
+        self.assertEqual(extract("飞鸟马时（toki）", "飞鸟马时"), ("toki",))
+        self.assertEqual(extract("飞鸟马时(toki)", "飞鸟马时"), ("toki",))
+        self.assertEqual(
+            extract("画兔女郎飞鸟马时(toki)自拍", "飞鸟马时"),
+            ("toki",),
+        )
+        self.assertEqual(extract("飞鸟马时 / Asuma Toki", "飞鸟马时"), ("Asuma Toki",))
+        self.assertEqual(extract("飞鸟马时，兔女郎 (bunny)", "飞鸟马时"), ())
+        self.assertEqual(extract("假飞鸟马时(toki)", "飞鸟马时"), ())
+        self.assertEqual(extract("超级飞鸟马时(toki)", "飞鸟马时"), ())
+        self.assertEqual(extract("飞鸟马时(toki)", "时"), ())
+
+
+class HelpTextTests(unittest.IsolatedAsyncioTestCase):
+    """聊天帮助应准确区分生图管线、独立工具与换角降级。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _event():
+        return types.SimpleNamespace(plain_result=lambda text: text)
+
+    async def test_anima_help_documents_v12_pipelines_tools_and_swap_flags(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        results = [item async for item in plugin.cmd_help(self._event())]
+
+        self.assertEqual(len(results), 1)
+        help_text = results[0]
+        for expected in (
+            "3 个可选生图管线",
+            "base - Anima 原图",
+            "rtx - Anima 原图 + RTX 高清放大",
+            "iterative - Anima 原图 + 迭代采样放大",
+            "5 个独立图片操作",
+            "/放大 [倍率]",
+            "/底图控制 <要求> [--m p|d|l|r]",
+            "/改图 <要求> --mode preserve|balanced|free",
+            "/重绘 <要求> --mode quick",
+            "/重绘 <要求> --mode lanpaint",
+            "--pipeline base|rtx|iterative",
+            "--no-character-lora / --no-lora",
+            "目标角色 LoRA 完全未命中，或同一身份存在多个无法唯一选定的版本时",
+            "跨身份歧义、近似名称和显式文件请求仍会停止并要求确认",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, help_text)
+
+    async def test_comfy_help_separates_generation_and_image_operations(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        results = [item async for item in plugin.cmd_comfy_help(self._event())]
+
+        self.assertEqual(len(results), 1)
+        help_text = results[0]
+        for expected in (
+            "3 个可选生图管线（先由 Anima 生成）",
+            "1. base - 只生成 Anima 原图，不放大",
+            "2. rtx - Anima 原图生成后执行 RTX 高清放大",
+            "3. iterative - Anima 原图生成后执行迭代采样放大",
+            "5 个独立图片操作（不属于生图管线切换）",
+            "/放大 [倍率]",
+            "/底图控制 <要求> [--m p|d|l|r]",
+            "--mode preserve|balanced|free",
+            "--mode quick",
+            "--mode lanpaint",
+            "--no-character-lora / --no-lora",
+            "/画图 <英文 Tag或画面描述> [--llm [u|ultra]]",
+            "/画图no <英文 Tag或画面描述> [--llm [u|ultra]]",
+            "默认按原始 Tags 执行",
+            "--llm / --l 使用 Standard 优化",
+            "--llm u / --l u 使用 Ultra 华丽扩写",
+            "--raw / --no-llm 明确保持原样",
+            "缺失或同一身份有多个版本时使用纯语义 Tags",
+            "明确文件名或跨身份歧义不会猜选",
+            "/画图 一名蓝发少女蹲在海边浅水里看烟花 --llm --pipeline rtx",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, help_text)
+
+
+class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """验证自然语言绘图不会在第一条进度消息后提前终止。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_explicit_draw_command_cannot_be_stolen_by_pose_route(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_natural_draw=True)
+        plugin._looks_like_inpaint_request = lambda _text: False
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                raise AssertionError("explicit /画图 must not reach image control")
+
+        plugin._image_input = ImageInput()
+        prompt = (
+            "画图 1girl, solo, Takanashi Rikka, dramatic pose, "
+            "wind blowing hair and skirt --llm"
+        )
+
+        class Event:
+            message_str = prompt
+            message_obj = types.SimpleNamespace(message_str=f"/{prompt}")
+
+            @staticmethod
+            def get_extra(key, default=None):
+                if key == "handlers_parsed_params":
+                    return {
+                        "astrbot_plugin_comfy_anima.cmd_draw_forward": {
+                            "prompt_text": "1girl,"
+                        }
+                    }
+                return default
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+            @staticmethod
+            def stop_event():
+                raise AssertionError("natural control must not stop explicit /画图")
+
+        replies = [
+            item async for item in plugin.natural_language_control_draw(Event())
+        ]
+        self.assertEqual(replies, [])
+
+    def test_explicit_command_guard_preserves_slash_only_natural_wake(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "帮我画一只猫"
+            message_obj = types.SimpleNamespace(message_str="/帮我画一只猫")
+
+            @staticmethod
+            def get_extra(_key, default=None):
+                return default
+
+        self.assertFalse(plugin._event_has_explicit_command_route(Event()))
+
+    def test_explicit_command_guard_has_original_message_fallback(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "画图 1girl, dramatic pose --llm"
+            message_obj = types.SimpleNamespace(
+                message_str="/画图 1girl, dramatic pose --llm"
+            )
+
+        self.assertTrue(plugin._event_has_explicit_command_route(Event()))
+
+    async def test_event_stops_only_after_generator_finishes(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_natural_draw=True)
+        plugin._access_error = lambda _event, _message: None
+        plugin._director = None
+        plugin._director_error = "test unavailable"
+
+        draw_now = self.main.DRAW_NOW
+
+        class FakeJudge:
+            async def judge(self, message, bot_reply, context=""):
+                return types.SimpleNamespace(
+                    decision=draw_now,
+                    confidence=0.9,
+                    backend_used="test",
+                    reason="test",
+                    latency_ms=0.0,
+                    trace={},
+                )
+
+        plugin._build_intent_judge_service = lambda: FakeJudge()
+
+        class Event:
+            message_str = "帮我画一个小猫"
+
+            def __init__(self):
+                self.stopped = False
+                self._extras = {
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                        NaturalLanguageDrawLifecycleTests.main,
+                        draw_now,
+                        "帮我画一个小猫",
+                    )
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_draw(event)
+
+        first_result = await anext(generator)
+        self.assertIn("LLM", first_result)
+        self.assertFalse(event.stopped)
+
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_success_path_yields_progress_then_image_before_stopping(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_natural_draw=True,
+            show_llm_prompt=False,
+        )
+        plugin._access_error = lambda _event, _message: None
+        plugin._director = object()
+
+        draw_now = self.main.DRAW_NOW
+
+        class FakeJudge:
+            async def judge(self, message, bot_reply, context=""):
+                return types.SimpleNamespace(
+                    decision=draw_now,
+                    confidence=0.9,
+                    backend_used="test",
+                    reason="test",
+                    latency_ms=0.0,
+                    trace={},
+                )
+
+        plugin._build_intent_judge_service = lambda: FakeJudge()
+
+        async def generate_prompt(_event, _message):
+            return "1girl, cat ears", "test-provider", "school uniform"
+
+        captured_options = []
+
+        async def run_job(_event, _options, *, notify_queue=True):
+            captured_options.append(_options)
+            return (["test.png"], 123, "", "", "")
+
+        plugin._generate_directed_prompt = generate_prompt
+        plugin._run_job = run_job
+        plugin._make_image_result = (
+            lambda _event, _paths, _seed, forward=False: "IMAGE_RESULT"
+        )
+        plugin._schedule_cleanup = lambda _paths: None
+
+        class Event:
+            message_str = "帮我画一个小猫"
+
+            def __init__(self):
+                self.stopped = False
+                self._extras = {
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                        NaturalLanguageDrawLifecycleTests.main,
+                        draw_now,
+                        "帮我画一个小猫",
+                    )
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_draw(event)
+
+        progress = await anext(generator)
+        self.assertIn("正在分析", progress)
+        self.assertFalse(event.stopped)
+
+        image_result = await anext(generator)
+        self.assertEqual(image_result, "IMAGE_RESULT")
+        self.assertEqual(captured_options[0].negative_prompt, "school uniform")
+        self.assertFalse(event.stopped)
+
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_natural_character_swap_stops_only_after_all_replies(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                return True
+
+        async def handle(_event, request):
+            self.assertEqual(request.source_query, "达妮娅")
+            self.assertEqual(request.target_query, "卡莲")
+            yield "SWAP_PROGRESS"
+            yield "SWAP_IMAGE"
+
+        plugin._image_input = ImageInput()
+        plugin._handle_character_swap = handle
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        class Event:
+            message_str = "把引用图片里的达妮娅换成卡莲，衣服保持不变"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_character_swap(event)
+        self.assertEqual(await anext(generator), "SWAP_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "SWAP_IMAGE")
+        self.assertFalse(event.stopped)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_reverse_draw_command_routes_exact_no_lora_swap_phrase(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+
+        async def handle(_event, request):
+            captured.append(request)
+            yield "SWAP_PROGRESS"
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = handle
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        class Event:
+            message_str = (
+                "/反推画图 把角色换成赛马娘的米浴，无需使用角色lora"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(replies, ["SWAP_PROGRESS", "SWAP_IMAGE"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].source_query, "")
+        self.assertEqual(captured[0].target_query, "赛马娘的米浴")
+        self.assertFalse(captured[0].use_target_lora)
+
+    async def test_reverse_draw_character_change_ultra_options_are_stripped_first(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+
+        async def handle(_event, request):
+            captured.append(request)
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = handle
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        class Event:
+            message_str = (
+                "/反推画图 把黄色头发的角色换成目标角色:"
+                "BlueArchive日鞠(himari) --l cc u"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(replies, ["SWAP_IMAGE"])
+        self.assertEqual(captured[0].source_query, "黄色头发的角色")
+        self.assertNotIn("--l", captured[0].target_query)
+        self.assertEqual(captured[0].prompt_expansion_mode, "ultra")
+
+    async def test_control_command_infers_pose_depth_without_reference(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+        plugin._find_requested_style_preset = (
+            lambda text: "风格001-1" if "风格001-1" in text else ""
+        )
+
+        async def handle(_event, options):
+            captured.append(options)
+            yield "CONTROL_PROGRESS"
+            yield "CONTROL_IMAGE"
+
+        plugin._handle_control_draw = handle
+
+        class Event:
+            message_str = "/底图控制 构图和姿势不变，用风格001-1 画出来。"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_control_draw(Event())]
+
+        self.assertEqual(replies, ["CONTROL_PROGRESS", "CONTROL_IMAGE"])
+        self.assertEqual(captured[0].control_modes, ("pose", "depth"))
+        self.assertEqual(captured[0].lora_preset, "风格001-1")
+
+    async def test_control_command_explicit_modes_override_natural_text(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+        plugin._find_requested_style_preset = lambda _text: "风格001-1"
+
+        async def handle(_event, options):
+            captured.append(options)
+            yield "CONTROL_IMAGE"
+
+        plugin._handle_control_draw = handle
+
+        class Event:
+            message_str = (
+                "/底图控制 构图和姿势不变，用风格001-1画出来 --m r"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_control_draw(Event())]
+
+        self.assertEqual(replies, ["CONTROL_IMAGE"])
+        self.assertEqual(captured[0].control_modes, ("reference",))
+
+    async def test_control_command_accepts_free_content_mode_with_pose_depth(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        captured = []
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        async def handle(_event, options):
+            captured.append(options)
+            yield "CONTROL_IMAGE"
+
+        plugin._handle_control_draw = handle
+
+        class Event:
+            message_str = (
+                "/底图控制 构图和姿势不变，换成新角色 --m p d --mode free"
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_control_draw(Event())]
+
+        self.assertEqual(replies, ["CONTROL_IMAGE"])
+        self.assertEqual(captured[0].control_modes, ("pose", "depth"))
+        self.assertEqual(captured[0].semantic_redraw_mode, "free")
+
+    async def test_anima_draw_consumes_character_change_mode(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+        captured = []
+
+        async def swap(_event, request, *, forward=False):
+            captured.append((request, forward))
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/anima draw 1girl，把角色换成甘雨 --llmcc"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [
+            item
+            async for item in plugin.cmd_draw(
+                Event(),
+                "1girl，把角色换成甘雨 --llmcc",
+            )
+        ]
+
+        self.assertEqual(replies, ["SWAP_IMAGE"])
+        self.assertEqual(captured[0][0].target_query, "甘雨")
+        self.assertFalse(captured[0][1])
+
+    async def test_reverse_draw_can_reuse_one_image_for_pose_depth_control(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            Image.new("RGB", (640, 960), "white").save(image_path)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._director = object()
+            plugin._control_workflow_builder = object()
+            plugin._control_initialization_error = ""
+            plugin._initialization_error = ""
+            plugin._director_error = ""
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._find_requested_style_preset = (
+                lambda text: "风格001-1" if "风格001-1" in text else ""
+            )
+            collect_count = 0
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    nonlocal collect_count
+                    collect_count += 1
+                    return image_path
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        types.SimpleNamespace(
+                            negative_tags="old outfit",
+                            drawing_request=lambda requirement: (
+                                f"image facts; request={requirement}"
+                            ),
+                            control_generation_request=(
+                                lambda requirement, modes, content_mode: (
+                                    "image facts; "
+                                    f"request={requirement}; modes={modes}; "
+                                    f"content_mode={content_mode}"
+                                )
+                            ),
+                        ),
+                        "vision-provider",
+                    )
+
+            uploads = []
+
+            class Client:
+                @staticmethod
+                async def upload_image(path):
+                    uploads.append(path)
+                    return types.SimpleNamespace(workflow_value="input/control.png")
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+            plugin._client = Client()
+
+            async def directed(_event, request, **kwargs):
+                self.assertIn("image facts", request)
+                self.assertEqual(kwargs["task_kind"], self.main.TASK_CONTROL_DRAW)
+                return (
+                    types.SimpleNamespace(
+                        prompt="1girl, dynamic pose",
+                        negative_prompt="bad anatomy",
+                        pipeline="base",
+                    ),
+                    "director-provider",
+                )
+
+            plugin._generate_directed_instruction = directed
+            executed = []
+
+            async def execute_job(
+                _job,
+                options,
+                _event,
+                *,
+                control_image_name="",
+                img2img_image_name="",
+            ):
+                self.assertFalse(img2img_image_name)
+                executed.append((options, control_image_name))
+                paths = GeneratedImagePaths()
+                paths.append(Path("output.png"))
+                return paths, 42, options.prompt, "", None
+
+            plugin._execute_job = execute_job
+
+            async def run_auxiliary(_event, _label, operation):
+                return await operation(
+                    self.main.GenerationJob("tester", "reverse draw", 0.0)
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._schedule_cleanup = lambda _paths: None
+
+            class Event:
+                message_str = (
+                    "/反推画图 构图和姿势不变，用风格001-1画出来 "
+                    "--size 512x512"
+                )
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(collect_count, 1)
+        self.assertEqual(uploads, [image_path])
+        self.assertEqual(len(executed), 1)
+        options, control_image_name = executed[0]
+        self.assertEqual(options.control_modes, ("pose", "depth"))
+        self.assertEqual(options.lora_preset, "风格001-1")
+        self.assertEqual((options.width, options.height), (512, 512))
+        self.assertEqual(control_image_name, "input/control.png")
+        self.assertTrue(any("pose + depth" in item for item in replies))
+        self.assertEqual(replies[-1], "IMAGE_RESULT")
+
+    async def test_natural_upscale_routes_existing_image_without_llm(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(rtx_scale=2.0)
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                return True
+
+        async def handle(_event, scale):
+            self.assertEqual(scale, 2.5)
+            yield "UPSCALE_PROGRESS"
+            yield "UPSCALE_IMAGE"
+
+        plugin._image_input = ImageInput()
+        plugin._handle_rtx_upscale = handle
+
+        class Event:
+            message_str = "把这张图放大到2.5倍"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        event = Event()
+        generator = plugin.natural_language_rtx_upscale(event)
+        self.assertEqual(await anext(generator), "UPSCALE_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "UPSCALE_IMAGE")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_natural_inpaint_routes_colloquial_region_edit(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(enable_inpaint=True)
+        plugin._find_requested_style_preset = lambda _text: "风格001"
+
+        async def handle(_event, options):
+            self.assertEqual(options.inpaint_mode, "lanpaint")
+            self.assertEqual(options.lora_preset, "风格001")
+            yield "INPAINT_PROGRESS"
+            yield "INPAINT_IMAGE"
+
+        plugin._handle_inpaint = handle
+
+        class Event:
+            message_str = "精细修复遮罩区域里的手指"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+        event = Event()
+        generator = plugin.natural_language_inpaint(event)
+        self.assertEqual(await anext(generator), "INPAINT_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "INPAINT_IMAGE")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_natural_semantic_redraw_routes_one_image_without_mask(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class ImageInput:
+            @staticmethod
+            async def has_any(_event):
+                return True
+
+        plugin._image_input = ImageInput()
+        plugin._prepare_semantic_redraw_options = lambda _text: self.main.GenerationOptions(
+            prompt="把衣服换成红裙",
+            semantic_redraw_mode="preserve",
+        )
+
+        async def handle(_event, options):
+            self.assertEqual(options.semantic_redraw_mode, "preserve")
+            yield "REDRAW_PROGRESS"
+            yield "REDRAW_IMAGE"
+
+        plugin._handle_semantic_redraw = handle
+
+        class Event:
+            message_str = "把这张图里的衣服换成红裙，其他保持不变"
+
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+        event = Event()
+        generator = plugin.natural_language_semantic_redraw(event)
+        self.assertEqual(await anext(generator), "REDRAW_PROGRESS")
+        self.assertFalse(event.stopped)
+        self.assertEqual(await anext(generator), "REDRAW_IMAGE")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(generator)
+        self.assertTrue(event.stopped)
+
+    async def test_redraw_command_without_mask_language_routes_semantic_redraw(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._looks_like_inpaint_request = lambda _text: False
+        plugin._finalize_semantic_redraw_options = lambda options: replace(
+            options,
+            semantic_redraw_mode=options.semantic_redraw_mode or "preserve",
+        )
+        plugin._extract_command_text = lambda *_args, **_kwargs: (
+            "把角色泳装换成三点式，加一条白丝大腿袜，构图不变"
+        )
+
+        async def semantic(_event, options):
+            self.assertIn("泳装", options.prompt)
+            yield "SEMANTIC_REDRAW"
+
+        async def swap(_event, _request):
+            yield "WRONG_SWAP"
+
+        plugin._handle_semantic_redraw = semantic
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/重绘 把角色泳装换成三点式，加一条白丝大腿袜，构图不变"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_inpaint(Event())]
+        self.assertEqual(replies, ["SEMANTIC_REDRAW"])
+
+    async def test_redraw_command_free_mode_routes_whole_image_redraw(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._looks_like_inpaint_request = lambda _text: False
+        plugin._extract_command_text = lambda *_args, **_kwargs: (
+            "把衣服换成红裙 --mode free"
+        )
+        plugin._finalize_semantic_redraw_options = lambda options: options
+
+        async def semantic(_event, options):
+            self.assertEqual(options.semantic_redraw_mode, "free")
+            self.assertNotIn("--mode", options.prompt)
+            yield "SEMANTIC_REDRAW"
+
+        plugin._handle_semantic_redraw = semantic
+
+        class Event:
+            message_str = "/重绘 把衣服换成红裙 --mode free"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_inpaint(Event())]
+        self.assertEqual(replies, ["SEMANTIC_REDRAW"])
+
+    async def test_semantic_redraw_strips_options_before_natural_swap(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._extract_pipeline_request = lambda _text: ""
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        async def swap(_event, request):
+            self.assertEqual(request.target_query, "米浴")
+            self.assertNotIn("--mode", request.target_query)
+            self.assertEqual(request.denoise, 0.4)
+            yield "SWAP_IMAGE"
+
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/改图 把达妮娅换成米浴 --denoise 0.4"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_semantic_redraw(Event())]
+        self.assertEqual(replies, ["SWAP_IMAGE"])
+
+    async def test_semantic_redraw_rejects_unconsumed_content_mode_for_swap(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "/改图 把达妮娅换成米浴 --mode free"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_semantic_redraw(Event())]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("精确换角不使用", replies[0])
+
+    async def test_upscale_unknown_option_reports_option_error(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            message_str = "/放大 --mode free"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_rtx_upscale(Event())]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("不支持选项: --mode", replies[0])
+
+    async def test_redraw_command_combines_character_and_outfit_change(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._looks_like_inpaint_request = lambda _text: False
+        plugin._extract_command_text = lambda *_args, **_kwargs: (
+            "把达妮娅换成米浴并穿红色礼服，构图不变"
+        )
+        plugin._extract_resolution_request = lambda _text: (None, None)
+        plugin._find_requested_style_preset = lambda _text: ""
+
+        async def swap(_event, request):
+            self.assertEqual(request.target_query, "米浴")
+            self.assertIn("红色礼服", request.edit_requirement)
+            yield "COMBINED_SWAP"
+
+        plugin._handle_character_swap = swap
+
+        class Event:
+            message_str = "/重绘 把达妮娅换成米浴并穿红色礼服，构图不变"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        replies = [item async for item in plugin.cmd_inpaint(Event())]
+        self.assertEqual(replies, ["COMBINED_SWAP"])
+
+    async def test_reverse_draw_without_control_uses_true_img2img(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            Image.new("RGB", (640, 960), "white").save(image_path)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._img2img_workflow_builder = object()
+            plugin._director = object()
+            plugin._initialization_error = ""
+            plugin._director_error = ""
+            plugin._img2img_initialization_error = ""
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._find_requested_style_preset = lambda _text: ""
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return image_path
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        types.SimpleNamespace(
+                            negative_tags="old outfit",
+                            drawing_request=lambda requirement: (
+                                f"source facts; request={requirement}"
+                            ),
+                        ),
+                        "vision-provider",
+                    )
+
+            class Client:
+                @staticmethod
+                async def upload_image(_path):
+                    return types.SimpleNamespace(workflow_value="input/img2img.png")
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+            plugin._client = Client()
+
+            async def directed(_event, _request, **kwargs):
+                self.assertEqual(kwargs["task_kind"], self.main.TASK_REVERSE_DRAW)
+                return (
+                    self.main.PictureInstruction(
+                        "1girl, red evening dress",
+                        "old outfit",
+                        "base",
+                    ),
+                    "director-provider",
+                )
+
+            plugin._generate_directed_instruction = directed
+            captured = {}
+
+            async def execute_job(
+                _job,
+                options,
+                _event,
+                *,
+                img2img_image_name="",
+            ):
+                captured["options"] = options
+                captured["img2img_image_name"] = img2img_image_name
+                paths = GeneratedImagePaths()
+                paths.append(Path("output.png"))
+                return paths, 42, options.prompt, "", None
+
+            plugin._execute_job = execute_job
+
+            async def run_auxiliary(_event, _label, operation):
+                return await operation(
+                    self.main.GenerationJob("tester", "reverse draw", 0.0)
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._schedule_cleanup = lambda _paths: None
+
+            class Event:
+                message_str = "/反推画图 换成红色晚礼服"
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertEqual(captured["img2img_image_name"], "input/img2img.png")
+        self.assertEqual(captured["options"].denoise, 0.55)
+        self.assertTrue(captured["options"].suppress_default_style)
+        self.assertIn("IMAGE_RESULT", replies)
+
+    async def test_control_job_builds_source_aware_director_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            Image.new("RGB", (640, 960), "white").save(source)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_prompt_llm=True,
+                enable_reverse_prompt=True,
+            )
+            plugin.context = object()
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return source
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        ReversePromptResult(
+                            positive_tags="1girl, black coat, standing, rainy street",
+                            composition="full body, centered",
+                            scene_description_zh="雨夜街道",
+                        ),
+                        "vision-provider",
+                    )
+
+            class Client:
+                @staticmethod
+                async def upload_image(_path):
+                    return types.SimpleNamespace(workflow_value="input/control.png")
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+            plugin._client = Client()
+            captured = {}
+
+            async def execute(
+                _job,
+                options,
+                _event,
+                *,
+                control_image_name="",
+            ):
+                captured["options"] = options
+                captured["control_image_name"] = control_image_name
+                return GeneratedImagePaths(), 1, options.prompt, "", None
+
+            plugin._execute_job = execute
+            await plugin._execute_control_job(
+                self.main.GenerationJob("tester", "control", time.monotonic()),
+                object(),
+                self.main.GenerationOptions(
+                    prompt="换成红色晚礼服，构图不变",
+                    control_modes=("pose", "reference"),
+                ),
+            )
+
+        effective = captured["options"]
+        self.assertIn("1girl, black coat", effective.prompt)
+        self.assertIn("换成红色晚礼服", effective.prompt)
+        self.assertTrue(effective.suppress_default_style)
+        self.assertEqual(captured["control_image_name"], "input/control.png")
+
+    async def test_semantic_redraw_preserves_source_ratio_and_applies_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            output = Path(directory) / "output.png"
+            Image.new("RGB", (1200, 600), "white").save(source)
+            Image.new("RGB", (512, 512), "white").save(output)
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                max_prompt_length=2000,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            class Client:
+                @staticmethod
+                async def upload_image(_path):
+                    return types.SimpleNamespace(workflow_value="input/source.png")
+
+            plugin._client = Client()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._img2img_workflow_builder = object()
+            plugin._director = object()
+            plugin._initialization_error = None
+            plugin._director_error = None
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._access_error = lambda *_args, **_kwargs: None
+            phases = []
+            plugin._record_image_task_phase = (
+                lambda _job, _phase, _message, code, **_kwargs: phases.append(code)
+            )
+            captured = {}
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return source
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*args, **_kwargs):
+                    captured["reverse_focus"] = args[3]
+                    return (
+                        ReversePromptResult(
+                            positive_tags=(
+                                "1girl, school uniform, standing, classroom"
+                            ),
+                            negative_tags="text, watermark",
+                        ),
+                        "vision-provider",
+                    )
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+
+            async def direct(_event, request, **_kwargs):
+                captured["director_request"] = request
+                return (
+                    self.main.PictureInstruction(
+                        "1girl, red evening dress, standing, classroom",
+                        "school uniform",
+                        "base",
+                    ),
+                    "director-provider",
+                )
+
+            plugin._generate_directed_instruction = direct
+
+            async def execute(
+                _job,
+                options,
+                _event,
+                *,
+                img2img_image_name="",
+            ):
+                captured["options"] = options
+                captured["img2img_image_name"] = img2img_image_name
+                paths = GeneratedImagePaths()
+                paths.append(output)
+                paths.elapsed_seconds = 1.25
+                paths.gpu_name = "Test GPU"
+                return paths, 42, options.prompt, "", None
+
+            plugin._execute_job = execute
+
+            async def run_auxiliary(_event, label, operation):
+                self.assertEqual(label, "semantic redraw")
+                return await operation(
+                    self.main.GenerationJob("tester", label, time.monotonic())
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+            plugin._schedule_cleanup = lambda _paths: None
+
+            class Event:
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+                @staticmethod
+                def chain_result(components):
+                    return components
+
+            replies = [
+                item
+                async for item in plugin._handle_semantic_redraw(
+                    Event(),
+                    self.main.GenerationOptions(
+                        prompt="只把衣服换成红色晚礼服，其他保持不变",
+                        semantic_redraw_mode="preserve",
+                        use_prompt_llm=False,
+                    ),
+                )
+            ]
+
+        effective = captured["options"]
+        self.assertEqual(captured["img2img_image_name"], "input/source.png")
+        self.assertEqual(effective.denoise, 0.64)
+        self.assertEqual(effective.steps, 16)
+        self.assertEqual(effective.width % 64, 0)
+        self.assertEqual(effective.height % 64, 0)
+        self.assertAlmostEqual(effective.width / effective.height, 2.0, delta=0.15)
+        self.assertEqual(effective.pipeline, "base")
+        self.assertTrue(effective.suppress_default_style)
+        self.assertIn("text, watermark", effective.negative_prompt)
+        self.assertIn("school uniform", effective.negative_prompt)
+        self.assertIn("source image exactly as shown", captured["reverse_focus"])
+        self.assertNotIn("红色晚礼服", captured["reverse_focus"])
+        self.assertIn("无蒙版整图语义重绘", captured["director_request"])
+        self.assertIn("明确替换的旧内容必须从正面提示词删除", captured["director_request"])
+        self.assertIn("不得自动套用默认风格001", captured["director_request"])
+        self.assertIn("semantic_redraw_output_ready", phases)
+        self.assertEqual(len(replies), 2)
+
+
+class AuxiliaryImageTaskFailureTests(unittest.IsolatedAsyncioTestCase):
+    """验证反推失败阶段和安全错误码进入持久任务记录。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_reverse_failure_keeps_stage_and_omits_private_detail(self) -> None:
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+        class Event:
+            @staticmethod
+            def get_sender_id():
+                return "tester"
+
+            @staticmethod
+            def is_admin():
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._jobs_lock = asyncio.Lock()
+            plugin._active_jobs = {}
+            plugin._last_request_at = {}
+            plugin._task_store = store
+            plugin._client = None
+            plugin.settings = types.SimpleNamespace(
+                admin_ignore_cooldown=False,
+                user_cooldown=0,
+            )
+
+            async def operation(job):
+                job.state = "reverse_prompting"
+                raise self.main.ReversePromptError(
+                    "结构化反推失败",
+                    "PRIVATE_PROVIDER_BODY",
+                    code="repair_exhausted",
+                )
+
+            with self.assertRaises(self.main.ReversePromptError):
+                await plugin._run_auxiliary_job(
+                    Event(),
+                    "reverse draw",
+                    operation,
+                )
+
+            task = store.recent_tasks(limit=1)[0]
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["error_code"], "repair_exhausted")
+            self.assertEqual(task["error_summary"], "结构化反推失败")
+            events = store.read_events(run_id=task["run_id"], limit=50)["entries"]
+            failed = [
+                item
+                for item in events
+                if item["event_code"] == "image_task_failed"
+            ]
+            self.assertEqual(
+                failed[0]["details"]["failed_stage"],
+                "reverse_prompting",
+            )
+            persisted = str(events) + str(store.recent_runtime_logs(limit=50))
+            self.assertNotIn("PRIVATE_PROVIDER_BODY", persisted)
+            store.close()
+
+    async def test_nested_generation_failure_keeps_the_real_stage(self) -> None:
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+        class Event:
+            @staticmethod
+            def get_sender_id():
+                return "tester"
+
+            @staticmethod
+            def is_admin():
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._jobs_lock = asyncio.Lock()
+            plugin._active_jobs = {}
+            plugin._last_request_at = {}
+            plugin._task_store = store
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._control_workflow_builder = None
+            plugin._img2img_workflow_builder = object()
+            plugin._director = object()
+            plugin._initialization_error = ""
+            plugin._director_error = ""
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin.settings = self.main.PluginSettings.from_mapping(
+                {
+                    "admin_ignore_cooldown": False,
+                    "user_cooldown": 0,
+                    "enable_prompt_llm": True,
+                    "prompt_llm_fallback": False,
+                }
+            )
+
+            async def fail_director(_event, _prompt):
+                raise self.main.PromptDirectorError(
+                    "director failed",
+                    fatal=True,
+                )
+
+            plugin._generate_directed_prompt = fail_director
+
+            async def operation(job):
+                return await plugin._execute_job(
+                    job,
+                    self.main.GenerationOptions(prompt="safe prompt"),
+                    Event(),
+                )
+
+            with self.assertRaises(self.main.PromptDirectorError):
+                await plugin._run_auxiliary_job(
+                    Event(),
+                    "reverse draw",
+                    operation,
+                )
+
+            task = store.recent_tasks(limit=1)[0]
+            events = store.read_events(run_id=task["run_id"], limit=50)["entries"]
+            failed = [
+                item
+                for item in events
+                if item["event_code"] == "image_task_failed"
+            ]
+            self.assertEqual(failed[0]["details"]["failed_stage"], "directing")
+            self.assertEqual(failed[0]["details"]["final_state"], "failed")
+            store.close()
+
+    async def test_character_swap_failure_persists_sanitized_term_evidence(self) -> None:
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+        class Event:
+            @staticmethod
+            def get_sender_id():
+                return "tester"
+
+            @staticmethod
+            def is_admin():
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._jobs_lock = asyncio.Lock()
+            plugin._active_jobs = {}
+            plugin._last_request_at = {}
+            plugin._task_store = store
+            plugin._client = None
+            plugin.settings = types.SimpleNamespace(
+                admin_ignore_cooldown=False,
+                user_cooldown=0,
+            )
+
+            async def operation(job):
+                job.state = "validating_swap"
+                raise self.main.CharacterSwapError(
+                    "source classification rejected",
+                    code="unsafe_source_identity_classification",
+                    details={
+                        "term_id": 17,
+                        "danbooru_category": "general",
+                        "danbooru_verified": True,
+                        "prompt_text": "PRIVATE_PROMPT",
+                    },
+                )
+
+            with self.assertRaises(self.main.CharacterSwapError):
+                await plugin._run_auxiliary_job(
+                    Event(),
+                    "character swap",
+                    operation,
+                )
+
+            task = store.recent_tasks(limit=1)[0]
+            events = store.read_events(run_id=task["run_id"], limit=50)["entries"]
+            failed = next(
+                item
+                for item in events
+                if item["event_code"] == "image_task_failed"
+            )
+            self.assertEqual(failed["details"]["term_id"], 17)
+            self.assertEqual(failed["details"]["danbooru_category"], "general")
+            self.assertTrue(failed["details"]["danbooru_verified"])
+            self.assertEqual(
+                failed["details"]["prompt_text"],
+                {"omitted": True, "chars": len("PRIVATE_PROMPT")},
+            )
+            self.assertNotIn("PRIVATE_PROMPT", str(events))
+            store.close()
+
+
+class PerUserImageQueueTests(unittest.IsolatedAsyncioTestCase):
+    """同一用户的图片任务应进入 FIFO，而不是要求重新发送。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        cls.task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+
+    class Event:
+        def __init__(self, sender: str = "tester") -> None:
+            self.sender = sender
+            self.messages = []
+
+        def get_sender_id(self):
+            return self.sender
+
+        @staticmethod
+        def is_admin():
+            return False
+
+        @staticmethod
+        def plain_result(text):
+            return text
+
+        async def send(self, message):
+            self.messages.append(message)
+
+    def _plugin(self, store, *, capacity: int = 3):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._jobs_lock = asyncio.Lock()
+        plugin._active_jobs = {}
+        plugin._queued_jobs = {}
+        plugin._last_request_at = {}
+        plugin._task_store = store
+        plugin._client = None
+        plugin.settings = types.SimpleNamespace(
+            admin_ignore_cooldown=False,
+            user_cooldown=30,
+            max_queued_jobs_per_user=capacity,
+        )
+        return plugin
+
+    async def test_second_image_task_is_persisted_and_runs_fifo(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            second_started = asyncio.Event()
+            order = []
+
+            async def first_operation(job):
+                order.append("first")
+                first_started.set()
+                await release_first.wait()
+                job.state = "completed"
+                return "first-result"
+
+            async def second_operation(job):
+                order.append("second")
+                second_started.set()
+                job.state = "completed"
+                return "second-result"
+
+            first = asyncio.create_task(
+                plugin._run_auxiliary_job(
+                    self.Event(),
+                    "reverse draw",
+                    first_operation,
+                )
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second_event = self.Event()
+            second = asyncio.create_task(
+                plugin._run_auxiliary_job(
+                    second_event,
+                    "character swap",
+                    second_operation,
+                )
+            )
+            await asyncio.sleep(0.05)
+
+            self.assertFalse(second_started.is_set())
+            self.assertTrue(any("等待位置 1/3" in item for item in second_event.messages))
+            tasks = store.recent_tasks(limit=10)
+            self.assertEqual({item["status"] for item in tasks}, {"queued", "running"})
+            queued_task = next(item for item in tasks if item["status"] == "queued")
+            queued_events = store.read_events(
+                run_id=queued_task["run_id"],
+                limit=20,
+            )["entries"]
+            self.assertTrue(
+                any(item["event_code"] == "image_task_queued" for item in queued_events)
+            )
+
+            release_first.set()
+            self.assertEqual(await asyncio.wait_for(first, timeout=1), "first-result")
+            self.assertEqual(await asyncio.wait_for(second, timeout=1), "second-result")
+            self.assertEqual(order, ["first", "second"])
+            self.assertTrue(
+                any("已轮到你的排队任务" in item for item in second_event.messages)
+            )
+            self.assertEqual(plugin._active_jobs, {})
+            self.assertEqual(plugin._queued_jobs, {})
+            self.assertEqual(
+                {item["status"] for item in store.recent_tasks(limit=10)},
+                {"partial"},
+            )
+            store.close()
+
+    async def test_normal_generation_uses_the_same_queue(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            execution_order = []
+
+            async def execute(job, options, _event):
+                execution_order.append(options.prompt)
+                if options.prompt == "first":
+                    first_started.set()
+                    await release_first.wait()
+                job.state = "completed"
+                return ([], 1, options.prompt, "", None)
+
+            plugin._execute_job = execute
+            first = await plugin._create_job(
+                "tester",
+                self.main.GenerationOptions(prompt="first"),
+                self.Event(),
+            )
+            self.assertIsInstance(first, self.main.GenerationJob)
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second_event = self.Event()
+            second = await plugin._create_job(
+                "tester",
+                self.main.GenerationOptions(prompt="second"),
+                second_event,
+            )
+            self.assertIsInstance(second, self.main.GenerationJob)
+            self.assertTrue(second.was_queued)
+            self.assertEqual(second.task_type, "generation")
+            self.assertTrue(any("等待位置 1/3" in item for item in second_event.messages))
+
+            release_first.set()
+            await asyncio.wait_for(first.task, timeout=1)
+            await asyncio.wait_for(second.task, timeout=1)
+            self.assertEqual(execution_order, ["first", "second"])
+            self.assertEqual(
+                {item["task_type"] for item in store.recent_tasks(limit=10)},
+                {"generation"},
+            )
+            store.close()
+
+    async def test_queue_capacity_rejects_only_after_waiting_slots_are_full(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store, capacity=1)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def blocking(job):
+                first_started.set()
+                await release_first.wait()
+                job.state = "completed"
+                return "done"
+
+            async def queued(job):
+                job.state = "completed"
+                return "queued"
+
+            first = asyncio.create_task(
+                plugin._run_auxiliary_job(self.Event(), "reverse draw", blocking)
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second = asyncio.create_task(
+                plugin._run_auxiliary_job(self.Event(), "reverse draw", queued)
+            )
+            await asyncio.sleep(0)
+            with self.assertRaisesRegex(ValueError, "队列已满"):
+                await plugin._run_auxiliary_job(
+                    self.Event(),
+                    "reverse draw",
+                    queued,
+                )
+            release_first.set()
+            await asyncio.wait_for(first, timeout=1)
+            await asyncio.wait_for(second, timeout=1)
+            store.close()
+
+    async def test_web_ui_can_cancel_a_queued_image_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.task_module.TaskStore(Path(directory) / "tasks.sqlite3")
+            plugin = self._plugin(store)
+            plugin._background_task_runs = {}
+            plugin._danbooru_cancel_events = {}
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            queued_started = asyncio.Event()
+
+            async def blocking(job):
+                first_started.set()
+                await release_first.wait()
+                job.state = "completed"
+
+            async def should_not_start(job):
+                queued_started.set()
+                job.state = "completed"
+
+            first = asyncio.create_task(
+                plugin._run_auxiliary_job(self.Event(), "reverse draw", blocking)
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            second = asyncio.create_task(
+                plugin._run_auxiliary_job(
+                    self.Event(),
+                    "character swap",
+                    should_not_start,
+                )
+            )
+            await asyncio.sleep(0.05)
+            queued_task = next(
+                item
+                for item in store.recent_tasks(limit=10)
+                if item["status"] == "queued"
+            )
+
+            result = await plugin.web_ui_cancel_task(queued_task["run_id"])
+            self.assertEqual(result["message"], "已请求取消图片任务")
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+            self.assertFalse(queued_started.is_set())
+            self.assertEqual(
+                store.get_task(queued_task["run_id"])["status"],
+                "cancelled",
+            )
+            release_first.set()
+            await asyncio.wait_for(first, timeout=1)
+            store.close()
+
+
+class CharacterSwapClassifierRoutingTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_complete_local_evidence_skips_provider_classifier(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        phases = []
+        plugin._record_image_task_phase = (
+            lambda _job, phase, _message, event_code, **kwargs: phases.append(
+                (phase, event_code, kwargs.get("details", {}))
+            )
+        )
+
+        async def provider_must_not_run(*_args, **_kwargs):
+            raise AssertionError("Provider classifier must be bypassed")
+
+        plugin._classify_character_swap = provider_must_not_run
+        classification = types.SimpleNamespace(
+            confidence=1.0,
+            subject_count=1,
+            source_identity_ids=(0, 1),
+        )
+        planner = types.SimpleNamespace(
+            deterministic_classification=lambda _preparation: classification
+        )
+        preparation = types.SimpleNamespace(
+            tags=("eri \\(blue archive\\)", "grey hair"),
+            target_trigger_words=("Viola",),
+            request=types.SimpleNamespace(
+                feature_swap_enabled=False,
+                feature_swap_categories=(),
+            ),
+        )
+        job = self.main.GenerationJob("tester", "character swap", 0.0)
+
+        result, source = await plugin._resolve_character_swap_classification(
+            object(),
+            job,
+            planner,
+            preparation,
+        )
+
+        self.assertIs(result, classification)
+        self.assertEqual(source, "local:danbooru-exact")
+        self.assertEqual(job.state, "classifying_swap")
+        self.assertEqual(phases[0][1], "character_swap_classifier_bypassed")
+        self.assertFalse(phases[0][2]["llm_called"])
+
+    async def test_feature_scoped_local_route_reports_transform_without_provider(
+        self,
+    ) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        phases = []
+        plugin._record_image_task_phase = (
+            lambda _job, phase, _message, event_code, **kwargs: phases.append(
+                (phase, event_code, kwargs.get("details", {}))
+            )
+        )
+
+        async def provider_must_not_run(*_args, **_kwargs):
+            raise AssertionError("Provider classifier must be bypassed")
+
+        plugin._classify_character_swap = provider_must_not_run
+        classification = types.SimpleNamespace(
+            confidence=1.0,
+            subject_count=1,
+            source_identity_ids=(3, 4),
+        )
+        planner = types.SimpleNamespace(
+            deterministic_classification=lambda _preparation: classification
+        )
+        preparation = types.SimpleNamespace(
+            tags=("1girl", "stage", "spot light", "pink hair", "side braid"),
+            target_trigger_words=("rio_(blue_archive)",),
+            request=types.SimpleNamespace(
+                feature_swap_enabled=True,
+                feature_swap_categories=("hair_style", "hair_color"),
+            ),
+        )
+        job = self.main.GenerationJob("tester", "character swap", 0.0)
+
+        result, source = await plugin._resolve_character_swap_classification(
+            object(),
+            job,
+            planner,
+            preparation,
+        )
+
+        self.assertIs(result, classification)
+        self.assertEqual(source, "local:character-feature-swap")
+        self.assertEqual(
+            phases[0][1],
+            "character_swap_feature_transform_ready",
+        )
+        self.assertEqual(phases[0][2]["selected_source_term_count"], 2)
+        self.assertFalse(phases[0][2]["llm_called"])
+
+    async def test_incomplete_local_evidence_uses_provider_classifier(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        expected = types.SimpleNamespace(confidence=0.85, subject_count=1)
+        calls = []
+
+        async def provider_classifier(event, job, planner, preparation):
+            calls.append((event, job, planner, preparation))
+            return expected, "provider-id"
+
+        plugin._classify_character_swap = provider_classifier
+        planner = types.SimpleNamespace(
+            deterministic_classification=lambda _preparation: None
+        )
+        preparation = types.SimpleNamespace(
+            tags=("unknown",),
+            target_trigger_words=(),
+            request=types.SimpleNamespace(
+                feature_swap_enabled=False,
+                feature_swap_categories=(),
+            ),
+        )
+        job = self.main.GenerationJob("tester", "character swap", 0.0)
+        event = object()
+
+        result, source = await plugin._resolve_character_swap_classification(
+            event,
+            job,
+            planner,
+            preparation,
+        )
+
+        self.assertIs(result, expected)
+        self.assertEqual(source, "provider-id")
+        self.assertEqual(calls, [(event, job, planner, preparation)])
+
+
+class ReverseDrawAccessTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_sensitive_director_prompt_is_blocked_before_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            image_path.write_bytes(b"image")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(
+                enable_reverse_prompt=True,
+                show_llm_prompt=False,
+            )
+            plugin.context = object()
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._director = object()
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._pipeline_builders = {}
+            plugin._control_workflow_builder = None
+            plugin._img2img_workflow_builder = object()
+            plugin._initialization_error = ""
+            plugin._director_error = ""
+            plugin._extract_command_text = lambda *_args, **_kwargs: "safe request"
+            plugin._extract_resolution_request = lambda _text: (512, 512)
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+
+            class ImageInput:
+                @staticmethod
+                async def collect_one(_event):
+                    return image_path
+
+            class ReversePrompt:
+                @staticmethod
+                async def reverse(*_args, **_kwargs):
+                    return (
+                        types.SimpleNamespace(
+                            negative_tags="",
+                            drawing_request=lambda _supplement: "image facts",
+                        ),
+                        "vision-provider",
+                    )
+
+            plugin._image_input = ImageInput()
+            plugin._reverse_prompt = ReversePrompt()
+
+            async def directed_prompt(_event, _request):
+                return "blocked final prompt", "director-provider", ""
+
+            plugin._generate_directed_prompt = directed_prompt
+            access_checks = []
+
+            def access_error(_event, text, check_sensitive=True):
+                access_checks.append((text, check_sensitive))
+                if text == "blocked final prompt":
+                    return "final prompt blocked by policy"
+                return None
+
+            plugin._access_error = access_error
+            executed = False
+
+            async def execute_job(*_args, **_kwargs):
+                nonlocal executed
+                executed = True
+                raise AssertionError("generation must not run")
+
+            plugin._execute_job = execute_job
+
+            async def run_auxiliary(_event, _label, operation):
+                return await operation(
+                    self.main.GenerationJob("tester", "reverse draw", 0.0)
+                )
+
+            plugin._run_auxiliary_job = run_auxiliary
+
+            class Event:
+                message_str = "/reverse draw safe request"
+
+                @staticmethod
+                def plain_result(text):
+                    return text
+
+            replies = [item async for item in plugin.cmd_reverse_draw(Event())]
+
+        self.assertFalse(executed)
+        self.assertIn(("blocked final prompt", True), access_checks)
+        self.assertTrue(any("final prompt blocked by policy" in item for item in replies))
+
+
+class GenerationReplyMetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def test_generation_summary_includes_elapsed_time_and_gpu(self) -> None:
+        paths = GeneratedImagePaths()
+        paths.extend([Path("one.png"), Path("two.png")])
+        paths.elapsed_seconds = 12.345
+        paths.llm_elapsed_seconds = 2.125
+        paths.llm_call_count = 1
+        paths.comfy_elapsed_seconds = 8.5
+        paths.gpu_name = "NVIDIA GeForce RTX 5060 Ti"
+        summary = self.main.ComfyAnimaPlugin._generation_summary(paths, 42)
+        self.assertIn("Seed: 42", summary)
+        self.assertIn("12.35 秒", summary)
+        self.assertIn("LLM 提示词: 2.12 秒", summary)
+        self.assertIn("ComfyUI 生图: 8.50 秒", summary)
+        self.assertIn("准备/校验: 1.72 秒", summary)
+        self.assertIn("NVIDIA GeForce RTX 5060 Ti", summary)
+        self.assertIn("2 张", summary)
+
+    def test_generation_summary_marks_llm_as_unused(self) -> None:
+        paths = GeneratedImagePaths()
+        paths.append(Path("one.png"))
+        paths.elapsed_seconds = 3.0
+        paths.comfy_elapsed_seconds = 2.25
+        summary = self.main.ComfyAnimaPlugin._generation_summary(paths, 7)
+        self.assertIn("LLM 提示词: 未调用", summary)
+        self.assertIn("ComfyUI 生图: 2.25 秒", summary)
+        self.assertIn("准备/校验: 0.75 秒", summary)
+
+
+class GenerationTimingAccountingTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_timed_llm_call_accumulates_duration_and_count(self) -> None:
+        job = self.main.GenerationJob("u", "preview", 1.0)
+        result = await self.main.ComfyAnimaPlugin._timed_llm_call(
+            job,
+            asyncio.sleep(0.03, result="ok"),
+        )
+        self.assertEqual(result, "ok")
+        self.assertEqual(job.llm_call_count, 1)
+        self.assertGreaterEqual(job.llm_elapsed_seconds, 0.005)
+        self.assertLess(job.llm_elapsed_seconds, 1.0)
+
+    async def test_finalize_image_timings_uses_job_lifetime(self) -> None:
+        created_at = time.monotonic() - 15.0
+        job = self.main.GenerationJob("u", "preview", created_at)
+        job.llm_elapsed_seconds = 3.25
+        job.llm_call_count = 2
+        paths = GeneratedImagePaths()
+        paths.comfy_elapsed_seconds = 7.5
+        self.main.ComfyAnimaPlugin._finalize_image_timings(
+            paths,
+            job,
+            created_at + 5.0,
+        )
+        self.assertGreaterEqual(paths.elapsed_seconds, 15.0)
+        self.assertLess(paths.elapsed_seconds, 16.0)
+        self.assertEqual(paths.llm_elapsed_seconds, 3.25)
+        self.assertEqual(paths.llm_call_count, 2)
+        self.assertEqual(paths.comfy_elapsed_seconds, 7.5)
+
+    async def test_submit_wait_download_records_comfy_duration(self) -> None:
+        class Client:
+            @staticmethod
+            async def submit(_workflow):
+                await asyncio.sleep(0.02)
+                return "prompt-id"
+
+            @staticmethod
+            async def wait_for_images(_prompt_id, _preferred):
+                await asyncio.sleep(0.02)
+                return (object(),)
+
+            @staticmethod
+            async def download_image(_reference, job_dir):
+                await asyncio.sleep(0.005)
+                return job_dir / "result.png"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._client = Client()
+        plugin._generation_slots = asyncio.Semaphore(1)
+        plugin._temp_dir = Path(tempfile.mkdtemp())
+        paths = GeneratedImagePaths()
+        job = self.main.GenerationJob("u", "preview", time.monotonic())
+        await plugin._submit_wait_download(
+            job,
+            {"workflow": True},
+            ["out"],
+            paths,
+            active_state="generating",
+        )
+        self.assertEqual(len(paths), 1)
+        self.assertGreaterEqual(paths.comfy_elapsed_seconds, 0.01)
+        self.assertLess(paths.comfy_elapsed_seconds, 1.0)
+
+
+class GenerationReplyMetadataMutationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def test_explicit_lora_cleanup_updates_all_referencing_presets(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {"default_style_preset": "风格1"}
+        )
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=4)
+        plugin._lora_presets.save(
+            name="风格1",
+            category="style",
+            selections=(
+                LoraSelection("styles/base", 0.5),
+                LoraSelection("shared/remove-me", 0.4),
+            ),
+        )
+        plugin._lora_presets.save(
+            name="角色1",
+            category="character",
+            selections=(LoraSelection("shared/remove-me", 0.8),),
+        )
+        persisted = []
+        plugin._persist_config_transaction_sync = (
+            lambda updates, **kwargs: persisted.append(updates) or True
+        )
+
+        self.assertEqual(
+            plugin._lora_preset_references("shared/remove-me.safetensors"),
+            ("风格1", "角色1"),
+        )
+        changed = plugin._remove_lora_from_presets("shared/remove-me.safetensors")
+        self.assertEqual(changed, 2)
+        self.assertEqual(plugin._lora_preset_references("shared/remove-me"), ())
+        self.assertEqual(len(plugin._lora_presets.presets), 1)
+        self.assertEqual(plugin._lora_presets.presets[0].name, "风格1")
+        self.assertEqual(persisted[0]["lora_presets"][0]["loras"], ["styles/base=0.5"])
+
+
+class LoraDeleteTransactionTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def _plugin_with_referenced_preset(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {"default_style_preset": "风格1"}
+        )
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
+
+        class Config(dict):
+            def __init__(self, path: Path, **values):
+                super().__init__(**values)
+                self.config_path = str(path)
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        plugin.config = Config(config_path, default_style_preset="风格1")
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=4)
+        plugin._lora_presets.save(
+            name="风格1",
+            category="style",
+            selections=(LoraSelection("shared/remove-me", 0.5),),
+        )
+        plugin.config["lora_presets"] = plugin._lora_presets.to_config()
+        plugin.config.save_config()
+        plugin._task_store = None
+        plugin._model_manager_error = ""
+        return plugin
+
+    async def test_unconfirmed_remote_delete_restores_preset_state(self) -> None:
+        plugin = self._plugin_with_referenced_preset()
+
+        class FailingManager:
+            async def delete_lora(_self, *_args, **_kwargs):
+                plugin._remove_lora_from_presets("shared/remove-me")
+                raise self.main.ModelManagerError("Manager 未确认删除成功")
+
+        plugin._model_manager = FailingManager()
+        with self.assertRaisesRegex(
+            self.main.WebUiActionError, "组合配置已恢复"
+        ):
+            await plugin._web_ui_delete_asset(
+                "lora",
+                {
+                    "exact_name": "shared/remove-me",
+                    "confirm_name": "shared/remove-me",
+                    "remove_from_presets": True,
+                },
+            )
+
+        self.assertEqual(
+            plugin._lora_preset_references("shared/remove-me"), ("风格1",)
+        )
+        self.assertEqual(plugin.config["default_style_preset"], "风格1")
+        self.assertEqual(len(plugin.config["lora_presets"]), 1)
+
+    async def test_post_delete_refresh_failure_keeps_cleanup(self) -> None:
+        plugin = self._plugin_with_referenced_preset()
+
+        class Result:
+            removed_from_presets = True
+            preset_cleanup_count = 1
+
+            def as_dict(self):
+                return {"deleted": True}
+
+        class SuccessfulManager:
+            async def delete_lora(_self, *_args, **_kwargs):
+                plugin._remove_lora_from_presets("shared/remove-me")
+                return Result()
+
+        class FailingCatalog:
+            async def refresh_for_operation(_self):
+                raise self.main.LoraCatalogError("删除后刷新失败")
+
+        plugin._model_manager = SuccessfulManager()
+        plugin._lora_catalog = FailingCatalog()
+        with self.assertRaisesRegex(
+            self.main.WebUiActionError, "远端 LoRA 已删除.*已保留组合清理结果"
+        ):
+            await plugin._web_ui_delete_asset(
+                "lora",
+                {
+                    "exact_name": "shared/remove-me",
+                    "confirm_name": "shared/remove-me",
+                    "remove_from_presets": True,
+                },
+            )
+
+        self.assertEqual(plugin._lora_preset_references("shared/remove-me"), ())
+        self.assertEqual(plugin.config["default_style_preset"], "")
+        self.assertEqual(plugin.config["lora_presets"], [])
+
+
+class StyleSaveReloadTests(unittest.IsolatedAsyncioTestCase):
+    """验证风格保存提示及延迟单插件重载机制。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_scheduler_reloads_only_current_plugin(self) -> None:
+        calls = []
+
+        class StarManager:
+            async def reload(self, plugin_name):
+                calls.append(plugin_name)
+                return True, None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(_star_manager=StarManager())
+        plugin._self_reload_tasks = set()
+
+        task = plugin._schedule_self_reload(delay=0)
+        self.assertIsNotNone(task)
+        await task
+        self.assertEqual(calls, [self.main.PLUGIN_NAME])
+
+    async def test_scheduler_debounces_multiple_pending_reloads(self) -> None:
+        calls = []
+
+        class StarManager:
+            async def reload(self, plugin_name):
+                calls.append(plugin_name)
+                return True, None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(_star_manager=StarManager())
+        plugin._self_reload_tasks = set()
+
+        first = plugin._schedule_self_reload(delay=0.05, reason="first")
+        second = plugin._schedule_self_reload(delay=0, reason="second")
+        await asyncio.gather(first, second, return_exceptions=True)
+
+        self.assertEqual(calls, [self.main.PLUGIN_NAME])
+
+    async def test_started_reload_is_not_cancelled_and_old_instance_rejects_save(
+        self,
+    ) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        class StarManager:
+            async def reload(self, plugin_name):
+                calls.append(plugin_name)
+                entered.set()
+                await release.wait()
+                return True, None
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(_star_manager=StarManager())
+        plugin._self_reload_tasks = set()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=False,
+        )
+        plugin._lora_catalog = None
+        plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(0)
+
+        async def persist(*_args):
+            return True
+
+        plugin._persist_config = persist
+
+        first = plugin._schedule_self_reload(delay=0, reason="first")
+        await entered.wait()
+        second = plugin._schedule_self_reload(delay=0, reason="second")
+        self.assertIs(first, second)
+        save_task = asyncio.create_task(
+            plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="should-not-commit",
+                entries="<lora:styles/blocked.safetensors:0.5>",
+            )
+        )
+        release.set()
+        await first
+
+        with self.assertRaisesRegex(self.main.LoraPresetError, "正在重载"):
+            await save_task
+        self.assertEqual(calls, [self.main.PLUGIN_NAME])
+        self.assertEqual(plugin._lora_presets.presets, ())
+
+    async def test_concurrent_style_saves_are_serialized_and_failure_cannot_erase_success(
+        self,
+    ) -> None:
+        self_main = self.main
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=True,
+        )
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        active_refreshes = 0
+        max_active_refreshes = 0
+
+        async def refresh(_action):
+            nonlocal active_refreshes, max_active_refreshes
+            active_refreshes += 1
+            max_active_refreshes = max(max_active_refreshes, active_refreshes)
+            await asyncio.sleep(0.01)
+            active_refreshes -= 1
+
+        class Catalog:
+            async def resolve_selections(self, selections, *, strict):
+                return selections
+
+            async def classify_selections(self, selections):
+                return {
+                    selection.name: self_main.PRESET_CATEGORY_ARTIST_STYLE
+                    for selection in selections
+                }
+
+        plugin._refresh_lora_manager_before = refresh
+        plugin._lora_catalog = Catalog()
+
+        async def persist(_key, value):
+            return not any(item.get("name") == "失败风格" for item in value)
+
+        plugin._persist_config = persist
+        failed, succeeded = await asyncio.gather(
+            plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="失败风格",
+                entries="<lora:styles/fail.safetensors:0.5>",
+            ),
+            plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="成功风格",
+                entries="<lora:styles/success.safetensors:0.5>",
+            ),
+            return_exceptions=True,
+        )
+
+        self.assertIsInstance(failed, self.main.LoraPresetError)
+        self.assertEqual(succeeded.name, "成功风格")
+        self.assertEqual(max_active_refreshes, 1)
+        self.assertEqual(
+            plugin._lora_presets.resolve("成功风格").name,
+            "成功风格",
+        )
+
+    async def test_style_save_schedules_reload_after_persistence(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=False,
+            auto_reload_after_style_save=True,
+        )
+        plugin._lora_catalog = None
+
+        async def refresh_lora_manager(_action):
+            return 1
+
+        plugin._refresh_lora_manager_before = refresh_lora_manager
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        persisted = []
+        scheduled = []
+        async def persist(key, value):
+            persisted.append((key, value))
+            return True
+
+        plugin._persist_config = persist
+        plugin._schedule_self_reload = (
+            lambda **_kwargs: scheduled.append(True) or object()
+        )
+
+        class Event:
+            message_str = (
+                "/lora组合保存 风格 002 <lora:test-style:0.6> "
+                '--alias "风格2" --note "画师测试备注"'
+            )
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        results = [result async for result in plugin.cmd_lora_preset_save(Event())]
+        self.assertEqual(len(results), 1)
+        self.assertIn("风格002", results[0])
+        self.assertIn("自动重载", results[0])
+        self.assertEqual(scheduled, [True])
+        self.assertEqual(persisted[0][0], "lora_presets")
+        self.assertEqual(persisted[0][1][0]["aliases"], ["风格2"])
+        self.assertEqual(persisted[0][1][0]["note"], "画师测试备注")
+
+    async def test_style_save_rejects_semantic_identity_binding(self) -> None:
+        class Record:
+            name = "characters/denia.safetensors"
+
+        class Catalog:
+            async def resolve_selections_with_records(self, selections, *, strict):
+                return selections, {"characters/denia": Record()}
+
+            async def classify_selections(self, selections):
+                return {
+                    selection.name: self_main.PRESET_CATEGORY_ARTIST_STYLE
+                    for selection in selections
+                }
+
+        self_main = self.main
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            max_preset_loras=12,
+            max_total_dynamic_loras=12,
+            strict_lora_validation=True,
+        )
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(
+            0, result=()
+        )
+        async def persist(_key, _value):
+            return True
+
+        plugin._persist_config = persist
+        fake_entry = types.SimpleNamespace(
+            identity_bindings=(object(),),
+        )
+        plugin._runtime_semantic_index = lambda: types.SimpleNamespace(
+            entry_for=lambda _record: fake_entry,
+        )
+
+        with self.assertRaisesRegex(self.main.LoraPresetError, "角色或混合"):
+            await plugin._save_lora_preset_persisted(
+                category_text="style",
+                name="坏风格",
+                entries="<lora:characters/denia.safetensors:0.8>",
+            )
+
+        self.assertEqual(plugin._lora_presets.presets, ())
+
+    async def test_conversation_tool_persists_and_survives_fresh_registry(self) -> None:
+        self_main = self.main
+
+        class Config(dict):
+            def __init__(self, path: Path):
+                super().__init__(lora_presets=[])
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        class Catalog:
+            async def resolve_selections(self, selections, *, strict):
+                return selections
+
+            async def classify_selections(self, selections):
+                return {
+                    selection.name: self_main.PRESET_CATEGORY_ARTIST_STYLE
+                    for selection in selections
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "plugin.json"
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.config = Config(config_path)
+            plugin.settings = types.SimpleNamespace(
+                max_preset_loras=12,
+                max_total_dynamic_loras=12,
+                strict_lora_validation=True,
+                auto_reload_after_style_save=True,
+            )
+            plugin._lora_catalog = Catalog()
+            plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+            plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(
+                0, result=()
+            )
+            scheduled = []
+            plugin._schedule_self_reload = (
+                lambda **kwargs: scheduled.append(kwargs) or object()
+            )
+
+            class Event:
+                @staticmethod
+                def is_admin():
+                    return True
+
+            result = await plugin.save_anima_lora_style(
+                Event(),
+                "006",
+                "<lora:styles/ink.safetensors:0.7> "
+                "<lora:styles/light.safetensors:0.4>",
+                "ink, warm light",
+                "聊天保存测试",
+            )
+            persisted = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            fresh_registry = self.main.LoraPresetRegistry(
+                persisted["lora_presets"],
+                max_loras=12,
+            )
+
+        self.assertIn("STYLE_SAVE_COMMITTED", result)
+        self.assertEqual(fresh_registry.resolve("风格006").description, "聊天保存测试")
+        self.assertEqual(len(fresh_registry.resolve("风格006").selections), 2)
+        self.assertEqual(scheduled[0]["delay"], 10.0)
+
+    async def test_conversation_tool_rejects_non_admin_without_mutation(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_presets = self.main.LoraPresetRegistry([])
+
+        class Event:
+            @staticmethod
+            def is_admin():
+                return False
+
+        result = await plugin.save_anima_lora_style(
+            Event(),
+            "006",
+            "<lora:styles/ink.safetensors:0.7>",
+        )
+
+        self.assertIn("STYLE_SAVE_DENIED", result)
+        self.assertEqual(plugin._lora_presets.presets, ())
+
+    async def test_admin_conversation_requires_committed_style_tool_result(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            natural_draw_mode="full",
+            enable_session_recipe_continuity=False,
+        )
+        plugin._internal_llm_events = set()
+        plugin._auto_draw_system_prompt = ""
+        plugin._access_error = lambda *_args, **_kwargs: None
+        plugin._chat_draw_terminal_states = {}
+        plugin._director = types.SimpleNamespace(
+            danbooru_runtime_context=lambda: (
+                "本地 Danbooru 索引状态：ready=true，canonical_tags=10，aliases=2。"
+            )
+        )
+
+        draw_now = self.main.DRAW_NOW
+
+        class Event:
+            message_str = "管理员保存风格"
+
+            def __init__(self):
+                self._extras = {
+                    "astrbot_plugin_comfy_anima:intent_router_gate_result": make_gate_payload(
+                        StyleSaveReloadTests.main,
+                        draw_now,
+                        "管理员保存风格",
+                    )
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
+
+            @staticmethod
+            def is_admin():
+                return True
+
+        request = types.SimpleNamespace(system_prompt="base")
+        await plugin.inject_auto_draw_prompt(Event(), request)
+
+        self.assertIn("save_anima_lora_style", request.system_prompt)
+        self.assertIn("STYLE_SAVE_COMMITTED", request.system_prompt)
+        self.assertIn(
+            "never substitute memory, shell output or prose",
+            request.system_prompt,
+        )
+        self.assertIn(
+            "Never call or mention the private `emit_anima_plan_v1` schema",
+            request.system_prompt,
+        )
+        self.assertIn(
+            "final control item must be exactly one valid `<pic",
+            request.system_prompt,
+        )
+        self.assertIn("search_anima_danbooru_tags", request.system_prompt)
+        self.assertIn("canonical_tags=10", request.system_prompt)
+        self.assertIn("Standard is concise and obedience-first", request.system_prompt)
+        self.assertIn("Use Ultra only when", request.system_prompt)
+        self.assertIn(
+            "A bare tag string, bare LoRA string or promise",
+            request.system_prompt,
+        )
+
+
+class UnetModelSwitchTests(unittest.IsolatedAsyncioTestCase):
+    """验证切换前刷新清单、持久化并更新 UNET 工作流设置。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_switch_refreshes_latest_catalog_before_persisting(self) -> None:
+        events = []
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
+        entries = (
+            types.SimpleNamespace(index=1, name="anima-a.safetensors"),
+            types.SimpleNamespace(index=2, name="anima-b.safetensors"),
+        )
+
+        class Config(dict):
+            def __init__(self, path: Path, **values):
+                super().__init__(**values)
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        class Catalog:
+            async def list_models(self):
+                events.append("list")
+                return entries
+
+            @staticmethod
+            def resolve(identifier, refreshed_entries):
+                events.append("resolve")
+                self.assertEqual(refreshed_entries, entries)
+                self.assertEqual(identifier, "2")
+                return refreshed_entries[1]
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin.config = Config(
+            config_path,
+            workflow_file="workflow/anima_api.json",
+        )
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        plugin._unet_catalog = Catalog()
+        plugin._unet_catalog_error = ""
+        plugin._schedule_self_reload = (
+            lambda **kwargs: events.append(f"reload:{kwargs['reason']}") or object()
+        )
+
+        class Event:
+            message_str = "/模型切换 2"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        results = [result async for result in plugin.cmd_unet_model_switch(Event())]
+        self.assertEqual(events[:2], ["list", "resolve"])
+        self.assertEqual(plugin.config["unet_model_name"], "anima-b.safetensors")
+        self.assertEqual(plugin.settings.unet_model_name, "anima-b.safetensors")
+        self.assertEqual(events[-1], "reload:切换 UNET 模型")
+        self.assertIn("全部 2 个模型", results[-1])
+        workflow, _, _ = plugin._workflow_builder.build(
+            self.main.GenerationOptions(prompt="1girl", seed=1)
+        )
+        self.assertEqual(
+            workflow["429"]["inputs"]["unet_name"],
+            "anima-b.safetensors",
+        )
+
+    async def test_switch_uses_anima_v2_profile_unet_binding(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
+        entries = (
+            types.SimpleNamespace(index=1, name="anima-v2-a.safetensors"),
+            types.SimpleNamespace(index=2, name="anima-v2-b.safetensors"),
+        )
+
+        class Config(dict):
+            def __init__(self, path: Path, **values):
+                super().__init__(**values)
+                self.config_path = str(path)
+                self.save_config()
+
+            def save_config(self):
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        class Catalog:
+            async def list_models(self):
+                return entries
+
+            @staticmethod
+            def resolve(identifier, refreshed_entries):
+                self.assertEqual(identifier, "2")
+                self.assertEqual(refreshed_entries, entries)
+                return refreshed_entries[1]
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin.config = Config(
+            config_path,
+            workflow_file="workflow/anima_v2_api.json",
+        )
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        plugin._unet_catalog = Catalog()
+        plugin._unet_catalog_error = ""
+        plugin._schedule_self_reload = lambda **_kwargs: object()
+
+        class Event:
+            message_str = "/模型切换 2"
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        results = [result async for result in plugin.cmd_unet_model_switch(Event())]
+
+        self.assertNotIn("缺少 UNET 节点 429", "\n".join(results))
+        workflow, _, _ = plugin._workflow_builder.build(
+            self.main.GenerationOptions(prompt="1girl", seed=1)
+        )
+        self.assertEqual(
+            workflow["44"]["inputs"]["unet_name"],
+            "anima-v2-b.safetensors",
+        )
+
+
+class MandatoryLoraRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """每次 LLM LoRA 工具调用都必须重新扫描 Manager。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_repeated_tool_calls_honor_refresh_false_and_true(self) -> None:
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+                self.cache_reads = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (types.SimpleNamespace(name="denia"),)
+
+            async def _get_records(self, **_kwargs):
+                self.cache_reads += 1
+                return (types.SimpleNamespace(name="denia"),)
+
+            async def format_records_for_llm(self, records, **kwargs):
+                return "fresh denia"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin.settings = types.SimpleNamespace(lora_max_results=50)
+
+        first = await plugin.list_anima_loras(object(), keyword="denia")
+        second = await plugin.list_anima_loras(object(), keyword="denia")
+        forced = await plugin.list_anima_loras(
+            object(),
+            keyword="denia",
+            refresh=True,
+        )
+
+        self.assertEqual(first, "fresh denia")
+        self.assertEqual(second, "fresh denia")
+        self.assertEqual(forced, "fresh denia")
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+        self.assertEqual(plugin._lora_catalog.cache_reads, 2)
+
+    async def test_refresh_false_reuses_task_snapshot_when_enabled(self) -> None:
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (types.SimpleNamespace(name="denia"),)
+
+            async def format_records_for_llm(self, records, **kwargs):
+                return "fresh denia"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin.settings = types.SimpleNamespace(
+            lora_max_results=50,
+            enable_task_lora_snapshot=True,
+            lora_snapshot_max_age=300,
+        )
+        plugin._lora_operation_snapshots = {}
+        plugin._lora_snapshot_locks = {}
+
+        event = object()
+        first = await plugin.list_anima_loras(event, keyword="denia")
+        second = await plugin.list_anima_loras(event, keyword="denia")
+
+        self.assertEqual(first, "fresh denia")
+        self.assertEqual(second, "fresh denia")
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+
+    async def test_deleted_lora_preset_is_omitted_after_fresh_validation(self) -> None:
+        class Catalog:
+            async def refresh_for_operation(self):
+                return (types.SimpleNamespace(name="present"),)
+
+            async def _get_records(self, **_kwargs):
+                return (types.SimpleNamespace(name="present"),)
+
+            async def resolve_selections(self, selections, *, strict):
+                if any(selection.name == "deleted-denia" for selection in selections):
+                    raise self_main.LoraCatalogError("missing")
+                return selections
+
+        self_main = self.main
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        registry.save(
+            name="风格正常",
+            category="style",
+            selections=(LoraSelection("present", 0.5),),
+        )
+        registry.save(
+            name="风格旧缓存",
+            category="style",
+            selections=(LoraSelection("deleted-denia", 0.8),),
+        )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = registry
+
+        result = await plugin.list_anima_lora_presets(
+            object(),
+            category="风格",
+        )
+
+        self.assertIn("<lora:present:0.5>", result)
+        self.assertNotIn("<lora:deleted-denia:0.8>", result)
+        self.assertIn("风格旧缓存", result)
+
+    async def test_list_anima_lora_presets_limit_truncates(self) -> None:
+        class Catalog:
+            async def _get_records(self, **_kwargs):
+                return (types.SimpleNamespace(name="present"),)
+
+            async def resolve_selections(self, selections, *, strict):
+                return selections
+
+        registry = self.main.LoraPresetRegistry([], max_loras=4)
+        for index in range(3):
+            registry.save(
+                name=f"风格{index}",
+                category="style",
+                selections=(LoraSelection(f"styles/ink{index}", 0.5),),
+            )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = registry
+
+        result = await plugin.list_anima_lora_presets(
+            object(),
+            limit=1,
+        )
+
+        self.assertIn("… and 2 more presets", result)
+        self.assertIn("风格0", result)
+        self.assertNotIn("风格2", result)
+
+
+    async def test_unbound_character_loras_lists_only_unbound_characters(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._semantic_index = None
+        records = (
+            LoraRecord("characters/denia.safetensors", category="character"),
+            LoraRecord("characters/rio.safetensors", category="character"),
+            LoraRecord("styles/ink.safetensors", category="artist_style"),
+        )
+        index = LoraSemanticIndex.empty()
+        index.upsert(
+            SemanticEntry(
+                identity_key=semantic_identity_key("characters/rio", ""),
+                canonical_name="characters/rio",
+                identity_bindings=(
+                    LoraIdentityBinding(
+                        character_canonical="rio_(blue_archive)",
+                        copyright_canonical="blue_archive",
+                        activation_terms=("rio",),
+                    ),
+                ),
+            )
+        )
+        plugin._semantic_index = index
+
+        unbound = plugin._unbound_character_loras(records)
+
+        self.assertEqual(
+            [item["name"] for item in unbound],
+            ["characters/denia.safetensors"],
+        )
+
+    async def test_lora_refresh_summary_compares_fingerprints(self) -> None:
+        previous = (
+            LoraRecord("characters/denia.safetensors", sha256="a" * 64),
+            LoraRecord("styles/old.safetensors", sha256="b" * 64),
+        )
+        current = (
+            LoraRecord("characters/denia.safetensors", sha256="a" * 64),
+            LoraRecord("styles/old.safetensors", sha256="c" * 64),
+            LoraRecord("characters/rio.safetensors", sha256="d" * 64),
+        )
+
+        summary = self.main.ComfyAnimaPlugin._lora_refresh_summary(
+            previous,
+            current,
+        )
+
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["added"], 1)
+        self.assertEqual(summary["removed"], 0)
+        self.assertEqual(summary["changed"], 1)
+        self.assertEqual(summary["unchanged"], 1)
+
+
+class GenerationLoraRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    """The submitted workflow must use fresh exact files and safe triggers."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        cls.catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+
+    async def test_execute_job_rejects_provider_error_before_submit(self) -> None:
+        submit_calls = 0
+
+        class Client:
+            @staticmethod
+            async def submit(_workflow):
+                nonlocal submit_calls
+                submit_calls += 1
+                raise AssertionError("submit must not be reached")
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._client = Client()
+        plugin._workflow_builder = object()
+        plugin._pipeline_builders = {}
+        plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+        job = self.main.GenerationJob("u", "semantic redraw", 0.0)
+
+        with self.assertRaises(self.main.WorkflowError) as raised:
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(
+                    prompt=(
+                        "All chat models failed: EmptyModelOutputError: "
+                        "OpenAI completion has no choices. response_id=private"
+                    ),
+                    use_prompt_llm=False,
+                ),
+                object(),
+            )
+
+        self.assertIn("安全闸门", str(raised.exception))
+        self.assertEqual(submit_calls, 0)
+
+    async def test_execute_job_locks_style_and_adds_role_aware_triggers(self) -> None:
+        records = (
+            self.catalog_module.LoraRecord(
+                "styles/base.safetensors",
+                category="quality_enhancement",
+                trigger_words=("masterpiece", "very aesthetic"),
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
+            ),
+            self.catalog_module.LoraRecord(
+                "characters/denia.safetensors",
+                category="character",
+                trigger_words=("denia_wuwa", "black coat", "silver hair"),
+                character_name="Denia",
+                aliases=("denia", "达妮娅"),
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
+            ),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+                _self.refreshes = 0
+
+            async def refresh_for_operation(_self):
+                _self.refreshes += 1
+                _self._cache = records
+                _self._cache_expires_at = float("inf")
+                return records
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return records
+
+        captured = []
+
+        class Builder:
+            @staticmethod
+            def build(options):
+                captured.append(options)
+                return {"workflow": True}, 123, ["out"]
+
+        class Client:
+            @staticmethod
+            async def submit(workflow):
+                self.assertEqual(workflow, {"workflow": True})
+                return "prompt-id"
+
+            @staticmethod
+            async def wait_for_images(prompt_id, preferred):
+                self.assertEqual((prompt_id, preferred), ("prompt-id", ["out"]))
+                return (object(),)
+
+            @staticmethod
+            async def download_image(_reference, job_dir):
+                return job_dir / "result.png"
+
+            @staticmethod
+            async def gpu_name():
+                return "Test GPU"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": False,
+                "default_style_preset": "",
+                "strict_lora_validation": True,
+                "max_dynamic_loras": 3,
+                "max_total_dynamic_loras": 12,
+                "max_prompt_length": 4000,
+            }
+        )
+        plugin._generation_slots = __import__("asyncio").Semaphore(1)
+        plugin._client = Client()
+        plugin._workflow_builder = Builder()
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        plugin._lora_presets.save(
+            name="风格001",
+            category="style",
+            selections=(LoraSelection("styles/base", 0.5),),
+        )
+        plugin._temp_dir = Path(tempfile.mkdtemp())
+        plugin._access_error = lambda _event, _text: None
+        job = self.main.GenerationJob("u", "preview", 0.0)
+        options = self.main.GenerationOptions(
+            prompt=(
+                "1girl, casual hoodie, "
+                "<lora:styles/base:1.5>, <lora:characters/denia:0.8>"
+            ),
+            negative_prompt="black coat",
+            lora_preset="风格001",
+        )
+
+        paths, seed, prompt, _, _ = await plugin._execute_job(
+            job,
+            options,
+            object(),
+        )
+
+        # One refresh prepares the exact LoRA plan; a second refresh immediately
+        # before submission catches deletion, rename or metadata replacement.
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+        self.assertEqual(seed, 123)
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(
+            captured[0].dynamic_loras,
+            (
+                LoraSelection("styles/base", 0.5),
+                LoraSelection("characters/denia", 0.8),
+            ),
+        )
+        self.assertEqual(
+            prompt,
+            "1girl, casual hoodie, masterpiece, very aesthetic, denia_wuwa",
+        )
+        self.assertEqual(captured[0].negative_prompt, "black coat")
+        self.assertNotIn("silver hair", prompt)
+
+    async def test_character_preset_identity_is_expected_not_unexpected(self) -> None:
+        """A contract-enabled character preset must not trip the final gate."""
+
+        records = (
+            self.catalog_module.LoraRecord(
+                "characters/denia.safetensors",
+                category="character",
+                trigger_words=(),
+                character_name="Denia",
+                aliases=("denia", "达妮娅"),
+                compatible_model_families=("anima_legacy_28l",),
+                compatibility_mode="legacy_only",
+            ),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+                _self.refreshes = 0
+
+            async def refresh_for_operation(_self):
+                _self.refreshes += 1
+                _self._cache = records
+                _self._cache_expires_at = float("inf")
+                return records
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return records
+
+        captured = []
+
+        class Builder:
+            @staticmethod
+            def build(options):
+                captured.append(options)
+                return {"workflow": True}, 123, ["out"]
+
+        class Client:
+            @staticmethod
+            async def submit(workflow):
+                self.assertEqual(workflow, {"workflow": True})
+                return "prompt-id"
+
+            @staticmethod
+            async def wait_for_images(prompt_id, preferred):
+                self.assertEqual((prompt_id, preferred), ("prompt-id", ["out"]))
+                return (object(),)
+
+            @staticmethod
+            async def download_image(_reference, job_dir):
+                return job_dir / "result.png"
+
+            @staticmethod
+            async def gpu_name():
+                return "Test GPU"
+
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "denia_(wuthering_waves)",
+                                "category": "character",
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = self.main.PluginSettings.from_mapping(
+                {
+                    "enable_prompt_llm": False,
+                    "default_style_preset": "",
+                    "strict_lora_validation": True,
+                    "max_dynamic_loras": 3,
+                    "max_total_dynamic_loras": 12,
+                    "max_prompt_length": 4000,
+                }
+            )
+            plugin._generation_slots = asyncio.Semaphore(1)
+            plugin._client = Client()
+            plugin._workflow_builder = Builder()
+            plugin._lora_catalog = Catalog()
+            plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+            preset = plugin._lora_presets.save(
+                name="达妮娅",
+                category=self.main.PRESET_CATEGORY_CHARACTER,
+                selections=(LoraSelection("characters/denia", 0.8),),
+                identity_anchor=r"denia \(wuthering waves\)",
+                required_trigger_terms=("wuthering waves",),
+                enforce_character_contract=True,
+            )
+            plugin._danbooru_index = index
+            plugin._temp_dir = Path(tempfile.mkdtemp())
+            plugin._access_error = lambda _event, _text: None
+            job = self.main.GenerationJob("u", "preview", 0.0)
+            options = self.main.GenerationOptions(
+                prompt=(
+                    r"1girl, denia \(wuthering waves\), "
+                    "<lora:characters/denia:0.8>"
+                ),
+                lora_preset=preset.name,
+                validate_llm_characters=True,
+            )
+
+            paths, seed, prompt, _, _ = await plugin._execute_job(
+                job,
+                options,
+                object(),
+            )
+
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(len(paths), 1)
+        self.assertIn(r"denia \(wuthering waves\)", prompt)
+
+    async def test_character_swap_rejects_target_changed_after_planning(self) -> None:
+        current = self.catalog_module.LoraRecord(
+            "characters/kallen.safetensors",
+            sha256="bb22cc33",
+            category="character",
+            character_name="Kallen",
+            trigger_words=("kallen",),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+
+            async def refresh_for_operation(_self):
+                _self._cache = (current,)
+                _self._cache_expires_at = float("inf")
+                return (current,)
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return (current,)
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": False,
+                "default_style_preset": "",
+                "strict_lora_validation": True,
+                "max_dynamic_loras": 3,
+                "max_total_dynamic_loras": 12,
+                "max_prompt_length": 4000,
+            }
+        )
+        plugin._generation_slots = asyncio.Semaphore(1)
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        job = self.main.GenerationJob("u", "preview", 0.0)
+
+        with self.assertRaisesRegex(self.main.WorkflowError, "内容变化"):
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(
+                    prompt="1girl, kallen",
+                    use_prompt_llm=False,
+                    dynamic_loras=(
+                        LoraSelection("characters/kallen.safetensors", 0.65),
+                    ),
+                    lora_identity_expectations=(
+                        LoraIdentityExpectation(
+                            "characters/kallen.safetensors",
+                            sha256="aa11bb22",
+                        ),
+                    ),
+                    character_swap_target_lora=(
+                        "characters/kallen.safetensors"
+                    ),
+                ),
+                object(),
+            )
+        self.assertEqual(job.failed_stage, "building")
+
+    async def test_character_swap_rejects_target_weight_changed_before_submit(self) -> None:
+        current = self.catalog_module.LoraRecord(
+            "characters/kallen.safetensors",
+            sha256="aa11bb22",
+            category="character",
+            character_name="Kallen",
+            trigger_words=("kallen",),
+        )
+
+        class Catalog(self.catalog_module.LoraCatalogService):
+            def __init__(_self):
+                super().__init__(self.main.PluginSettings.from_mapping({}))
+
+            async def refresh_for_operation(_self):
+                _self._cache = (current,)
+                _self._cache_expires_at = float("inf")
+                return (current,)
+
+            async def _get_records(_self, *_args, **_kwargs):
+                return (current,)
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": False,
+                "default_style_preset": "",
+                "strict_lora_validation": True,
+                "max_dynamic_loras": 3,
+                "max_total_dynamic_loras": 12,
+                "max_prompt_length": 4000,
+            }
+        )
+        plugin._generation_slots = asyncio.Semaphore(1)
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([], max_loras=12)
+        job = self.main.GenerationJob("u", "preview", 0.0)
+
+        with self.assertRaisesRegex(self.main.WorkflowError, "权重发生变化"):
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(
+                    prompt="1girl, kallen",
+                    use_prompt_llm=False,
+                    dynamic_loras=(
+                        LoraSelection("characters/kallen.safetensors", 0.55),
+                    ),
+                    lora_identity_expectations=(
+                        LoraIdentityExpectation(
+                            "characters/kallen.safetensors",
+                            sha256="aa11bb22",
+                        ),
+                    ),
+                    character_swap_target_lora=(
+                        "characters/kallen.safetensors"
+                    ),
+                    character_swap_target_lora_strength=0.65,
+                ),
+                object(),
+            )
+        self.assertEqual(job.failed_stage, "building")
+
+    async def test_fatal_lora_tool_error_never_uses_raw_prompt_fallback(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "enable_prompt_llm": True,
+                "prompt_llm_fallback": True,
+            }
+        )
+        plugin._generation_slots = __import__("asyncio").Semaphore(1)
+        plugin._client = object()
+        plugin._workflow_builder = object()
+        plugin._director = object()
+
+        async def fail_director(_event, _prompt):
+            raise self.main.PromptDirectorError(
+                "LoRA 工具失败",
+                fatal=True,
+            )
+
+        plugin._generate_directed_prompt = fail_director
+        job = self.main.GenerationJob("u", "preview", 0.0)
+
+        with self.assertRaises(self.main.PromptDirectorError):
+            await plugin._execute_job(
+                job,
+                self.main.GenerationOptions(prompt="帮我用 LoRA 画图"),
+                object(),
+            )
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.failed_stage, "directing")
+
+
+class CharacterSwapClassifierTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """The configured swap timeout is one total retry budget."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_timeout_retry_stays_inside_total_budget(self) -> None:
+        calls = 0
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                nonlocal calls
+                calls += 1
+                await asyncio.sleep(5)
+                return types.SimpleNamespace(completion_text="{}")
+
+        class Director:
+            @staticmethod
+            async def resolve_provider_id(_context, _event):
+                return "swap-provider"
+
+        class Planner:
+            @staticmethod
+            def classification_prompts(_preparation):
+                return "system", "user"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = Context()
+        plugin.settings = types.SimpleNamespace(
+            character_swap_timeout=1,
+            prompt_llm_max_tokens=1200,
+        )
+        plugin._director = Director()
+        plugin._internal_llm_events = set()
+        phases = []
+        plugin._record_image_task_phase = (
+            lambda _job, _stage, _message, code, **kwargs: phases.append(
+                (code, kwargs.get("details", {}))
+            )
+        )
+        job = self.main.GenerationJob("u", "swap", 0.0)
+        preparation = types.SimpleNamespace(
+            tags=("1girl",),
+            target_trigger_words=("target",),
+        )
+
+        started = time.monotonic()
+        with self.assertRaises(self.main.CharacterSwapError) as captured:
+            await plugin._classify_character_swap(
+                object(),
+                job,
+                Planner(),
+                preparation,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(captured.exception.code, "swap_provider_timeout")
+        self.assertEqual(calls, 2)
+        self.assertLess(elapsed, 1.5)
+        timeout_events = [item for item in phases if item[0] == "character_swap_classifier_timeout"]
+        self.assertEqual(len(timeout_events), 2)
+        self.assertTrue(timeout_events[0][1]["will_retry"])
+        self.assertFalse(timeout_events[1][1]["will_retry"])
+
+
+class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
+    """Pure-Tags identity planning rejects malformed or control-bearing JSON."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def _plugin(self, response_text):
+        calls = []
+        responses = list(response_text) if isinstance(response_text, tuple) else [response_text]
+
+        class Context:
+            async def llm_generate(self, **kwargs):
+                calls.append(kwargs)
+                response = responses[min(len(calls) - 1, len(responses) - 1)]
+                if isinstance(response, str):
+                    return types.SimpleNamespace(completion_text=response)
+                return response
+
+        class Director:
+            @staticmethod
+            async def resolve_provider_id(_context, _event):
+                return "semantic-provider"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = Context()
+        plugin._director = Director()
+        plugin.settings = types.SimpleNamespace(character_swap_timeout=5)
+        plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+        return plugin, calls
+
+    async def test_gallery_exact_builds_profile_for_existing_target_lora(self) -> None:
+        class Client:
+            @staticmethod
+            async def danbooru_gallery_health():
+                return {"connected": True, "source": "danbooru"}
+
+            @staticmethod
+            async def danbooru_character_autocomplete(query, *, limit=20):
+                del limit
+                if query == "viola":
+                    return [
+                        {
+                            "name": "viola_(pokemon)",
+                            "category": 4,
+                            "post_count": 314,
+                        },
+                        {
+                            "name": "viola_(majo_no_ie)",
+                            "category": 4,
+                            "post_count": 151,
+                        },
+                    ]
+                return []
+
+            @staticmethod
+            async def danbooru_character_posts(_canonical, *, limit=100):
+                del limit
+                return [
+                    {
+                        "id": index + 1,
+                        "rating": "g",
+                        "tag_string_character": "viola_(bang_dream!)",
+                        "tag_string_general": (
+                            "1girl solo green_hair green_eyes long_hair "
+                            "single_side_bun x_hair_ornament mole_under_mouth"
+                        ),
+                        "is_deleted": False,
+                        "is_pending": False,
+                        "is_flagged": False,
+                        "is_banned": False,
+                    }
+                    for index in range(12)
+                ]
+
+        plugin, _calls = self._plugin("unused")
+        plugin._client = Client()
+        plugin._danbooru_index = None
+        plugin._character_appearance_profiles = None
+        plugin._runtime_semantic_index = lambda: LoraSemanticIndex.empty()
+        record = LoraRecord(
+            name="viola-000020.safetensors",
+            sha256="viola-sha",
+            category="character",
+            character_name="Viola",
+            trigger_words=("Viola",),
+            source_work="bang_dream!",
+        )
+
+        tags, evidence = await plugin._resolve_character_evidence_without_provider(
+            self.main.GenerationJob("u", "swap", 0.0),
+            "Viola",
+            (record,),
+        )
+
+        self.assertEqual(tags[0], "viola_(bang_dream!)")
+        self.assertIn("green hair", tags)
+        self.assertIn("green eyes", tags)
+        self.assertIn("single side bun", tags)
+        self.assertIn("x hair ornament", tags)
+        self.assertIn("mole under mouth", tags)
+        self.assertEqual(evidence["anchor_source"], "danbooru_gallery_exact")
+        self.assertEqual(evidence["appearance_source"], "danbooru_gallery")
+
+    async def test_valid_payload_uses_json_wrapped_target_data(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "identity_tags": [
+                        "rice_shower_(umamusume)",
+                        "brown hair",
+                    ],
+                    "confidence": 0.95,
+                }
+            )
+        )
+        tags, provider, evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags[0], "rice_shower_(umamusume)")
+        self.assertEqual(evidence["confidence"], 0.95)
+        self.assertFalse(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "provider_qualified")
+        self.assertEqual(
+            json.loads(calls[0]["prompt"]),
+            {"target_character": "赛马娘的米浴"},
+        )
+
+    async def test_danbooru_exact_lookup_canonicalizes_and_pins_evidence(
+        self,
+    ) -> None:
+        plugin, _calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "jinhsi_(wuthering_waves)",
+                    "appearance_tags": ["long white hair", "red eyes"],
+                    "confidence": 0.94,
+                }
+            )
+        )
+        lookups = []
+
+        class ExactIndex:
+            @staticmethod
+            def lookup(tag, category):
+                lookups.append((tag, category))
+                return types.SimpleNamespace(
+                    found=True,
+                    verified=True,
+                    category="character",
+                    canonical_tag="jinhsi_(wuthering_waves)",
+                    tag="jinhsi_(wuthering_waves)",
+                )
+
+        plugin._danbooru_index = ExactIndex()
+
+        tags, provider, evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "鸣潮的今汐",
+        )
+
+        self.assertEqual(
+            lookups,
+            [
+                ("wuthering_waves", "copyright"),
+                ("jinhsi_(wuthering_waves)", "character"),
+                ("jinhsi", "character"),
+            ],
+        )
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags, ("jinhsi_(wuthering_waves)",))
+        self.assertEqual(evidence["confidence"], 0.94)
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "danbooru_exact")
+
+    async def test_unqualified_hatsune_miku_requires_and_passes_local_exact(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "hatsune_miku",
+                    "identity_candidates": ["hatsune_miku"],
+                    "work_hints": ["vocaloid"],
+                    "appearance_tags": [],
+                    "confidence": 0.99,
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "hatsune_miku",
+                                "category": "character",
+                                "aliases": ["miku_hatsune"],
+                                "count": 128767,
+                            },
+                            {
+                                "tag": "vocaloid",
+                                "category": "copyright",
+                                "count": 900000,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "初音未来",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags, ("hatsune_miku",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "danbooru_exact")
+        self.assertEqual(evidence["match_variant"], "canonical_exact")
+
+    async def test_unknown_unqualified_character_cannot_bypass_local_exact(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "unknown_fake_character",
+                    "identity_candidates": ["unknown_fake_character"],
+                    "work_hints": [],
+                    "appearance_tags": [],
+                    "confidence": 0.99,
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "hatsune_miku",
+                                "category": "character",
+                                "count": 128767,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            with self.assertRaises(self.main.CharacterSwapError) as raised:
+                await plugin._generate_semantic_target_tags(
+                    object(),
+                    self.main.GenerationJob("u", "swap", 0.0),
+                    "不存在的角色",
+                )
+
+        self.assertEqual(
+            raised.exception.code,
+            "semantic_target_identity_unverified",
+        )
+        self.assertEqual(len(calls), 2)
+
+    async def test_danbooru_alias_without_work_resolves_asuma_toki(self) -> None:
+        plugin, calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": "asuma_toki_(blue_archive)",
+                    "identity_candidates": ["asuma_toki", "toki"],
+                    "work_hints": ["blue_archive"],
+                    "appearance_tags": ["long white hair", "blue eyes"],
+                    "confidence": 0.95,
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki"],
+                                "count": 10652,
+                            },
+                            {
+                                "tag": "toki_(bunny)_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki_(bunny)"],
+                                "count": 5539,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "碧蓝档案里的飞鸟马时",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags, ("toki_(blue_archive)",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["match_variant"], "alias_without_work")
+
+    async def test_ascii_user_alias_uses_local_index_without_provider(self) -> None:
+        plugin, calls = self._plugin("provider must not run")
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "toki_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["asuma_toki"],
+                                "count": 10652,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "飞鸟马时/Asuma Toki",
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(provider, "danbooru-local")
+        self.assertEqual(tags, ("toki_(blue_archive)",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["match_variant"], "user_ascii_exact")
+
+    async def test_lora_archive_bridges_localized_rio_to_character_category(self) -> None:
+        plugin, calls = self._plugin("provider must not run")
+        record = LoraRecord(
+            "baarmed_4in1_v1.safetensors",
+            sha256="rio-armed",
+            category="character",
+            character_name="莉音 / Rio",
+            source_work="Blue Archive / 蔚蓝档案",
+            trigger_words=(
+                r"rio \(armed\) \(blue archive\), black bodysuit",
+            ),
+        )
+        record = replace(
+            record,
+            source_fingerprint=semantic_source_fingerprint(record),
+        )
+        entry = SemanticEntry(
+            identity_key=semantic_identity_key(record.name, record.sha256),
+            canonical_name=record.name,
+            sha256=record.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "llm_inferred", confidence=0.95),),
+            character_names=(
+                SemanticFact("莉音", "llm_inferred", confidence=0.95),
+                SemanticFact("Rio", "llm_inferred", confidence=0.95),
+            ),
+            source_works=(
+                SemanticFact("Blue Archive", "llm_inferred", confidence=0.95),
+            ),
+            analysis_summary="莉音(Rio) from Blue Archive.",
+            analysis_confidence=0.95,
+            source_fingerprint=record.source_fingerprint,
+        )
+        plugin._semantic_index = LoraSemanticIndex(
+            entries={entry.identity_key: entry}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "rio_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["rio"],
+                                "count": 12095,
+                            },
+                            {
+                                "tag": "blue_archive",
+                                "category": "copyright",
+                                "count": 500000,
+                            },
+                            {
+                                "tag": "black_hair",
+                                "category": "general",
+                                "count": 900000,
+                            },
+                            {
+                                "tag": "rio_artist",
+                                "category": "artist",
+                                "count": 100,
+                            },
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "《BlueArchive》的调月莉音",
+                records=(record,),
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(provider, "danbooru-local")
+        self.assertEqual(tags, ("rio_(blue_archive)",))
+        self.assertTrue(evidence["index_verified"])
+        self.assertEqual(evidence["anchor_source"], "danbooru_exact")
+
+    async def test_exact_rio_uses_public_stable_appearance_profile(self) -> None:
+        plugin, calls = self._plugin("provider must not run")
+        with tempfile.TemporaryDirectory() as directory:
+            index = DanbooruTagIndex(Path(directory) / "tags.sqlite3")
+            index.import_bytes(
+                json.dumps(
+                    {
+                        "tags": [
+                            {
+                                "tag": "rio_(blue_archive)",
+                                "category": "character",
+                                "aliases": ["tsukatsuki_rio"],
+                                "count": 12095,
+                            }
+                        ]
+                    }
+                ).encode(),
+                content_type="json",
+            )
+            plugin._danbooru_index = index
+
+            class Store:
+                saved = None
+
+                @staticmethod
+                def get(_canonical):
+                    return None
+
+                @classmethod
+                def put(cls, profile):
+                    cls.saved = profile
+
+            class Client:
+                @staticmethod
+                async def danbooru_character_posts(_canonical, *, limit=100):
+                    self.assertEqual(limit, 100)
+                    return [
+                        {
+                            "id": index + 1,
+                            "rating": "g",
+                            "tag_string_character": "rio_(blue_archive)",
+                            "tag_string_general": (
+                                "1girl solo black_hair red_eyes long_hair halo "
+                                "white_sweater large_breasts"
+                            ),
+                        }
+                        for index in range(100)
+                    ]
+
+            plugin._character_appearance_profiles = Store()
+            plugin._client = Client()
+            tags, provider, evidence = await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "tsukatsuki_rio",
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(provider, "danbooru-local")
+        self.assertEqual(
+            tags,
+            (
+                "rio_(blue_archive)",
+                "black hair",
+                "red eyes",
+                "long hair",
+                "halo",
+            ),
+        )
+        self.assertEqual(evidence["appearance_source"], "danbooru_gallery")
+        self.assertEqual(evidence["appearance_count"], 4)
+        self.assertEqual(evidence["appearance_sample_count"], 100)
+        self.assertIsNotNone(Store.saved)
+
+    async def test_formatter_accepts_think_extra_fields_and_numeric_strings(self) -> None:
+        plugin, _calls = self._plugin(
+            '<think>private reasoning</think>Answer:\n```json\n'
+            '{"identity_tags":"rice_shower_(umamusume), brown hair",'
+            '"confidence":"0.85","reason":"bounded"}\n```'
+        )
+        event = object()
+
+        tags, provider, _evidence = await plugin._generate_semantic_target_tags(
+            event,
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(provider, "semantic-provider")
+        self.assertEqual(tags, ("rice_shower_(umamusume)", "brown hair"))
+        self.assertNotIn(id(event), plugin._internal_llm_events)
+
+    async def test_structured_schema_percent_confidence_and_danbooru_escapes(self) -> None:
+        plugin, _calls = self._plugin(
+            json.dumps(
+                {
+                    "canonical_identity_tag": r"rice_shower_\(umamusume\)",
+                    "appearance_tags": ["brown hair", "purple eyes"],
+                    "confidence": "95%",
+                }
+            )
+        )
+
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(
+            tags,
+            ("rice_shower_(umamusume)", "brown hair", "purple eyes"),
+        )
+
+    async def test_nested_result_chain_json_component_is_accepted(self) -> None:
+        response = types.SimpleNamespace(
+            role="assistant",
+            result_chain=[
+                {
+                    "type": "json",
+                    "data": {
+                        "identity_tag": "rice_shower_(umamusume)",
+                        "appearance_tags": ["brown hair"],
+                        "confidence": 95,
+                    },
+                }
+            ],
+        )
+        plugin, _calls = self._plugin(response)
+
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(tags, ("rice_shower_(umamusume)", "brown hair"))
+
+    async def test_message_history_uses_only_last_assistant_answer(self) -> None:
+        response = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        '{"identity_tag":"wrong_character_(wrong_work)",'
+                        '"appearance_tags":[],"confidence":0.99}'
+                    ),
+                },
+                {
+                    "role": "reasoning",
+                    "content": "hidden intermediate text",
+                },
+                {
+                    "role": "assistant",
+                    "content": (
+                        '{"identity_tag":"rice_shower_(umamusume)",'
+                        '"appearance_tags":["brown hair"],"confidence":0.95}'
+                    ),
+                },
+            ]
+        }
+        plugin, _calls = self._plugin(response)
+
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(tags[0], "rice_shower_(umamusume)")
+
+    async def test_openai_choices_message_content_is_accepted(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            '{"identity_tag":"rice_shower_(umamusume)",'
+                            '"appearance_tags":[],"confidence":95.5}'
+                        ),
+                    }
+                }
+            ]
+        }
+        plugin, _calls = self._plugin(response)
+
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(tags, ("rice_shower_(umamusume)",))
+
+    async def test_nested_error_role_overrides_visible_json(self) -> None:
+        response = {
+            "messages": [
+                {"role": "err", "content": "private upstream error"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        '{"identity_tag":"rice_shower_(umamusume)",'
+                        '"appearance_tags":[],"confidence":0.95}'
+                    ),
+                },
+            ]
+        }
+        plugin, _calls = self._plugin(response)
+
+        with self.assertRaises(self.main.CharacterSwapError) as raised:
+            await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "赛马娘的米浴",
+            )
+
+        self.assertEqual(raised.exception.code, "semantic_target_provider_error")
+
+    async def test_provider_error_role_is_reported_without_schema_misdiagnosis(self) -> None:
+        plugin, calls = self._plugin(
+            types.SimpleNamespace(
+                role="err",
+                completion_text="all_models_failed: private upstream detail",
+            )
+        )
+
+        with self.assertRaises(self.main.CharacterSwapError) as raised:
+            await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "赛马娘的米浴",
+            )
+
+        self.assertEqual(raised.exception.code, "semantic_target_provider_error")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("private", str(raised.exception.details))
+
+    async def test_low_confidence_stops_without_confidence_laundering_retry(self) -> None:
+        plugin, calls = self._plugin(
+            '{"canonical_identity_tag":"unknown_character_(work)",'
+            '"appearance_tags":[],"confidence":0.6}'
+        )
+
+        with self.assertRaises(self.main.CharacterSwapError) as raised:
+            await plugin._generate_semantic_target_tags(
+                object(),
+                self.main.GenerationJob("u", "swap", 0.0),
+                "冷门角色",
+            )
+
+        self.assertEqual(raised.exception.code, "semantic_target_low_confidence")
+        self.assertEqual(len(calls), 1)
+
+    async def test_qualified_identity_name_may_contain_appearance_word(self) -> None:
+        plugin, _calls = self._plugin(
+            '{"canonical_identity_tag":"hat_kid_(a_hat_in_time)",'
+            '"appearance_tags":[],"confidence":0.92}'
+        )
+
+        tags, _provider, _evidence = await plugin._generate_semantic_target_tags(
+            object(),
+            self.main.GenerationJob("u", "swap", 0.0),
+            "Hat Kid",
+        )
+
+        self.assertEqual(tags, ("hat_kid_(a_hat_in_time)",))
+
+    async def test_generic_qualified_concepts_and_second_identity_are_rejected(self) -> None:
+        invalid_responses = (
+            '{"identity_tag":"red_dress_(fiction)",'
+            '"appearance_tags":[],"confidence":0.95}',
+            '{"identity_tag":"target_character_(real_game)",'
+            '"appearance_tags":["other_character_(other_game)"],'
+            '"confidence":0.95}',
+        )
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                plugin, _calls = self._plugin(response)
+                with self.assertRaises(self.main.CharacterSwapError):
+                    await plugin._generate_semantic_target_tags(
+                        object(),
+                        self.main.GenerationJob("u", "swap", 0.0),
+                        "Target",
+                    )
+
+    async def test_internal_llm_event_guard_is_active_during_provider_call(self) -> None:
+        seen = []
+
+        class Context:
+            async def llm_generate(inner_self, **_kwargs):
+                seen.append(id(event) in plugin._internal_llm_events)
+                return types.SimpleNamespace(
+                    completion_text=(
+                        '{"identity_tags":["rice_shower_(umamusume)"],'
+                        '"confidence":0.95}'
+                    )
+                )
+
+        class Director:
+            @staticmethod
+            async def resolve_provider_id(_context, _event):
+                return "semantic-provider"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = Context()
+        plugin._director = Director()
+        plugin.settings = types.SimpleNamespace(character_swap_timeout=5)
+        plugin._record_image_task_phase = lambda *_args, **_kwargs: None
+        plugin._internal_llm_events = set()
+        event = object()
+
+        await plugin._generate_semantic_target_tags(
+            event,
+            self.main.GenerationJob("u", "swap", 0.0),
+            "赛马娘的米浴",
+        )
+
+        self.assertEqual(seen, [True])
+        self.assertNotIn(id(event), plugin._internal_llm_events)
+
+    async def test_reverse_call_keeps_both_attempts_out_of_auto_draw_injection(
+        self,
+    ) -> None:
+        seen = []
+        system_prompts = []
+
+        class ReverseService:
+            async def reverse(
+                inner_self,
+                _context,
+                current_event,
+                _image_path,
+                _supplement,
+                _progress,
+                *,
+                profile,
+            ):
+                for _attempt in (1, 2):
+                    seen.append(id(current_event) in plugin._internal_llm_events)
+                    request = types.SimpleNamespace(system_prompt="reverse-json-only")
+                    await plugin.inject_auto_draw_prompt(current_event, request)
+                    system_prompts.append(request.system_prompt)
+                return object(), f"vision-{profile}"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._reverse_prompt = ReverseService()
+        plugin._internal_llm_events = set()
+        plugin.settings = types.SimpleNamespace(enable_llm_pic_trigger=True)
+        event = object()
+
+        _result, provider_id = await plugin._call_reverse_prompt(
+            object(),
+            event,
+            Path("input.png"),
+            "focus",
+            None,
+            profile="swap",
+        )
+
+        self.assertEqual(provider_id, "vision-swap")
+        self.assertEqual(seen, [True, True])
+        self.assertEqual(system_prompts, ["reverse-json-only", "reverse-json-only"])
+        self.assertNotIn(id(event), plugin._internal_llm_events)
+
+    async def test_invalid_json_confidence_and_control_tags_fail_closed(self) -> None:
+        invalid_responses = (
+            "[]",
+            '{"identity_tags":["hero"],"confidence":NaN}',
+            '{"identity_tags":["hero"],"confidence":Infinity}',
+            '{"identity_tags":["hero"],"confidence":1.2}',
+            '{"identity_tags":["BREAK"],"confidence":0.95}',
+            '{"identity_tags":["embedding:hero"],"confidence":0.95}',
+            '{"identity_tags":["__hero__"],"confidence":0.95}',
+        )
+        for response_text in invalid_responses:
+            with self.subTest(response_text=response_text):
+                plugin, _calls = self._plugin(response_text)
+                with self.assertRaises(self.main.CharacterSwapError) as raised:
+                    await plugin._generate_semantic_target_tags(
+                        object(),
+                        self.main.GenerationJob("u", "swap", 0.0),
+                        "Target",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "semantic_target_tags_invalid",
+                )
+
+
+class WorkflowWebUiTests(unittest.IsolatedAsyncioTestCase):
+    """WebUI workflow selection must separate generation and RTX tools."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    def _plugin(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin.settings = self.main.PluginSettings.from_mapping(
+            {
+                "workflow_dir": str(plugin.plugin_dir / "workflow"),
+                "workflow_file": "workflow/anima_api.json",
+            }
+        )
+        plugin._workflow_registry = self.main.WorkflowRegistry(
+            plugin.plugin_dir / "workflow",
+            plugin.settings,
+        )
+        plugin._active_workflow_name = "anima_api.json"
+        plugin._active_jobs = {}
+        plugin._queued_jobs = {}
+        plugin._jobs_lock = asyncio.Lock()
+        plugin._pipeline_builders = {}
+        plugin._control_workflow_builder = None
+        plugin._control_initialization_error = ""
+        plugin._workflow_switch_lock = asyncio.Lock()
+        plugin._initialization_error = None
+        return plugin
+
+    async def test_list_distinguishes_generation_and_standalone_upscale(self) -> None:
+        plugin = self._plugin()
+
+        result = await plugin.web_ui_list_workflows()
+
+        self.assertEqual(
+            [item["capability_id"] for item in result["generation_items"]],
+            ["base", "rtx", "iterative"],
+        )
+        self.assertEqual(
+            [item["capability_id"] for item in result["tool_items"]],
+            [
+                "standalone_rtx",
+                "control",
+                "img2img",
+                "semantic_redraw",
+                "quick",
+                "lanpaint",
+            ],
+        )
+        self.assertTrue(all(item["selectable"] for item in result["generation_items"]))
+        self.assertTrue(all(not item["selectable"] for item in result["tool_items"]))
+        self.assertEqual(
+            [item["command"] for item in result["tool_items"]],
+            [
+                "/放大",
+                "/底图控制 <要求> [--m p|d|l|r]",
+                "/改图 or /反推画图",
+                "/改图 <要求> --mode preserve|balanced|free",
+                "/重绘 <要求> --mode quick",
+                "/重绘 <要求> --mode lanpaint",
+            ],
+        )
+        by_name = {item["filename"]: item for item in result["items"]}
+        self.assertTrue(by_name["anima_base_api.json"]["selectable"])
+        self.assertFalse(by_name["anima_v2_api.json"]["selectable"])
+        self.assertEqual(
+            by_name["anima_base_api.json"]["task_type"],
+            "text_to_image",
+        )
+        self.assertFalse(by_name["rtx_upscale_api.json"]["selectable"])
+        self.assertEqual(
+            by_name["rtx_upscale_api.json"]["task_type"],
+            "upscale",
+        )
+
+    async def test_select_persists_then_hot_switches_generation_workflow(self) -> None:
+        plugin = self._plugin()
+        persisted = []
+
+        async def persist(updates):
+            persisted.append(updates)
+            return True
+
+        plugin._persist_config_updates = persist
+
+        result = await plugin.web_ui_select_workflow("anima_iterative_api.json")
+
+        self.assertEqual(result["selected"], "anima_iterative_api.json")
+        self.assertEqual(plugin._active_workflow_name, "anima_iterative_api.json")
+        self.assertEqual(plugin.settings.default_generation_pipeline, "iterative")
+        self.assertEqual(
+            persisted,
+            [
+                {
+                    "workflow_file": "workflow/anima_iterative_api.json",
+                    "default_generation_pipeline": "iterative",
+                    "enable_upscale": True,
+                }
+            ],
+        )
+
+    async def test_select_rejects_upscale_and_running_jobs(self) -> None:
+        plugin = self._plugin()
+        async def persist(_updates):
+            return True
+
+        plugin._persist_config_updates = persist
+        with self.assertRaisesRegex(self.main.WebUiActionError, "独立图片放大"):
+            await plugin.web_ui_select_workflow("rtx_upscale_api.json")
+
+        task = asyncio.get_running_loop().create_future()
+        plugin._active_jobs = {
+            "u": self.main.GenerationJob("u", "preview", 0.0, task=task)
+        }
+        try:
+            with self.assertRaisesRegex(self.main.WebUiActionError, "任务运行中"):
+                await plugin.web_ui_select_workflow("anima_base_api.json")
+        finally:
+            task.cancel()
+
+    async def test_workflow_dependency_check_uses_live_object_info(self) -> None:
+        plugin = self._plugin()
+        filenames = (
+            "anima_base_api.json",
+            "anima_rtx_api.json",
+            "anima_iterative_api.json",
+            "rtx_upscale_api.json",
+            "anima_inpaint_crop_api.json",
+            "anima_lanpaint_api.json",
+            "anima_control_api.json",
+        )
+        class_types = set()
+        for filename in filenames:
+            payload = json.loads(
+                (plugin.plugin_dir / "workflow" / filename).read_text(encoding="utf-8")
+            )
+            class_types.update(node["class_type"] for node in payload.values())
+        object_info = {node_type: {} for node_type in class_types}
+        object_info.update(
+            {
+                "UNETLoader": {
+                    "input": {"required": {"unet_name": [["miaomiaoHarem_anima8Step10.safetensors"], {}]}}
+                },
+                "CLIPLoader": {
+                    "input": {
+                        "required": {
+                            "clip_name": [["qwen_3_06b_base.safetensors"], {}],
+                            "type": [["qwen_image"], {}],
+                        }
+                    }
+                },
+                "VAELoader": {
+                    "input": {"required": {"vae_name": [["qwen_image_vae.safetensors"], {}]}}
+                },
+                "AnimaLLLiteApply": {
+                    "input": {
+                        "required": {
+                            "lllite_name": [[
+                                "Anima\\anima-lllite-pose-1.safetensors",
+                                "Anima\\anima-lllite-depth-1.safetensors",
+                                "Anima\\anima-lllite-lineart-1.safetensors",
+                                "Anima\\anima-lllite-any-test-like-v2.safetensors",
+                            ], {}]
+                        }
+                    }
+                },
+                "DepthAnythingV2Preprocessor": {
+                    "input": {
+                        "optional": {
+                            "ckpt_name": [["depth_anything_v2_vitl.pth"], {}]
+                        }
+                    }
+                },
+            }
+        )
+
+        class Client:
+            async def object_info(self):
+                return object_info
+
+        plugin._client = Client()
+        result = await plugin.web_ui_check_workflows()
+        self.assertEqual(result["ready_count"], 8)
+        control = next(item for item in result["items"] if item["id"] == "control")
+        self.assertEqual(control["status"], "ready")
+        self.assertEqual(control["missing_models"], [])
+
+        object_info.pop("LanPaint_MaskBlend")
+        degraded = await plugin.web_ui_check_workflows()
+        lanpaint = next(item for item in degraded["items"] if item["id"] == "lanpaint")
+        self.assertEqual(lanpaint["status"], "unavailable")
+        self.assertIn("LanPaint_MaskBlend", lanpaint["missing_node_types"])
+
+    def test_pipeline_priority_preserves_legacy_upscale_flags(self) -> None:
+        plugin = self._plugin()
+        plugin.settings = replace(
+            plugin.settings,
+            default_generation_pipeline="iterative",
+        )
+
+        self.assertEqual(
+            plugin._resolve_generation_pipeline(
+                self.main.GenerationOptions(
+                    prompt="1girl",
+                    pipeline="base",
+                    enable_upscale=True,
+                )
+            ),
+            "base",
+        )
+        self.assertEqual(
+            plugin._resolve_generation_pipeline(
+                self.main.GenerationOptions(
+                    prompt="1girl",
+                    enable_upscale=False,
+                )
+            ),
+            "base",
+        )
+        self.assertEqual(
+            plugin._resolve_generation_pipeline(
+                self.main.GenerationOptions(prompt="1girl"),
+            ),
+            "iterative",
+        )
+
+
+class WebUiControllerTests(unittest.IsolatedAsyncioTestCase):
+    """Verify that the Web UI reuses the plugin's strict live-data rules."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    async def test_preset_list_shows_manager_and_effective_trigger_words(self) -> None:
+        record = LoraRecord(
+            name="styles/kei.safetensors",
+            category="artist_style",
+            trigger_words=("kei style", "soft lineart"),
+        )
+
+        class Catalog:
+            @staticmethod
+            async def resolve_selections_with_records(selections, *, strict):
+                self.assertTrue(strict)
+                resolved = (
+                    LoraSelection("styles/kei.safetensors", 0.7),
+                )
+                return resolved, {
+                    "styles/kei": record,
+                    "styles/kei.safetensors": record,
+                }
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_presets = self.main.LoraPresetRegistry([])
+        plugin._lora_presets.save(
+            name="风格1011 kei",
+            category="style",
+            selections=(LoraSelection("styles/kei", 0.7),),
+            trigger_words="manual glow",
+            aliases=("kei风格",),
+            note="测试备注",
+        )
+        plugin._refresh_lora_manager_before = lambda _action: asyncio.sleep(0)
+
+        result = await plugin.web_ui_list_presets()
+        item = result["items"][0]
+
+        self.assertEqual(item["manager_trigger_words"], ["kei style", "soft lineart"])
+        self.assertEqual(
+            item["effective_trigger_words"],
+            ["manual glow", "kei style", "soft lineart"],
+        )
+        self.assertIn("风格1011", item["derived_aliases"])
+        self.assertEqual(item["note"], "测试备注")
+
+    async def test_lora_search_refreshes_for_every_request(self) -> None:
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (
+                    types.SimpleNamespace(
+                        name="black deniav1-2.safetensors",
+                        category="character",
+                        model_name="Denia",
+                        base_model="Anima",
+                        trigger_words=("denia",),
+                        tags=("character",),
+                        source="manager+comfyui",
+                        favorite=False,
+                        aliases=("denia",),
+                        character_name="Denia",
+                        source_work="Wuthering Waves",
+                        from_civitai=True,
+                    ),
+                )
+
+            @staticmethod
+            def search_records(records, keyword):
+                return tuple(
+                    record
+                    for record in records
+                    if keyword.casefold() in record.name.casefold()
+                    or keyword.casefold() in record.model_name.casefold()
+                )
+
+            @staticmethod
+            def archive_summary(records):
+                return {
+                    "categories": {
+                        "character": len(records),
+                        "artist_style": 0,
+                        "mixed": 0,
+                        "unknown": 0,
+                    },
+                    "civitai_enriched": len(records),
+                    "identified_characters": len(records),
+                    "works": [],
+                }
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+
+        first = await plugin.web_ui_search_loras("denia", 50)
+        second = await plugin.web_ui_search_loras("denia", 50)
+
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+        self.assertEqual(first["items"][0]["name"], "black deniav1-2.safetensors")
+        self.assertEqual(second["total"], 1)
+
+    async def test_web_ui_archive_state_distinguishes_current_stale_and_unarchived(self) -> None:
+        catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+        record = catalog_module.LoraRecord(
+            name="characters/denia.safetensors",
+            model_name="Denia",
+            description="current metadata",
+            base_model="Anima",
+            trigger_words=("denia",),
+            tags=("character",),
+            aliases=("达妮娅",),
+            character_name="Denia",
+            source_work="Wuthering Waves",
+            sha256="abc",
+            from_civitai=True,
+        )
+        fingerprint = self.main.LoraArchiveService.record_fingerprint(record)
+        entry = {
+            "catalog_source_fingerprint": fingerprint,
+            "classification": {"category": "character"},
+        }
+
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(record, entry),
+            "archived",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(
+                record,
+                {**entry, "catalog_source_fingerprint": "old"},
+            ),
+            "stale",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(record, {}),
+            "metadata_only",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(
+                replace(record, from_civitai=False),
+                {},
+            ),
+            "unarchived",
+        )
+        self.assertEqual(
+            self.main.ComfyAnimaPlugin._web_ui_archive_state(
+                record,
+                {"catalog_source_fingerprint": fingerprint, "classification": {}},
+            ),
+            "metadata_only",
+        )
+
+    async def test_removed_only_archive_sync_does_not_call_llm(self) -> None:
+        class Status:
+            def __init__(self, *, removed=(), changed=True):
+                self.added = ()
+                self.modified = ()
+                self.removed = tuple(removed)
+                self.changed = changed
+
+            def to_dict(self):
+                return {
+                    "added": list(self.added),
+                    "modified": list(self.modified),
+                    "removed": list(self.removed),
+                    "changed": self.changed,
+                }
+
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return ()
+
+        class Archiver:
+            def __init__(self):
+                self.synced = 0
+
+            def catalog_status(self, _records):
+                return Status(removed=("deleted.safetensors",))
+
+            def sync_catalog_presence(self, _records):
+                self.synced += 1
+                return Status(removed=(), changed=False)
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_archiver = Archiver()
+        plugin._run_lora_archive_llm = lambda *_args: self.fail("LLM must not run")
+
+        result = await plugin.web_ui_archive_loras({"sync_only": True})
+
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["removed_names"], ["deleted.safetensors"])
+        self.assertEqual(plugin._lora_catalog.refreshes, 1)
+        self.assertEqual(plugin._lora_archiver.synced, 1)
+
+    async def test_provider_list_reads_instantiated_astrbot_chat_models(self) -> None:
+        class Provider:
+            def __init__(self, provider_id, model, provider_type, name, key):
+                self.provider_config = {
+                    "id": provider_id,
+                    "model": model,
+                    "type": provider_type,
+                    "name": name,
+                    "key": key,
+                }
+                self._meta = types.SimpleNamespace(
+                    id=provider_id,
+                    model=model,
+                    type=provider_type,
+                )
+
+            def meta(self):
+                return self._meta
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        runtime_provider = Provider(
+            "openai-custom-1",
+            "gpt-test",
+            "openai_chat_completion",
+            "绘图导演",
+            "secret-key",
+        )
+        plugin.context = types.SimpleNamespace(
+            get_all_providers=lambda: [runtime_provider],
+            provider_manager=types.SimpleNamespace(
+                providers_config=[
+                    {
+                        **runtime_provider.provider_config,
+                        "provider_type": "chat_completion",
+                        "enable": True,
+                    },
+                    {
+                        "id": "saved-disabled",
+                        "type": "openai_chat_completion",
+                        "provider_type": "chat_completion",
+                        "model": "gpt-disabled",
+                        "enable": False,
+                        "key": "another-secret",
+                    },
+                    {
+                        "id": "tts-provider",
+                        "type": "edge_tts",
+                        "provider_type": "text_to_speech",
+                        "enable": True,
+                    },
+                ]
+            ),
+        )
+        plugin.settings = types.SimpleNamespace(
+            prompt_llm_provider_id="openai-custom-1"
+        )
+
+        result = await plugin.web_ui_list_providers()
+
+        self.assertEqual(result["selected"], "openai-custom-1")
+        self.assertEqual(result["items"][0]["model"], "gpt-test")
+        self.assertEqual(result["items"][0]["name"], "绘图导演")
+        self.assertTrue(result["items"][0]["available"])
+        self.assertEqual(result["items"][1]["id"], "saved-disabled")
+        self.assertFalse(result["items"][1]["available"])
+        self.assertNotIn("tts-provider", str(result))
+        self.assertNotIn("key", result["items"][0])
+        self.assertNotIn("secret-key", str(result))
+        self.assertNotIn("another-secret", str(result))
+
+    async def test_provider_catalog_merges_sources_and_keeps_four_selections_independent(self) -> None:
+        class Provider:
+            def __init__(self, provider_id, provider_type):
+                self.provider_config = {"id": provider_id}
+                self._meta = types.SimpleNamespace(
+                    id=provider_id,
+                    model="",
+                    type=provider_type,
+                )
+
+            def meta(self):
+                return self._meta
+
+        provider_sources = {
+            "chat-vision-source": {
+                "id": "chat-vision-source",
+                "provider_type": "chat_completion",
+                "type": "openai_chat_completion",
+                "name": "Vision source",
+                "model": "vision-model",
+                "modalities": ["text", "image"],
+                "key": "vision-source-secret",
+                "base_url": "http://vision-source.invalid/v1",
+            },
+            "chat-text-source": {
+                "id": "chat-text-source",
+                "provider_type": "chat_completion",
+                "type": "openai_chat_completion",
+                "name": "Text source",
+                "model": "text-model",
+                "modalities": {"text": True, "image": False},
+                "key": "text-source-secret",
+            },
+            "embedding-source": {
+                "id": "embedding-source",
+                "provider_type": "embedding",
+                "type": "openai_embedding",
+                "name": "Embedding source",
+                "embedding_model": "bge-m3",
+                "key": "embedding-source-secret",
+                "api_base": "http://embedding-source.invalid/v1",
+            },
+            "rerank-source": {
+                "id": "rerank-source",
+                "provider_type": "rerank",
+                "type": "xinference_rerank",
+                "name": "Rerank source",
+                "rerank_model": "bge-reranker-v2-m3",
+                "key": "rerank-source-secret",
+            },
+        }
+
+        class Manager:
+            providers_config = [
+                {
+                    "id": "chat-vision",
+                    "provider_source_id": "chat-vision-source",
+                    "enable": True,
+                },
+                {
+                    "id": "chat-text",
+                    "provider_source_id": "chat-text-source",
+                    "enable": True,
+                },
+                {
+                    "id": "chat-unknown",
+                    "provider_type": "chat_completion",
+                    "type": "openai_chat_completion",
+                    "model": "legacy-unknown-model",
+                    "enable": True,
+                    "key": "unknown-chat-secret",
+                    "base_url": "http://unknown-chat.invalid/v1",
+                },
+                {
+                    "id": "embedding-main",
+                    "provider_source_id": "embedding-source",
+                    "enable": True,
+                },
+                {
+                    "id": "rerank-main",
+                    "provider_source_id": "rerank-source",
+                    "enable": True,
+                },
+            ]
+
+            def __init__(self, rerank_provider):
+                self.rerank_provider_insts = [rerank_provider]
+
+            @staticmethod
+            def get_merged_provider_config(provider_config):
+                source_id = provider_config.get("provider_source_id", "")
+                source = provider_sources.get(source_id, {})
+                return {**source, **provider_config, "id": provider_config["id"]}
+
+        vision = Provider("chat-vision", "openai_chat_completion")
+        text = Provider("chat-text", "openai_chat_completion")
+        unknown = Provider("chat-unknown", "openai_chat_completion")
+        embedding = Provider("embedding-main", "openai_embedding")
+        rerank = Provider("rerank-main", "xinference_rerank")
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.context = types.SimpleNamespace(
+            get_all_providers=lambda: [vision, text, unknown],
+            get_all_embedding_providers=lambda: [embedding],
+            provider_manager=Manager(rerank),
+        )
+        plugin.settings = types.SimpleNamespace(
+            prompt_llm_provider_id="chat-text",
+            reverse_prompt_provider_id="chat-vision",
+            lora_embedding_provider_id="embedding-main",
+            lora_rerank_provider_id="rerank-main",
+        )
+
+        result = await plugin.web_ui_list_providers()
+
+        self.assertEqual(result["selected_prompt"], "chat-text")
+        self.assertEqual(result["selected_reverse"], "chat-vision")
+        self.assertEqual(result["selected_embedding"], "embedding-main")
+        self.assertEqual(result["selected_rerank"], "rerank-main")
+        self.assertEqual(result["chat"]["selected"], "chat-text")
+        self.assertEqual(result["embedding"]["selected"], "embedding-main")
+        self.assertEqual(result["rerank"]["selected"], "rerank-main")
+
+        chat = {item["id"]: item for item in result["chat"]["items"]}
+        self.assertIs(chat["chat-vision"]["supports_image"], True)
+        self.assertIs(chat["chat-text"]["supports_image"], False)
+        self.assertIsNone(chat["chat-unknown"]["supports_image"])
+        self.assertEqual(chat["chat-vision"]["model"], "vision-model")
+
+        embedding_items = {
+            item["id"]: item for item in result["embedding"]["items"]
+        }
+        rerank_items = {item["id"]: item for item in result["rerank"]["items"]}
+        self.assertEqual(embedding_items["embedding-main"]["model"], "bge-m3")
+        self.assertEqual(
+            rerank_items["rerank-main"]["model"],
+            "bge-reranker-v2-m3",
+        )
+        self.assertTrue(embedding_items["embedding-main"]["available"])
+        self.assertTrue(rerank_items["rerank-main"]["available"])
+
+        serialized = str(result)
+        for secret in (
+            "vision-source-secret",
+            "text-source-secret",
+            "embedding-source-secret",
+            "rerank-source-secret",
+            "unknown-chat-secret",
+            "http://vision-source.invalid/v1",
+            "http://embedding-source.invalid/v1",
+            "http://unknown-chat.invalid/v1",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, serialized)
+        for group_name in ("chat", "embedding", "rerank"):
+            for item in result[group_name]["items"]:
+                self.assertNotIn("key", item)
+                self.assertNotIn("base_url", item)
+                self.assertNotIn("api_base", item)
+
+    async def test_settings_save_keeps_existing_password_when_omitted(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config_path = Path(directory.name) / "plugin.json"
+
+        class Config(dict):
+            def __init__(self, path: Path, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.config_path = str(path)
+                self.saved = 0
+                self.save_config()
+
+            def save_config(self):
+                self.saved += 1
+                Path(self.config_path).write_text(
+                    json.dumps(self, ensure_ascii=False),
+                    encoding="utf-8-sig",
+                )
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.config = Config(
+            config_path,
+            {
+                "enable_web_ui": True,
+                "web_ui_password": "existing-password",
+                "enable_llm_pic_trigger": True,
+                "enable_chat_draw_terminal_guard": False,
+                "default_width": 832,
+                "max_preset_loras": 12,
+                "max_total_dynamic_loras": 12,
+            }
+        )
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        plugin.plugin_dir = Path(__file__).resolve().parents[1]
+        plugin._schedule_self_reload = lambda **_kwargs: object()
+
+        result = await plugin.web_ui_save_settings(
+            {
+                "default_width": 1024,
+                "enable_reverse_json_formatter": False,
+                "enable_reverse_json_repair_retry": False,
+                "show_chat_generation_details": False,
+            }
+        )
+
+        self.assertEqual(plugin.config["default_width"], 1024)
+        self.assertFalse(plugin.config["enable_reverse_json_formatter"])
+        self.assertFalse(plugin.config["enable_reverse_json_repair_retry"])
+        self.assertFalse(plugin.config["show_chat_generation_details"])
+        self.assertTrue(plugin.config["enable_chat_draw_terminal_guard"])
+        self.assertEqual(plugin.config["web_ui_password"], "existing-password")
+        self.assertEqual(plugin.config.saved, 2)
+        self.assertTrue(result["reload_scheduled"])
+
+    async def test_v170_settings_reject_out_of_range_or_fractional_values(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.config = {
+            "max_preset_loras": 12,
+            "max_total_dynamic_loras": 12,
+        }
+        plugin.settings = self.main.PluginSettings.from_mapping(plugin.config)
+        invalid = (
+            {"max_queued_jobs_per_user": -1},
+            {"max_queued_jobs_per_user": 11},
+            {"max_queued_jobs_per_user": 1.5},
+            {"prompt_asset_max_download_mb": 17},
+            {"prompt_lab_batch_capacity": 3},
+            {"prompt_lab_ttl_seconds": 59},
+            {"lora_visual_cache_mb": -1},
+            {"lora_visual_warmup_workers": 5},
+            {"lora_visual_preview_max_mb": 33},
+            {"lora_visual_thumbnail_size": 127},
+            {"lora_visual_warmup_workers": 1.5},
+        )
+
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises(self.main.WebUiActionError):
+                    await plugin.web_ui_save_settings(payload)
+
+    async def test_web_ui_metadata_fetch_refreshes_before_and_after(self) -> None:
+        record = types.SimpleNamespace(
+            name="characters/denia.safetensors",
+            file_path="E:/loras/characters/denia.safetensors",
+        )
+
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (record,)
+
+        class MetadataService:
+            def __init__(self):
+                self.paths = []
+
+            async def fetch_civitai_metadata(self, path):
+                self.paths.append(path)
+                return True, "ok"
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = Catalog()
+        plugin._lora_downloader = MetadataService()
+        plugin._lora_download_error = ""
+        plugin._lora_archiver = self.main.LoraArchiveService(Path("archive.json"))
+
+        result = await plugin.web_ui_fetch_lora_metadata(
+            {"mode": "selected", "names": [record.name]}
+        )
+
+        self.assertEqual(plugin._lora_catalog.refreshes, 2)
+        self.assertEqual(plugin._lora_downloader.paths, [record.file_path])
+        self.assertEqual(result["success"], 1)
+
+    async def test_web_ui_archive_contract_supports_all_and_force(self) -> None:
+        captured = {}
+
+        class Result:
+            skipped = False
+            selected_count = 2
+            batch_count = 1
+
+            @staticmethod
+            def to_dict():
+                return {
+                    "skipped": False,
+                    "selected_count": 2,
+                    "batch_count": 1,
+                    "updated_names": ["a", "b"],
+                    "status": {"changed": False},
+                }
+
+        class Archiver:
+            async def archive_from_catalog(self, catalog, callback, **kwargs):
+                captured.update(kwargs)
+                captured["callback"] = callback
+                return Result()
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_catalog = object()
+        plugin._lora_archiver = Archiver()
+        plugin.settings = types.SimpleNamespace(prompt_llm_provider_id="director")
+
+        result = await plugin.web_ui_archive_loras(
+            {"mode": "all", "names": [], "force": True}
+        )
+
+        self.assertIsNone(captured["selected_names"])
+        self.assertFalse(captured["skip_when_unchanged"])
+        self.assertEqual(result["provider_id"], "director")
+        self.assertEqual(result["selected_count"], 2)
+
+    async def test_v2_archive_returns_run_id_and_finishes_in_background(self) -> None:
+        catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+        semantic_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_semantic"
+        )
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+        record = catalog_module.LoraRecord(
+            name="characters/denia.safetensors",
+            model_name="Denia",
+            category="character",
+            sha256="a" * 64,
+        )
+
+        class Catalog:
+            def __init__(self):
+                self.refreshes = 0
+
+            async def refresh_for_operation(self):
+                self.refreshes += 1
+                return (record,)
+
+            async def get_detail_v2(self, current):
+                return types.SimpleNamespace(
+                    name=current.name,
+                    metadata_health=types.SimpleNamespace(
+                        status="complete",
+                        missing_sources=(),
+                        error_sources=(),
+                    ),
+                )
+
+        class Analysis:
+            def __init__(self, store):
+                self.store = store
+
+            async def run(self, details, callback, **kwargs):
+                self.store.finish_task(
+                    kwargs["run_id"],
+                    "succeeded",
+                    completed_items=len(details),
+                    failed_items=0,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = task_module.TaskStore(root / "tasks.sqlite3")
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._lora_catalog = Catalog()
+            plugin._semantic_index = semantic_module.LoraSemanticIndex.empty()
+            plugin._semantic_index_path = root / "semantic.json"
+            plugin._task_store = store
+            plugin._task_store_error = ""
+            plugin._lora_analysis = Analysis(store)
+            plugin._background_task_runs = {}
+            plugin.settings = types.SimpleNamespace(
+                prompt_llm_provider_id="director",
+            )
+            plugin.context = types.SimpleNamespace(
+                get_all_providers=lambda: [],
+                provider_manager=types.SimpleNamespace(providers_config=[]),
+                get_provider_by_id=lambda identifier: (
+                    object() if identifier == "director" else None
+                ),
+            )
+
+            result = await plugin.web_ui_archive_loras(
+                {"mode": "selected", "names": [record.name]}
+            )
+            self.assertEqual(result["status"], "queued")
+            self.assertTrue(result["run_id"])
+            task = plugin._background_task_runs[result["run_id"]]
+            await task
+            saved = store.get_task(result["run_id"])
+            self.assertEqual(saved["status"], "succeeded")
+            self.assertEqual(saved["completed_items"], 1)
+            self.assertGreaterEqual(plugin._lora_catalog.refreshes, 2)
+            store.close()
+
+
+class V170ControllerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Exercise v1.7 controller gates without constructing a full AstrBot runtime."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _asset_status(count: int = 0) -> dict[str, object]:
+        return {
+            "ready": bool(count),
+            "schema_version": "1",
+            "asset_count": count,
+            "custom_count": 0,
+            "favorite_count": 0,
+            "type_counts": {},
+            "last_import_sha256": "",
+            "last_import_count": count,
+            "error": "",
+        }
+
+    def _asset_plugin(self, library, *, remote: bool = False):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_prompt_asset_library=True,
+            prompt_asset_remote_import_enabled=remote,
+            prompt_asset_max_download_mb=64,
+        )
+        plugin._prompt_assets = library
+        plugin._prompt_assets_error = ""
+        plugin._task_store = None
+        return plugin
+
+    def _prompt_lab_plugin(self, root: Path):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_prompt_lab=True,
+            max_total_dynamic_loras=12,
+            default_generation_pipeline="base",
+        )
+        plugin._prompt_assets = self.main.PromptAssetLibrary(
+            root / "prompt_assets.sqlite3"
+        )
+        plugin._prompt_assets_error = ""
+        plugin._prompt_lab = self.main.PromptLab()
+        plugin._prompt_composer = self.main.PromptComposer(
+            adaptive_negative_mode="off",
+            validation_mode="off",
+        )
+        plugin._prompt_lab_batch_capacity = 4
+        plugin._prompt_lab_ttl_seconds = 120
+        plugin._prompt_lab_batches = self.main.OrderedDict()
+        plugin._prompt_lab_lock = asyncio.Lock()
+        plugin._task_store = None
+        plugin._lora_catalog = None
+        plugin._prompt_plans = self.main.PromptPlanStore(
+            root / "prompt_plans_v1.json"
+        )
+        return plugin
+
+    async def test_disabled_asset_library_is_unavailable_and_rejects_actions(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            enable_prompt_asset_library=False,
+            prompt_asset_remote_import_enabled=False,
+        )
+        plugin._prompt_assets = None
+        plugin._prompt_assets_error = ""
+
+        status = await plugin.web_ui_prompt_assets_status()
+        self.assertFalse(status["enabled"])
+        self.assertFalse(status["available"])
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_search({})
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_import(
+                {"text": "[]", "source": "test"}
+            )
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_update_url(
+                {"url": "https://example.com/assets.json"}
+            )
+
+    async def test_remote_asset_gate_rejects_before_network_call(self):
+        library = Mock()
+        library.update_from_url = AsyncMock()
+        plugin = self._asset_plugin(library, remote=False)
+
+        with self.assertRaises(self.main.WebUiActionError):
+            await plugin.web_ui_prompt_assets_update_url(
+                {"url": "https://example.com/assets.json"}
+            )
+        library.update_from_url.assert_not_awaited()
+
+    async def test_remote_asset_update_passes_public_https_policy_and_hard_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status(2)
+            library.update_from_url = AsyncMock(
+                return_value=self._asset_status(2)
+            )
+            plugin = self._asset_plugin(library, remote=True)
+
+            result = await plugin.web_ui_prompt_assets_update_url(
+                {
+                    "url": "https://example.com/assets.json",
+                    "timeout": 19,
+                    "mode": "replace_source",
+                }
+            )
+
+        self.assertEqual(result["asset_count"], 2)
+        kwargs = library.update_from_url.await_args.kwargs
+        self.assertEqual(kwargs["timeout"], 19)
+        self.assertEqual(kwargs["max_bytes"], 16 * 1024 * 1024)
+        self.assertFalse(kwargs["allow_private_http"])
+
+    async def test_text_import_uses_cancellation_aware_api_and_never_import_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status(1)
+            library.import_bytes_async = AsyncMock(
+                return_value=self._asset_status(1)
+            )
+            library.import_file = Mock()
+            plugin = self._asset_plugin(library)
+
+            result = await plugin.web_ui_prompt_assets_import(
+                {
+                    "source": "reviewed-test-pack",
+                    "format": "json",
+                    "text": '{"assets":[{"type":"pose","name":"standing"}]}',
+                }
+            )
+
+        self.assertEqual(result["asset_count"], 1)
+        library.import_bytes_async.assert_awaited_once()
+        library.import_file.assert_not_called()
+        self.assertEqual(
+            library.import_bytes_async.await_args.kwargs["source"],
+            "reviewed-test-pack",
+        )
+
+    async def test_asset_search_forwards_source_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status()
+            library.search.return_value = {
+                "items": [],
+                "total": 0,
+                "page": 1,
+                "page_size": 50,
+                "pages": 0,
+            }
+            plugin = self._asset_plugin(library)
+
+            await plugin.web_ui_prompt_assets_search(
+                {"query": "rice", "source": "reviewed-pack"}
+            )
+
+        self.assertEqual(library.search.call_args.kwargs["source"], "reviewed-pack")
+
+    async def test_asset_search_uses_same_transaction_opaque_revision(self):
+        library = Mock()
+        library.search.return_value = {
+            "items": [],
+            "total": 0,
+            "page": 1,
+            "page_size": 50,
+            "pages": 0,
+            "revision": "opaque-revision-7",
+        }
+        library.status.side_effect = AssertionError(
+            "same-transaction revision must avoid a second status read"
+        )
+        plugin = self._asset_plugin(library)
+
+        result = await plugin.web_ui_prompt_assets_search({})
+
+        self.assertEqual(result["fingerprint"], "opaque-revision-7")
+        library.status.assert_not_called()
+
+    async def test_empty_asset_facets_falls_back_without_undefined_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Mock()
+            library.path = Path(directory) / "missing.sqlite3"
+            library.status.return_value = self._asset_status()
+            library.facets.return_value = {
+                "type_counts": {},
+                "sources": [],
+                "categories": [],
+                "traits": [],
+                "revision": "",
+            }
+            plugin = self._asset_plugin(library)
+
+            result = await plugin.web_ui_prompt_assets_facets({})
+
+        self.assertTrue(result["fingerprint"])
+        self.assertEqual(result["sources"], [])
+
+    async def test_asset_controller_crud_round_trip_uses_mutation_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = self.main.PromptAssetLibrary(
+                Path(directory) / "prompt_assets.sqlite3"
+            )
+            plugin = self._asset_plugin(library)
+
+            created = await plugin.web_ui_prompt_asset_create(
+                {
+                    "asset_type": "pose",
+                    "name_en": "Standing",
+                    "tags": ["standing"],
+                }
+            )
+            asset_id = created["item"]["asset_id"]
+            self.assertEqual(created["fingerprint"], created["item"]["revision"])
+
+            updated = await plugin.web_ui_prompt_asset_update(
+                {
+                    "asset_id": asset_id,
+                    "changes": {"name_en": "Standing Tall"},
+                }
+            )
+            self.assertEqual(updated["item"]["name_en"], "Standing Tall")
+            self.assertEqual(updated["fingerprint"], updated["item"]["revision"])
+
+            favorite = await plugin.web_ui_prompt_asset_favorite(
+                {"asset_id": asset_id, "favorite": True}
+            )
+            self.assertTrue(favorite["item"]["favorite"])
+            self.assertEqual(favorite["fingerprint"], favorite["item"]["revision"])
+
+            searched = await plugin.web_ui_prompt_assets_search(
+                {"query": "standing tall", "custom_only": True}
+            )
+            self.assertEqual(searched["total"], 1)
+            self.assertEqual(searched["items"][0]["asset_id"], asset_id)
+
+            deleted = await plugin.web_ui_prompt_asset_delete(
+                {"asset_id": asset_id}
+            )
+            self.assertTrue(deleted["deleted"])
+            self.assertEqual(deleted["fingerprint"], deleted["revision"])
+            self.assertEqual(library.search(custom_only=True)["total"], 0)
+
+    async def test_empty_local_sync_clears_only_automatic_source(self):
+        def asset_pack(name: str, source_id: str) -> bytes:
+            return json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_type": "pose",
+                            "name_en": name,
+                            "tags": ["standing"],
+                            "source_id": source_id,
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            library = self.main.PromptAssetLibrary(
+                Path(directory) / "prompt_assets.sqlite3"
+            )
+            library.import_bytes(
+                asset_pack("Automatic Pose", "auto:pose"),
+                source="astrbot_local_assets",
+                content_type="application/json",
+            )
+            library.import_bytes(
+                asset_pack("Reviewed Pose", "reviewed:pose"),
+                source="reviewed_pack",
+                content_type="application/json",
+            )
+            custom = library.create_custom(
+                {
+                    "asset_type": "background",
+                    "name_en": "Custom Studio",
+                    "tags": ["studio"],
+                }
+            )
+            plugin = self._asset_plugin(library)
+            plugin._lora_catalog = None
+            plugin._lora_presets = types.SimpleNamespace(presets=())
+            plugin._semantic_index = None
+
+            result = await plugin.web_ui_prompt_assets_sync_local({})
+
+            self.assertEqual(result["synced"], 0)
+            self.assertEqual(result["removed"], 1)
+            self.assertEqual(result["fingerprint"], result["revision"])
+            self.assertEqual(
+                library.search(source="astrbot_local_assets")["total"], 0
+            )
+            self.assertEqual(library.search(source="reviewed_pack")["total"], 1)
+            self.assertEqual(library.get(custom["asset_id"])["name_en"], "Custom Studio")
+
+    async def test_prompt_lab_confirm_stops_after_asset_revision_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 42,
+                    "count": 1,
+                    "base_layers": {"identity": ["1girl"]},
+                }
+            )
+            plugin._prompt_assets.create_custom(
+                {"asset_type": "pose", "name_en": "standing"}
+            )
+
+            with self.assertRaisesRegex(
+                self.main.WebUiActionError,
+                "素材库在候选生成后发生变化",
+            ):
+                await plugin.web_ui_prompt_lab_confirm(
+                    {
+                        "batch_id": generated["batch"]["batch_id"],
+                        "selection": 1,
+                    }
+                )
+
+    async def test_prompt_lab_reloads_library_asset_instead_of_trusting_client_tags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            asset = plugin._prompt_assets.create_custom(
+                {
+                    "asset_type": "character",
+                    "name_en": "Verified Character",
+                    "tags": ["server_verified_identity"],
+                }
+            )
+
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 7,
+                    "count": 1,
+                    "asset_pools": {
+                        "identity": [
+                            {
+                                "asset_id": asset["asset_id"],
+                                "tags": ["client_injected_identity"],
+                            }
+                        ]
+                    },
+                }
+            )
+
+        identity = generated["batch"]["candidates"][0]["layers"]["identity"]
+        self.assertIn("server_verified_identity", identity)
+        self.assertNotIn("client_injected_identity", identity)
+
+    async def test_prompt_lab_confirm_reloads_selected_library_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            asset = plugin._prompt_assets.create_custom(
+                {
+                    "asset_type": "character",
+                    "name_en": "Verified Character",
+                    "tags": ["server_verified_identity"],
+                }
+            )
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 9,
+                    "count": 1,
+                    "asset_pools": {
+                        "identity": [{"asset_id": asset["asset_id"]}]
+                    },
+                }
+            )
+            original_get = plugin._prompt_assets.get
+            plugin._prompt_assets.get = Mock(wraps=original_get)
+
+            confirmed = await plugin.web_ui_prompt_lab_confirm(
+                {
+                    "batch_id": generated["batch"]["batch_id"],
+                    "selection": 1,
+                }
+            )
+
+        self.assertTrue(confirmed["confirmed"])
+        plugin._prompt_assets.get.assert_called_once_with(asset["asset_id"])
+
+    async def test_prompt_lab_confirm_saves_persistent_qq_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self._prompt_lab_plugin(root)
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 27,
+                    "count": 1,
+                    "base_layers": {
+                        "identity": ["1girl"],
+                        "background": ["rain", "night"],
+                    },
+                }
+            )
+
+            confirmed = await plugin.web_ui_prompt_lab_confirm(
+                {
+                    "batch_id": generated["batch"]["batch_id"],
+                    "selection": 1,
+                    "save_plan": True,
+                    "plan_name": "雨夜方案（测试）",
+                    "pipeline": "rtx",
+                }
+            )
+
+            self.assertRegex(confirmed["plan"]["plan_id"], r"^P-[0-9A-F]{6}$")
+            self.assertEqual(confirmed["plan"]["pipeline"], "rtx")
+            reloaded = self.main.PromptPlanStore(
+                root / "prompt_plans_v1.json"
+            ).resolve_plan("雨夜方案")
+            self.assertEqual(reloaded["plan_id"], confirmed["plan"]["plan_id"])
+            self.assertIn("1girl", reloaded["positive_prompt"])
+
+    async def test_prompt_plan_command_routes_through_run_job_without_llm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            saved = plugin._prompt_plans.save_plan(
+                name="方案测试（雨夜）",
+                positive_prompt="1girl, rain, night. A girl waits under an awning.",
+                negative_prompt="lowres",
+                pipeline="rtx",
+            )
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=2000,
+                send_generation_notice=False,
+            )
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._initialization_error = ""
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            calls = []
+
+            async def run_job(event, options, *, notify_queue=True):
+                calls.append((event, options))
+                return [Path("plan.png")], 321, options.prompt, "", None
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(
+                message_str=f"/方案 {saved['plan_id']} --seed 99 --p b",
+                plain_result=lambda text: text,
+            )
+            responses = [
+                item
+                async for item in plugin.cmd_prompt_plan_draw(
+                    event,
+                    saved["plan_id"],
+                )
+            ]
+
+        self.assertEqual(len(calls), 1)
+        options = calls[0][1]
+        self.assertFalse(options.use_prompt_llm)
+        self.assertEqual(options.seed, 99)
+        self.assertEqual(options.pipeline, "base")
+        self.assertEqual(options.negative_prompt, "lowres")
+        self.assertIn("IMAGE_RESULT", responses)
+
+    async def test_prompt_plan_rejects_control_and_character_change_options(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+
+        class Event:
+            def __init__(self, message_str):
+                self.message_str = message_str
+
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        control_replies = [
+            item
+            async for item in plugin.cmd_prompt_plan_draw(
+                Event("/方案 EX-005 --m p"),
+                "EX-005 --m p",
+            )
+        ]
+        swap_replies = [
+            item
+            async for item in plugin.cmd_prompt_plan_draw(
+                Event("/方案 EX-005 --llmcc"),
+                "EX-005 --llmcc",
+            )
+        ]
+
+        self.assertIn("不接收底图控制选项", control_replies[0])
+        self.assertIn("不直接执行语义换角", swap_replies[0])
+
+    async def test_prompt_plan_command_resolves_id_before_natural_language_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=2000,
+                send_generation_notice=False,
+                show_llm_prompt=False,
+            )
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._initialization_error = ""
+            plugin._director = object()
+            plugin._director_error = ""
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._extract_pipeline_request = lambda _text: ""
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._generate_directed_instruction = AsyncMock(
+                return_value=(
+                    self.main.PictureInstruction(
+                        "1girl, cosplay costume, cafe. A cosplayer sits beside a warm window.",
+                        "bad hands",
+                        "",
+                    ),
+                    "director-provider",
+                )
+            )
+            calls = []
+
+            async def run_job(event, options, *, notify_queue=True):
+                calls.append((event, options))
+                return [Path("plan.png")], 654, options.prompt, "", None
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(
+                message_str="/方案 ex-005 再出个cos给我看看 --seed 11",
+                plain_result=lambda text: text,
+            )
+            responses = [
+                item
+                async for item in plugin.cmd_prompt_plan_draw(
+                    event,
+                    "ex-005",
+                )
+            ]
+
+        self.assertEqual(len(calls), 1)
+        options = calls[0][1]
+        self.assertEqual(options.seed, 11)
+        self.assertFalse(options.use_prompt_llm)
+        self.assertIn("cosplay costume", options.prompt)
+        self.assertIn("bad hands", options.negative_prompt)
+        self.assertIn("IMAGE_RESULT", responses)
+        director_request = plugin._generate_directed_instruction.await_args.args[1]
+        self.assertIn('"user_delta":"再出个cos给我看看"', director_request)
+        self.assertNotIn("prompt plan not found", "\n".join(map(str, responses)))
+
+    def test_prompt_plan_request_uses_longest_unique_name_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            saved = plugin._prompt_plans.save_plan(
+                name="风格2（凛然）",
+                positive_prompt="1girl, portrait. A woman faces the viewer.",
+            )
+
+            plan, delta = plugin._resolve_prompt_plan_request(
+                "风格2 再画一张夜景版本"
+            )
+
+        self.assertEqual(plan["plan_id"], saved["plan_id"])
+        self.assertEqual(delta, "再画一张夜景版本")
+
+    def test_prompt_plan_request_does_not_match_id_without_boundary(self):
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._prompt_plans = self.main.PromptPlanStore("unused.json")
+
+        with self.assertRaises(self.main.PromptPlanNotFoundError):
+            plugin._resolve_prompt_plan_request("EX-005foo")
+
+    async def test_prompt_plan_raw_delta_appends_without_director(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            plugin.settings = types.SimpleNamespace(
+                max_prompt_length=4000,
+                send_generation_notice=False,
+                show_llm_prompt=False,
+            )
+            plugin._client = object()
+            plugin._workflow_builder = object()
+            plugin._pipeline_builders = {}
+            plugin._initialization_error = ""
+            plugin._director = None
+            plugin._director_error = "disabled"
+            plugin._access_error = lambda *_args, **_kwargs: None
+            plugin._extract_resolution_request = lambda _text: (None, None)
+            plugin._extract_pipeline_request = lambda _text: ""
+            plugin._find_requested_style_preset = lambda _text: ""
+            plugin._schedule_cleanup = lambda _paths: None
+            plugin._make_image_result = lambda *_args, **_kwargs: "IMAGE_RESULT"
+            plugin._generate_directed_instruction = AsyncMock()
+            calls = []
+
+            async def run_job(event, options, *, notify_queue=True):
+                calls.append(options)
+                return [Path("raw.png")], 1, options.prompt, "", None
+
+            plugin._run_job = run_job
+            event = types.SimpleNamespace(
+                message_str="/方案 EX-005 red cosplay costume --raw",
+                plain_result=lambda text: text,
+            )
+            responses = [
+                item
+                async for item in plugin.cmd_prompt_plan_draw(event, "EX-005")
+            ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("red cosplay costume", calls[0].prompt)
+        plugin._generate_directed_instruction.assert_not_awaited()
+        self.assertIn("IMAGE_RESULT", responses)
+
+    async def test_prompt_plan_llm_tool_is_admin_only_and_path_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin._prompt_plans = self.main.PromptPlanStore(
+                Path(directory) / "plans.json"
+            )
+            saved = plugin._prompt_plans.save_plan(
+                name="暖光咖啡馆",
+                positive_prompt="1girl, cafe. A woman sits beside a warm window.",
+                pipeline="base",
+            )
+            denied = await plugin.list_anima_prompt_plans(
+                types.SimpleNamespace(is_admin=lambda: False),
+                keyword=saved["plan_id"],
+                detail=True,
+            )
+            allowed = await plugin.list_anima_prompt_plans(
+                types.SimpleNamespace(is_admin=lambda: True),
+                keyword=saved["plan_id"],
+                detail=True,
+            )
+
+        self.assertEqual(json.loads(denied)["code"], "PROMPT_PLAN_DENIED")
+        payload = json.loads(allowed)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["plans"][0]["plan_id"], saved["plan_id"])
+        self.assertNotIn("storage_path", allowed)
+        self.assertNotIn(str(directory), allowed)
+
+    async def test_prompt_lab_confirm_rechecks_revision_after_lora_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": 11,
+                    "count": 1,
+                    "base_layers": {"identity": ["1girl"]},
+                }
+            )
+
+            async def mutate_library(*_args, **_kwargs):
+                plugin._prompt_assets.create_custom(
+                    {"asset_type": "pose", "name_en": "Changed During Confirm"}
+                )
+                return {"required": 0, "validated": 0, "catalog_fingerprint": ""}
+
+            plugin._validate_prompt_lab_loras = AsyncMock(
+                side_effect=mutate_library
+            )
+
+            with self.assertRaises(self.main.WebUiActionError) as captured:
+                await plugin.web_ui_prompt_lab_confirm(
+                    {
+                        "batch_id": generated["batch"]["batch_id"],
+                        "selection": 1,
+                    }
+                )
+
+        self.assertIn("确认校验期间", str(captured.exception))
+
+    async def test_prompt_lab_private_batch_is_actively_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            plugin._prompt_lab_batches["batch"] = {
+                "expires_at": time.time() + 0.01,
+            }
+            plugin._schedule_prompt_lab_expiry("batch", time.time() + 0.01)
+
+            await asyncio.sleep(0.15)
+
+        self.assertNotIn("batch", plugin._prompt_lab_batches)
+
+    async def test_prompt_lab_lora_confirmation_is_exact_and_never_submits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._prompt_lab_plugin(Path(directory))
+            plugin._lora_catalog = object()
+            plugin._client = types.SimpleNamespace(submit=AsyncMock())
+            plugin._refresh_lora_manager_before = AsyncMock(
+                return_value=(
+                    types.SimpleNamespace(name="foo.safetensors"),
+                )
+            )
+            generated = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": "fixed-seed",
+                    "count": 1,
+                    "base_layers": {
+                        "identity": ["1girl"],
+                        "lora": ["<lora:folder/foo:0.7>"],
+                    },
+                }
+            )
+            request = {
+                "batch_id": generated["batch"]["batch_id"],
+                "selection": 1,
+            }
+            with self.assertRaisesRegex(
+                self.main.WebUiActionError,
+                "完整名称唯一确认",
+            ):
+                await plugin.web_ui_prompt_lab_confirm(request)
+
+            plugin._refresh_lora_manager_before.return_value = (
+                types.SimpleNamespace(name="folder/foo.safetensors"),
+            )
+            confirmed = await plugin.web_ui_prompt_lab_confirm(request)
+
+        self.assertTrue(confirmed["confirmed"])
+        self.assertFalse(confirmed["submitted"])
+        self.assertEqual(confirmed["lora_validation"]["validated"], 1)
+        plugin._client.submit.assert_not_awaited()
+        self.assertTrue(
+            all(call.kwargs.get("force") is True for call in plugin._refresh_lora_manager_before.await_args_list)
+        )
+
+    async def test_lora_gallery_is_path_free_and_uses_forced_refresh(self):
+        class Page:
+            def to_dict(self):
+                return {
+                    "manifest_fingerprint": "a" * 64,
+                    "items": [
+                        {
+                            "asset_id": "b" * 64,
+                            "name": "characters/example.safetensors",
+                            "path": "/models/loras/private/example.safetensors",
+                        }
+                    ],
+                    "total": 1,
+                    "page": 1,
+                    "page_size": 50,
+                    "pages": 1,
+                }
+
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_visuals = types.SimpleNamespace(
+            list_page=Mock(return_value=Page())
+        )
+        plugin._lora_visual_error = ""
+        plugin._refresh_lora_manager_before = AsyncMock(return_value=(object(),))
+
+        result = await plugin.web_ui_lora_gallery({})
+
+        self.assertNotIn("path", result["items"][0])
+        self.assertTrue(plugin._refresh_lora_manager_before.await_args.kwargs["force"])
+
+    async def test_empty_root_gallery_warms_remote_keys_and_serves_reencoded_data(self):
+        catalog_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_catalog"
+        )
+        visual_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.lora_visuals"
+        )
+        record = catalog_module.LoraRecord(
+            name="characters/remote.safetensors",
+            preview_url="http://manager.invalid/api/lm/previews?opaque=1",
+            source_fingerprint="d" * 64,
+        )
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), (255, 128, 0)).save(image_buffer, format="PNG")
+
+        class Catalog:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch_manager_preview(self, current, *, max_bytes):
+                self.calls += 1
+                self.assert_record = current
+                self.max_bytes = max_bytes
+                return image_buffer.getvalue(), "image/png"
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = visual_module.LoraVisualService(
+                (),
+                Path(directory) / "cache",
+                max_preview_bytes=4 * 1024 * 1024,
+            )
+            manifest = service.build_manifest((record,))
+            key = manifest.items[0].preview_key
+            catalog = Catalog()
+            plugin = object.__new__(self.main.ComfyAnimaPlugin)
+            plugin.settings = types.SimpleNamespace(lora_visual_preview_max_mb=4)
+            plugin._lora_visuals = service
+            plugin._lora_visual_error = ""
+            plugin._lora_catalog = catalog
+            plugin._task_store = None
+            plugin._refresh_lora_manager_before = AsyncMock(return_value=(record,))
+
+            warmed = await plugin.web_ui_lora_visual_warm(
+                {"keys": [key], "limit": 1}
+            )
+            latest = service.build_manifest((record,))
+            preview = await plugin.web_ui_lora_preview(key, latest.fingerprint)
+            service.close()
+
+        self.assertEqual(warmed["schedule"]["remote_succeeded"], 1)
+        self.assertEqual(warmed["schedule"]["remote_failed"], 0)
+        self.assertEqual(catalog.calls, 1)
+        self.assertEqual(preview["media_type"], "image/webp")
+        self.assertTrue(preview["data_url"].startswith("data:image/webp;base64,"))
+        self.assertNotIn("path", preview)
+
+    async def test_lora_preview_rejects_stale_manifest_before_read(self):
+        manifest = types.SimpleNamespace(
+            fingerprint="a" * 64,
+            items=(),
+        )
+        service = types.SimpleNamespace(
+            build_manifest=Mock(return_value=manifest),
+            read_preview=Mock(),
+        )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(lora_visual_preview_max_mb=4)
+        plugin._lora_visuals = service
+        plugin._lora_visual_error = ""
+        plugin._lora_catalog = object()
+        plugin._refresh_lora_manager_before = AsyncMock(return_value=(object(),))
+
+        with self.assertRaisesRegex(
+            self.main.WebUiActionError,
+            "LoRA 图库已变化",
+        ):
+            await plugin.web_ui_lora_preview("b" * 64, "c" * 64)
+        service.read_preview.assert_not_called()
+
+    async def test_lora_cache_delete_uses_strict_clear_not_quota_prune(self):
+        service = types.SimpleNamespace(
+            build_manifest=Mock(
+                return_value=types.SimpleNamespace(fingerprint="a" * 64)
+            ),
+            clear_cache=Mock(
+                return_value={
+                    "removed": 2,
+                    "removed_bytes": 1024,
+                    "remaining_bytes": 0,
+                }
+            ),
+            prune_cache=Mock(),
+        )
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._lora_visuals = service
+        plugin._lora_visual_error = ""
+        plugin._refresh_lora_manager_before = AsyncMock(return_value=(object(),))
+
+        result = await plugin.web_ui_lora_visual_prune()
+
+        self.assertEqual(result["removed"], 2)
+        service.clear_cache.assert_called_once_with()
+        service.prune_cache.assert_not_called()
+
+    async def test_prompt_lab_task_events_store_hashes_not_private_content(self):
+        task_module = importlib.import_module(
+            "astrbot_plugin_comfy_anima.services.task_store"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self._prompt_lab_plugin(root)
+            store = task_module.TaskStore(root / "tasks.sqlite3")
+            plugin._task_store = store
+            result = await plugin.web_ui_prompt_lab_generate(
+                {
+                    "seed": "private-seed-value",
+                    "count": 1,
+                    "base_layers": {"identity": ["private-character-term"]},
+                }
+            )
+            task = store.get_task(result["task_run_id"])
+            events = store.read_events(run_id=result["task_run_id"])
+            serialized = json.dumps(
+                {"task": task, "events": events},
+                ensure_ascii=False,
+            )
+            store.close()
+
+        self.assertNotIn("private-seed-value", serialized)
+        self.assertNotIn("private-character-term", serialized)
+        self.assertIn("prompt_lab_candidates_ready", serialized)
+
+
+class V210ReverseAndControlIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _settings(**overrides):
+        values = {
+            "enable_reverse_prompt": True,
+            "reverse_backend": "workflow",
+            "enable_control_stack_v2": True,
+            "control_default_fidelity": "balanced",
+            "control_default_resize_policy": "fit",
+            "control_default_reference_scope": "appearance",
+            "default_generation_pipeline": "base",
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    async def test_workflow_reverse_never_calls_vision_service(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+
+        class WorkflowReverse:
+            @staticmethod
+            async def reverse(_path):
+                return ReverseEvidence.flat_tagger(
+                    r"1girl, rio_\(blue_archive\)",
+                    backend="workflow:wd_tagger_mira",
+                )
+
+        class VisionReverse:
+            @staticmethod
+            async def reverse(*_args, **_kwargs):
+                raise AssertionError("workflow backend must not call vision")
+
+        plugin._workflow_reverse = WorkflowReverse()
+        plugin._reverse_prompt = VisionReverse()
+        result, provider = await plugin._call_reverse_prompt(
+            object(), object(), Path("input.png")
+        )
+
+        self.assertEqual(provider, "workflow:wd_tagger_mira")
+        self.assertFalse(result.confidence_available)
+
+    async def test_workflow_failure_is_closed_without_vision_fallback(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+        called = 0
+
+        class WorkflowReverse:
+            @staticmethod
+            async def reverse(_path):
+                raise ReverseWorkflowError("tagger output is empty", code="empty_tags")
+
+        class VisionReverse:
+            @staticmethod
+            async def reverse(*_args, **_kwargs):
+                nonlocal called
+                called += 1
+
+        plugin._workflow_reverse = WorkflowReverse()
+        plugin._reverse_prompt = VisionReverse()
+        with self.assertRaises(self.main.ReversePromptError) as raised:
+            await plugin._call_reverse_prompt(object(), object(), Path("input.png"))
+
+        self.assertEqual(raised.exception.code, "workflow_empty_tags")
+        self.assertEqual(called, 0)
+
+    async def test_hybrid_is_the_only_mode_that_falls_back_to_vision(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings(
+            reverse_backend="hybrid",
+            enable_llm_pic_trigger=False,
+        )
+        plugin._internal_llm_events = set()
+
+        class WorkflowReverse:
+            @staticmethod
+            async def reverse(_path):
+                raise ReverseWorkflowError("tagger timed out", code="timeout")
+
+        class VisionReverse:
+            @staticmethod
+            async def reverse(*_args, **_kwargs):
+                return ReversePromptResult("1girl, solo"), "vision-provider"
+
+        plugin._workflow_reverse = WorkflowReverse()
+        plugin._reverse_prompt = VisionReverse()
+        _result, provider = await plugin._call_reverse_prompt(
+            object(), object(), Path("input.png")
+        )
+
+        self.assertEqual(provider, "vision-provider")
+
+    def test_dual_image_natural_binding_builds_independent_channels(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+        plan = plugin._make_control_plan(
+            self.main.GenerationOptions(
+                prompt="姿势用图1，构图用图2",
+                control_modes=("pose", "depth"),
+                pipeline="base",
+            ),
+            image_count=2,
+        )
+
+        self.assertEqual(
+            [(channel.mode, channel.source_index) for channel in plan.channels],
+            [("pose", 1), ("depth", 2)],
+        )
+
+    def test_dual_image_ambiguous_binding_stops_before_submission(self) -> None:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin.settings = self._settings()
+        with self.assertRaisesRegex(ValueError, "未明确绑定"):
+            plugin._make_control_plan(
+                self.main.GenerationOptions(
+                    prompt="保持姿势和构图",
+                    control_modes=("pose", "depth"),
+                ),
+                image_count=2,
+            )
+
+
+class TwoNineBDefaultStyleIsolationTests(unittest.TestCase):
+    """A 2.9B profile must not inherit the persisted Legacy style preset."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+    @staticmethod
+    def _plugin(model_family: str):
+        plugin = object.__new__(TwoNineBDefaultStyleIsolationTests.main.ComfyAnimaPlugin)
+        plugin.settings = types.SimpleNamespace(
+            model_family=model_family,
+            default_style_preset="风格001",
+        )
+
+        class Registry:
+            @staticmethod
+            def match_style_selections(_parsed):
+                return ()
+
+            @staticmethod
+            def resolve(identifier):
+                category = "artist_style" if identifier == "风格001" else "character"
+                return types.SimpleNamespace(
+                    name=identifier,
+                    category=category,
+                    selections=(),
+                )
+
+        plugin._lora_presets = Registry()
+        return plugin
+
+    def test_29b_omits_default_style_without_mutating_setting(self) -> None:
+        plugin = self._plugin("anima_29b_40l")
+        presets, replace_stack = plugin._resolve_job_presets("", ())
+        self.assertEqual(presets, ())
+        self.assertFalse(replace_stack)
+        self.assertEqual(plugin.settings.default_style_preset, "风格001")
+
+    def test_29b_character_preset_does_not_auto_add_legacy_style(self) -> None:
+        plugin = self._plugin("anima_29b_40l")
+        presets, replace_stack = plugin._resolve_job_presets("角色001", ())
+        self.assertEqual([preset.name for preset in presets], ["角色001"])
+        self.assertFalse(replace_stack)
+
+    def test_legacy_still_uses_default_style(self) -> None:
+        plugin = self._plugin("anima_legacy_28l")
+        presets, replace_stack = plugin._resolve_job_presets("", ())
+        self.assertEqual([preset.name for preset in presets], ["风格001"])
+        self.assertTrue(replace_stack)
+
+
+
+class RecipeAnchorBindingTests(unittest.TestCase):
+    """3.1.431：配方角色 LoRA 在自拍/多人 prompt 缺自身锚点 tag 时的放行。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _install_astrbot_stubs()
+        cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
+        _install_ledger_fallback()
+
+    def _index(self) -> "DanbooruTagIndex":
+        index = DanbooruTagIndex(Path(tempfile.mkdtemp()) / "tags.sqlite3")
+        index.import_bytes(
+            json.dumps(
+                {
+                    "tags": [
+                        {"tag": "wuthering_waves", "category": "copyright"},
+                        {
+                            "tag": "denia_(wuthering_waves)",
+                            "category": "character",
+                        },
+                        {
+                            "tag": "sigrika_(wuthering_waves)",
+                            "category": "character",
+                        },
+                    ],
+                    "aliases": [],
+                }
+            ).encode(),
+            content_type="json",
+        )
+        return index
+
+    def _plugin(self, record, entry) -> object:
+        plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        plugin._danbooru_index = self._index()
+        plugin._danbooru_index_ready = lambda: True
+        plugin._runtime_semantic_index = lambda: SimpleNamespace(
+            entry_for=lambda _record: entry,
+            entries={entry.identity_key: entry},
+        )
+        plugin._record_image_task_phase = lambda *args, **kwargs: None
+        return plugin
+
+    def _denia_record(self):
+        return LoraRecord(
+            "29B/anima-000040_29b.safetensors",
+            sha256="a" * 64,
+            category="character",
+            character_name="Denia",
+        )
+
+    def _denia_entry(self, record):
+        return SemanticEntry(
+            identity_key=semantic_identity_key(record.name, record.sha256),
+            canonical_name=record.name,
+            sha256=record.sha256,
+            analysis_status="searchable",
+            category=(SemanticFact("character", "manual"),),
+            identity_bindings=(
+                LoraIdentityBinding(
+                    character_canonical="denia_(wuthering_waves)",
+                    copyright_canonical="wuthering_waves",
+                    activation_terms=(),
+                ),
+            ),
+        )
+
+    def test_recipe_anchor_authorizes_self_lora_without_self_tag(self) -> None:
+        record = self._denia_record()
+        plugin = self._plugin(record, self._denia_entry(record))
+        job = self.main.GenerationJob("user", "draw", 0.0)
+        job.llm_declared_character_canonicals = frozenset(
+            {"sigrika_(wuthering_waves)"}
+        )
+        key = self.main.canonical_lora_name(record.name).casefold()
+        selection = LoraSelection(record.name, 0.8)
+        kept, _overrides, bound_overrides, filtered = asyncio.run(
+            plugin._bind_llm_character_loras(
+                job,
+                prompt="2girls, sigrika_\(wuthering_waves\), school uniform",
+                selections=(selection,),
+                resolved_records={key: record},
+                strict_keys=frozenset({key}),
+                recipe_identity_anchor="denia_(wuthering_waves)",
+            )
+        )
+        self.assertNotIn(key, {k.casefold() for k in filtered})
+        self.assertIn(key, {self.main.canonical_lora_name(s.name).casefold() for s in kept})
+        self.assertEqual(
+            job.character_identity["canonical"], "denia_(wuthering_waves)"
+        )
+        self.assertTrue(bound_overrides.get(key))
+
+    def test_sha_drift_still_authorizes_via_raw_binding_lookup(self) -> None:
+        """semantic entry 的 sha 与 record 漂移时，raw 回查仍放行配方 LoRA。"""
+
+        record = self._denia_record()
+        entry = self._denia_entry(record)
+        drifted_sha = "b" * 64
+        entry = replace(
+            entry,
+            sha256=drifted_sha,
+            identity_key=self.main.semantic_identity_key(record.name, drifted_sha),
+        )
+        plugin = self._plugin(record, entry)
+        job = self.main.GenerationJob("user", "draw", 0.0)
+        job.llm_declared_character_canonicals = frozenset(
+            {"sigrika_(wuthering_waves)"}
+        )
+        key = self.main.canonical_lora_name(record.name).casefold()
+        selection = LoraSelection(record.name, 0.8)
+        kept, _overrides, bound_overrides, filtered = asyncio.run(
+            plugin._bind_llm_character_loras(
+                job,
+                prompt="2girls, sigrika_\(wuthering_waves\), school uniform",
+                selections=(selection,),
+                resolved_records={key: record},
+                strict_keys=frozenset({key}),
+                recipe_identity_anchor="denia_(wuthering_waves)",
+            )
+        )
+        self.assertNotIn(key, {k.casefold() for k in filtered})
+        self.assertIn(key, {self.main.canonical_lora_name(s.name).casefold() for s in kept})
+        self.assertEqual(
+            job.character_identity["canonical"], "denia_(wuthering_waves)"
+        )
+        self.assertTrue(bound_overrides.get(key))
+
+    def test_unrelated_binding_still_rejected_without_recipe_anchor(self) -> None:
+        record = self._denia_record()
+        plugin = self._plugin(record, self._denia_entry(record))
+        job = self.main.GenerationJob("user", "draw", 0.0)
+        job.llm_declared_character_canonicals = frozenset(
+            {"sigrika_(wuthering_waves)"}
+        )
+        key = self.main.canonical_lora_name(record.name).casefold()
+        selection = LoraSelection(record.name, 0.8)
+        with self.assertRaises(self.main.LoraWorkflowError):
+            asyncio.run(
+                plugin._bind_llm_character_loras(
+                    job,
+                    prompt="2girls, sigrika_\(wuthering_waves\)",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                    strict_keys=frozenset({key}),
+                )
+            )
+
+    def test_mismatched_recipe_anchor_still_rejected(self) -> None:
+        record = self._denia_record()
+        plugin = self._plugin(record, self._denia_entry(record))
+        job = self.main.GenerationJob("user", "draw", 0.0)
+        job.llm_declared_character_canonicals = frozenset(
+            {"sigrika_(wuthering_waves)"}
+        )
+        key = self.main.canonical_lora_name(record.name).casefold()
+        selection = LoraSelection(record.name, 0.8)
+        with self.assertRaises(self.main.LoraWorkflowError):
+            asyncio.run(
+                plugin._bind_llm_character_loras(
+                    job,
+                    prompt="2girls, sigrika_\(wuthering_waves\)",
+                    selections=(selection,),
+                    resolved_records={key: record},
+                    strict_keys=frozenset({key}),
+                    recipe_identity_anchor="rio_(blue_archive)",
+                )
+            )
+
+
+
+if __name__ == "__main__":
+    unittest.main()

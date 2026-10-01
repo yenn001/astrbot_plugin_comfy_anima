@@ -1,0 +1,5 @@
+{
+  "1": {"inputs": {"image": "example.png"}, "class_type": "LoadImage", "_meta": {"title": "Reverse Input"}},
+  "2": {"inputs": {"image": ["1", 0], "model_name": "wd-convnext-tagger-v3.onnx", "general_threshold": 0.55, "character_threshold": 0.6, "general_mcut": false, "character_mcut": false, "replace_space": true, "categories": "copyright,character,general", "exclude_tags": "", "session_method": "CPU"}, "class_type": "wd_tagger_mira", "_meta": {"title": "Mira WD Tagger"}},
+  "3": {"inputs": {"text": ["2", 0]}, "class_type": "ShowText|pysssss", "_meta": {"title": "Reverse Tags"}}
+}

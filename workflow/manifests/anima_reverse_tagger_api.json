@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "profile_id": "anima_reverse_tagger",
+  "display_name": "Anima Local Mira WD Tagger Reverse",
+  "workflow_file": "anima_reverse_tagger_api.json",
+  "task_type": "analysis",
+  "bindings": {
+    "input_image": {"node_id": "1", "input": "image"},
+    "tagger": {"node_id": "2", "image_input": "image", "model_input": "model_name", "general_input": "general_threshold", "character_input": "character_threshold", "categories_input": "categories", "exclude_tags_input": "exclude_tags", "session_input": "session_method"},
+    "text_output": {"node_id": "3"}
+  },
+  "defaults": {"model_name": "wd-convnext-tagger-v3.onnx", "general": 0.55, "character": 0.6, "categories": "copyright,character,general", "session_method": "CPU"}
+}
