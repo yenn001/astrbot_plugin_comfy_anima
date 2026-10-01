@@ -307,9 +307,23 @@
                 <label><span>Rerank 差值阈值</span><input name="intent_judge_local_rerank_threshold" type="number" min="-1" max="1" step="0.01"></label>
                 <label><span>Auto 本地置信度下限</span><input name="intent_judge_auto_confidence_floor" type="number" min="0" max="1" step="0.05"></label>
                 <label><span>在线判断超时（秒）</span><input name="intent_judge_online_timeout" type="number" min="1" max="120" step="0.5"></label>
+                <label><span>在线判断 Temperature</span><input name="intent_judge_online_temperature" type="number" min="0" max="2" step="0.05"></label>
+                <label><span>本地路由最低置信度</span><input name="intent_router_min_confidence" type="number" min="0" max="1" step="0.05"></label>
+                <label><span>判定失败时回退为</span><select name="intent_judge_fallback">
+                  <option value="no_draw">no_draw：不出图（保守）</option>
+                  <option value="draw_now">draw_now：出图</option>
+                  <option value="await">await：等下一轮</option>
+                </select></label>
+                <label class="toggle"><input name="enable_local_intent_router" type="checkbox"><span>启用本地意图路由（embedding + rerank）</span></label>
+                <label class="span-2"><span>正向语义锚点（每行一条）</span><textarea name="intent_judge_positive_anchors" rows="2" placeholder="Bot is about to generate and send an image"></textarea></label>
+                <label class="span-2"><span>负向语义锚点（每行一条）</span><textarea name="intent_judge_negative_anchors" rows="2" placeholder="Bot is only chatting normally without drawing"></textarea></label>
                 <label><span>普通聊天模式</span><select name="interaction_mode"><option value="smart">Smart：独立模型判断</option><option value="strict">Strict：命令/确认后提交</option></select></label>
                 <label><span>最大输出 Tokens</span><input name="prompt_llm_max_tokens" type="number" min="128"></label>
                 <label><span>换角分类总超时（秒）</span><input name="character_swap_timeout" type="number" min="30" max="600" step="1"></label>
+                <div class="span-4 section-divider"><span>提示词定制</span></div>
+                <label class="span-2"><span>导演附加指令</span><textarea name="director_extra_instruction" rows="2" placeholder="追加给绘图导演的固定要求"></textarea></label>
+                <label class="span-2"><span>创作偏好</span><textarea name="director_creative_preference" rows="2" placeholder="偏向的题材 / 构图 / 氛围"></textarea></label>
+                <label class="span-4"><span>角色扮演契约提示词（普通聊天出图时注入）</span><textarea name="chat_roleplay_draw_prompt" rows="3" placeholder="留空则使用内置默认契约"></textarea></label>
                 <label class="toggle"><input name="enable_prompt_llm" type="checkbox"><span>启用 LLM 提示词优化</span></label>
                 <label><span>自然语言绘图模式</span><select name="natural_draw_mode"><option value="off">关闭</option><option value="photo_only">仅照片/视觉请求</option><option value="full">完整自然绘图</option></select></label>
                 <label class="toggle"><input name="enable_time_context" type="checkbox"><span>出图同步现实时间（按时段补光影标签）</span></label>
@@ -333,6 +347,12 @@
                   <small class="muted">独立于上方用户消息闸门后端；管理员门禁跟随 AstrBot 平台主管理员列表，插件内不另设名单。</small>
                 </div>
                 <label class="span-3"><span>交付语词表（逗号或换行，仅作用于 Bot 回复判定）</span><textarea name="bot_reply_draw_delivery_phrases" rows="2"></textarea></label>
+                <div class="span-4 section-divider"><span>BOT 角色绑定</span></div>
+                <label class="toggle"><input name="enable_bot_character_binding" type="checkbox"><span>启用绑定（未点名其它角色的出图，自动套用绑定预设）</span></label>
+                <label><span>中间轮次静默</span><input name="suppress_intermediate_draw_text" type="checkbox" style="width:auto"></label>
+                <label class="span-2"><span>绑定角色预设名</span><input name="bot_character_preset" placeholder="角色类预设名，例如 达妮娅；须为契约角色预设"></label>
+                <label class="span-3"><span>作用域覆盖（每行 `scope=预设名`；scope 可为 unified_msg_origin、session:sender、self:session:sender 或平台段）</span><textarea name="bot_character_preset_scopes" rows="2" placeholder="Bot:FriendMessage:719397082=达妮娅"></textarea></label>
+                <p class="span-4 muted">绑定把"这个 BOT 是谁"变成配置事实，不依赖运行时 persona。预设必须是契约角色预设（身份锚点与必需触发词齐全），否则保存会被拒绝并列出可用项。用户显式点名其它角色、或执行换角命令时，绑定自动让位。</p>
                 <div class="span-4 section-divider"><span>Prompt Composer v2</span></div>
                 <label class="toggle"><input name="enable_prompt_composer_v2" type="checkbox"><span>启用三层提示词整理</span></label>
                 <label><span>动态负面词策略</span><select name="adaptive_negative_mode"><option value="off">关闭</option><option value="conservative">保守</option><option value="standard">标准</option></select></label>

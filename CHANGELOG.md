@@ -2,6 +2,31 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.3] - 2026-10-02（构建 3.1.441）
+
+### WebUI 配置面对接修复（P1–P3）与新增配置的界面入口
+
+- **P1（缺陷修复）**：`enable_bot_reply_draw`、`bot_reply_draw_cooldown_seconds`、
+  `bot_reply_intent_backend`、`bot_reply_draw_delivery_phrases` 四个控件一直渲染在
+  设置表单里、bootstrap 也下发当前值，但**不在保存白名单** `WEB_UI_EDITABLE_FIELDS`
+  ——保存被静默丢弃（只改它们还会报"没有收到可保存的设置"）。现已纳入白名单，
+  并补判定后端枚举、冷却范围校验。
+- **P2（新增配置补控件）**：`enable_bot_character_binding`、`bot_character_preset`、
+  `bot_character_preset_scopes`、`suppress_intermediate_draw_text` 四项新增配置
+  此前只能手改 JSON 或用 AstrBot 原生页；现补入独立控制台设置表单与 bootstrap 载荷。
+  绑定预设（含作用域值）在**保存期**即校验是否为契约角色预设，非法直接拒绝并列出可用项
+  （运行期仍是 fail-soft 警告）。
+- **P3（补齐已有配置的控件）**：`chat_roleplay_draw_prompt`、`director_extra_instruction`、
+  `director_creative_preference`、`intent_judge_positive_anchors`、
+  `intent_judge_negative_anchors`、`intent_judge_fallback`、
+  `intent_judge_online_temperature`、`intent_router_min_confidence`、
+  `enable_local_intent_router` 九项后端早已可保存、bootstrap 早已下发，仅缺前端控件；
+  现补入意图判定与提示词定制两处。
+- 前端：`web/`（真源）新增 13 个控件、类型集与收集逻辑补齐（含字典字段按 `键=值` 行
+  的双向转换）；`pages/control/` 由 `scripts/sync_web_assets.py` 同步。
+- 复核：四方审计（表单 / 白名单 / schema / 模型）A 类归零；bootstrap 轴仅剩
+  `web_ui_password`（不回显属正确设计）。
+
 ## [2.4.3] - 2026-10-01（构建 3.1.440）
 
 ### 工具轮次不再逐轮刷屏 + 家族映射去重

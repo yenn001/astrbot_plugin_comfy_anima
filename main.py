@@ -700,6 +700,27 @@ WEB_UI_EDITABLE_FIELDS = (
     "web_ui_username",
     "web_ui_password",
     "web_ui_session_ttl",
+    # Bot 回复意图续画：界面早已渲染这四个控件，但此前不在保存白名单里，
+    # 保存时被静默丢弃（只改它们还会报"没有收到可保存的设置"）。
+    "enable_bot_reply_draw",
+    "bot_reply_draw_cooldown_seconds",
+    "bot_reply_intent_backend",
+    "bot_reply_draw_delivery_phrases",
+    # BOT 角色绑定与绘图链中间轮次静默（本插件新增配置的界面入口）
+    "enable_bot_character_binding",
+    "bot_character_preset",
+    "bot_character_preset_scopes",
+    "suppress_intermediate_draw_text",
+    # 提示词与意图判定调参：bootstrap 早已下发这些值，此前没有对应控件
+    "chat_roleplay_draw_prompt",
+    "director_extra_instruction",
+    "director_creative_preference",
+    "intent_judge_positive_anchors",
+    "intent_judge_negative_anchors",
+    "intent_judge_fallback",
+    "intent_judge_online_temperature",
+    "intent_router_min_confidence",
+    "enable_local_intent_router",
 )
 
 WEB_UI_LEGACY_FIELDS = frozenset(
@@ -711,6 +732,12 @@ WEB_UI_LEGACY_FIELDS = frozenset(
         "enable_chinese_prompt_translation",
     }
 )
+
+# Web UI 保存期的枚举约束（与 intent_judge 的后端常量保持一致）
+WEB_UI_REPLY_INTENT_BACKENDS = frozenset(
+    {"off", "rule", "local", "online", "auto", "both"}
+)
+WEB_UI_INTENT_FALLBACKS = frozenset({"no_draw", "draw_now", "await"})
 
 IMAGE_TASK_TYPES = frozenset(
     {
@@ -15971,6 +15998,16 @@ QQ快捷指令:
                 "bot_reply_draw_delivery_phrases": (
                     list(settings.bot_reply_draw_delivery_phrases)
                 ),
+                "enable_bot_character_binding": (
+                    settings.enable_bot_character_binding
+                ),
+                "bot_character_preset": settings.bot_character_preset,
+                "bot_character_preset_scopes": dict(
+                    settings.bot_character_preset_scopes
+                ),
+                "suppress_intermediate_draw_text": (
+                    settings.suppress_intermediate_draw_text
+                ),
                 "interaction_mode": settings.interaction_mode,
                 "enable_prompt_composer_v2": settings.enable_prompt_composer_v2,
                 "natural_draw_mode": settings.natural_draw_mode,
@@ -16130,6 +16167,55 @@ QQ快捷指令:
             },
         }
 
+    def _validate_web_ui_character_binding(
+        self,
+        candidate: Mapping[str, Any],
+        supplied: set[str],
+    ) -> None:
+        """Reject a BOT character binding that cannot act as a deterministic identity.
+
+        The runtime treats an invalid binding as a warning and simply does not
+        apply it; the save path fails loudly instead, so a typo is visible while
+        the operator is still looking at the form. Scope overrides are checked
+        with the same rule because they shadow the global binding.
+        """
+
+        targets: list[tuple[str, str]] = []
+        if "bot_character_preset" in supplied:
+            name = str(candidate.get("bot_character_preset") or "").strip()
+            if name:
+                targets.append(("bot_character_preset", name))
+        if "bot_character_preset_scopes" in supplied:
+            scopes = candidate.get("bot_character_preset_scopes")
+            if isinstance(scopes, Mapping):
+                targets.extend(
+                    (f"scopes[{key}]", str(value or "").strip())
+                    for key, value in scopes.items()
+                    if str(value or "").strip()
+                )
+        registry = getattr(self, "_lora_presets", None)
+        if not targets or registry is None:
+            return
+        problems = [
+            f"{label}={name!r}: {problem}"
+            for label, name in targets
+            if (problem := self._bot_binding_preset_error(name))
+        ]
+        if not problems:
+            return
+        try:
+            available = sorted(
+                preset.name
+                for preset in registry.list_presets(
+                    category=PRESET_CATEGORY_CHARACTER
+                )
+                if getattr(preset, "contract_enabled", False)
+            )
+        except Exception:
+            available = []
+        hint = f"。可用契约角色预设：{'、'.join(available)}" if available else ""
+        raise WebUiActionError("BOT 角色绑定无效 —— " + "；".join(problems) + hint)
+
     async def web_ui_save_settings(
         self,
         payload: dict[str, Any],
@@ -16171,6 +16257,21 @@ QQ快捷指令:
             payload["interaction_mode"]
         ).strip().casefold() not in {"smart", "strict"}:
             raise WebUiActionError("interaction_mode must be smart or strict")
+        if "bot_reply_intent_backend" in supplied and str(
+            payload["bot_reply_intent_backend"]
+        ).strip().casefold() not in WEB_UI_REPLY_INTENT_BACKENDS:
+            raise WebUiActionError(
+                "Bot 回复判定后端仅支持 "
+                + "、".join(sorted(WEB_UI_REPLY_INTENT_BACKENDS))
+            )
+        if "intent_judge_fallback" in supplied and str(
+            payload["intent_judge_fallback"]
+        ).strip().casefold() not in WEB_UI_INTENT_FALLBACKS:
+            raise WebUiActionError(
+                "意图判定回退结论仅支持 "
+                + "、".join(sorted(WEB_UI_INTENT_FALLBACKS))
+            )
+        self._validate_web_ui_character_binding(candidate, supplied)
         router_id = str(candidate.get("intent_router_model") or "").strip()
         auto_cleared_router = False
         if router_id and router_id in {
@@ -16224,6 +16325,9 @@ QQ快捷指令:
             "lora_visual_warmup_workers": (1, 4),
             "lora_visual_preview_max_mb": (1, 32),
             "lora_visual_thumbnail_size": (128, 1024),
+            "bot_reply_draw_cooldown_seconds": (0, 3600),
+            "intent_judge_online_temperature": (0, 2),
+            "intent_router_min_confidence": (0, 1),
         }
         for key, (minimum, maximum) in numeric_ranges.items():
             if key not in supplied:

@@ -237,6 +237,8 @@ const numberFields = new Set([
   "danbooru_auto_update_interval_hours",
   "bot_reply_draw_cooldown_seconds",
   "sampler_cfg_override",
+  "intent_judge_online_temperature",
+  "intent_router_min_confidence",
 ]);
 
 const booleanFields = new Set([
@@ -273,6 +275,9 @@ const booleanFields = new Set([
   "enable_time_context",
   "enable_bot_reply_draw",
   "enable_ttp_detail",
+  "enable_bot_character_binding",
+  "suppress_intermediate_draw_text",
+  "enable_local_intent_router",
 ]);
 
 async function refreshStickyNegatives() {
@@ -1252,6 +1257,11 @@ function populateSettings(settings) {
       if (name === "enable_chat_draw_terminal_guard") field.disabled = true;
     } else if (Array.isArray(value)) {
       field.value = value.join("\n");
+    } else if (value && typeof value === "object") {
+      // 字典字段（如 bot_character_preset_scopes）回填为每行 `键=值`
+      field.value = Object.entries(value)
+        .map(([key, item]) => `${key}=${item}`)
+        .join("\n");
     } else {
       field.value = value ?? "";
     }
@@ -1287,12 +1297,26 @@ function collectSettings(form) {
       field.name === "group_whitelist" ||
       field.name === "bot_reply_draw_delivery_phrases" ||
       field.name === "global_extra_positive_tags" ||
-      field.name === "global_extra_negative_tags"
+      field.name === "global_extra_negative_tags" ||
+      field.name === "intent_judge_positive_anchors" ||
+      field.name === "intent_judge_negative_anchors"
     ) {
       result[field.name] = field.value
         .split(/[\n,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
+    } else if (field.name === "bot_character_preset_scopes") {
+      // 每行 `scope=预设名`；非法行直接忽略，由后端做最终校验。
+      const scopes = {};
+      for (const line of field.value.split(/\n+/)) {
+        const text = line.trim();
+        const separator = text.indexOf("=");
+        if (separator <= 0) continue;
+        const key = text.slice(0, separator).trim();
+        const value = text.slice(separator + 1).trim();
+        if (key && value) scopes[key] = value;
+      }
+      result[field.name] = scopes;
     } else if (field.name === "lora_alias_rules") {
       result[field.name] = field.value
         .split(/\n+/)
