@@ -2,6 +2,26 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.3] - 2026-10-02（构建 3.1.443）
+
+### 死配置清理：接线一个、移除两个、加闸门
+
+- **接线** `intent_router_probe_plan`：此前只被装载、从未被读取。现在关闭它会让
+  `_build_auto_draw_intent_plan` 返回不带探针的计划，导演因而不进入两阶段资产探测、
+  直接单阶段出图（省一轮工具调用，代价是不做 LoRA/Danbooru 预检）。
+  **默认保持 `true`，出厂行为不变。**
+- **移除** 两个无消费点的配置项（连同字段、装载与 schema 条目）：
+  - `show_command_progress`：已被 `send_generation_notice` 与
+    `show_chat_generation_details` 取代；
+  - `follow_up_draw_priority`：未完成的设计，只有 `after_delivery` 一个候选值，
+    等于没有选择。
+- **新增配置面闸门** `tests/test_config_schema_gate.py`：遍历 `_conf_schema.json`
+  每个键，要求它在生产代码里有消费点（含"字段被 PluginSettings 方法消费、
+  且该方法被调用"这类间接路径）；无消费点者必须在允许清单里写明理由。
+  清单本身也被测试守护（接线或移除后必须同步清理）。
+- 待决：`conversation_draw_cooldown_seconds` 仍无消费点，已登记在允许清单中；
+  它的接线会改变沉浸聊天的出图节奏，需单独批准。
+
 ## [2.4.3] - 2026-10-02（构建 3.1.442）
 
 ### WebUI 补全档 1 + 档 2（32 个控件）

@@ -507,20 +507,11 @@
     "type": "float",
     "default": 8.0
   },
-  "follow_up_draw_priority": {
-    "description": "follow-up 出图优先级",
-    "type": "string",
-    "default": "after_delivery"
-  },
   "intent_router_probe_plan": {
     "description": "意图路由使用 probe plan",
     "type": "bool",
-    "default": true
-  },
-  "show_command_progress": {
-    "description": "显示命令进度提示",
-    "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "关闭后导演不要求任何资产探测，直接单阶段出图（省一轮工具调用，代价是不做 LoRA/Danbooru 预检）"
   },
   "director_reference_file": {
     "description": "内置分镜参考文件",

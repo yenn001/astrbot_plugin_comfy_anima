@@ -2699,7 +2699,7 @@ class ComfyAnimaPlugin(Star):
         identity_required = bool(subject) and not is_original_character_query(
             subject
         )
-        return build_intent_plan(
+        plan = build_intent_plan(
             message,
             decision=decision,
             requested_subject=subject,
@@ -2708,6 +2708,11 @@ class ComfyAnimaPlugin(Star):
                 getattr(self.settings, "enable_visual_task_intent", True)
             ),
         )
+        if bool(getattr(self.settings, "intent_router_probe_plan", True)):
+            return plan
+        # 关闭探针计划：导演不再要求任何资产探测，因而走单阶段直出、
+        # 省掉一轮工具调用。默认开启，出厂行为不变。
+        return replace(plan, required_probes=(), optional_probes=())
 
     def _director_verified_lora_names(self) -> tuple[str, ...]:
         """Return persisted, locally verified LoRA names for schema validation."""

@@ -328,9 +328,7 @@ class PluginSettings:
     director_creative_preference: str = ""
     max_auto_images_per_reply: int = 1
     conversation_draw_cooldown_seconds: float = 8.0
-    follow_up_draw_priority: str = "after_delivery"
     intent_router_probe_plan: bool = True
-    show_command_progress: bool = True
     enable_reverse_prompt: bool = True
     enable_workflow_reverse: bool = True
     reverse_backend: str = "workflow"
@@ -715,14 +713,8 @@ class PluginSettings:
                 data.get("conversation_draw_cooldown_seconds"),
                 8.0,
             ),
-            follow_up_draw_priority=str(
-                data.get("follow_up_draw_priority", "after_delivery")
-            ).strip(),
             intent_router_probe_plan=_as_bool(
                 data.get("intent_router_probe_plan"), True
-            ),
-            show_command_progress=_as_bool(
-                data.get("show_command_progress"), True
             ),
             enable_reverse_prompt=_as_bool(data.get("enable_reverse_prompt"), True),
             enable_workflow_reverse=_as_bool(
