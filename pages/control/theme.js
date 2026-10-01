@@ -1,7 +1,7 @@
 "use strict";
 
 (() => {
-  const allowed = new Set(["workshop", "editorial", "night"]);
+  const allowed = new Set(["workshop", "editorial", "night", "neon", "console"]);
   let selected = "workshop";
   try {
     const saved = window.localStorage.getItem("comfy-anima-theme");

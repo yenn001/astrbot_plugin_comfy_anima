@@ -2,6 +2,22 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.3] - 2026-10-02（构建 3.1.445）
+
+### 新增两套用户可选主题（暗色霓虹 / 密集终端）
+
+- 控制台原有主题机制（`theme.js` 首屏恢复 + `app.js` `applyTheme` + `app.css`
+  的 `html[data-theme]` 覆盖块 + 顶部主题选择器）保持不变，只是新增两套皮肤：
+  - **暗色霓虹 `neon`**：深色玻璃质感、青紫渐变强调色、去掉硬偏移阴影、圆角卡片；
+  - **密集终端 `console`**：全局等宽字体、无阴影、方角、扁平深色，信息密度更高。
+- 实现要点：两套主题都以 CSS 变量覆盖为主（含 `--hard-shadow` 置空以取消粗野风硬阴影、
+  `--font-display` 去掉衬线），再加针对侧栏/卡片/表格/表单/按钮的结构性覆盖；
+  追加在 `app.css` 末尾以取得源码顺序优先级。
+- 在四处同时登记（缺一会导致选不到或空白）：`web/theme.js` 白名单、
+  `web/app.css` 主题块、`web/app.js` `themeMetaColors`、`web/index.html` 选择器选项。
+- 新增 `tests/test_theme_registry.py`：四处登记必须一致，且每个主题都要有
+  `theme-color` 元色。
+
 ## [2.4.3] - 2026-10-02（构建 3.1.444）
 
 ### 补上 `intent_router_probe_plan` 的界面控件

@@ -88,6 +88,8 @@ const themeMetaColors = {
   workshop: "#25211d",
   editorial: "#34322e",
   night: "#151311",
+  neon: "#0a0c14",
+  console: "#0e1116",
 };
 
 const loraCategoryLabels = {
