@@ -738,6 +738,7 @@ WEB_UI_EDITABLE_FIELDS = (
     "prompt_llm_timeout",
     "prompt_llm_fallback",
     "router_timeout_before_agent",
+    "intent_router_probe_plan",
     "enable_parallel_preflight",
     "provider_max_concurrent_jobs",
     "allow_global_interrupt",
@@ -16072,6 +16073,7 @@ QQ快捷指令:
                 "prompt_llm_timeout": settings.prompt_llm_timeout,
                 "prompt_llm_fallback": settings.prompt_llm_fallback,
                 "router_timeout_before_agent": settings.router_timeout_before_agent,
+                "intent_router_probe_plan": settings.intent_router_probe_plan,
                 "enable_parallel_preflight": settings.enable_parallel_preflight,
                 "provider_max_concurrent_jobs": (
                     settings.provider_max_concurrent_jobs

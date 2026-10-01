@@ -361,6 +361,7 @@
                 <label><span>导演 LLM 超时（秒）</span><input name="prompt_llm_timeout" type="number" min="10" max="600" step="10"></label>
                 <label class="toggle"><input name="prompt_llm_fallback" type="checkbox"><span>导演失败时回退为原始提示词</span></label>
                 <label><span>Agent 前路由超时（秒）</span><input name="router_timeout_before_agent" type="number" min="0" max="120" step="1"></label>
+                <label class="toggle"><input name="intent_router_probe_plan" type="checkbox"><span>意图路由使用探针计划（关闭则导演跳过一次资产预检直接出图）</span></label>
                 <div class="span-4 section-divider"><span>行为与调优</span></div>
                 <label><span>每回复最多出图数</span><input name="max_auto_images_per_reply" type="number" min="1" max="8" step="1"></label>
                 <label><span>导演结构化传输</span><select name="structured_director_mode">

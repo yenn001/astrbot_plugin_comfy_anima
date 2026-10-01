@@ -303,6 +303,7 @@ const booleanFields = new Set([
   "enable_user_picture_preferences",
   "enable_lock_command",
   "enable_unet_switch",
+  "intent_router_probe_plan",
 ]);
 
 async function refreshStickyNegatives() {
