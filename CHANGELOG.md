@@ -2,6 +2,32 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.3] - 2026-10-02（构建 3.1.447）
+
+### 注册一致性闸门 + 吊带袜翻译缺口修复
+
+- **先量后写**：新增配置项要同时出现在 8 处，漏一处就复现一类既有缺陷。动手前先量出真实缺口，
+  再据此写测试，避免把猜测写成断言。
+- **修掉量出的真实缺口**：
+  - `enable_layered_lora_retrieval` 可保存但 bootstrap 不下发 → 补入 bootstrap；
+  - 四个意图判定数字框（`intent_judge_auto_confidence_floor`、
+    `intent_judge_local_embedding_threshold`、`intent_judge_local_rerank_threshold`、
+    `intent_judge_online_timeout`）未登记进前端 `numberFields` → 补入。
+- **新增注册不变量测试** `tests/test_registration_invariants.py`（5 条）：
+  白名单 ⇒ bootstrap（含密码豁免与理由）、表单复选框 ⇒ `booleanFields`、
+  表单数字框 ⇒ `numberFields`、豁免清单不得过期、schema 键 ⇔ 设置模型字段。
+- **修复「吊带丝袜」画不出吊带**（有代码实证）：A1 词典按键长从长到短做子串匹配，
+  而 `吊带袜` 并非 `吊带丝袜` 的子串（字序为 吊带·丝·袜），于是最长命中落到 `丝袜`
+  → `pantyhose`，**"吊带"在翻译这一步就丢了**。现补入
+  `吊带丝袜` / `吊带长筒袜` / `蕾丝吊带袜` / `吊带网袜` 四个变体，并把 `吊带袜` 的映射
+  由 `garter belt, thighhighs` 修正为 **`garter straps, thighhighs`**
+  （Danbooru 里 `garter belt` 指腰间束带，可见的吊带是 `garter straps`）。
+- **新增** `tests/test_garment_translation.py`（8 条）：按代码同样的最长键匹配规则复核词典，
+  断言任何"吊带X袜"说法都不得退化成无吊带的普通袜，且无吊带说法不被误加吊带。
+- **补齐槽位诊断词表**：`_PROMPT_TAG_SLOT_KEYWORDS["clothing"]` 原先漏收
+  `thighhighs` / `pantyhose` / `garter straps` / `nightgown` / `pajamas` / `lingerie` 等，
+  导致服装槽位标记**低估**真实覆盖（实测三张图 clothing=1 即因此偏低）。
+
 ## [2.4.3] - 2026-10-02（构建 3.1.446）
 
 ### tag 串下限（Phase 1：只测量与告警，不改变出图行为）

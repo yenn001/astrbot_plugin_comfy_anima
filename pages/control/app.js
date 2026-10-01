@@ -256,6 +256,10 @@ const numberFields = new Set([
   "lora_max_results",
   "lora_tool_max_steps",
   "min_prompt_tags",
+  "intent_judge_auto_confidence_floor",
+  "intent_judge_local_embedding_threshold",
+  "intent_judge_local_rerank_threshold",
+  "intent_judge_online_timeout",
 ]);
 
 const booleanFields = new Set([

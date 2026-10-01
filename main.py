@@ -790,9 +790,11 @@ _PROMPT_TAG_SLOT_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
     "clothing": (
         "dress", "shirt", "skirt", "jacket", "coat", "sweater", "socks",
-        "stockings", "boots", "shoes", "hat", "necklace", "earrings", "gloves",
-        "belt", "ribbon", "uniform", "underwear", "bra", "panties", "kimono",
-        "swimsuit", "apron", "scarf",
+        "stockings", "thighhighs", "pantyhose", "garter straps", "garter belt",
+        "fishnet", "leotard", "boots", "shoes", "hat", "necklace", "earrings",
+        "gloves", "belt", "ribbon", "uniform", "underwear", "bra", "panties",
+        "kimono", "swimsuit", "apron", "scarf", "nightgown", "pajamas",
+        "negligee", "camisole", "lingerie", "bra", "off-shoulder",
     ),
     "action": (
         "sitting", "standing", "lying", "holding", "looking", "smiling",
@@ -16115,6 +16117,9 @@ QQ快捷指令:
                 "show_llm_prompt": settings.show_llm_prompt,
                 "max_auto_images_per_reply": settings.max_auto_images_per_reply,
                 "min_prompt_tags": settings.min_prompt_tags,
+                "enable_layered_lora_retrieval": (
+                    settings.enable_layered_lora_retrieval
+                ),
                 "enable_session_recipe_continuity": (
                     settings.enable_session_recipe_continuity
                 ),
