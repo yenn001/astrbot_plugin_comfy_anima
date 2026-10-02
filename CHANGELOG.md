@@ -2,6 +2,25 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-02（构建 3.1.456）
+
+### 紧急修复：保存设置被 schema 校验拒绝（group_block_levels）
+
+- **现象**：在 Web 控制台**任何一次保存**都会弹出「`group_block_levels` 必须是字符串数组」，
+  切换图片反推模型后保存时最容易撞上。
+- **根因（我的回归）**：3.1.442 给 `group_block_levels` 加控件时，我按"字段在模型里是
+  `dict[str, str]`"就把它放进了前端的**字典分支**，于是前端提交**对象**；而
+  `_conf_schema.json` 里它的类型是 **`list`**（`default: []`）——
+  **AstrBot 以 schema 为准做校验**，对象直接不合法 → 保存被拒。
+  （后端 `_as_group_levels()` 其实**字典与列表都兼容**，所以问题不在它，而在 schema 校验。）
+- **修法**：把 `group_block_levels` 从字典分支**移到数组分支**——每行 `群号=级别`
+  作为数组元素提交，schema 通过，后端再按 `=` 解析。字典分支只保留
+  `bot_character_preset_scopes`（它的 schema 确实是 `dict`）。
+- **新增不变量测试** `tests/test_settings_serialization.py`：
+  按 **schema 类型**逐字段核对前端序列化——`list` 必须发数组、（`dict` 必须发对象），
+  并钉住本次事故字段（必须在数组分支、不得回到字典分支）。
+  这条测试正是原先缺失的那一层：此前只核对了"字段有没有登记进类型集"，
+  却没有核对"**提交形态与 schema 类型是否一致**"。
 ## [2.5.0] - 2026-10-02（构建 3.1.455）
 
 ### 没有 LoRA 也按 Danbooru 补全角色外貌（并保留 LoRA 触发词）

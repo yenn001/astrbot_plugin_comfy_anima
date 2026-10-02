@@ -15,7 +15,7 @@ from typing import Final
 
 PLUGIN_NAME: Final[str] = "astrbot_plugin_comfy_anima"
 PLUGIN_VERSION: Final[str] = "2.5.0"
-INTERNAL_BUILD_ID: Final[str] = "3.1.455"
+INTERNAL_BUILD_ID: Final[str] = "3.1.456"
 
 DEFAULT_WORKFLOW_FILE: Final[str] = "workflow/anima_v2_api.json"
 DEFAULT_DIRECTOR_REFERENCE_FILE: Final[str] = "prompts/director_creative_default.txt"

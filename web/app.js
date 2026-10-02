@@ -1332,15 +1332,19 @@ function collectSettings(form) {
       field.name === "global_extra_positive_tags" ||
       field.name === "global_extra_negative_tags" ||
       field.name === "intent_judge_positive_anchors" ||
-      field.name === "intent_judge_negative_anchors"
+      field.name === "intent_judge_negative_anchors" ||
+      // schema 声明为 list(default [])，必须发数组：每行 `群号=级别`，
+      // 交给后端 _as_group_levels 解析。发对象会被 schema 校验拒绝。
+      field.name === "group_block_levels" ||
+      // 逗号/换行分隔的普通列表控件（如 WD Tagger 输出分类）
+      field.name === "reverse_categories"
     ) {
       result[field.name] = field.value
         .split(/[\n,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
     } else if (
-      field.name === "bot_character_preset_scopes" ||
-      field.name === "group_block_levels"
+      field.name === "bot_character_preset_scopes"
     ) {
       // 每行 `scope=预设名` / `群号=放行等级`；非法行忽略，由后端最终校验。
       const entries = {};
