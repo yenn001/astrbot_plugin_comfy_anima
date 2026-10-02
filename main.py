@@ -14283,6 +14283,101 @@ QQ快捷指令:
                 runtime_capabilities=capabilities,
             )
 
+    async def _repair_director_tag_floor(
+        self,
+        job: Any,
+        event: AstrMessageEvent,
+        instruction: Any,
+        provider_id: str,
+        *,
+        expansion_mode: str,
+        task_kind: str,
+    ) -> tuple[Any, str]:
+        """Ask the director once more when its own tag block misses the floor.
+
+        The floor is checked against the director's own rendered prompt because the
+        presets are resolved only after this point; their tags are merged on top,
+        so the merged prompt always carries at least this many tags. One extra
+        round at most, and a still-short result warns instead of raising: image
+        delivery must not depend on the director complying.
+        """
+
+        floor = int(getattr(self.settings, "min_prompt_tags", 0) or 0)
+        if floor <= 0 or not self._director:
+            return instruction, provider_id
+        original_prompt = str(getattr(instruction, "prompt", "") or "")
+        metrics = _prompt_tag_metrics(original_prompt)
+        if metrics["tag_count"] >= floor:
+            return instruction, provider_id
+        thin = [
+            slot for slot, count in metrics["slot_markers"].items() if not count
+        ]
+        self._record_image_task_phase(
+            job,
+            "director",
+            f"tag 串 {metrics['tag_count']} 项低于下限 {floor}，要求导演补一轮。",
+            "prompt_tag_floor_repair_requested",
+            level="WARNING",
+            details={
+                "tag_count": metrics["tag_count"],
+                "tag_floor": floor,
+                "thin_slots": thin,
+            },
+        )
+        feedback = (
+            f"上一版提示词的 tag 串只有 {metrics['tag_count']} 项，"
+            f"低于要求的 {floor} 项。保留已确认的事实与可见关系，只补齐 tag 串："
+            "按槽位继续补可见证据（身份、服装含饰品从上到下、动作、镜头、场景、主光），"
+            + (f"当前为空的槽位：{'、'.join(thin)}。" if thin else "")
+            + "只设下限不设上限；不得用无信息量的填充词凑数。输入数据：\n"
+            + json.dumps(
+                {
+                    "previous_prompt": original_prompt,
+                    "required_min_tags": floor,
+                    "empty_slots": thin,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        try:
+            repaired, repaired_provider = await self._timed_llm_call(
+                job,
+                self._generate_directed_instruction(
+                    event,
+                    feedback,
+                    expansion_mode,
+                    task_kind=task_kind,
+                ),
+            )
+        except PromptDirectorError as exc:
+            logger.warning(f"[{PLUGIN_NAME}] tag 串补轮失败，保留原稿：{exc}")
+            return instruction, provider_id
+        repaired_metrics = _prompt_tag_metrics(
+            str(getattr(repaired, "prompt", "") or "")
+        )
+        accepted = repaired_metrics["tag_count"] > metrics["tag_count"]
+        self._record_image_task_phase(
+            job,
+            "director",
+            (
+                f"补轮后 tag 串 {repaired_metrics['tag_count']} 项，"
+                + ("已采用。" if accepted else "未优于原稿，保留原稿。")
+            ),
+            "prompt_tag_floor_repair_completed",
+            level="INFO" if accepted else "WARNING",
+            details={
+                "tag_count_before": metrics["tag_count"],
+                "tag_count_after": repaired_metrics["tag_count"],
+                "tag_floor": floor,
+                "accepted": accepted,
+                "thin_slots": thin,
+            },
+        )
+        if accepted:
+            return repaired, repaired_provider
+        return instruction, provider_id
+
     async def _generate_directed_instruction(
         self,
         event: AstrMessageEvent,
@@ -23654,6 +23749,19 @@ QQ快捷指令:
                                 ),
                             ),
                         )
+                        if not options.control_modes and not img2img_image_name:
+                            # Phase 2：仅对纯生成路径做一次 tag 串补轮，
+                            # 改图/底图控制靠源图供细节，不受下限约束。
+                            instruction, provider_id = (
+                                await self._repair_director_tag_floor(
+                                    job,
+                                    event,
+                                    instruction,
+                                    provider_id,
+                                    expansion_mode=options.prompt_expansion_mode,
+                                    task_kind=TASK_DRAW,
+                                )
+                            )
                         effective_prompt = instruction.prompt
                         director_negative = instruction.negative_prompt
                         director_pipeline = instruction.pipeline
