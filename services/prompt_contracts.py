@@ -345,6 +345,39 @@ def density_contract(expansion_mode: str) -> str:
     )
 
 
+def resolve_director_transport(
+    *,
+    has_output_tools: bool,
+    structured_mode: str,
+) -> str:
+    """Return the transport the director will actually use for this request.
+
+    The mapping is explicit because it is counter-intuitive: any available
+    structured-output tool forces ``function`` regardless of the configured mode,
+    and both ``auto`` and ``legacy`` fall through to ``pic``.
+    """
+
+    if has_output_tools:
+        return "function"
+    normalized = str(structured_mode or "auto").strip().casefold()
+    if normalized in {"json", "function_call"}:
+        return "json"
+    return "pic"
+
+
+def redact_director_output(value: object, *, limit: int = 800) -> str:
+    """Collapse and bound one model response so it can be stored for diagnosis.
+
+    Protocol failures are otherwise indistinguishable from each other, and the
+    raw response is what identifies the actual cause.
+    """
+
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…[truncated {len(text) - limit} chars]"
+
+
 def build_director_contract(
     *,
     task_kind: str = TASK_DRAW,

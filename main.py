@@ -22005,6 +22005,20 @@ QQ快捷指令:
                         "failed_stage": failed_stage,
                         "error_type": type(exc).__name__,
                         "error_code": error_code,
+                        # 导演协议失败时带上模型原始输出（已在错误里截断压空白）：
+                        # 否则事后只能靠错误类型反推它到底返回了什么。
+                        **(
+                            {
+                                "director_detail": str(
+                                    getattr(exc, "detail", "") or ""
+                                )[:160],
+                                "director_raw_output": str(
+                                    getattr(exc, "raw_output", "") or ""
+                                )[:1200],
+                            }
+                            if getattr(exc, "raw_output", "")
+                            else {}
+                        ),
                     },
                 )
                 await self._task_store.finish_task_async(

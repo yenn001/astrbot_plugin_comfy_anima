@@ -1163,7 +1163,7 @@
       "json",
       "legacy"
     ],
-    "hint": "auto 优先 Function Calling 并兼容 JSON/<pic>；function_call 为严格模式",
+    "hint": "实际映射（按代码）：只要当前导演模型提供结构化输出工具，无论选哪一项都走 function 传输；模型不提供该工具时，json / function_call 走 JSON 传输，auto 与 legacy 都走 <pic> 标签传输。若模型既不支持结构化工具、又写不好严格的 <pic> 契约，出图会在导演阶段失败并提示；此时请换用支持函数调用的模型，或改用能稳定输出单个 <pic> 标签的模型。",
     "default": "auto"
   },
   "enable_prompt_composer_v2": {
@@ -1724,7 +1724,14 @@
     "description": "Bot 交付语词表（每行一条）",
     "type": "list",
     "hint": "规则后端识别的 Bot 交付语（如“给你看”）；只作用于 Bot 回复判定，否定/推迟句式仍被拦",
-    "default": ["给你看", "给你瞧瞧", "快看", "拍给你看", "穿给你看", "我给你看"]
+    "default": [
+      "给你看",
+      "给你瞧瞧",
+      "快看",
+      "拍给你看",
+      "穿给你看",
+      "我给你看"
+    ]
   },
   "enable_bot_character_binding": {
     "description": "启用 BOT 绑定角色预设组合",

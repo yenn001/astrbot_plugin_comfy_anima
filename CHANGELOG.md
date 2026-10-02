@@ -2,6 +2,28 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-02（构建 3.1.451）
+
+### 导演失败可诊断：记录模型原始输出 + 澄清传输映射
+
+重绘连续失败时，插件只留下错误类型（`invalid_picture_protocol` /
+"结构化分镜输出工具不可用"），**看不到模型到底返回了什么**——排查只能靠推断。
+本版把这条诊断链补上：
+
+- **P1 记录模型原始输出**：导演协议校验失败时，`PromptDirectorError` 现在携带
+  模型原始返回（压空白 + 截断），并在任务事件 `image_task_failed` 中以
+  `director_raw_output` / `director_detail` 落库。三个失败点均覆盖：
+  唯一标签校验、标签外多余内容、以及"连续两次失败"的终态错误。
+- **P2' 传输解析单一化**：新增 `resolve_director_transport()`
+  （`services/prompt_contracts.py`），把原先内联在导演里的 transport 表达式
+  提取为唯一真相，供导演与日志共用。
+- **P5 修正设置提示**：`structured_director_mode` 的原 hint 写"auto 优先
+  Function Calling"，**与实际不符**。真实映射为：
+  **只要当前模型提供结构化输出工具，无论选哪一项都走 `function` 传输；
+  模型不提供该工具时，`json`/`function_call` 走 JSON 传输，
+  `auto` 与 `legacy` 都走 `<pic>` 标签传输。**
+- 本版为**诊断与文档**改动，不改变出图行为（传输解析与原先的内联表达式等价）。
+
 ## [2.5.0] - 2026-10-02（构建 3.1.448）
 
 ### 可见性构图规则：点名要看的细节不得被外层衣物遮住

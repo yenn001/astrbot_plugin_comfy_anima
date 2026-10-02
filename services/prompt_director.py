@@ -34,6 +34,8 @@ from .prompt_contracts import (
     build_director_contract,
     build_director_user_prompt,
     normalize_capabilities,
+    redact_director_output,
+    resolve_director_transport,
     normalize_task_kind,
     transport_terminal_seal,
 )
@@ -390,10 +392,19 @@ ANIMA_VISUAL_EXPANSION_PROTOCOL = CONTRACT_VISUAL_EXPANSION_PROTOCOL
 class PromptDirectorError(RuntimeError):
     """LLM 分镜规划失败。"""
 
-    def __init__(self, user_message: str, detail: str = "", *, fatal: bool = False):
+    def __init__(
+        self,
+        user_message: str,
+        detail: str = "",
+        *,
+        fatal: bool = False,
+        raw_output: str = "",
+    ):
         self.user_message = user_message
         self.detail = detail
         self.fatal = fatal
+        # 协议失败时保留模型原始输出（截断、压空白），否则只能靠错误类型反推。
+        self.raw_output = redact_director_output(raw_output)
         super().__init__(detail or user_message)
 
 
@@ -888,12 +899,9 @@ class PromptDirector:
         structured_mode = str(
             getattr(self._settings, "structured_director_mode", "auto") or "auto"
         ).casefold()
-        transport = (
-            "function"
-            if output_tools is not None
-            else "json"
-            if structured_mode in {"json", "function_call"}
-            else "pic"
+        transport = resolve_director_transport(
+            has_output_tools=output_tools is not None,
+            structured_mode=structured_mode,
         )
         base_user_prompt = build_director_user_prompt(
             scene_text,
@@ -1184,6 +1192,11 @@ class PromptDirector:
                     if first_error is not None and not detail:
                         detail = first_error.detail or first_error.user_message
                     err_suffix = f" (原因: {detail})" if detail else ""
+                    # 把最后一次的模型原始输出带出去：否则失败时只有错误类型，
+                    # 无法分辨"没按格式回"还是"回了别的东西"。
+                    last_raw = getattr(exc, "raw_output", "") or getattr(
+                        first_error, "raw_output", ""
+                    )
                     raise PromptDirectorError(
                         (
                             f"【绘图导演思考模型】本地资产工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI (Provider: {provider_id}){err_suffix}"
@@ -1192,6 +1205,7 @@ class PromptDirector:
                         ),
                         detail,
                         fatal=True,
+                        raw_output=last_raw,
                     ) from exc
                 first_error = exc
                 if uses_lookup_tools and not hasattr(context, "llm_generate"):
@@ -1740,6 +1754,7 @@ class PromptDirector:
                 f"LLM 没有返回唯一合法的 <{control_name}> 标签",
                 detail,
                 fatal=True,
+                raw_output=source,
             )
         match = matches[0]
         if source[: match.start()].strip() or source[match.end() :].strip():
@@ -1747,6 +1762,7 @@ class PromptDirector:
                 f"LLM 在 <{control_name}> 标签之外返回了额外内容",
                 detail,
                 fatal=True,
+                raw_output=source,
             )
         return match
 
