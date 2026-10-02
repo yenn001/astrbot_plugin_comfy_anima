@@ -2,6 +2,29 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-02（构建 3.1.454）
+
+### 重绘沿用反推身份，启用 Danbooru 外貌锚点补全
+
+- **现象**：重绘时角色外貌不按 Danbooru canonical 特征补全，长相取决于反推描述
+  与导演的发挥。
+- **根因（已核实到机制层）**：外貌锚点机制（`_subject_appearance_anchors()`）
+  挂在意图计划的 subject 上——`_generate_directed_instruction()` 内
+  `if plan.identity_required and plan.requested_subject:` 才取锚点。而重绘的请求是
+  "改什么"而非"是谁"，`_requested_subject_hint()` 只会从「角色是/为/换成/改成 X」
+  这类说法里提取主体 → 重绘时**取不到主体** → 门禁始终关着 → 锚点恒为空。
+- **修法（零新机制、零副作用）**：重绘路径在构建意图计划后，
+  **仅当计划本就没有主体**时，采用反推结果里**唯一**且非空的身份名
+  （`replace(plan, requested_subject=…, identity_required=True)`），
+  于是既有门禁自然触发，canonical 外貌锚点经原路径送达导演。
+  - **绝不覆盖**用户明确点名的角色（有主体就直接返回）；
+  - **多人或不明确时不猜**（角色数 ≠ 1 或名字为空则不采用）；
+  - **验证仍交给既有的 subject 绑定门禁**（其文档明示 Missing/ambiguous 会降级为
+    tag-only 而非失败），因此本处不引入自造阈值。
+- **可观测**：新增两个事件 `appearance_anchors_requested`（采用了哪个主体、原因）
+  与 `appearance_anchors_skipped`（未采用的原因与角色数）。
+- 新增 `tests/test_redraw_appearance.py`（6 条）：单一身份被采用；无人/多人/空名/
+  字段缺失均安全返回空；已有主体不得被覆盖。
 ## [2.5.0] - 2026-10-02（构建 3.1.453）
 
 ### 修掉重绘间歇性失败：忽略标签外的 HTML 包裹噪声

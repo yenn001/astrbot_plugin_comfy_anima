@@ -839,6 +839,23 @@ def _prompt_tag_metrics(prompt: str) -> dict[str, Any]:
     }
 
 
+def _redraw_subject_from_reverse(reverse_result: Any) -> str:
+    """Return the single confidently named character from a reverse pass, else "".
+
+    A redraw request usually says what to change rather than who the character is,
+    so the intent plan carries no subject and the appearance-anchor gate stays
+    closed. The reverse pass has already named the character; adopting that name
+    lets the existing gate run. Ambiguity (zero or several characters) returns "",
+    and the binding gate still performs its own verification, so nothing is guessed
+    here.
+    """
+
+    characters = tuple(getattr(reverse_result, "characters", ()) or ())
+    if len(characters) != 1:
+        return ""
+    return str(getattr(characters[0], "name", "") or "").strip()
+
+
 IMAGE_TASK_TYPES = frozenset(
     {
         "generation",
@@ -7384,6 +7401,42 @@ class ComfyAnimaPlugin(Star):
                 else:
                     director_request = reverse_result.drawing_request(requirement)
                 intent_plan = self._build_auto_draw_intent_plan(director_request)
+                # 重绘通常只说"改什么"、不说"是谁"，于是意图计划里没有主体 →
+                # 外貌锚点门禁（_generate_directed_instruction 内）始终关着。
+                # 反推已经认出角色，这里**只在计划本来没有主体时**采用它，
+                # 绝不覆盖用户明确点名的角色；验证仍交给既有的 subject 绑定门禁。
+                if not getattr(intent_plan, "requested_subject", ""):
+                    reverse_subject = _redraw_subject_from_reverse(reverse_result)
+                    if reverse_subject:
+                        intent_plan = replace(
+                            intent_plan,
+                            requested_subject=reverse_subject,
+                            identity_required=True,
+                        )
+                        self._record_image_task_phase(
+                            job,
+                            "director",
+                            "采用反推身份作为重绘主体，启用外貌锚点补全。",
+                            "appearance_anchors_requested",
+                            details={
+                                "subject": reverse_subject,
+                                "reason": "redraw_plan_had_no_subject",
+                            },
+                        )
+                    else:
+                        self._record_image_task_phase(
+                            job,
+                            "director",
+                            "反推未给出可确定的单一身份，本次不做外貌锚点补全。",
+                            "appearance_anchors_skipped",
+                            level="WARNING",
+                            details={
+                                "reason": "reverse_named_no_single_character",
+                                "character_count": len(
+                                    tuple(getattr(reverse_result, "characters", ()) or ())
+                                ),
+                            },
+                        )
                 instruction, director_provider = await self._timed_llm_call(
                     job,
                     self._generate_directed_instruction(
