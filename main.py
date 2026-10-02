@@ -7060,10 +7060,10 @@ class ComfyAnimaPlugin(Star):
                                 parsed_options.denoise
                                 if parsed_options.denoise is not None
                                 else {
-                                    "preserve": 0.35,
-                                    "balanced": 0.55,
-                                    "free": 0.8,
-                                }.get(parsed_options.semantic_redraw_mode, 0.55)
+                                    "preserve": 0.55,
+                                    "balanced": 0.62,
+                                    "free": 0.7,
+                                }.get(parsed_options.semantic_redraw_mode, 0.62)
                             ),
                         },
                     )
@@ -7091,10 +7091,10 @@ class ComfyAnimaPlugin(Star):
                                 None
                                 if control_modes
                                 else {
-                                    "preserve": 0.35,
-                                    "balanced": 0.55,
-                                    "free": 0.8,
-                                }.get(parsed_options.semantic_redraw_mode, 0.55)
+                                    "preserve": 0.55,
+                                    "balanced": 0.62,
+                                    "free": 0.7,
+                                }.get(parsed_options.semantic_redraw_mode, 0.62)
                             )
                         ),
                         use_prompt_llm=False,

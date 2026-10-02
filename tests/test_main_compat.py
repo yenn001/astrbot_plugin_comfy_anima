@@ -4565,7 +4565,8 @@ class NaturalLanguageDrawLifecycleTests(unittest.IsolatedAsyncioTestCase):
             replies = [item async for item in plugin.cmd_reverse_draw(Event())]
 
         self.assertEqual(captured["img2img_image_name"], "input/img2img.png")
-        self.assertEqual(captured["options"].denoise, 0.55)
+        # 未指定模式时的兜底默认 = balanced 档；3.1.459 起 balanced 由 0.55 调整为 0.62。
+        self.assertEqual(captured["options"].denoise, 0.62)
         self.assertTrue(captured["options"].suppress_default_style)
         self.assertIn("IMAGE_RESULT", replies)
 

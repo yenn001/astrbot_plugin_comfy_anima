@@ -319,9 +319,14 @@ def semantic_redraw_parameters(
     """Choose enough edit strength while keeping explicit user values authoritative."""
 
     normalized_mode = str(mode or "balanced").casefold()
-    base = {"preserve": 0.32, "balanced": 0.55, "free": 0.78}.get(
+    # 三档默认强度（2026-10-03 调整）：
+    #   preserve = 原来的 balanced（0.55）——它才是"能改但很保守"的档；
+    #   balanced 0.62 / free 0.70：free 的提示词本就允许重排构图，强度略高一点。
+    # 原先的 preserve 0.32 太弱（改不动发色一类的外观变更），free 0.78 又太强
+    # （几乎等于重画、构图必漂），因此把档位收敛到 0.55/0.62/0.70。
+    base = {"preserve": 0.55, "balanced": 0.62, "free": 0.7}.get(
         normalized_mode,
-        0.55,
+        0.62,
     )
     magnitude = classify_edit_magnitude(requirement)
     floors = {
@@ -330,7 +335,12 @@ def semantic_redraw_parameters(
         "minor": 0.40,
         "unknown": base,
     }
-    denoise = explicit_denoise if explicit_denoise is not None else max(base, floors[magnitude])
+    if explicit_denoise is not None:
+        denoise = explicit_denoise
+    else:
+        # 下限对三档一视同仁（既有设计）：major 时三档都会到 0.64，
+        # 保证"大改"有足够强度；只有在非 major 时，三档才按 0.55/0.62/0.70 区分。
+        denoise = max(base, floors[magnitude])
     if explicit_steps is not None:
         steps = explicit_steps
     else:
