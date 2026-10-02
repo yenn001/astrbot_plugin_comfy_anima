@@ -9616,6 +9616,16 @@ QQ快捷指令:
     ) -> CharacterAppearanceProfile | None:
         """Load or derive bounded stable appearance for one exact identity."""
 
+        # 先记下"被问的是谁"：此前事件只记数量、不记 canonical，
+        # 于是无法判断是查错了名字，还是查对了却没命中。
+        self._record_image_task_phase(
+            job,
+            "resolver",
+            "开始解析角色稳定外貌证据。",
+            "character_swap_appearance_lookup",
+            details={"canonical": str(canonical_tag or "")[:120]},
+        )
+
         store = getattr(self, "_character_appearance_profiles", None)
         if store is not None:
             try:
@@ -14466,6 +14476,21 @@ QQ快捷指令:
                     str(getattr(intent_plan, "requested_subject", "") or "")
                 )
                 appearance_profile = None
+                self._record_image_task_phase(
+                    job,
+                    "director",
+                    "已确定用于外貌补全的 canonical 与来源。",
+                    "appearance_anchor_target",
+                    details={
+                        "canonical": canonical[:120],
+                        "from_binding": bool(
+                            str(getattr(subject_binding, "canonical", "") or "").strip()
+                        ),
+                        "requested_subject": str(
+                            getattr(intent_plan, "requested_subject", "") or ""
+                        )[:120],
+                    },
+                )
                 if canonical:
                     if job is not None:
                         appearance_profile = (

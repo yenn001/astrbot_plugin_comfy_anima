@@ -2,6 +2,21 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-02（构建 3.1.458）
+
+### 外貌证据：看清"在查谁"，并停止把接口错误当成数据
+
+- **加观测（决定性）**：此前解析外貌的事件**只记数量、不记被查询的 canonical**，
+  于是无法区分"查错了名字"与"查对了却没命中"——排查因此卡住一轮。
+  现新增两个事件，把输入固定下来：
+  - `character_swap_appearance_lookup`（解析器入口，记 `canonical`）；
+  - `appearance_anchor_target`（导演侧锚点入口，记 `canonical` / `from_binding` /
+    `requested_subject`）。
+- **修掉把错误当数据**：`danbooru_character_posts` 在 gallery 连不上站点时收到的
+  `HTTP 200 + [{"error": ...}]` 会被原样当成"1 条帖子"，于是网络故障被下游报成
+  「样本不足，不补写猜测」，误导排查。现识别该形状并抛出带原文的错误
+  （含 `error_info.summary`），交由解析器记为 `character_swap_appearance_unavailable`。
+- 仍不改变"不猜"原则：错误时依旧不补写外貌，只是错误信息如实呈现。
 ## [2.5.0] - 2026-10-02（构建 3.1.457）
 
 ### 角色外貌档案：过期不再等于失效（TTL 只安排刷新）

@@ -171,6 +171,19 @@ class ComfyClient:
             raise ComfyClientError("Danbooru 角色外观证据格式无效") from exc
         if not isinstance(payload, list):
             raise ComfyClientError("Danbooru 角色外观证据不是列表")
+        # gallery 连不上站点时会返回 HTTP 200 + [{"error": ...}]。照单收下就会被
+        # 下游当成"只取到 1 条帖子"，把网络故障误报成样本不足。
+        for item in payload:
+            if isinstance(item, dict) and item.get("error"):
+                info = item.get("error_info")
+                summary = ""
+                if isinstance(info, dict):
+                    summary = str(info.get("summary") or info.get("title") or "")
+                raise ComfyClientError(
+                    "Danbooru 角色外观证据接口返回错误",
+                    f"{str(item.get('error'))[:200]}"
+                    + (f" | {summary[:200]}" if summary else ""),
+                )
         return [item for item in payload[:bounded_limit] if isinstance(item, dict)]
 
     async def danbooru_character_autocomplete(
