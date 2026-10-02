@@ -7444,6 +7444,7 @@ class ComfyAnimaPlugin(Star):
                         director_request,
                         task_kind=TASK_SEMANTIC_REDRAW,
                         intent_plan=intent_plan,
+                        job=job,
                     ),
                 )
                 instruction = self._ensure_instruction_subject_query(
@@ -14343,6 +14344,7 @@ QQ快捷指令:
         expansion_mode: str = "standard",
         task_kind: str = TASK_DRAW,
         intent_plan: Any = None,
+        job: Any = None,
     ) -> tuple[Any, str]:
         """Return a structured picture instruction including pipeline intent."""
 
@@ -14367,11 +14369,39 @@ QQ快捷指令:
             subject_appearance_anchors: tuple[str, ...] = ()
             if intent_plan is not None and getattr(
                 intent_plan, "identity_required", False
-            ) and getattr(intent_plan, "requested_subject", ""):
-                subject_appearance_anchors = self._subject_appearance_anchors(
-                    subject_binding,
-                    user_text=scene_text,
+            ):
+                # 外貌档案按 canonical 存，与是否绑定 LoRA 无关：
+                # 有 LoRA 用 binding.canonical；没有 LoRA 就用点名的 canonical。
+                # 未缓存时经由既有解析器【按需去 Danbooru 取】（无样本则不补、不猜）。
+                canonical = str(
+                    getattr(subject_binding, "canonical", "") or ""
+                ).strip() or normalize_tag(
+                    str(getattr(intent_plan, "requested_subject", "") or "")
                 )
+                appearance_profile = None
+                if canonical:
+                    if job is not None:
+                        appearance_profile = (
+                            await self._resolve_character_appearance_profile(
+                                job, canonical
+                            )
+                        )
+                    else:
+                        store = getattr(self, "_character_appearance_profiles", None)
+                        if store is not None:
+                            try:
+                                appearance_profile = await asyncio.to_thread(
+                                    store.get, canonical
+                                )
+                            except (OSError, TypeError, ValueError):
+                                appearance_profile = None
+                if appearance_profile is not None:
+                    subject_appearance_anchors = tuple(
+                        self._filter_character_appearance_overrides(
+                            tuple(appearance_profile.appearance_tags),
+                            scene_text,
+                        )[:6]
+                    )
             lookup_tools = None
             runtime_capabilities: tuple[str, ...] = ()
             for probe in intent_plan.required_probes:
@@ -23720,6 +23750,7 @@ QQ快捷指令:
                                 event,
                                 director_request,
                                 options.prompt_expansion_mode,
+                                job=job,
                                 task_kind=(
                                     TASK_CONTROL_DRAW
                                     if options.control_modes

@@ -2,6 +2,37 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-02（构建 3.1.455）
+
+### 没有 LoRA 也按 Danbooru 补全角色外貌（并保留 LoRA 触发词）
+
+- **需求**：指定角色时，**即使本地没有该角色的 LoRA，也要去 Danbooru 取它的稳定外貌特征**；
+  有 LoRA 时**两者并存**（LoRA 触发词 + 外貌特征）。
+- **复核到的真实缺口（两条）**：
+  1. `_subject_appearance_anchors()` 的第一步是 `if binding is None: return ()`——
+     **外貌档案其实按 canonical tag 存、与 LoRA 无关**，却被 `binding` 前置卡住：
+     点名一个本地没有 LoRA 的角色（如 `toki_(blue_archive)`）时，档案里明明有
+     `blonde hair`（来源 danbooru_gallery，支持率 0.98）却**一个锚点都取不出来**；
+  2. 该函数**只查缓存、不按需取**——即便有 LoRA 绑定，角色未被缓存过时同样取不到。
+- **修法（合并为一条路，复用既有解析器）**：
+  - canonical 取值：**有 binding 用 `binding.canonical`；没有就用计划里点名的
+    `requested_subject`**（同一个 canonical 命名空间）；
+  - 经既有的 `_resolve_character_appearance_profile(job, canonical)`：
+    **缓存命中直接用**；**未命中则现去 Danbooru 取并写回缓存**；
+    **取不到就不补、不猜**（解析器自带"样本不足不补写猜测"）；
+  - 结果仍经 `_filter_character_appearance_overrides(..., scene_text)` 过滤，
+    **用户明确指定发色/瞳色时不会被档案顶回**；随后走既有的
+    `required_appearance_anchors` 强制与修复回路。
+  - 为此给 `_generate_directed_instruction()` 增加可选 `job` 参数
+    （解析器需要它记录事件），并在**重绘路径与 `_execute_job` 两条路径**传入；
+    没有 `job` 时退化为"只查缓存"，行为与旧版一致。
+- **可见性**：解析器自身已有事件——`character_swap_appearance_cache_hit` /
+  `character_swap_appearance_resolved` / `character_swap_appearance_unavailable` /
+  `character_swap_appearance_insufficient`，据此可判断外貌从哪来、是否命中缓存、
+  以及是否因样本不足而未补。
+- 新增 `tests/test_appearance_anchor_source.py`（6 条）：签名含 `job`；
+  **无 LoRA 时 canonical 来自点名主体**；**有 LoRA 时来自 binding**；
+  过滤会丢掉用户指定的发色而保留其它锚点；解析器在有 job 时被调用。
 ## [2.5.0] - 2026-10-02（构建 3.1.454）
 
 ### 重绘沿用反推身份，启用 Danbooru 外貌锚点补全
