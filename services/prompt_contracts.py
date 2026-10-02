@@ -365,17 +365,26 @@ def resolve_director_transport(
     return "pic"
 
 
-def redact_director_output(value: object, *, limit: int = 800) -> str:
+def redact_director_output(
+    value: object,
+    *,
+    head: int = 1200,
+    tail: int = 600,
+) -> str:
     """Collapse and bound one model response so it can be stored for diagnosis.
 
-    Protocol failures are otherwise indistinguishable from each other, and the
-    raw response is what identifies the actual cause.
+    Protocol failures are decided by the *end* of the response (whether the tag
+    closes and whether anything follows it), so a head-only truncation hides the
+    very evidence needed. Long responses therefore keep both ends and mark the
+    omitted middle; the original length is always reported.
     """
 
     text = " ".join(str(value or "").split())
-    if len(text) <= limit:
+    total = len(text)
+    if total <= head + tail:
         return text
-    return f"{text[:limit]}…[truncated {len(text) - limit} chars]"
+    omitted = total - head - tail
+    return f"{text[:head]} …[omitted {omitted} chars of {total}]… {text[-tail:]}"
 
 
 def build_director_contract(

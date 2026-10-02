@@ -399,12 +399,17 @@ class PromptDirectorError(RuntimeError):
         *,
         fatal: bool = False,
         raw_output: str = "",
+        protocol_reason: str = "",
     ):
         self.user_message = user_message
         self.detail = detail
         self.fatal = fatal
-        # 协议失败时保留模型原始输出（截断、压空白），否则只能靠错误类型反推。
+        # 协议失败时保留模型原始输出（压空白；长响应保留头尾，见 redact_director_output），
+        # 否则只能靠错误类型反推——而解析结论恰恰取决于响应的【结尾】。
         self.raw_output = redact_director_output(raw_output)
+        self.raw_output_chars = len(" ".join(str(raw_output or "").split()))
+        # 区分严格校验的两个失败分支：标签数量不对 / 标签外有多余内容。
+        self.protocol_reason = str(protocol_reason or "")
         super().__init__(detail or user_message)
 
 
@@ -1197,6 +1202,9 @@ class PromptDirector:
                     last_raw = getattr(exc, "raw_output", "") or getattr(
                         first_error, "raw_output", ""
                     )
+                    last_reason = getattr(exc, "protocol_reason", "") or getattr(
+                        first_error, "protocol_reason", ""
+                    )
                     raise PromptDirectorError(
                         (
                             f"【绘图导演思考模型】本地资产工具分镜结果无效；连续两次修复失败，已停止且不会提交 ComfyUI (Provider: {provider_id}){err_suffix}"
@@ -1206,6 +1214,7 @@ class PromptDirector:
                         detail,
                         fatal=True,
                         raw_output=last_raw,
+                        protocol_reason=last_reason,
                     ) from exc
                 first_error = exc
                 if uses_lookup_tools and not hasattr(context, "llm_generate"):
@@ -1755,14 +1764,20 @@ class PromptDirector:
                 detail,
                 fatal=True,
                 raw_output=source,
+                protocol_reason=f"tag_count={len(matches)}",
             )
         match = matches[0]
-        if source[: match.start()].strip() or source[match.end() :].strip():
+        leading = source[: match.start()].strip()
+        trailing = source[match.end() :].strip()
+        if leading or trailing:
             raise PromptDirectorError(
                 f"LLM 在 <{control_name}> 标签之外返回了额外内容",
                 detail,
                 fatal=True,
                 raw_output=source,
+                protocol_reason=(
+                    f"extra_content leading={len(leading)} trailing={len(trailing)}"
+                ),
             )
         return match
 

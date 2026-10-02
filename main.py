@@ -22012,9 +22012,15 @@ QQ快捷指令:
                                 "director_detail": str(
                                     getattr(exc, "detail", "") or ""
                                 )[:160],
+                                "director_protocol_reason": str(
+                                    getattr(exc, "protocol_reason", "") or ""
+                                )[:160],
+                                "director_raw_chars": int(
+                                    getattr(exc, "raw_output_chars", 0) or 0
+                                ),
                                 "director_raw_output": str(
                                     getattr(exc, "raw_output", "") or ""
-                                )[:1200],
+                                )[:2400],
                             }
                             if getattr(exc, "raw_output", "")
                             else {}
