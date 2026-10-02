@@ -2,6 +2,34 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-02（构建 3.1.457）
+
+### 角色外貌档案：过期不再等于失效（TTL 只安排刷新）
+
+- **现象**：`重绘 角色是toki_(Blue_Archive)；…` 两张都不出金发。
+- **实测链（来自任务事件）**：外貌锚点的取用路径**已被 3.1.455 接通** ✓
+  （事件出现 `character_swap_appearance_insufficient`，此前根本走不到解析器），
+  但连续两次都因 `post_count: 1` 判为「样本不足」→ 无锚点 → 不成金发。
+  而库中 toki 的档案本就是正确答案（`blonde hair` 支持率 **0.98**、**52** 个样本、
+  来源 `danbooru_gallery`），**只因超出 TTL 被 `get()` 当作不存在**：
+  `if age > self.ttl_seconds: return None`。
+- **设计修正（本轮）**：TTL 的语义是「**该刷新了**」，不是「**证据失效了**」——
+  一次通过样本与支持率门槛的聚合仍然成立，因此：
+  1. `CharacterAppearanceProfileStore` 新增 `get_including_stale()` 与 `is_stale()`；
+     过期档案**照常作为证据使用**，`get()` 语义不变（仍只返回新鲜档案）；
+  2. 命中过期档案时立即用旧证据出图，**刷新改为后台任务**
+     （`_refresh_appearance_profile()`，失败只影响新鲜度，不影响本次出图）；
+  3. **负缓存**：确实取不到稳定外貌的角色，`APPEARANCE_UNRESOLVABLE_TTL_SECONDS`
+     （6 小时）内不再重复慢查询，事件记为 `character_swap_appearance_negative_cached`。
+- **可见性**：命中过期档案时记录 `character_swap_appearance_stale_used`，
+  含 `appearance_count` / `sample_count` / `age_days`，可判断用的是哪个年代的证据。
+- **不引入猜测**：仍只使用该 canonical **自己**验证过的聚合；库里没有的角色依旧
+  返回空（测试覆盖）。用户明确指定发色时仍由
+  `_filter_character_appearance_overrides` 过滤，不会被档案顶回。
+- 新增 `tests/test_stale_appearance_profile.py`（5 条）：新鲜档案两个读取口都返回；
+  **过期档案 `get()` 隐藏但仍可作证据**；规范化键可命中；**未知角色两个口都返回空**；
+  负缓存窗口有界。
+- 未做（另行评估）：⑤ 第二证据源（wiki/放宽安全级）——它改变证据类别，需单独论证。
 ## [2.5.0] - 2026-10-02（构建 3.1.456）
 
 ### 紧急修复：保存设置被 schema 校验拒绝（group_block_levels）

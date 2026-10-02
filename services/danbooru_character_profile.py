@@ -453,6 +453,41 @@ class CharacterAppearanceProfileStore:
                 return None
             return profile
 
+    def get_including_stale(
+        self, canonical_tag: str
+    ) -> CharacterAppearanceProfile | None:
+        """Return the verified aggregate even after its TTL has passed.
+
+        The TTL answers "should this be refreshed", not "is this evidence still
+        true". An aggregate that once passed the sample and support thresholds
+        (blonde hair at 0.98 over 52 posts) remains valid evidence, so an expired
+        record must not be treated as missing; freshness only schedules a
+        background refresh.
+        """
+
+        canonical = normalize_tag(canonical_tag)
+        if not canonical:
+            return None
+        with self._lock:
+            state = self._load()
+            raw = state["profiles"].get(canonical)
+            if not isinstance(raw, Mapping):
+                return None
+            try:
+                profile = CharacterAppearanceProfile.from_dict(raw)
+            except (TypeError, ValueError):
+                return None
+            if profile.canonical_tag != canonical:
+                return None
+            if time.time() - profile.fetched_at < -300.0:
+                return None
+            return profile
+
+    def is_stale(self, profile: CharacterAppearanceProfile) -> bool:
+        """Report whether one profile is past its refresh interval."""
+
+        return (time.time() - float(profile.fetched_at or 0.0)) > self.ttl_seconds
+
     def put(self, profile: CharacterAppearanceProfile) -> None:
         with self._lock:
             state = self._load()

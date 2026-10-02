@@ -839,6 +839,36 @@ def _prompt_tag_metrics(prompt: str) -> dict[str, Any]:
     }
 
 
+# 取不到稳定外貌的角色，短期内不再重复慢查询。
+APPEARANCE_UNRESOLVABLE_TTL_SECONDS = 6 * 3600
+
+
+async def _refresh_appearance_profile(
+    client: Any,
+    store: Any,
+    canonical_tag: str,
+) -> None:
+    """Refresh one stale appearance profile without blocking the draw.
+
+    Fire-and-forget: the draw already used the existing verified evidence, so a
+    failure here only leaves the record stale until the next attempt.
+    """
+
+    try:
+        posts = await client.danbooru_character_posts(canonical_tag, limit=100)
+        profile = await asyncio.to_thread(
+            build_character_appearance_profile, canonical_tag, posts
+        )
+    except (ComfyClientError, OSError, RuntimeError, TypeError, ValueError):
+        return
+    if profile is None or store is None:
+        return
+    try:
+        await asyncio.to_thread(store.put, profile)
+    except (OSError, TypeError, ValueError):
+        return
+
+
 def _redraw_subject_from_reverse(reverse_result: Any) -> str:
     """Return the single confidently named character from a reverse pass, else "".
 
@@ -9604,6 +9634,58 @@ QQ快捷指令:
                     },
                 )
                 return cached
+            # TTL 只表示"该刷新了"，不表示证据失效：一次通过样本与支持率门槛的
+            # 聚合（如 blonde hair 0.98 / 52 帖）依旧成立，因此过期档案照用，
+            # 只把刷新挪到后台，避免出图等它、也避免取不到就什么都没有。
+            try:
+                stale = await asyncio.to_thread(
+                    store.get_including_stale, canonical_tag
+                )
+            except (OSError, TypeError, ValueError):
+                stale = None
+            if stale is not None:
+                self._record_image_task_phase(
+                    job,
+                    "resolver",
+                    "缓存的角色外貌证据已过期，先按既有证据出图，并在后台刷新。",
+                    "character_swap_appearance_stale_used",
+                    level="WARNING",
+                    details={
+                        "appearance_count": len(stale.appearance_tags),
+                        "sample_count": stale.sample_count,
+                        "age_days": round(
+                            (time.time() - float(stale.fetched_at or 0.0)) / 86400.0, 1
+                        ),
+                    },
+                )
+                refresh_client = getattr(self, "_client", None)
+                if refresh_client is not None:
+                    try:
+                        asyncio.get_running_loop().create_task(
+                            _refresh_appearance_profile(
+                                refresh_client, store, canonical_tag
+                            )
+                        )
+                    except RuntimeError:
+                        pass
+                return stale
+
+        # 负缓存：确实取不到的角色，短期内不再重复慢查询。
+        unresolved = getattr(self, "_appearance_unresolvable", None)
+        if unresolved is None:
+            unresolved = {}
+            self._appearance_unresolvable = unresolved
+        last_failure = float(unresolved.get(canonical_tag, 0.0) or 0.0)
+        if last_failure and (time.time() - last_failure) < APPEARANCE_UNRESOLVABLE_TTL_SECONDS:
+            self._record_image_task_phase(
+                job,
+                "resolver",
+                "该角色近期已确认取不到稳定外貌证据，本次跳过重复查询。",
+                "character_swap_appearance_negative_cached",
+                level="WARNING",
+                details={"age_seconds": int(time.time() - last_failure)},
+            )
+            return None
         client = getattr(self, "_client", None)
         if client is None or not hasattr(client, "danbooru_character_posts"):
             return None
@@ -9633,6 +9715,11 @@ QQ快捷指令:
                 level="WARNING",
                 details={"post_count": len(posts)},
             )
+            failed = getattr(self, "_appearance_unresolvable", None)
+            if failed is None:
+                failed = {}
+                self._appearance_unresolvable = failed
+            failed[canonical_tag] = time.time()
             return None
         if store is not None:
             try:

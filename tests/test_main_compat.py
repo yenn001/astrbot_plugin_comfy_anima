@@ -7401,6 +7401,12 @@ class SemanticTargetTagValidationTests(unittest.IsolatedAsyncioTestCase):
                 def get(_canonical):
                     return None
 
+                @staticmethod
+                def get_including_stale(_canonical):
+                    # 3.1.457 起，过期档案仍可作为证据；本替身模拟"库里没有该角色"，
+                    # 因此两个读取口都返回 None。
+                    return None
+
                 @classmethod
                 def put(cls, profile):
                     cls.saved = profile
