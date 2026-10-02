@@ -15,20 +15,6 @@ from ._stubs import install_astrbot_stubs
 SHORT_PROMPT = (
     "1girl, red hair, smile, white dress. She stands by the window at night."
 )
-# tag 数达标（24 项）但【没有镜头与主光 tag】——正是线上三张图的症状
-FULL_TAGS_NO_CAMERA_LIGHT = (
-    "1girl, red hair, long hair, bangs, green eyes, pale skin, smile, "
-    "white dress, necklace, earrings, thighhighs, garter straps, boots, "
-    "gloves, ribbon, belt, sitting, holding cup, looking at viewer, "
-    "bedroom, window, indoors, night, bed. She sits by the window at night."
-)
-# 同样 24 项，但把两项换成镜头与主光 tag → 总数不变、空槽位减少
-FULL_TAGS_WITH_CAMERA_LIGHT = (
-    "1girl, red hair, long hair, bangs, green eyes, pale skin, smile, "
-    "white dress, necklace, earrings, thighhighs, garter straps, boots, "
-    "gloves, close-up, soft lighting, sitting, holding cup, looking at viewer, "
-    "bedroom, window, indoors, night, bed. She sits by the window at night."
-)
 LONG_PROMPT = (
     "1girl, denia_(wuthering_waves), red hair, long hair, bangs, smile, "
     "white dress, necklace, earrings, thighhighs, garter straps, boots, "
@@ -116,53 +102,6 @@ class DirectorTagFloorRepairTests(unittest.IsolatedAsyncioTestCase):
         instruction, _ = await self._run(plugin, SHORT_PROMPT)
         self.assertEqual(instruction.prompt, SHORT_PROMPT, "未优于原稿时应保留原稿")
         self.assertEqual(len(calls), 1)
-
-    async def test_empty_slot_triggers_repair_even_when_total_is_fine(self) -> None:
-        """总数达标但某槽位为空时也必须补轮（线上三张图的症状）。"""
-
-        plugin, calls = self._plugin(floor=20, replies=[LONG_PROMPT])
-        original = self.main._prompt_tag_metrics(FULL_TAGS_NO_CAMERA_LIGHT)
-        self.assertGreaterEqual(original["tag_count"], 20, "样例必须先满足总数下限")
-        self.assertEqual(original["slot_markers"]["camera"], 0)
-        self.assertEqual(original["slot_markers"]["lighting"], 0)
-
-        instruction, _ = await self._run(plugin, FULL_TAGS_NO_CAMERA_LIGHT)
-        self.assertEqual(len(calls), 1, "空槽位应触发补轮")
-        self.assertEqual(instruction.prompt, LONG_PROMPT)
-
-    async def test_repair_accepted_when_only_the_slots_improve(self) -> None:
-        """补齐槽位但总数不变，也算改善，必须采用。"""
-
-        before = self.main._prompt_tag_metrics(FULL_TAGS_NO_CAMERA_LIGHT)
-        after = self.main._prompt_tag_metrics(FULL_TAGS_WITH_CAMERA_LIGHT)
-        self.assertEqual(
-            before["tag_count"], after["tag_count"], "样例总数应相同"
-        )
-        self.assertGreater(after["slot_markers"]["camera"], 0)
-        self.assertGreater(after["slot_markers"]["lighting"], 0)
-
-        plugin, calls = self._plugin(floor=20, replies=[FULL_TAGS_WITH_CAMERA_LIGHT])
-        instruction, _ = await self._run(plugin, FULL_TAGS_NO_CAMERA_LIGHT)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            instruction.prompt,
-            FULL_TAGS_WITH_CAMERA_LIGHT,
-            "只改善槽位的补轮稿不应被当作劣稿丢弃",
-        )
-
-    async def test_fully_covered_prompt_is_not_repaired(self) -> None:
-        """总数与槽位都满足时不得补轮。"""
-
-        metrics = self.main._prompt_tag_metrics(LONG_PROMPT)
-        self.assertGreaterEqual(metrics["tag_count"], 20)
-        self.assertTrue(
-            all(count > 0 for count in metrics["slot_markers"].values()),
-            "样例应覆盖全部槽位",
-        )
-        plugin, calls = self._plugin(floor=20, replies=[FULL_TAGS_WITH_CAMERA_LIGHT])
-        instruction, _ = await self._run(plugin, LONG_PROMPT)
-        self.assertEqual(calls, [])
-        self.assertEqual(instruction.prompt, LONG_PROMPT)
 
 
 if __name__ == "__main__":

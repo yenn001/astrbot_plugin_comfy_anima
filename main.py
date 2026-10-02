@@ -14307,29 +14307,21 @@ QQ快捷指令:
             return instruction, provider_id
         original_prompt = str(getattr(instruction, "prompt", "") or "")
         metrics = _prompt_tag_metrics(original_prompt)
+        if metrics["tag_count"] >= floor:
+            return instruction, provider_id
         thin = [
             slot for slot, count in metrics["slot_markers"].items() if not count
         ]
-        if metrics["tag_count"] >= floor and not thin:
-            return instruction, provider_id
         self._record_image_task_phase(
             job,
             "director",
-            (
-                f"tag 串 {metrics['tag_count']} 项（下限 {floor}）、"
-                f"空槽位 {len(thin)} 个，要求导演补一轮。"
-            ),
+            f"tag 串 {metrics['tag_count']} 项低于下限 {floor}，要求导演补一轮。",
             "prompt_tag_floor_repair_requested",
             level="WARNING",
             details={
                 "tag_count": metrics["tag_count"],
                 "tag_floor": floor,
                 "thin_slots": thin,
-                "reason": (
-                    "tag_count_below_floor"
-                    if metrics["tag_count"] < floor
-                    else "empty_slots"
-                ),
             },
         )
         feedback = (
@@ -14364,22 +14356,12 @@ QQ快捷指令:
         repaired_metrics = _prompt_tag_metrics(
             str(getattr(repaired, "prompt", "") or "")
         )
-        repaired_thin = [
-            slot
-            for slot, count in repaired_metrics["slot_markers"].items()
-            if not count
-        ]
-        # 采用条件：tag 数增加，或空槽位减少（补齐槽位但总数不变也算改善）。
-        accepted = (
-            repaired_metrics["tag_count"] > metrics["tag_count"]
-            or len(repaired_thin) < len(thin)
-        )
+        accepted = repaired_metrics["tag_count"] > metrics["tag_count"]
         self._record_image_task_phase(
             job,
             "director",
             (
-                f"补轮后 tag 串 {repaired_metrics['tag_count']} 项、"
-                f"空槽位 {len(repaired_thin)} 个，"
+                f"补轮后 tag 串 {repaired_metrics['tag_count']} 项，"
                 + ("已采用。" if accepted else "未优于原稿，保留原稿。")
             ),
             "prompt_tag_floor_repair_completed",
@@ -14388,9 +14370,8 @@ QQ快捷指令:
                 "tag_count_before": metrics["tag_count"],
                 "tag_count_after": repaired_metrics["tag_count"],
                 "tag_floor": floor,
-                "thin_slots_before": thin,
-                "thin_slots_after": repaired_thin,
                 "accepted": accepted,
+                "thin_slots": thin,
             },
         )
         if accepted:
