@@ -1757,6 +1757,27 @@ class PromptDirector:
 
         source = str(model_output or "")
         PromptDirector.reject_provider_error_output(source)
+        # 有些模型会把答案包在 HTML 里，在 <pic> 前后留下 </p>、</pic>、<br> 这类
+        # 包裹噪声（实测 trailing=4 就是 </p>）。它们不携带任何信息，先剥掉再做
+        # 严格校验；标签之外若真有文字，仍旧照原样失败。
+        wrapper_stripped = 0
+        for _ in range(6):
+            trimmed = re.sub(
+                r"^\s*(?:</?p\b[^>]*>|<br\s*/?>|</pic\s*>)\s*",
+                "",
+                source,
+                flags=re.IGNORECASE,
+            )
+            trimmed = re.sub(
+                r"\s*(?:</?p\b[^>]*>|<br\s*/?>|</pic\s*>)\s*$",
+                "",
+                trimmed,
+                flags=re.IGNORECASE,
+            )
+            if trimmed == source:
+                break
+            wrapper_stripped += 1
+            source = trimmed
         matches = list(pattern.finditer(source))
         if len(matches) != 1:
             raise PromptDirectorError(
@@ -1764,7 +1785,9 @@ class PromptDirector:
                 detail,
                 fatal=True,
                 raw_output=source,
-                protocol_reason=f"tag_count={len(matches)}",
+                protocol_reason=(
+                    f"tag_count={len(matches)} wrapper_stripped={wrapper_stripped}"
+                ),
             )
         match = matches[0]
         leading = source[: match.start()].strip()
@@ -1777,6 +1800,7 @@ class PromptDirector:
                 raw_output=source,
                 protocol_reason=(
                     f"extra_content leading={len(leading)} trailing={len(trailing)}"
+                    f" wrapper_stripped={wrapper_stripped}"
                 ),
             )
         return match
