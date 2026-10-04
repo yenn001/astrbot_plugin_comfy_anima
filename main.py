@@ -2762,8 +2762,11 @@ class ComfyAnimaPlugin(Star):
                 raw,
             )
             cleaned = " ".join(raw.split()).strip(" ，。.!！?？").rstrip("_-.")
+            # 中文角色名（如「大肥鱼」）必须能通过：此前只允许 ASCII 开头，
+            # 于是中文名一律被丢弃、掉进"从文本里捞已知别名"的兜底，
+            # 主体被解析成反推事实里的 "shadow"/"background"，LoRA 也就永远挂不上。
             if cleaned and re.fullmatch(
-                r"[A-Za-z][A-Za-z0-9_\- ]{0,48}",
+                r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff ]{0,48}",
                 cleaned,
             ):
                 return cleaned
