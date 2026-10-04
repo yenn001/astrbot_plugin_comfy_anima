@@ -2595,27 +2595,52 @@ class ComfyAnimaPlugin(Star):
                     names.add(canonical_lora_name(name).casefold())
         return frozenset(names)
 
-    @staticmethod
-    def _find_subject_lora_by_alias(records: tuple[Any, ...], subject: str) -> Any:
+    def _find_subject_lora_by_alias(
+        self, records: tuple[Any, ...], subject: str
+    ) -> Any:
         """Fallback selection by file name / alias when semantic index lacks the record."""
 
         folded = str(subject or "").strip().casefold()
         if not folded:
             return None
+        try:
+            index = self._runtime_semantic_index()
+        except (AttributeError, TypeError, ValueError):
+            index = None
         candidates = []
         for record in records:
-            hay = " ".join(
-                (
-                    str(getattr(record, "name", "") or ""),
-                    str(getattr(record, "model_name", "") or ""),
-                    *(
-                        str(alias)
-                        for alias in (getattr(record, "aliases", ()) or ())
-                    ),
-                )
-            ).casefold()
+            values: list[Any] = [
+                getattr(record, "name", ""),
+                getattr(record, "model_name", ""),
+                *(getattr(record, "aliases", ()) or ()),
+            ]
+            # 中文别名只存在于语义索引（如 "deepseek娘化(大肥鱼)"）；LoRA 记录自身的
+            # aliases 通常只有文件名，于是「角色是大肥鱼」以前永远匹配不到，
+            # 只能靠下面那条硬编码的「达妮娅」特例兜住个别人物。
+            if index is not None:
+                try:
+                    entry = index.entry_for(record)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    entry = None
+                if entry is not None:
+                    for field in ("aliases", "character_names", "activation_terms",
+                                  "source_works"):
+                        for item in getattr(entry, field, ()) or ():
+                            values.append(getattr(item, "value", item))
+            hay = " ".join(str(value or "") for value in values).casefold()
             if folded in hay:
                 candidates.append(record)
+        if len(candidates) > 1:
+            # 29B 投影与原版会同时命中同一中文别名：投影不是独立角色，
+            # 优先选非 _29b 的那个，避免"同名多个"把请求判成歧义。
+            flagship = [
+                item
+                for item in candidates
+                if "_29b" not in str(getattr(item, "name", "") or "").casefold()
+            ] or candidates
+            if len(flagship) == 1:
+                return flagship[0]
+            candidates = flagship
         if not candidates and folded == "达妮娅":
             for record in records:
                 if "denia" in str(getattr(record, "name", "") or "").casefold():

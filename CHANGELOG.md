@@ -2,6 +2,27 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-04（构建 3.1.463）
+
+### 修：中文角色别名（如「大肥鱼」）选不中对应 LoRA
+
+- **现象**：`/重绘 角色是大肥鱼 --m p` 完全不是 LoRA 里的角色；事件显示
+  `lora_count: 0` ✗，而提示词开头是 `big fat fish` ✗（导演把中文名当普通中文译掉了）。
+- **实测根因**：兜底函数 `_find_subject_lora_by_alias()` 只检查 LoRA 记录自身的
+  `name / model_name / aliases`（都是**文件名类**）✗，**没有查语义索引** ✗ ——
+  而条目 `deepseek anima0060` 的中文别名 `deepseek娘化(大肥鱼)` 与
+  `character_names: deepseek娘化` **恰恰只存在于语义索引** ✓，于是中文名永远匹配不到，
+  库里只剩一条**硬编码的「达妮娅」特例**在兜个别人物 ✗（这解释了"达妮娅能中、大肥鱼不能"）。
+- **修法（小、且沿用既有 API）**：兜底函数改为实例方法 ✓，除记录自身字段外，
+  一并检索语义条目的 `aliases / character_names / activation_terms / source_works` ✓
+  （与 `_subject_lora_selections` 里 `entry_for(record).aliases` 的既有用法一致 ✓）；
+  并处理 **29B 投影与原版同时命中** 的情况：优先选非 `_29b` 的那个 ✓，
+  避免"同名多个"被误判为歧义 ✓。硬编码的「达妮娅」特例**保留**（不回归 ✓）。
+- 新增 `tests/test_subject_alias_fallback.py`（5 条）：语义中文别名可命中 ✓；
+  文件名直配照旧 ✓；**29B 投影不造成歧义** ✓；未知名字仍返回空 ✓；达妮娅特例仍可用 ✓。
+- 仍待办（同一链路的下半段）：导演 LLM 会把中文名译成 `big fat fish` ✗ ——
+  插件已有"不可翻译片段"机制但只接在 `direct_draw` ✗；LoRA 一旦选中，
+  触发词经 `lora_activation_overrides` 注入 ✓，能大幅抵消该问题，故先落这一半并验收。
 ## [2.5.0] - 2026-10-04（构建 3.1.462）
 
 ### 重绘：点名角色时，剔除反推事实里的原图发色/瞳色
