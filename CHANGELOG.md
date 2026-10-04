@@ -2,6 +2,26 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-04（构建 3.1.462）
+
+### 重绘：点名角色时，剔除反推事实里的原图发色/瞳色
+
+- **病根（提示词原文为证）**：`_filter_character_appearance_overrides` 只看文本里有没有
+  `hair`／`eyes` 这类词就判定"**用户自己指定过**该槽位"（`\b(?:hair|hairstyle)\b` ✓）。
+  而重绘传给它的文本是**反推事实**（含 `long blue-gray hair` ✗）→ 锚点里的 `blonde hair`
+  **被整条丢掉** ✗ → 强制校验因此**不再报缺** ✗ → 任务"成功"但成图仍是原图发色 ✗
+  —— 也因此"时好时坏"：反推**没提**发色的那一次就成了金发 ✓。
+  （同一机制也解释了为何 `halo` 与 `blue eyes` 活着：前者反推没提 ✓，后者与反推同值 ✓）
+- **主修（用户提出）**：`semantic_redraw_request(..., strip_appearance_colors=)` —— 点名
+  canonical 角色时，从 `positive_tags` 里剔除**颜色词 + hair/eyes** 里的颜色部分
+  （有限颜色词表 ✓），**保留** `long hair` / `side braid` / `hair ornament` / `ahoge` 等
+  非颜色特征 ✓；**只在重绘这一条路径、且仅当点名了角色**时启用（纯图片编辑场景原样保留 ✓）。
+- **补充**：外貌块改用**用户本人的话**（`event.message_str`）判断"是否自己指定过"，
+  而不是拼装文本（防复发：拼装文本冒充"用户的话"是本轮与上一轮同类病根）✓。
+- 新增 `tests/test_strip_appearance_colors.py`（4 条）：颜色被剔除且长度/光环保留 ✓；
+  非颜色特征一律保留 ✓；**不点名时原样保留原图颜色** ✓；**用户原话一字不动** ✓。
+- 验收：同一命令连画 3 次，`prompt_appearance_terms` 每次都应含 `blonde hair`、
+  且不含 `blue-gray hair` —— 从"时好时坏"变为**确定**。
 ## [2.5.0] - 2026-10-04（构建 3.1.461）
 
 ### 诊断：把最终提示词的片段与命中的外观词记进任务事件

@@ -7448,22 +7448,29 @@ class ComfyAnimaPlugin(Star):
                         "mode": mode,
                     },
                 )
-                request_builder = getattr(
-                    reverse_result,
-                    "semantic_redraw_request",
-                    None,
-                )
-                if callable(request_builder):
-                    director_request = request_builder(requirement, mode)
-                else:
-                    director_request = reverse_result.drawing_request(requirement)
-                intent_plan = self._build_auto_draw_intent_plan(director_request)
                 # 用户在要求里直接写了 canonical tag（如 toki_(Blue_Archive)）时以它为准：
                 # 外貌档案按该**完整** tag 建键，而别处的主体解析会刻意丢掉括号部分，
                 # 于是外貌查询会去问 "archive)"，或从反推事实里捞到无关别名（"background"）。
                 canonical_hint = _appearance_canonical_hint(
                     str(getattr(event, "message_str", "") or "")
                 )
+                request_builder = getattr(
+                    reverse_result,
+                    "semantic_redraw_request",
+                    None,
+                )
+                if callable(request_builder):
+                    # 点名了 canonical 角色时，原图的发色/瞳色**不再权威**：留着会与
+                    # 该角色的 canonical 外貌竞争（实测提示词里两者并存，成图跟原图走）。
+                    # 非颜色特征（long hair / side braid / hair ornament）一律保留。
+                    director_request = request_builder(
+                        requirement,
+                        mode,
+                        strip_appearance_colors=bool(canonical_hint),
+                    )
+                else:
+                    director_request = reverse_result.drawing_request(requirement)
+                intent_plan = self._build_auto_draw_intent_plan(director_request)
                 if canonical_hint:
                     intent_plan = replace(
                         intent_plan,
@@ -14550,7 +14557,10 @@ QQ快捷指令:
                     subject_appearance_anchors = tuple(
                         self._filter_character_appearance_overrides(
                             tuple(appearance_profile.appearance_tags),
-                            scene_text,
+                            # 用**用户本人**的话判断"是否自己指定过发色"：
+                            # 传 scene_text 会把反推事实里的 hair 当成用户指定，
+                            # 于是 blonde hair 被整条丢掉（实测病根）。
+                            str(getattr(event, "message_str", "") or "") or scene_text,
                         )[:6]
                     )
             lookup_tools = None

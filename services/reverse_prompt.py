@@ -318,8 +318,19 @@ class ReversePromptResult:
         self,
         supplement: str,
         mode: str = "balanced",
+        *,
+        strip_appearance_colors: bool = False,
     ) -> str:
-        """Build a constrained no-mask whole-image regeneration request."""
+        """Build a constrained no-mask whole-image regeneration request.
+
+        ``strip_appearance_colors`` removes hair/eye **colour** words from the
+        observable tags when the user named a canonical character. Otherwise the
+        source image's colour competes with that character's verified appearance,
+        and the director follows the source (measured: the prompt carried both the
+        anchor and the reverse-derived colour, and the image kept the source hair).
+        Non-colour traits such as ``long hair``, ``side braid`` or ``hair ornament``
+        are left untouched.
+        """
 
         normalized_mode = str(mode or "balanced").strip().casefold()
         mode_rules = {
@@ -339,6 +350,20 @@ class ReversePromptResult:
         }
         if normalized_mode not in mode_rules:
             normalized_mode = "balanced"
+        observable_tags = str(self.positive_tags or "")
+        if strip_appearance_colors:
+            # 只删"颜色词 + hair/eyes"里的颜色部分，保留 hair/eyes 本身与其它特征
+            # （long hair / side braid / hair ornament / ahoge 一律不动）。
+            color = (
+                r"(?:blonde|blue|grey|gray|black|brown|pink|white|silver|purple|"
+                r"green|red|orange|golden|aqua|cyan|multicolored|two-?tone)"
+            )
+            observable_tags = re.sub(
+                rf"\b{color}(?:[\s-]+{color})*[\s_-]*(?=hair\b|eyes\b)",
+                "",
+                observable_tags,
+                flags=re.IGNORECASE,
+            )
         parts = [
             "任务类型：无蒙版整图语义重绘。最终会重新生成整张图片，不是局部修补，"
             "也不保证原像素不变。只输出 pic，不得输出 edit。",
@@ -353,7 +378,7 @@ class ReversePromptResult:
                 "明确证明旧内容时，才可把少量互斥旧词加入 negative；身份、作品名、脸、"
                 "发色、瞳色和体型不得因为换衣而进入 negative。"
             ),
-            f"原图可观察 Tags：{self.positive_tags}",
+            f"原图可观察 Tags：{observable_tags}",
         ]
         if self.composition:
             parts.append(f"原图构图：{self.composition}")
