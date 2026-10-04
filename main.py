@@ -869,6 +869,33 @@ async def _refresh_appearance_profile(
         return
 
 
+_APPEARANCE_CANONICAL_RE = re.compile(
+    r"[A-Za-z0-9_'\-\.]+_\((?:[A-Za-z0-9_'\-\.]|\s){1,60}\)"
+)
+
+
+def _appearance_canonical_hint(text: str) -> str:
+    """Return the Danbooru ``name_(work)`` tag the user wrote, otherwise "".
+
+    The appearance store is keyed by that whole tag, so a redraw that names a
+    character this way must keep the qualifier. Subject extraction elsewhere drops
+    it deliberately (treating ``_(work)`` as a work note), which left appearance
+    lookups asking for a fragment such as ``archive)``; its alias fallback could
+    instead pick an unrelated name out of the reverse facts (``background``).
+    Matching only this literal tag shape keeps both failure modes out.
+    """
+
+    for match in _APPEARANCE_CANONICAL_RE.finditer(str(text or "")):
+        # 括号内可能有多余空白（"toki_( blue_archive )"）：先规整再归一化，
+        # 否则 normalize_tag 会把空白变成下划线，得到 "toki_(_blue_archive_)"。
+        raw = re.sub(r"\(\s*", "(", match.group(0))
+        raw = re.sub(r"\s*\)", ")", raw)
+        candidate = normalize_tag(re.sub(r"\s+", "_", raw))
+        if candidate:
+            return candidate
+    return ""
+
+
 def _redraw_subject_from_reverse(reverse_result: Any) -> str:
     """Return the single confidently named character from a reverse pass, else "".
 
@@ -7431,6 +7458,18 @@ class ComfyAnimaPlugin(Star):
                 else:
                     director_request = reverse_result.drawing_request(requirement)
                 intent_plan = self._build_auto_draw_intent_plan(director_request)
+                # 用户在要求里直接写了 canonical tag（如 toki_(Blue_Archive)）时以它为准：
+                # 外貌档案按该**完整** tag 建键，而别处的主体解析会刻意丢掉括号部分，
+                # 于是外貌查询会去问 "archive)"，或从反推事实里捞到无关别名（"background"）。
+                canonical_hint = _appearance_canonical_hint(
+                    str(getattr(event, "message_str", "") or "")
+                )
+                if canonical_hint:
+                    intent_plan = replace(
+                        intent_plan,
+                        requested_subject=canonical_hint,
+                        identity_required=True,
+                    )
                 # 重绘通常只说"改什么"、不说"是谁"，于是意图计划里没有主体 →
                 # 外貌锚点门禁（_generate_directed_instruction 内）始终关着。
                 # 反推已经认出角色，这里**只在计划本来没有主体时**采用它，

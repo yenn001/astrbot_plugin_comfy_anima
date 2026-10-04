@@ -2,6 +2,32 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-04（构建 3.1.460）
+
+### 修：用户点名的 canonical tag 被截断，导致外貌锚点查错名字
+
+- **现象**：`重绘 角色是toki_(Blue_Archive)；兔女郎，女仆，吊带袜` 不出金发，
+  需要手动把"金发、蓝瞳、光环"写进要求才行。
+- **实测根因（3.1.458 的观测字段把它照出来了）**：外貌查询实际发出的是
+  `canonical="archive)"`（`_requested_subject_hint` 会**刻意删掉** `_(Blue_Archive)`
+  这段"作品注释"，而外貌档案的键**恰恰需要它**）或 `canonical="background"`
+  （删掉后抓不到，就回退到"从文本里捞已知 LoRA 别名"，于是从反推事实的
+  `plain white background` 里捞到了背景 LoRA 的别名）→ `unavailable` → 零锚点 →
+  提示词里没有 `blonde hair`。
+- **用户对照实验（本次修正了我的判断）**：**同样的 img2img 强度**下，手动加金发 tag
+  与不加是两个结果 → **唯一缺的是 tag 本身**，强度不是拦路环节。此前我把强度列为
+  "可能的边界"是错的，已收回。
+- **修法**：新增 `_appearance_canonical_hint()`——只在用户**真的写出** `name_(work)`
+  这种 tag 形态时命中，返回**完整** canonical；重绘路径在建好意图计划后，
+  若命中则用它**覆盖**计划里的主体（`requested_subject` + `identity_required=True`），
+  从而走既有的外貌锚点门禁。**只匹配这一种字面形态**，因此
+  "从描述文字里捞别名"这条错路被彻底绕开（反推事实里不会再产生主体）。
+- **不影响其他路径**：`_requested_subject_hint` 及其"删作品注释"的行为**保持原样** ✗
+  （LoRA 绑定确实需要短名），只是外貌查询改用自己的完整 canonical。
+- **回归测试** `tests/test_appearance_canonical_hint.py`（6 条）：用户原话必须得到
+  `toki_(blue_archive)`（而非 `archive)`）；大小写与空格归一；**没有作品括号就返回空**
+  （宁可不查也不查错）；**反推事实文本绝不产生主体**（`plain white background` → 空）；
+  多个 tag 取第一个；空输入安全。
 ## [2.5.0] - 2026-10-03（构建 3.1.459）
 
 ### 重绘三档默认强度重排：0.55 / 0.62 / 0.70
