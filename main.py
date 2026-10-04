@@ -24707,6 +24707,18 @@ QQ快捷指令:
                     details={
                         "conditioning_type": conditioning_type,
                         **tag_metrics,
+                        # 诊断：此前只记长度与 tag 数，无法确认外貌锚点是否真的进了提示词，
+                        # 只能靠推断。这里直接记下片段与命中的外观词。
+                        "positive_prompt_head": clean_prompt[:400],
+                        "prompt_appearance_terms": [
+                            term
+                            for term in (
+                                "blonde hair", "blue hair", "grey hair", "gray hair",
+                                "brown hair", "black hair", "pink hair", "white hair",
+                                "silver hair", "purple hair", "blue eyes", "halo",
+                            )
+                            if term in clean_prompt.casefold()
+                        ],
                         "profile_id": getattr(profile, "profile_id", "legacy_or_test"),
                         "pipeline": requested_pipeline,
                         "positive_node_id": (

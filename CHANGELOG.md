@@ -2,6 +2,19 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-04（构建 3.1.461）
+
+### 诊断：把最终提示词的片段与命中的外观词记进任务事件
+
+- **为什么加**：外貌锚点是否真的进了最终提示词，此前**无从确认** ✗ ——
+  `workflow_payload_ready` 只记 `prompt_chars` / `prompt_sha256` / `tag_count` /
+  `slot_markers`，而提示词诊断库是**内存态且只有 DELETE 路由**（`plugin_page.py:929`），
+  取不到原文；于是"锚点有没有生效"只能靠长度差推断 ✗（推断正是反复出错的来源）。
+- **加什么**：`workflow_payload_ready` 的 details 新增
+  `positive_prompt_head`（提示词前 400 字符）与
+  `prompt_appearance_terms`（提示词中命中的外观词，如 `blonde hair` / `blue hair` /
+  `halo`）——一眼就能看出**两个发色是否并存**，或锚点是否根本没进提示词。
+- 纯诊断，**不改变任何出图行为**。
 ## [2.5.0] - 2026-10-04（构建 3.1.460）
 
 ### 修：用户点名的 canonical tag 被截断，导致外貌锚点查错名字
