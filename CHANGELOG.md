@@ -2,6 +2,27 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-10-06（构建 3.1.466）
+
+### 修：意图门"静默 no_draw"可诊断；执行守卫不再掐断用户对话
+
+- **现象**（用户日志证据）："娅娅，你在干嘛呢，拍张照片给我看看（用ComfyAnima，画出来）"
+  → `intent gate: no_draw, not submitting to ComfyUI` ✗（不出图）→ 模型自行调用
+  `astrbot_execute_shell` 诊断 ComfyUI ✗ → 守卫判"绘图请求越权工具" ✗ →
+  `Agent execution was requested to stop by user` ✗ —— **整轮对话被掐断** ✗。
+- **A1（诊断补全）**：`_event_intent_gate_result()` 的任一项校验不符都会**静默**返回空
+  并落到 `no_draw` ✗。新增 `_log_intent_gate_rejection()`，在 `no_draw` 时逐项打印
+  校验结果：`status / decision_id / result_hash / public_version / internal_target_version /
+  user_id_hash / session_id_hash / user_message_hash / decision ledger` ✓
+  —— 静默变可诊断，下一句日志就会指明**到底是哪一项**把它拒了 ✓。
+  （注意：`bot_reply_draw_delivery_phrases` 属于**主动画给你看**那条路径，**不在这条链上**，
+  所以加短语治不了本问题 —— 这也是本轮先把诊断做出来的原因。）
+- **B（守卫与意图门一致）**：守卫原来只检查 `trace["intent"]` ✗，而同一会话里会**残留
+  上一次绘图的 trace** ✓ → 普通轮次的诊断性 shell 被按"绘图请求"处理 ✗。
+  现在额外检查 `trace["terminal_state"] == "no_draw"` ✓ —— 意图门本轮已判不绘图时直接放行 ✓。
+- **C（不得掐断对话）**：守卫原先在拦截后调用 `event.stop_event()` ✗ → 代价是
+  **结束用户这一轮对话** ✗。现改为**只标记 `blocked`** ✓ —— 终态自然不会提交 ComfyUI ✓
+  （"本张不提交"的保护不变 ✓），但不再因此打断用户 ✓。
 ## [2.5.1] - 2026-10-06（构建 3.1.465）
 
 ### 修：普通聊天轮次不再摘掉 AstrBot 宿主工具（搜索/记忆/定时/MCP/技能/代码）

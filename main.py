@@ -3559,6 +3559,10 @@ class ComfyAnimaPlugin(Star):
         trace = self._chat_draw_terminal_trace(event)
         if trace is None or not bool(trace.get("intent")):
             return
+        if str(trace.get("terminal_state") or "") == "no_draw":
+            # 意图门本轮已判"不绘图"（同一会话里可能残留上一次绘图的 trace）。
+            # 此时模型调用 shell 之类只是普通诊断，不该按"绘图请求越权工具"处理。
+            return
         if tool_name in BLOCKED_EXECUTION_TOOL_NAMES:
             # Stage 1 execution-layer defense in depth. Request-stage isolation
             # already removes these tools for fresh drawing turns, but follow-up
@@ -3575,14 +3579,10 @@ class ComfyAnimaPlugin(Star):
                 f"[{PLUGIN_NAME}] blocked tool on drawing request: "
                 f"tool={tool_name}"
             )
-            stop = getattr(event, "stop_event", None)
-            if callable(stop):
-                try:
-                    stopped = stop()
-                    if asyncio.iscoroutine(stopped):
-                        await stopped
-                except Exception:
-                    pass
+            # 只标记 blocked：终态自然会拒绝提交 ComfyUI。
+            # 此前这里调用 event.stop_event()，代价是**把用户这一轮对话整条掐断**
+            # （日志表现：Agent execution was requested to stop by user），
+            # 对一次无害的诊断性调用来说惩罚过重。
 
     @filter.on_llm_tool_respond()
     async def track_chat_draw_asset_tool_result(
@@ -4656,6 +4656,8 @@ class ComfyAnimaPlugin(Star):
             trace["intent_source"] = "intent_judge_gate"
             trace["terminal_state"] = "no_draw"
             # 未通过意图判断就是一次普通闲聊：不打扰用户，只在插件日志留痕。
+            # 但要写清"被哪一项挡住"，否则只能靠猜。
+            self._log_intent_gate_rejection(event)
             logger.info(
                 f"[{PLUGIN_NAME}] intent gate: no_draw, not submitting to ComfyUI"
             )
@@ -15229,6 +15231,62 @@ QQ快捷指令:
             or ""
         ).strip()
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    def _log_intent_gate_rejection(self, event: AstrMessageEvent) -> None:
+        """Explain why the intent gate produced no DRAW_NOW decision.
+
+        此前只留一行 "no_draw"：版本戳、哈希、账本任一不符都会静默落到那里，
+        排查只能靠猜。这里把每一项校验的结果逐个打出来。
+        """
+
+        getter = getattr(event, "get_extra", None)
+        payload = None
+        if callable(getter):
+            try:
+                payload = getter(_INTENT_ROUTER_GATE_EXTRA_KEY, None)
+            except (TypeError, ValueError):
+                payload = None
+        if not isinstance(payload, Mapping):
+            logger.info(
+                f"[{PLUGIN_NAME}] intent gate rejected: no judged payload on this event"
+            )
+            return
+        failures: list[str] = []
+        if str(payload.get("status") or "") != "judged":
+            failures.append(f"status={payload.get('status')!r}")
+        if not str(payload.get("decision_id") or "").strip():
+            failures.append("decision_id missing")
+        if not str(payload.get("result_hash") or "").strip():
+            failures.append("result_hash missing")
+        if str(payload.get("public_version") or "") != PLUGIN_VERSION:
+            failures.append(
+                f"public_version={payload.get('public_version')!r}"
+                f" != {PLUGIN_VERSION!r}"
+            )
+        if str(payload.get("internal_target_version") or "") != INTERNAL_BUILD_ID:
+            failures.append(
+                f"internal_target_version={payload.get('internal_target_version')!r}"
+                f" != {INTERNAL_BUILD_ID!r}"
+            )
+        if str(payload.get("user_id_hash") or "") != self._event_user_id_hash(event):
+            failures.append("user_id_hash mismatch")
+        if str(payload.get("session_id_hash") or "") != self._event_session_id_hash(
+            event
+        ):
+            failures.append("session_id_hash mismatch")
+        current_message_hash = hashlib.sha256(
+            str(getattr(event, "message_str", "") or "").encode("utf-8")
+        ).hexdigest()
+        if str(payload.get("user_message_hash") or "") != current_message_hash:
+            failures.append("user_message_hash mismatch")
+        if getattr(self, "_intent_decision_ledger", None) is None:
+            failures.append("decision ledger unavailable")
+        logger.info(
+            f"[{PLUGIN_NAME}] intent gate rejected: "
+            f"decision={payload.get('decision')!r} "
+            f"reason={payload.get('reason')!r} "
+            f"failures={failures or 'none (payload valid; judge chose not to draw)'}"
+        )
 
     def _event_intent_gate_result(self, event: AstrMessageEvent) -> Mapping[str, Any]:
         """Return a verified intent gate payload, or an empty mapping.
