@@ -4600,19 +4600,12 @@ class ComfyAnimaPlugin(Star):
                     )
             return
         if director_primary:
-            # Immersive hotfix: keep competing delivery and host tools removed
-            # from EVERY request, but allow the legacy terminal contract below
-            # so a drawing intent inside roleplay chat can render text + image.
-            if getattr(req, "func_tool", None) is not None:
-                isolated = isolate_picture_delivery_tools(
-                    req.func_tool,
-                    additional_blocked_names=BLOCKED_EXECUTION_TOOL_NAMES,
-                    allowed_names=drawing_request_allowlist(),
-                )
-                req.func_tool = isolated
-                logger.info(
-                    f"[{PLUGIN_NAME}] director_primary immersive tool isolation applied"
-                )
+            # 普通聊天轮次**不做任何工具隔离**：此前这里用绘图白名单整体替换
+            # req.func_tool，把宿主工具（Tavily 搜索、记忆、定时、MCP、技能、
+            # 代码/文件读写）与其它插件的工具一并摘掉——实测关掉插件后这些立刻恢复，
+            # 即故障就在此处。生图链路并不依赖它：绘图轮次仍走上面的 active 白名单，
+            # 且执行阶段另有 fail-closed 关卡（BLOCKED_EXECUTION_TOOL_NAMES）。
+            pass
         message = str(getattr(event, "message_str", "") or "")
         request_prompt = str(getattr(req, "prompt", "") or "")
 
