@@ -11106,9 +11106,25 @@ QQ快捷指令:
             and normalize_tag(term) not in authorized_set
         )
         if unknown_qualified:
-            raise LoraWorkflowError(
-                "最终提示词包含无法通过当前 Danbooru 或请求级外部 exact 授权的限定角色 Tag"
-            )
+            if bool(
+                getattr(
+                    getattr(self, "settings", None),
+                    "allow_unverified_character_names",
+                    True,
+                )
+            ):
+                # 与角色编译门的策略一致：名字认不出来也照画，只记警告。
+                # 此前这里直接抛错，造成"点了未收录的角色 → 整张不出图"。
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 最终提示词含未验证的限定角色 Tag "
+                    f"{len(unknown_qualified)} 个"
+                    f"（{', '.join(unknown_qualified[:3])[:80]}）；"
+                    "按 allow_unverified_character_names 照画"
+                )
+            else:
+                raise LoraWorkflowError(
+                    "最终提示词包含无法通过当前 Danbooru 或请求级外部 exact 授权的限定角色 Tag"
+                )
         external_by_base = {
             re.sub(r"_\([^()]+\)$", "", canonical): canonical
             for canonical in external_canonicals
@@ -11289,9 +11305,23 @@ QQ快捷指令:
                     "character",
                 )
             except (DanbooruIndexError, OSError, RuntimeError, ValueError) as exc:
-                raise LoraWorkflowError(
-                    "角色 LoRA 元数据触发词无法通过本地 Danbooru Character 复核"
-                ) from exc
+                if not bool(
+                    getattr(
+                        getattr(self, "settings", None),
+                        "allow_unverified_character_names",
+                        True,
+                    )
+                ):
+                    raise LoraWorkflowError(
+                        "角色 LoRA 元数据触发词无法通过本地 Danbooru Character 复核"
+                    ) from exc
+                # 索引异常属于基础设施问题，不该因此停图：按"全部未验证"继续，
+                # 下游对 None 的 getattr(lookup, "verified", False) 天然视为未验证。
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 角色 LoRA 触发词复核失败（Danbooru 索引异常："
+                    f"{type(exc).__name__}）；按 allow_unverified_character_names 跳过复核继续"
+                )
+                lookups = [None] * len(lookup_terms)
             for trigger, lookup in zip(lookup_terms, lookups):
                 if not bool(getattr(lookup, "verified", False)):
                     continue
