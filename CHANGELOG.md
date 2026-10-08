@@ -2,6 +2,29 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-10-08（构建 3.1.467）
+
+### 改：角色名验证不过也能出图（新增可关闭的策略开关）
+
+- **现象（用户实测）**：一条点了**两个角色**的 `/画图` 指令连续四次失败 ✗ ——
+  依次报 `LLM 角色校验失败` / `动态 LoRA 处理失败` / `invalid_picture_protocol` ✗；
+  用户的原话是"**没 LoRA 或者 Danbooru 过不了就停止生图**" ✓。
+- **二审定位（三处否证后才确定）** ✓：
+  - 真正的门是 `main.py` 的 `character_resolution_unverified` ✓，
+    抛错文案 `无法通过本地 Danbooru 或当前唯一角色 LoRA + Gallery exact 确认角色“…”` ✓；
+  - **否掉** `character_purity_mode` ✗（它只**过滤**提示词里别的角色名 ✓，代码里从不 raise ✓）；
+  - **否掉** `strict_lora_validation` ✗（它管的是 **LoRA 清单解析** ✓，那 5 处 `strict=True`
+    全在 `resolve_selections` ✓，与角色名验证无关 ✓）；
+  - 判定依据是 `CharacterClaim.strict` ✓ —— **默认即为 False（宽松）** ✓，
+    因此导演"发现"的候选名本来就会被放行 ✓（记 `llm_character_advisory_unverified_kept` ✓）；
+    **但用户手写进指令的角色名**被构造为严格 ✗ → 验证不过即整张不出图 ✗。
+- **改法（方案 A）**：在**门口**加策略开关 ✓，不改 claim 的构造 ✓：
+  - 新增设置 **`allow_unverified_character_names`（默认 true）** ✓：
+    开启 → 照画 ✓，但不加载该角色 LoRA ✓，并在任务事件记
+    `llm_character_unverified_drawn`（WARNING，含 query 长度与 policy ✓）；
+  - 关闭 → 维持原来的严格行为 ✓（宁可不出，也不画错角色 ✓）。
+- **验证**：`_conf_schema.json` 同步新增该键 ✓（schema ⇔ 设置模型的不变量测试要求 ✓）；
+  新增回归测试钉住两条分支 ✓；全量测试与门控部署见日志 ✓。
 ## [2.5.1] - 2026-10-06（构建 3.1.466）
 
 ### 修：意图门"静默 no_draw"可诊断；执行守卫不再掐断用户对话

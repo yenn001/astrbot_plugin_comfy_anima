@@ -10851,6 +10851,29 @@ QQ快捷指令:
                         },
                     )
                     continue
+                if bool(
+                    getattr(
+                        getattr(self, "settings", None),
+                        "allow_unverified_character_names",
+                        True,
+                    )
+                ):
+                    # 默认策略：名字 exact 验证不过也**照画**（不加载对应角色 LoRA），
+                    # 只在任务事件里标注"未经验证"。此前这里直接 raise，造成
+                    # "Danbooru 或本地 LoRA 过不了 → 整张不出图"。
+                    self._record_image_task_phase(
+                        job,
+                        "character_validation",
+                        "角色名未通过 exact 验证；按设置照画，不加载对应角色 LoRA。",
+                        "llm_character_unverified_drawn",
+                        level="WARNING",
+                        details={
+                            "query_chars": len(name),
+                            "query_count": resolution.query_count,
+                            "policy": "allow_unverified_character_names",
+                        },
+                    )
+                    continue
                 raise CharacterPromptCompileError(
                     f"无法通过本地 Danbooru 或当前唯一角色 LoRA + Gallery exact 确认角色“{name}”",
                     code="character_resolution_unverified",

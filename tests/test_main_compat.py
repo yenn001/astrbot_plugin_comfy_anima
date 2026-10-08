@@ -2385,6 +2385,12 @@ class ChatDrawTerminalGuardTests(unittest.IsolatedAsyncioTestCase):
 
     def _llm_character_validation_plugin(self):
         plugin = object.__new__(self.main.ComfyAnimaPlugin)
+        # 本 fixture 供"角色名无法 exact 验证时必须 fail-closed"这组用例使用；
+        # 3.1.467 起默认策略改为"照画"，因此这里显式关闭该策略，
+        # 让这些用例继续钉住【严格模式】的原意（严格语义并未被削弱）。
+        plugin.settings = types.SimpleNamespace(
+            allow_unverified_character_names=False
+        )
         plugin._danbooru_index = _ExactCharacterIndex()
         plugin._danbooru_index_ready = lambda: True
         plugin._runtime_semantic_index = LoraSemanticIndex.empty

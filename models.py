@@ -507,6 +507,10 @@ class PluginSettings:
     auto_reload_after_style_save: bool = False
     lora_presets: list[dict[str, Any]] = field(default_factory=_default_lora_presets)
     strict_lora_validation: bool = True
+    # 角色名无法通过 Danbooru / 本地 LoRA exact 验证时的策略：
+    # True  → 照画（记为"未经验证"，可能与设定有差；默认值，符合"认不出来也别停图"）
+    # False → 严格：拒绝出图（宁可不出，也不画错角色）
+    allow_unverified_character_names: bool = True
     prompt_node_id: str = DEFAULT_PROMPT_NODE_ID
     negative_node_id: str = DEFAULT_NEGATIVE_NODE_ID
     workflow_positive_node_overrides: list[str] = field(default_factory=list)
@@ -1264,6 +1268,9 @@ class PluginSettings:
                 data.get("lora_presets", _default_lora_presets())
             ),
             strict_lora_validation=_as_bool(data.get("strict_lora_validation"), True),
+            allow_unverified_character_names=_as_bool(
+                data.get("allow_unverified_character_names"), True
+            ),
             prompt_node_id=str(
                 data.get("prompt_node_id", DEFAULT_PROMPT_NODE_ID)
             ).strip(),
