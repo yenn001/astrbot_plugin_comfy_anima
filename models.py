@@ -512,6 +512,10 @@ class PluginSettings:
     # True  → 照画（记为"未经验证"，可能与设定有差；默认值，符合"认不出来也别停图"）
     # False → 严格：拒绝出图（宁可不出，也不画错角色）
     allow_unverified_character_names: bool = True
+    # 用户点名的维度（景别/机位/视线）在提示词里允许出现的最靠后位置（按逗号分隔的
+    # 第几个 tag 计，从 0 起）。落在这个位置之后即视为"没前置"，走一次修复重问。
+    # 0 = 关闭该校验。默认 16：紧接在角色/触发词块之后。
+    user_priority_anchor_max_index: int = 16
     prompt_node_id: str = DEFAULT_PROMPT_NODE_ID
     negative_node_id: str = DEFAULT_NEGATIVE_NODE_ID
     workflow_positive_node_overrides: list[str] = field(default_factory=list)
@@ -1271,6 +1275,9 @@ class PluginSettings:
             strict_lora_validation=_as_bool(data.get("strict_lora_validation"), True),
             allow_unverified_character_names=_as_bool(
                 data.get("allow_unverified_character_names"), True
+            ),
+            user_priority_anchor_max_index=min(
+                200, _as_int(data.get("user_priority_anchor_max_index"), 16, 0)
             ),
             prompt_node_id=str(
                 data.get("prompt_node_id", DEFAULT_PROMPT_NODE_ID)

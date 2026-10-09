@@ -24,6 +24,7 @@ from ..core.lora import LORA_TAG_PATTERN
 from ..models import PluginSettings
 from .prompt_composer import PromptComposer, PromptDiagnostics
 from .prompt_contracts import (
+    USER_PRIORITY_ANCHOR_TAGS,
     ANIMA_VISUAL_EXPANSION_PROTOCOL as CONTRACT_VISUAL_EXPANSION_PROTOCOL,
     CAPABILITY_DANBOORU,
     TASK_CONTROL_DRAW,
@@ -743,6 +744,7 @@ class PromptDirector:
     def _require_appearance_anchors(
         instruction: PictureInstruction,
         anchors: tuple[str, ...],
+        max_index: int = 16,
     ) -> None:
         """Require every planned anchor in the final instruction.
 
@@ -767,6 +769,37 @@ class PromptDirector:
             raise PromptDirectorError(
                 "【绘图导演思考模型】绘图模型没有写入必须包含的锚点标签",
                 "character_appearance_anchors_missing:" + ",".join(missing),
+            )
+        # 位置校验：用户点名的维度必须靠前。LoRA 触发词固定占最前位，写在尾部的
+        # 要求压不过它的训练偏置 —— 实测 upper body 落在第 20/21 个 tag 时仍出全身。
+        # max_index 由调用方从设置传入（本方法是 staticmethod，无 self）
+        if max_index <= 0:
+            return
+        priority = tuple(
+            anchor
+            for anchor in anchors
+            if str(anchor or "").strip().casefold() in USER_PRIORITY_ANCHOR_TAGS
+        )
+        if not priority:
+            return
+        items = [
+            item.strip().casefold()
+            for item in str(instruction.prompt or "").split(",")
+            if item.strip()
+        ]
+        late: list[str] = []
+        for anchor in priority:
+            key = str(anchor).strip().casefold()
+            position = next(
+                (index for index, item in enumerate(items) if key in item),
+                None,
+            )
+            if position is not None and position >= max_index:
+                late.append(str(anchor).strip())
+        if late:
+            raise PromptDirectorError(
+                "【绘图导演思考模型】用户点名的维度没有前置（尾部会被 LoRA 触发词压过）",
+                "user_priority_anchor_late:" + ",".join(late),
             )
 
     async def generate_instruction_probe_then_structured(
@@ -1100,9 +1133,17 @@ class PromptDirector:
                             provider_id=provider_id,
                         )
                     self._require_appearance_anchors(
-                        instruction,
-                        required_appearance_anchors,
+                instruction,
+                required_appearance_anchors,
+                int(
+                    getattr(
+                        getattr(self, "_settings", None),
+                        "user_priority_anchor_max_index",
+                        16,
                     )
+                    or 0
+                ),
+            )
                     return instruction, provider_id
                 if transport in {"function", "json"}:
                     payload: Any = None
@@ -1160,9 +1201,17 @@ class PromptDirector:
                                 provider_id=provider_id,
                             )
                         self._require_appearance_anchors(
-                            instruction,
-                            required_appearance_anchors,
-                        )
+                instruction,
+                required_appearance_anchors,
+                int(
+                    getattr(
+                        getattr(self, "_settings", None),
+                        "user_priority_anchor_max_index",
+                        16,
+                    )
+                    or 0
+                ),
+            )
                         return instruction, provider_id
                 completion = response_text(response)
                 if not isinstance(completion, str) or not completion.strip():
@@ -1181,9 +1230,17 @@ class PromptDirector:
                         provider_id=provider_id,
                     )
                 self._require_appearance_anchors(
-                    instruction,
-                    required_appearance_anchors,
-                )
+                instruction,
+                required_appearance_anchors,
+                int(
+                    getattr(
+                        getattr(self, "_settings", None),
+                        "user_priority_anchor_max_index",
+                        16,
+                    )
+                    or 0
+                ),
+            )
                 return instruction, provider_id
             except PromptDirectorError as exc:
                 if exc.detail in {
@@ -1231,6 +1288,16 @@ class PromptDirector:
                     and structured_mode == "auto"
                 )
                 anchor_directive = ""
+                if str(exc.detail or "").startswith("user_priority_anchor_late:"):
+                    late_list = str(exc.detail).split(":", 1)[1]
+                    anchor_directive = (
+                        " Also, these tags MUST sit among the FIRST tags of the "
+                        "positive prompt, directly AFTER the character/trigger "
+                        f"block: {late_list}. The user asked for them explicitly, "
+                        "so do not bury them after clothing or scene tags, and add "
+                        "the opposite framing to the negative prompt (for example "
+                        "`full body` when the user asked for an upper body)."
+                    )
                 if str(exc.detail or "").startswith(
                     "character_appearance_anchors_missing:"
                 ):

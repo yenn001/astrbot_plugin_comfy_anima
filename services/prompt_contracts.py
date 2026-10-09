@@ -409,6 +409,24 @@ User-priority anchors:
 """.strip()
 
 
+# 用户点名即需前置的维度标签（与 main 侧的中英对照表键一一对应）。
+# 单一来源放在这里：prompt_director 的位置校验按它判断，main 侧的识别按同一组标签返回。
+USER_PRIORITY_ANCHOR_TAGS: frozenset[str] = frozenset(
+    {
+        "upper body",
+        "full body",
+        "close-up",
+        "cowboy shot",
+        "from above",
+        "from below",
+        "from behind",
+        "from side",
+        "looking at viewer",
+        "facing away",
+    }
+)
+
+
 def build_director_contract(
     *,
     task_kind: str = TASK_DRAW,
