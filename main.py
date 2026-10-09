@@ -945,6 +945,21 @@ def _user_priority_anchors(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
+
+def _priority_anchors_for(event: Any, scene_text: str) -> tuple[str, ...]:
+    """Prefer the user message, but also honour the director input text.
+
+    Batch and re-draw paths carry a generic message (\u518d\u6765\u51e0\u5f20), while the
+    framing the user asked for lives in the request text the director received.
+    Union both, or the position check never sees the dimension at all.
+    """
+
+    from_message = _user_priority_anchors(
+        str(getattr(event, "message_str", "") or "")
+    )
+    from_scene = _user_priority_anchors(scene_text)
+    return tuple(dict.fromkeys((*from_message, *from_scene)))
+
 IMAGE_TASK_TYPES = frozenset(
     {
         "generation",
@@ -14736,10 +14751,7 @@ QQ快捷指令:
                             dict.fromkeys(
                                 (
                                     *subject_appearance_anchors,
-                                    *_user_priority_anchors(
-                                        str(getattr(event, "message_str", "") or "")
-                                        or scene_text
-                                    ),
+                                    *_priority_anchors_for(event, scene_text),
                                 )
                             )
                         ),
@@ -14760,10 +14772,7 @@ QQ快捷指令:
                             dict.fromkeys(
                                 (
                                     *subject_appearance_anchors,
-                                    *_user_priority_anchors(
-                                        str(getattr(event, "message_str", "") or "")
-                                        or scene_text
-                                    ),
+                                    *_priority_anchors_for(event, scene_text),
                                 )
                             )
                         ),

@@ -50,7 +50,9 @@ class UserPriorityAnchorWiringTests(unittest.TestCase):
             2,
             "两个导演调用点都应携带锚点（含用户点名维度）",
         )
-        self.assertEqual(main_src.count("*_user_priority_anchors("), 2)
+        # 3.1.473 起两个调用点改为并集助手（用户消息 ∪ 请求文本），断言随之同步
+        self.assertEqual(main_src.count("*_priority_anchors_for("), 2)
+        self.assertEqual(main_src.count("def _priority_anchors_for("), 1)
 
     def test_contract_carries_the_general_rule(self) -> None:
         contracts = (ROOT / "services" / "prompt_contracts.py").read_text(encoding="utf-8")
@@ -90,6 +92,29 @@ class UserPriorityAnchorWiringTests(unittest.TestCase):
     def test_no_false_positive_without_any_signal(self) -> None:
         self.assertEqual(MAIN._user_priority_anchors("娅娅在干嘛呢"), ())
         self.assertEqual(MAIN._user_priority_anchors("1girl, maid, blue hair"), ())
+
+    def test_union_of_message_and_scene_text(self) -> None:
+        """批量/续抽路径的通用消息 + 请求文本，两边的点名都要算上。"""
+
+        class _Event:
+            def __init__(self, message: str) -> None:
+                self.message_str = message
+
+        # 消息里没有点名，请求文本里有 -> 仍要识别出来
+        self.assertEqual(
+            MAIN._priority_anchors_for(_Event("再来几张"), "1girl, upper body, maid"),
+            ("upper body",),
+        )
+        # 两边各有一个 -> 去重合并
+        self.assertEqual(
+            MAIN._priority_anchors_for(_Event("上半身来一张"), "full body not needed".replace("not needed", "").replace("full body ", "")),
+            ("upper body",),
+        )
+        # 两边都有不同维度 -> 合并保序
+        got = MAIN._priority_anchors_for(_Event("上半身"), "looking at viewer")
+        self.assertEqual(got, ("upper body", "looking at viewer"))
+        # 都没有 -> 空
+        self.assertEqual(MAIN._priority_anchors_for(_Event("再来几张"), "1girl, maid"), ())
 
 
 if __name__ == "__main__":
