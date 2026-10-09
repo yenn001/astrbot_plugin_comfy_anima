@@ -811,10 +811,6 @@ _PROMPT_TAG_SLOT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "forest", "beach", "window", "bed", "sofa", "room", "sky", "city",
         "garden", "school",
     ),
-    "lighting": (
-        "lighting", "backlight", "sunlight", "moonlight", "shadow", "glow",
-        "rim light", "soft light", "neon", "candle", "lamp", "lens flare",
-    ),
 }
 
 def _prompt_tag_metrics(prompt: str) -> dict[str, Any]:

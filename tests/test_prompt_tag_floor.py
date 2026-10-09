@@ -56,23 +56,23 @@ class PromptTagMetricsTests(unittest.TestCase):
 
         metrics = self.main._prompt_tag_metrics(HYBRID)
         markers = metrics["slot_markers"]
+        # P1：lighting 槽已按新模板删除（不再统计光线），槽位表随之收敛
         self.assertEqual(set(markers), {
-            "identity", "clothing", "action", "camera", "scene", "lighting",
+            "identity", "clothing", "action", "camera", "scene",
         })
         self.assertGreater(markers["clothing"], 0)
         self.assertGreater(markers["identity"], 0)
-        # 该样例的 "soft rim lighting" 只出现在场景句里、没进 tag 串，
+        # 该样例的机位只写在场景句里、没进 tag 串，
         # 槽位标记据此报 0 —— 这正是"该槽位未被 tag 串覆盖"的诊断信号。
-        self.assertEqual(markers["lighting"], 0)
         self.assertEqual(markers["camera"], 0)
 
     def test_slot_markers_ignore_the_scene_sentence(self) -> None:
-        """把光效写进 tag 串才会被记为覆盖。"""
+        """把机位写进 tag 串才会被记为覆盖（lighting 槽已按新模板删除）。"""
 
         tags_only = self.main._prompt_tag_metrics(
-            "1girl, red hair, white dress, rim lighting, soft lighting"
+            "1girl, red hair, white dress, from above, cowboy shot"
         )
-        self.assertGreater(tags_only["slot_markers"]["lighting"], 0)
+        self.assertGreater(tags_only["slot_markers"]["camera"], 0)
 
     def test_empty_prompt_is_zero_not_an_error(self) -> None:
         metrics = self.main._prompt_tag_metrics("")
@@ -87,9 +87,10 @@ class PromptTagFloorConfigTests(unittest.TestCase):
         cls.main = importlib.import_module("astrbot_plugin_comfy_anima.main")
         cls.models = importlib.import_module("astrbot_plugin_comfy_anima.models")
 
-    def test_floor_defaults_to_twenty(self) -> None:
+    def test_floor_defaults_to_sixteen(self) -> None:
+        # P1：按新模板的分档（单人 16-30），下限由 20 降为 16，避免简单场景误报
         settings = self.models.PluginSettings.from_mapping({})
-        self.assertEqual(settings.min_prompt_tags, 20)
+        self.assertEqual(settings.min_prompt_tags, 16)
 
     def test_floor_is_clamped(self) -> None:
         self.assertEqual(

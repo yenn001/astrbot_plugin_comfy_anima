@@ -134,11 +134,14 @@ HYBRID_PROMPT_CONTRACT = """
 Positive prompt composition:
 - Keep all exact tool-returned LoRA controls first and unchanged. Then write
   ordered English Danbooru/Anima hard tags, a few visible relation/material
-  phrases when needed, and exactly one present-tense scene sentence after a
-  period. The sentence belongs inside the same positive prompt.
-- Hard tags own discrete facts. The sentence owns relationships, contact points,
-  held objects, garment state, foreground/background interaction and main-light
-  direction. Repeat only a few high-value anchors and add no new fact.
+  phrases when needed, and zero to three present-tense natural-language phrases.
+  Every phrase stays inside the same positive prompt and after all tags.
+- Hard tags own discrete facts. The phrases own relationships, contact points,
+  held objects, garment state and foreground/background interaction. Repeat only
+  a few high-value anchors and add no new fact. Use more than one phrase only
+  when one cannot carry the ambiguities; keep each phrase short.
+- Do NOT emit lighting, shadow, rim-light or colour-grade tags: the Anima LoRA
+  already carries them. Weather words (rain, snow, fog, steam) are allowed.
 - Use natural spaces and comma separators for ordinary tags. Preserve exact
   tool-returned filenames and trigger words. Escape ordinary parentheses in
   rendered Danbooru tags as `\\(` and `\\)`.
@@ -265,27 +268,31 @@ and never add the target identity or any guessed LoRA.
 }
 
 STANDARD_DENSITY_CONTRACT = """
-Density: Standard. Prefer obedience and stability. Use roughly 14-32 useful
-ordinary tags, at most a few relation/material phrases and one concise 18-45
-word scene sentence when the request benefits from it. Simpler images may be
-shorter. Do not use weight syntax; emphasize by front-loading high-value
-anchors and adding visible detail.
+Density: Standard. Prefer obedience and stability. Keep the ordinary tag count
+inside the band for this scene: 16-30 for a single-subject showcase, 22-38 for a
+two-person scene, 30-48 for a crowded or story-driven scene. Bands are guidance
+with an upper bound, not a quota: never pad to reach a number.
+Close with zero to three short natural-language phrases after all tags.
+Do not use weight syntax; emphasize by front-loading high-value anchors.
+Do NOT emit lighting, shadow, rim-light or colour-grade tags.
 """.strip()
 
 ULTRA_DENSITY_CONTRACT = """
 Density: Ultra. Increase only relevant visible evidence: face/hair detail,
-garment construction and material, gesture/contact, motion, spatial layers,
-environment interaction, main/rim light and color separation. Roughly 30-65
-useful ordinary tags and one 35-80 word scene sentence are upper guidance, not
-quotas. Never use synonym repetition, conflicting effects or quality slogans to
-fake complexity.
+garment construction and material, gesture/contact, motion, spatial layers and
+environment interaction. Stay inside the scene band (16-30 / 22-38 / 30-48);
+the band is upper guidance, not a quota. Close with zero to three short
+natural-language phrases. Never use synonym repetition, conflicting effects or
+quality slogans to fake complexity. Do NOT emit lighting, shadow, rim-light or
+colour-grade tags.
 """.strip()
 
 QUALITY_BUDGET_CONTRACT = """
 Prompt quality budget:
-- Write the positive prompt as one English natural-language sentence ordered:
-  who + appearance DNA + outfit + action + expression + location + camera +
-  light. Small Danbooru tags may anchor the sentence; do not use weight syntax.
+- Write the positive prompt as ordered English tags first, then zero to three
+  short natural-language phrases covering who + appearance DNA + outfit + action
+  + expression + location + camera. Small Danbooru tags may anchor the phrases;
+  do not use weight syntax and do not emit lighting or colour-grade tags.
 - Cover all six DNA anchors for every character: hair color, hairstyle+length,
   bangs, eye color, face shape, skin/body.
 - Per-person word budgets are upper limits, not minimums: N=1 <=150 words;

@@ -1173,11 +1173,12 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("draw a beach scene", request_prompt)
         self.assertIn("ordered English Danbooru/Anima hard tags", system_prompt)
         self.assertIn(
-            "sentence belongs inside the same positive prompt",
+            "phrase stays inside the same positive prompt",
             system_prompt,
         )
         self.assertIn("Density: Standard", system_prompt)
-        self.assertIn("18-45", system_prompt)
+        # P1：数量由"18-45 词一句"改为按场景分档（带上限）
+        self.assertIn("16-30", system_prompt)
         self.assertIn(
             "Terminal seal: call emit_anima_plan_v1 exactly once",
             system_prompt,
@@ -1221,7 +1222,9 @@ class PromptDirectorToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("density=Ultra", str(context.kwargs["prompt"]))
         self.assertIn("Density: Ultra", str(context.kwargs["system_prompt"]))
-        self.assertIn("35-80 word scene sentence", str(context.kwargs["system_prompt"]))
+        # P1：改为分档 + 0-3 句，不再有"35-80 词一句"
+        self.assertIn("30-48", str(context.kwargs["system_prompt"]))
+        self.assertIn("zero to three", str(context.kwargs["system_prompt"]))
         self.assertIn(
             "Terminal seal: call emit_anima_plan_v1 exactly once",
             str(context.kwargs["system_prompt"]),
