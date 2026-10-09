@@ -909,6 +909,40 @@ def _redraw_subject_from_reverse(reverse_result: Any) -> str:
     return str(getattr(characters[0], "name", "") or "").strip()
 
 
+# 用户在指令里明确点名、却容易被角色 LoRA 训练偏置压过的维度。
+# 键 = 提示词里应出现的英文 tag；值 = 中文说法（用于从用户原话里识别）。
+# 只在用户明说时生效：未提及的维度不得强加。
+_USER_PRIORITY_ANCHOR_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("upper body", ("上半身", "半身像", "胸像", "半身")),
+    ("full body", ("全身", "全身照")),
+    ("close-up", ("特写", "近景", "脸部特写")),
+    ("cowboy shot", ("七分身", "膝上")),
+    ("from above", ("俯视", "从上往下", "高角度")),
+    ("from below", ("仰视", "从下往上", "低角度")),
+    ("from behind", ("背影", "背面", "从背后")),
+    ("from side", ("侧面", "侧身")),
+    ("looking at viewer", ("看镜头", "看着镜头", "看向镜头")),
+    ("facing away", ("背对镜头", "别过头")),
+)
+
+
+def _user_priority_anchors(text: str) -> tuple[str, ...]:
+    """Return English tags for dimensions the user explicitly named.
+
+    Framing, camera angle and viewing direction are easily overridden by a
+    character LoRA's training bias, so an explicit request for one of them is
+    enforced through the same anchor channel as appearance anchors (checked,
+    non-fatal, repaired once by the existing repair loop).
+    """
+
+    source = str(text or "")
+    found: list[str] = []
+    for tag, variants in _USER_PRIORITY_ANCHOR_TERMS:
+        if any(variant in source for variant in variants):
+            found.append(tag)
+    return tuple(dict.fromkeys(found))
+
+
 IMAGE_TASK_TYPES = frozenset(
     {
         "generation",
@@ -14696,7 +14730,17 @@ QQ快捷指令:
                         expansion_mode=expansion_mode,
                         task_kind=task_kind,
                         runtime_capabilities=runtime_capabilities,
-                        required_appearance_anchors=subject_appearance_anchors,
+                        required_appearance_anchors=tuple(
+                            dict.fromkeys(
+                                (
+                                    *subject_appearance_anchors,
+                                    *_user_priority_anchors(
+                                        str(getattr(event, "message_str", "") or "")
+                                        or scene_text
+                                    ),
+                                )
+                            )
+                        ),
                     )
                 return await self._director.generate_instruction(
                     self.context,
@@ -14710,7 +14754,17 @@ QQ快捷指令:
                     expansion_mode=expansion_mode,
                     task_kind=task_kind,
                     runtime_capabilities=runtime_capabilities,
-                    required_appearance_anchors=subject_appearance_anchors,
+                    required_appearance_anchors=tuple(
+                            dict.fromkeys(
+                                (
+                                    *subject_appearance_anchors,
+                                    *_user_priority_anchors(
+                                        str(getattr(event, "message_str", "") or "")
+                                        or scene_text
+                                    ),
+                                )
+                            )
+                        ),
                 )
 
     async def _generate_directed_edit_instruction(

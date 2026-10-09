@@ -744,12 +744,14 @@ class PromptDirector:
         instruction: PictureInstruction,
         anchors: tuple[str, ...],
     ) -> None:
-        """Require every verified character appearance anchor in the plan.
+        """Require every planned anchor in the final instruction.
 
-        A bound character carries profile anchors (e.g. ``pink hair``); when
-        the model invents other hair/eye colors instead, the wrong color wins
-        over the LoRA and the face drifts. Missing anchors raise a non-fatal
-        error so the existing repair loop re-asks with an explicit directive.
+        Two kinds of anchor travel this channel: verified character appearance
+        (e.g. ``pink hair``, where an invented colour would beat the LoRA), and
+        dimensions the user explicitly named that a LoRA's training bias tends to
+        override (framing, camera angle, viewing direction). A missing anchor
+        raises a non-fatal error so the existing repair loop re-asks with an
+        explicit directive.
         """
 
         if not anchors:
@@ -763,7 +765,7 @@ class PromptDirector:
         )
         if missing:
             raise PromptDirectorError(
-                "【绘图导演思考模型】绘图模型没有写入已验证角色外貌锚点",
+                "【绘图导演思考模型】绘图模型没有写入必须包含的锚点标签",
                 "character_appearance_anchors_missing:" + ",".join(missing),
             )
 

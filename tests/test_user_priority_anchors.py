@@ -1,0 +1,74 @@
+"""用户点名维度（景别/机位/视线）必须能与外貌锚点走同一强制通道。
+
+背景：一条"上半身"的指令连续四次出成全身。取证发现提示词里确实有 upper body，
+但 LoRA 触发词占据最前位、且该 LoRA 训练以全身为主，尾部要求压不住。
+结论：不靠人工负面清单，而是让 LLM 逐次判断 + 插件校验（复用外貌锚点那套）。
+"""
+
+import importlib
+import re
+import unittest
+from pathlib import Path
+
+from ._stubs import install_astrbot_stubs
+
+install_astrbot_stubs()
+MAIN = importlib.import_module("astrbot_plugin_comfy_anima.main")
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class UserPriorityAnchorDerivationTests(unittest.TestCase):
+    def test_chinese_framing_words_map_to_tags(self) -> None:
+        cases = {
+            "给我画上半身的娅娅": ("upper body",),
+            "来张全身的": ("full body",),
+            "脸特写一张": ("close-up",),
+            "仰视角度拍一张": ("from below",),
+            "画背影": ("from behind",),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                got = MAIN._user_priority_anchors(text)
+                self.assertIn(expected[0], got)
+
+    def test_negated_or_absent_request_yields_nothing(self) -> None:
+        self.assertEqual(MAIN._user_priority_anchors("娅娅在干嘛呢"), ())
+        self.assertEqual(MAIN._user_priority_anchors(""), ())
+
+    def test_multiple_dimensions_are_collected_once(self) -> None:
+        got = MAIN._user_priority_anchors("上半身，仰视，看着镜头")
+        self.assertEqual(got, ("upper body", "from below", "looking at viewer"))
+        self.assertEqual(len(got), len(set(got)))
+
+
+class UserPriorityAnchorWiringTests(unittest.TestCase):
+    def test_both_director_call_sites_pass_priority_anchors(self) -> None:
+        main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            len(re.findall(r"required_appearance_anchors=tuple\(", main_src)),
+            2,
+            "两个导演调用点都应携带锚点（含用户点名维度）",
+        )
+        self.assertEqual(main_src.count("*_user_priority_anchors("), 2)
+
+    def test_contract_carries_the_general_rule(self) -> None:
+        contracts = (ROOT / "services" / "prompt_contracts.py").read_text(encoding="utf-8")
+        self.assertIn("USER_PRIORITY_ANCHOR_CONTRACT =", contracts)
+        self.assertEqual(contracts.count("parts.append(USER_PRIORITY_ANCHOR_CONTRACT)"), 1)
+        for phrase in (
+            "immediately AFTER the character/trigger block",
+            "add the opposite term to the negative prompt",
+            "Never silently drop an explicit user requirement",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, contracts)
+
+    def test_anchor_error_message_is_not_appearance_specific(self) -> None:
+        src = (ROOT / "services" / "prompt_director.py").read_text(encoding="utf-8")
+        self.assertIn("没有写入必须包含的锚点标签", src)
+        self.assertNotIn("没有写入已验证角色外貌锚点", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

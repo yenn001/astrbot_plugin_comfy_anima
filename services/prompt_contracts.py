@@ -394,6 +394,21 @@ def redact_director_output(
     return f"{text[:head]} …[omitted {omitted} chars of {total}]… {text[-tail:]}"
 
 
+USER_PRIORITY_ANCHOR_CONTRACT = """
+User-priority anchors:
+- Some dimensions dominate the frame and are easily overridden by the character
+  LoRA's own training bias: framing/shot size, camera angle, viewing direction,
+  clothing state and pose. When the user explicitly names one of them, the
+  character or LoRA blocks must not quietly win.
+- Therefore, for every dimension the user explicitly named: place its tag
+  immediately AFTER the character/trigger block (position carries emphasis), and
+  add the opposite term to the negative prompt (for example, an explicitly
+  requested upper body pairs with `full body` in the negative).
+- Never silently drop an explicit user requirement in favour of a LoRA default.
+  An honest, visible conflict beats a silent substitution.
+""".strip()
+
+
 def build_director_contract(
     *,
     task_kind: str = TASK_DRAW,
@@ -432,6 +447,8 @@ def build_director_contract(
         parts.append(CHARACTER_EVIDENCE_CONTRACT)
     if task != TASK_MASKED_REDRAW:
         parts.append(QUALITY_BUDGET_CONTRACT)
+        # 用户点名的高优先维度（景别/机位/视线等）与质量预算同层注入
+        parts.append(USER_PRIORITY_ANCHOR_CONTRACT)
     if CAPABILITY_PROMPT_PLAN in caps:
         parts.append(PROMPT_PLAN_CAPABILITY_CONTRACT)
     if CAPABILITY_LORA in caps:
