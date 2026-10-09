@@ -2,6 +2,28 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-10-09（构建 3.1.474）
+
+### ① 补全诊断关键词表：不再"写了却报 0"
+
+- **起因（用户一句追问）** ✓：`scene: 0` 是不是和"说了空白背景"有关 ✓ —— **是的，直接相关** ✓✓
+- **实证** ✓：`scene` 槽关键词原为
+  `('indoors','outdoors','bedroom',…,'school')` ✓ —— **不含** `background` / `white background` /
+  `blank background` / `day` / `daytime` ✗✓，实测这些词**全部 False** ✗
+  → 用户明确要求空白背景 ✓、提示词里 `white background, blank background` 都在 ✓，
+  却报 `scene: 0` ✗ ⇒ **是计数器不认这些词，不是没写场景** ✓✓
+- **我据此纠正上一轮的误判** ✗：我说"场景偏薄"是**误读** ✓（`slot_markers` 自己的 docstring
+  就写着"关键词估算、非强制" ✓）—— 这正说明**诊断不准会误导判断** ✓
+- **二审（改前先查消费者）** ✓：
+  `slot_markers` 全项目**仅 2 处引用** ✓（定义 + 一条告警文案 ✓，
+  且该文案自述"**仅告警，不阻断出图**" ✓✓）；`_PROMPT_TAG_SLOT_KEYWORDS` 仅定义 + 一处循环 ✓；
+  `_prompt_tag_metrics` 仅定义 + 一处调用 ✓（下限判定用的是 `min_prompt_tags`/`tag_count` ✓）
+  ⇒ **改关键词表只影响诊断文案，零行为风险** ✓✓
+- **本版改法（纯数据，只加不改）** ✓：补 `scene`（background 类 / day / 室内外 / 场所 ✓）、
+  `camera`（looking at viewer / chest up / bust / close up …✓）、`action`（smug / thumbs up …✓）、
+  `identity`（短/长发 / 马尾 / 渐变发 / expression …✓）、`clothing`（bow / collar / headdress / maid …✓）
+- **验证**：新增 `tests/test_scene_slot_coverage.py` ✓（白底必计入 scene ✓、
+  6 组常见写法各自计入正确槽位 ✓、槽位集合不变 ✓）；全量测试与门控部署见日志 ✓。
 ## [2.5.1] - 2026-10-09（构建 3.1.473）
 
 ### A：位置校验的锚点来源改为"用户消息 ∪ 请求文本"
