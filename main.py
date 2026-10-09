@@ -938,7 +938,9 @@ def _user_priority_anchors(text: str) -> tuple[str, ...]:
     source = str(text or "")
     found: list[str] = []
     for tag, variants in _USER_PRIORITY_ANCHOR_TERMS:
-        if any(variant in source for variant in variants):
+        # 中文说法或英文 tag 本身都算点名：指令里直接粘 tag 是常见用法，
+        # 实测该形式原本完全识别不到，位置校验于是静默失效。
+        if any(variant in source for variant in variants) or tag in source.casefold():
             found.append(tag)
     return tuple(dict.fromkeys(found))
 

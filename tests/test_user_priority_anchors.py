@@ -69,6 +69,28 @@ class UserPriorityAnchorWiringTests(unittest.TestCase):
         self.assertIn("没有写入必须包含的锚点标签", src)
         self.assertNotIn("没有写入已验证角色外貌锚点", src)
 
+    def test_english_tag_itself_is_recognised(self) -> None:
+        """指令里直接写英文 tag 也必须算点名。
+
+        实测：'/画图 1girl, upper body, blue hair, maid --llm' 原本返回 ()，
+        于是位置校验静默失效，upper body 落第 19/22 位仍出全身。
+        """
+
+        cases = {
+            "upper body": "upper body",
+            "1girl, upper body, blue hair, maid": "upper body",
+            "/draw 1girl, upper body, maid --llm": "upper body",
+            "full body standing": "full body",
+            "shot from above": "from above",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertIn(expected, MAIN._user_priority_anchors(text))
+
+    def test_no_false_positive_without_any_signal(self) -> None:
+        self.assertEqual(MAIN._user_priority_anchors("娅娅在干嘛呢"), ())
+        self.assertEqual(MAIN._user_priority_anchors("1girl, maid, blue hair"), ())
+
 
 if __name__ == "__main__":
     unittest.main()
