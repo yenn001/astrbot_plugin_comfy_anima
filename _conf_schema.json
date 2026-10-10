@@ -1774,5 +1774,17 @@
     "type": "int",
     "hint": "tag 数量下限。提示词契约已按场景分档（单人 16-30、双人 22-38、复杂 30-48），此值作为低于下限时的告警阈值，默认 16（简单场景不再误报）；填 0 关闭。",
     "default": 16
+  },
+  "danbooru_api_login": {
+    "description": "Danbooru API 登录名（配合 api_key）",
+    "type": "string",
+    "hint": "直连 Danbooru 官方 API 的用户名。匿名可读，但分页与速率受限。",
+    "default": "y59_001"
+  },
+  "danbooru_api_key": {
+    "description": "Danbooru API Key（按密码对待）",
+    "type": "string",
+    "hint": "在 Danbooru 个人资料页生成。只写入本插件配置，日志与任务事件中一律不出现。",
+    "default": ""
   }
 }

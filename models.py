@@ -482,6 +482,10 @@ class PluginSettings:
     danbooru_index_max_size_mb: int = 256
     danbooru_api_base_url: str = "https://danbooru.donmai.us"
     danbooru_api_proxy_url: str = ""
+    # 直连 Danbooru API 的凭据。匿名也能读，但分页与速率受限，
+    # 且文档要求带自定义 User-Agent。填写后外观证据与现查都更稳。
+    danbooru_api_login: str = "y59_001"
+    danbooru_api_key: str = ""
     danbooru_api_mode: str = "identity"
     danbooru_api_general_min_posts: int = 10
     danbooru_api_meta_min_posts: int = 10
@@ -1185,7 +1189,13 @@ class PluginSettings:
             ),
             danbooru_api_proxy_url=str(
                 data.get("danbooru_api_proxy_url", "")
+            ),
+            danbooru_api_login=str(
+                data.get("danbooru_api_login", "y59_001")
             ).strip(),
+            danbooru_api_key=str(
+                data.get("danbooru_api_key", "")
+            ).strip().strip(),
             danbooru_api_mode=(
                 str(data.get("danbooru_api_mode", "identity")).strip().casefold()
                 if str(data.get("danbooru_api_mode", "identity")).strip().casefold()

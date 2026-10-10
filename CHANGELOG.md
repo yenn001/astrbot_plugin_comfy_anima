@@ -2,6 +2,41 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-10-10（构建 3.1.479）
+
+### P4a：外貌证据改走**直连 Danbooru API**（代理坏掉也能补外貌）
+
+- **用户诉求** ✓：「能根据识别出来的角色，补充一定的外貌特征吗？不单单只是一个名」✓
+- **实测：机制早就有，但 85% 拿不到数据** ✗✓：
+  - 档案结构完好 ✓（样例：`aemeath_(wuthering_waves)` → `appearance_tags=[pink hair, orange eyes,
+    long hair, hair ornament, ahoge]` ✓ `sample_count=69` ✓ `support` 带支持率 ✓）；
+  - 但全量统计 ✗：`appearance_lookup 243` 次 → **`unavailable 208` 次** ✗ +
+    `insufficient 123` 次 ✗ + `stale_used 35` ✓；**缓存里只有 3 个角色** ✗；
+  - 近期实测：`monica_(granblue_fantasy)` 连续三次 `appearance_terms=0` ✗
+    （提示词里只剩 `fair skin` 这类通用词 ✗）；
+  - **根因** ✓：外观证据只走 ComfyUI 侧 `/danbooru_gallery/posts` ✗（`source: danbooru_gallery` ✓
+    即铁证 ✓），而该代理在本部署**已坏** ✗（HTTP 200 但内容是 `[{"error": …}]` ✗）。
+- **改法** ✓（方案 §8：硬超时 + 失败放行 + 可观测 ✓）：
+  1. **新增 `services/danbooru_api_client.py`** ✓：直连 `/posts.json` ✓
+     （`tags=<canonical> solo rating:g` ✓，`limit` 收敛到 API 上限 200 ✓，
+     带 `login`/`api_key` ✓，自定义 UA ✓）；返回**Danbooru 原生字段**
+     （`id`/`rating`/`tag_string_character`/`tag_string_general` ✓）——
+     实测档案解析读的就是这些键 ✓，因此**消费方零改动** ✓✓；
+     代理走 `curl --socks5-hostname` ✓（容器内唯一验证过可用的 SOCKS 客户端 ✓），
+     全程 `subprocess.run(timeout=…)` ✓ 兜底。
+  2. **新增设置** `danbooru_api_login` / `danbooru_api_key` ✓（models + loader + schema 三处同步 ✓，
+     schema 250 → **252 键** ✓）；**key 按密码对待** ✓：只进配置 ✓，日志/事件一律不出现 ✓。
+  3. **新增 `_danbooru_evidence_posts()`** ✓：**直连 API 优先 → 失败退 ComfyUI 代理 → 都失败返回空** ✓；
+     `asyncio.wait_for` + **15 秒硬超时** ✓；每次命中/兜底都写日志 ✓（"直连 API 取得 N 帖" ✓ /
+     "直连未命中（原因）" ✓）——**不再静默降级** ✓✓。
+  4. **3 个调用点全部改用它** ✓（含模块级 `_refresh_appearance_profile` ✓：它是模块级函数 ✗
+     不能用 `self` ✗ → **改为传入 `plugin`** ✓，唯一调用点同步 ✓）。
+- **验证**：新增 `tests/test_danbooru_evidence_direct.py` ✓（URL 构造/上限收敛/凭据仅在配置 key 时出现/
+  非法 canonical 拒绝/SOCKS 方案映射 ✓；接线：helper 存在 ✓ 直连在代理前 ✓ 旧调用只剩 1 处（兜底）✓
+  模块级函数收到 plugin ✓ 设置与 schema 齐备 ✓）；全量测试与门控部署见日志 ✓。
+- 回退点：**锚点12（3.1.478）** ✓ + `..._3.1.478_pre_p4a_...tar.gz` ✓
+- **下一步** ✓：P2 中文桥 → P3 隧道现查；另**样本门槛**（`MIN_PROFILE_SAMPLES=12` ✗）与
+  直连命中率需要在 P4a 上线后**用实测数据复核** ✓（那 123 次 `insufficient` 是否随之为 0 ✓）。
 ## [2.5.1] - 2026-10-10（构建 3.1.478）
 
 ### P1：名字被写歪时不再丢角色（容错确认）

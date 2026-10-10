@@ -85,6 +85,10 @@ from .models import (
     migrate_legacy_consolidated_config,
 )
 from .services.comfy_client import ComfyClient, ComfyClientError
+from .services.danbooru_api_client import (
+    DanbooruApiError,
+    fetch_character_posts,
+)
 from .services.character_swap import (
     CharacterSwapError,
     CharacterSwapPlan,
@@ -897,8 +901,12 @@ def _prompt_tag_metrics(prompt: str) -> dict[str, Any]:
 # 取不到稳定外貌的角色，短期内不再重复慢查询。
 APPEARANCE_UNRESOLVABLE_TTL_SECONDS = 6 * 3600
 
+# 直连 Danbooru API 取外貌证据的硬超时（方案 §8：宁可少补标签，也不能卡住出图）。
+DANBOORU_EVIDENCE_TIMEOUT_SECONDS = 15.0
+
 
 async def _refresh_appearance_profile(
+    plugin: Any,
     client: Any,
     store: Any,
     canonical_tag: str,
@@ -910,7 +918,10 @@ async def _refresh_appearance_profile(
     """
 
     try:
-        posts = await client.danbooru_character_posts(canonical_tag, limit=100)
+        posts = await plugin._danbooru_evidence_posts(
+            canonical_tag,
+            client=client,
+        )
         profile = await asyncio.to_thread(
             build_character_appearance_profile, canonical_tag, posts
         )
@@ -9849,6 +9860,7 @@ QQ快捷指令:
                     try:
                         asyncio.get_running_loop().create_task(
                             _refresh_appearance_profile(
+                                self,
                                 refresh_client, store, canonical_tag
                             )
                         )
@@ -9876,7 +9888,10 @@ QQ快捷指令:
         if client is None or not hasattr(client, "danbooru_character_posts"):
             return None
         try:
-            posts = await client.danbooru_character_posts(canonical_tag, limit=100)
+            posts = await self._danbooru_evidence_posts(
+            canonical_tag,
+            client=client,
+        )
             profile = await asyncio.to_thread(
                 build_character_appearance_profile,
                 canonical_tag,
@@ -11881,9 +11896,9 @@ QQ快捷指令:
                     direct_profiles[candidate_tag] = cached_profile
                     continue
                 try:
-                    posts = await client.danbooru_character_posts(
+                    posts = await self._danbooru_evidence_posts(
                         candidate_tag,
-                        limit=100,
+                        client=client,
                     )
                     direct_profile = await asyncio.to_thread(
                         build_character_appearance_profile,
@@ -15436,6 +15451,72 @@ QQ快捷指令:
         if rescued is not None and bool(getattr(rescued, "verified", False)):
             return rescued
         return current
+
+    async def _danbooru_evidence_posts(
+        self,
+        canonical_tag: str,
+        *,
+        client: Any = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return appearance-evidence posts, preferring the direct Danbooru API.
+
+        实测：ComfyUI 侧代理已坏（HTTP 200 但内容是 error），243 次取证据里 208 次
+        拿不到，已经验证过的角色于是长期缺外貌标签。这里先走直连 API（隧道可用时
+        亚秒级返回），失败再退代理；两条都失败返回空 —— 绝不阻塞出图（方案 §8）。
+        """
+
+        canonical = str(canonical_tag or "").strip()
+        api_error = ""
+        if canonical:
+            try:
+                posts = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        fetch_character_posts,
+                        canonical,
+                        base_url=str(
+                            getattr(self.settings, "danbooru_api_base_url", "") or ""
+                        ),
+                        login=str(getattr(self.settings, "danbooru_api_login", "") or ""),
+                        api_key=str(getattr(self.settings, "danbooru_api_key", "") or ""),
+                        proxy_url=str(
+                            getattr(self.settings, "danbooru_api_proxy_url", "") or ""
+                        ),
+                        limit=limit,
+                        timeout=DANBOORU_EVIDENCE_TIMEOUT_SECONDS,
+                    ),
+                    timeout=DANBOORU_EVIDENCE_TIMEOUT_SECONDS + 5.0,
+                )
+                if posts:
+                    logger.info(
+                        f"[{PLUGIN_NAME}] 外观证据：直连 API 取得 {len(posts)} 帖 "
+                        f"({canonical})"
+                    )
+                    return posts
+                api_error = "直连 API 返回 0 帖"
+            except Exception as exc:  # noqa: BLE001 - 取证据失败一律降级，不阻断
+                api_error = f"{type(exc).__name__}: {str(exc)[:80]}"
+        if not canonical:
+            return []
+        if client is None or not hasattr(client, "danbooru_character_posts"):
+            logger.warning(
+                f"[{PLUGIN_NAME}] 外观证据：直连 API 未命中 ({canonical})；api={api_error}"
+            )
+            return []
+        try:
+            posts = await client.danbooru_character_posts(canonical, limit=limit)
+        except Exception as exc:  # noqa: BLE001 - 同上
+            logger.warning(
+                f"[{PLUGIN_NAME}] 外观证据：直连与代理均失败 ({canonical})；"
+                f"api={api_error} proxy={type(exc).__name__}"
+            )
+            return []
+        if posts:
+            logger.info(
+                f"[{PLUGIN_NAME}] 外观证据：代理取得 {len(posts)} 帖 ({canonical})；"
+                f"直连未命中：{api_error}"
+            )
+        return list(posts or [])
 
     def _log_intent_gate_rejection(self, event: AstrMessageEvent) -> None:
         """Explain why the intent gate produced no DRAW_NOW decision.
