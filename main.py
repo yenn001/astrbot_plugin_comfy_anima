@@ -905,7 +905,7 @@ APPEARANCE_UNRESOLVABLE_TTL_SECONDS = 6 * 3600
 DANBOORU_EVIDENCE_TIMEOUT_SECONDS = 15.0
 
 # 歧义角色让 LLM 从真候选里挑一个的硬超时（方案 §8：失败即原样报错，不阻断）。
-CHARACTER_PICK_TIMEOUT_SECONDS = 20.0
+CHARACTER_PICK_TIMEOUT_SECONDS = 45.0
 
 
 def _describe_failure(exc: BaseException) -> str:
@@ -15597,6 +15597,35 @@ QQ快捷指令:
         head = _normalize(name).split("_(", 1)[0] or _normalize(name)
         if not head:
             return None
+        # 实测：同一角色每次出图都会重跑整套 LLM（准备/校验 37s → 215s → 396s 递增），
+        # 且偶发的 20 秒超时会让该次降级成原创。把"名字 → canonical"缓存住。
+        cache = getattr(self, "_resolved_character_name_cache", None)
+        if cache is None:
+            cache = {}
+            self._resolved_character_name_cache = cache
+        cache_key = _normalize(name)
+        cached = cache.get(cache_key)
+        if cached:
+            try:
+                hit = await asyncio.to_thread(index.lookup, cached, "character")
+            except Exception:  # noqa: BLE001
+                hit = None
+            if hit is not None and bool(getattr(hit, "verified", False)):
+                from .services.character_identity import CharacterIdentityResolution
+
+                logger.info(
+                    f"[{PLUGIN_NAME}] 角色名命中缓存：{name} -> {cached}"
+                )
+                return CharacterIdentityResolution(
+                    canonical_tag=str(getattr(hit, "canonical_tag", "") or cached),
+                    verified=True,
+                    ambiguous=False,
+                    match_variant="cached_name_resolution",
+                    match_type="exact",
+                    query_count=1,
+                    candidate_count=1,
+                    candidates=(cached,),
+                )
 
         async def _search(term: str):
             try:
@@ -15694,6 +15723,9 @@ QQ快捷指令:
         logger.info(
             f"[{PLUGIN_NAME}] 歧义角色已由 LLM 从真候选选定并 exact 确认："
             f"{name} -> {chosen}"
+        )
+        cache[_normalize(name)] = str(
+            getattr(confirmed, "canonical_tag", "") or chosen
         )
         # 调用方（角色校验链）读的是 CharacterIdentityResolution 的字段
         # （verified/ambiguous/match_variant/candidate_count…），不是 TagLookup。
