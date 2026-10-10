@@ -10982,11 +10982,22 @@ QQ快捷指令:
                         },
                     )
                     continue
-                raise CharacterPromptCompileError(
-                    f"角色“{name}”在本地 Danbooru 中命中多个身份，请补充准确作品名",
-                    code="character_resolution_ambiguous",
-                    details={"candidate_count": resolution.candidate_count},
+                # 歧义时先让 LLM 从【真候选+帖数】里挑一个（音译误差只有这样才能纠正）；
+                # 失败/超时/未通过 exact 校验一律返回 None，下面维持原有报错（方案 §8）。
+                picked = await self._pick_character_canonical(
+                    index,
+                    name,
+                    str(user_request or ""),
+                    work_hints=tuple(work_hints or ()),
                 )
+                if picked is None:
+                    raise CharacterPromptCompileError(
+                        f"角色“{name}”在本地 Danbooru 中命中多个身份，请补充准确作品名",
+                        code="character_resolution_ambiguous",
+                        details={"candidate_count": resolution.candidate_count},
+                    )
+                if picked is not None:
+                    resolution = picked
             if not resolution.verified:
                 # 名字可能被写歪（实测 "rio (bluearchive)"）：先用容错解析确认一次，
                 # 只在索引自己给出了同一 canonical 时才改变结论，不做任何猜测。
