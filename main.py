@@ -905,7 +905,7 @@ APPEARANCE_UNRESOLVABLE_TTL_SECONDS = 6 * 3600
 DANBOORU_EVIDENCE_TIMEOUT_SECONDS = 15.0
 
 # 歧义角色让 LLM 从真候选里挑一个的硬超时（方案 §8：失败即原样报错，不阻断）。
-CHARACTER_PICK_TIMEOUT_SECONDS = 12.0
+CHARACTER_PICK_TIMEOUT_SECONDS = 20.0
 
 
 def _describe_failure(exc: BaseException) -> str:
@@ -15652,7 +15652,25 @@ QQ快捷指令:
             f"[{PLUGIN_NAME}] 歧义角色已由 LLM 从真候选选定并 exact 确认："
             f"{name} -> {chosen}"
         )
-        return confirmed
+        # 调用方（角色校验链）读的是 CharacterIdentityResolution 的字段
+        # （verified/ambiguous/match_variant/candidate_count…），不是 TagLookup。
+        # 实测把它直接返回会炸 "'TagLookup' object has no attribute 'match_variant'"。
+        from .services.character_identity import CharacterIdentityResolution
+
+        return CharacterIdentityResolution(
+            canonical_tag=str(
+                getattr(confirmed, "canonical_tag", "") or getattr(confirmed, "tag", "") or chosen
+            ),
+            verified=True,
+            ambiguous=False,
+            match_variant="llm_candidate_pick",
+            match_type="exact",
+            query_count=1,
+            candidate_count=len(candidates),
+            candidates=tuple(
+                str(getattr(c, "tag", "")) for c in candidates[:12] if getattr(c, "tag", "")
+            ),
+        )
 
     @staticmethod
     def _normalize_picked_tag(value: str) -> str:
