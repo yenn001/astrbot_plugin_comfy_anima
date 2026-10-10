@@ -2,6 +2,35 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-10-10（构建 3.1.477）
+
+### ① 未指定 `--pipeline` 时不再被导演顶掉（TTP 开关因此变可靠）
+
+- **用户实测** ✓：连画三张，结果**互斥且反复** ✗ ——
+  第一次 **TTP 放大 ✓ 但不认角色** ✗、第二次 **没放大 ✗ 但认角色** ✓、
+  第三次**都不认也不放大** ✗
+- **取证（任务库 + 日志对照）** ✓：
+  | 时间 | payload pipeline | output_nodes | 角色 |
+  |---|---|---|---|
+  | 11:32 | `rtx` | **`['458']`** ← 这正是 **ttp 变体**的 preferred 节点 ✓ | 未验证 ✗ |
+  | 11:39 | `base` ✗ | `['88']` | 通过 ✓（`stale_used` 缓存证据 ✓）|
+  | 11:41 | `base` ✗ | `['88']` | 未验证 ✗ |
+  （**更正**：我上一轮说"`output_nodes` 不反映变体"是**错的** ✗ ——
+  档案里 `ttp→458` / `rtx→459` / `base→460` ✓，458 就是 TTP 的铁证 ✓）
+- **根因** ✓✓：`pipeline` 是**导演模型**在 `<pic … pipeline="…">` 里自写的 ✗，
+  而代码把它当**兜底**：`selected_pipeline = requested_pipeline or instruction.pipeline` ✗ ——
+  **与插件自己的帮助文档矛盾** ✗：文档明写"**未指定时使用 WebUI 当前默认生图管线**" ✓
+  → 于是你设的 rtx/ttp 默认值**被导演写的 base 顶掉** ✗✓（同一开关下三张图分别走 rtx/base/base ✓）
+- **本版改法（三处，最小）** ✓：生成路径去掉导演兜底 ✓ ——
+  `selected_pipeline = requested_pipeline` ✓ / `selected_pipeline = options.pipeline` ✓ /
+  `pipeline=parsed_options.pipeline,` ✓；
+  **用户显式 `--pipeline` 仍然优先** ✓，未指定则自然回落到 WebUI 默认 ✓✓
+  （`options.pipeline or self.settings.default_generation_pipeline` ✓ 保持不变 ✓）
+- **验证**：新增 `tests/test_pipeline_default_respected.py` ✓（三处旧写法必须消失 ✓、
+  用户选择仍优先 ✓、默认回落仍在 ✓、与帮助文档一致 ✓）；
+  全量测试与门控部署见日志 ✓。
+- **另** ✓：`rio` 时有时无属**另一路**（外貌证据取不到 → 不挂 LoRA ✓），
+  即此前记录的 `character_swap_appearance_unavailable` ✗，待做 ② ✓。
 ## [2.5.1] - 2026-10-10（构建 3.1.476）
 
 ### A+B：TTP 开关**找得到**、**开着无效会告警**

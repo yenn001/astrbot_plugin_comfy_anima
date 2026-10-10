@@ -6376,7 +6376,7 @@ class ComfyAnimaPlugin(Star):
                         authority,
                     )
                     final_prompt = purity.prompt
-                selected_pipeline = requested_pipeline or instruction.pipeline
+                selected_pipeline = requested_pipeline
                 final_access_error = self._access_error(event, final_prompt)
                 if final_access_error:
                     yield event.plain_result(
@@ -7236,7 +7236,7 @@ class ComfyAnimaPlugin(Star):
                         parsed_options,
                         prompt=final_prompt,
                         negative_prompt=negative_prompt,
-                        pipeline=parsed_options.pipeline or instruction.pipeline,
+                        pipeline=parsed_options.pipeline,
                         width=target_width,
                         height=target_height,
                         lora_preset=style_preset,
@@ -7718,6 +7718,7 @@ class ComfyAnimaPlugin(Star):
                     )
                     if part
                 )
+                # 重绘路径仍沿用导演给的 pipeline（它决定重绘走哪条工作流；不属本次改动范围）
                 selected_pipeline = options.pipeline or instruction.pipeline
                 denoise, steps, edit_magnitude = semantic_redraw_parameters(
                     requirement,
