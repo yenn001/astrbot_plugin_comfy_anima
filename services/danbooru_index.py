@@ -170,6 +170,18 @@ def normalize_tag(value: str) -> str:
     return text.strip("_").casefold()
 
 
+
+def _squash_identity(value: str) -> str:
+    """Return the identity key with every separator removed.
+
+    实测：导演会把角色名写成 ``rio (bluearchive)``，而规范 tag 是
+    ``rio_(blue_archive)``。``normalize_tag`` 只统一空格/下划线与全角，
+    不会在粘连词里补分隔符，所以按"去掉全部分隔符"比对才是可靠的桥。
+    """
+
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
 def escape_prompt_tag(value: str) -> str:
     """Format a normalized tag for prompt text without double escaping it."""
 
@@ -1203,6 +1215,40 @@ class DanbooruTagIndex:
             except (sqlite3.Error, DanbooruIndexError) as exc:
                 self._last_error = str(exc)
                 return ()
+
+    def resolve_candidate(
+        self,
+        value: str,
+        category: str = "character",
+    ) -> Any:
+        """Resolve a possibly malformed term to one verified canonical.
+
+        实测：索引对 ``rio (bluearchive)`` 其实已经给出正确 canonical
+        ``rio_(blue_archive)``，只是严格校验把它标为未验证；而导演经常写出
+        这种不规范形式，插件于是按"未验证"降级、丢掉角色 LoRA。
+
+        这里做一次**确认**：当索引给出的 canonical 与输入"去掉全部分隔符后
+        完全一致"时，它就是同一个身份，再用一次 exact 查询把它落实。
+        否则原样返回，保持调用方原有行为。
+        """
+
+        normalized = normalize_tag(value)
+        if not normalized:
+            return None
+        exact = self.lookup(normalized, category)
+        if bool(getattr(exact, "verified", False)):
+            return exact
+        canonical = str(
+            getattr(exact, "canonical_tag", "") or getattr(exact, "tag", "") or ""
+        ).strip()
+        if not canonical:
+            return exact
+        if _squash_identity(canonical) != _squash_identity(value):
+            return exact
+        confirmed = self.lookup(canonical, category)
+        if bool(getattr(confirmed, "verified", False)):
+            return confirmed
+        return exact
 
     @staticmethod
     def _connect_path(path: Path) -> sqlite3.Connection:

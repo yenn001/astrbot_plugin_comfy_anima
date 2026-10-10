@@ -10939,6 +10939,11 @@ QQ快捷指令:
                     details={"candidate_count": resolution.candidate_count},
                 )
             if not resolution.verified:
+                # 名字可能被写歪（实测 "rio (bluearchive)"）：先用容错解析确认一次，
+                # 只在索引自己给出了同一 canonical 时才改变结论，不做任何猜测。
+                resolution = self._rescue_character_resolution(
+                    index, name, resolution
+                )
                 claim = claims_by_raw.get(raw)
                 if claim is not None and not claim.strict:
                     # ``characters`` is a drawing-director discovery hint. A
@@ -15405,6 +15410,32 @@ QQ快捷指令:
             or ""
         ).strip()
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _rescue_character_resolution(
+        index: Any,
+        term: str,
+        current: Any,
+        category: str = "character",
+    ) -> Any:
+        """Confirm a canonical when the term was written in a malformed shape.
+
+        实测：导演会写 ``rio (bluearchive)``；索引本身能给出 ``rio_(blue_archive)``，
+        但严格校验把它标为未验证，插件随即按"未验证"降级、丢掉角色 LoRA。
+        这里只用索引自己的结论 + 一次"去掉全部分隔符"的一致性确认，
+        不引入任何猜测：不一致就原样返回。
+        """
+
+        resolver = getattr(index, "resolve_candidate", None)
+        if not callable(resolver):
+            return current
+        try:
+            rescued = resolver(term, category)
+        except Exception:
+            return current
+        if rescued is not None and bool(getattr(rescued, "verified", False)):
+            return rescued
+        return current
 
     def _log_intent_gate_rejection(self, event: AstrMessageEvent) -> None:
         """Explain why the intent gate produced no DRAW_NOW decision.

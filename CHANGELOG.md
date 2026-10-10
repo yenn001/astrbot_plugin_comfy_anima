@@ -2,6 +2,31 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-10-10（构建 3.1.478）
+
+### P1：名字被写歪时不再丢角色（容错确认）
+
+- **病灶（真机实测）** ✓：
+  ```
+  索引对照：
+    rio (bluearchive)   -> verified=False  canonical='rio_(blue_archive)'  ← ★ 索引其实找到了！
+    rio_(blue_archive)  -> verified=True   canonical='rio_(blue_archive)'  ✓
+  ```
+  → **索引早就解析出正确 canonical** ✓，只是**严格校验标为未验证** ✗ →
+  插件按未验证降级 ✗ → **不挂角色 LoRA → 角色丢** ✗✓
+  （生产日志原话："最终提示词含未验证的限定角色 Tag 1 个（rio (bluearchive)）" ✗）
+- **改法（两步，均不引入猜测）** ✓：
+  1. **索引新增 `resolve_candidate()`** ✓：先用既有 `lookup` ✓；未验证时，若索引给出的
+     canonical 与输入**去掉全部分隔符后完全一致** ✓（`riobluearchive == riobluearchive` ✓），
+     就用一次 exact 查询把它**确认** ✓；**不一致则原样返回** ✓（不硬塞 ✗）；
+     配套新增 `_squash_identity()` ✓（纯函数 ✓）。
+  2. **接到决策点** ✓：`_rescue_character_resolution()` ✓ 挂在我此前修过的
+     `if not resolution.verified:` 处 ✓ —— **只信索引自己的结论 + 一次一致性确认** ✓，
+     失败即原样返回 ✓，不影响任何既有分支 ✓。
+- **验证**：新增 `tests/test_character_term_rescue.py` ✓（`_squash_identity` 两侧等价 ✓、
+  不同身份不被强行合并 ✓、已验证直通 ✓、未知词不变 ✓、抢救必须发生在降级之前 ✓）；
+  全量测试与门控部署见日志 ✓；部署后用真索引复跑实测用例 ✓。
+- **仍未做** ✓：L2 中文桥（P2 ✓）、L3 隧道现查（P3 ✓）、L4 外貌证据改直连（P4 ✓）。
 ## [2.5.1] - 2026-10-10（构建 3.1.477）
 
 ### ① 未指定 `--pipeline` 时不再被导演顶掉（TTP 开关因此变可靠）
