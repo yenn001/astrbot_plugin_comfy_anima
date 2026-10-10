@@ -15,8 +15,9 @@ class FailureNoticeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         main = (ROOT / "main.py").read_text(encoding="utf-8")
-        start = main.find(chr(34) + "image_task_failed" + chr(34))
-        cls.block = main[start - 400 : start + 1500]
+        # 直接用失败通知那一行做锚点："image_task_failed" 在别处也出现，会取错窗口
+        start = main.find("failure_reason = _describe_failure(exc)")
+        cls.block = main[max(0, start - 600) : start + 1200]
         cls.main = main
 
     def test_failure_handler_notifies_the_user(self) -> None:
@@ -25,8 +26,9 @@ class FailureNoticeTests(unittest.TestCase):
         self.assertIn("failure_reason", self.block)
 
     def test_notice_uses_the_real_reason_not_the_class_name(self) -> None:
-        self.assertIn('getattr(exc, "user_message", "")', self.block)
-        self.assertIn("type(exc).__name__", self.block)
+        # 3.1.480 起改由 _describe_failure 沿因果链取真实原因
+        # （内层异常的原因也能带出来，见 test_failure_reason_chain.py）
+        self.assertIn("failure_reason = _describe_failure(exc)", self.block)
 
     def test_failure_is_also_logged(self) -> None:
         self.assertIn("image task failed: stage=", self.block)

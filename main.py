@@ -905,6 +905,28 @@ APPEARANCE_UNRESOLVABLE_TTL_SECONDS = 6 * 3600
 DANBOORU_EVIDENCE_TIMEOUT_SECONDS = 15.0
 
 
+def _describe_failure(exc: BaseException) -> str:
+    """Return the most informative short reason for one failure.
+
+    实测：出图失败时通知只显示 ``WorkflowError`` —— 因为该异常自身的
+    ``user_message`` 为空，兜底取了类名，而真正的原因在内层异常里
+    （例如 "LLM 角色校验失败: 角色…命中多个身份"）。这里沿因果链找第一句
+    真正有信息量的描述，让失败通知自己说清原因。
+    """
+
+    current: BaseException | None = exc
+    for _ in range(5):
+        if current is None:
+            break
+        candidate = str(getattr(current, "user_message", "") or "").strip()
+        if not candidate:
+            candidate = str(current).strip()
+        if candidate and candidate != type(current).__name__:
+            return candidate[:500]
+        current = current.__cause__ or current.__context__
+    return type(exc).__name__
+
+
 async def _refresh_appearance_profile(
     plugin: Any,
     client: Any,
@@ -22596,9 +22618,7 @@ QQ快捷指令:
             # image_task_failed，用户界面上一片安静（实测含"生成超过 1200 秒"
             # 那种挂了三小时的情况）。失败时本条回复里不会有图，通知是唯一
             # 告知渠道，故不受 notify_queue（排队提示）的抑制语义影响。
-            failure_reason = str(
-                getattr(exc, "user_message", "") or type(exc).__name__
-            )[:500]
+            failure_reason = _describe_failure(exc)
             await self._send_job_notice(
                 event,
                 f"{MessageEmoji.WARNING} 出图失败（{job.failed_stage or job.state}）："
