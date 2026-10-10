@@ -12,6 +12,7 @@ AstrBot Comfy Anima 插件 v2.1.0
 
 import copy
 import json
+import logging
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,11 @@ from .workflow_profiles import (
     WorkflowProfileError,
     load_workflow_profile,
 )
+
+logger = logging.getLogger(__name__)
+
+# TTP 开关无效时的告警只打一次，避免每张图都刷同一行日志。
+_TTP_WARNED: set[str] = set()
 
 
 class WorkflowError(ValueError):
@@ -653,12 +659,31 @@ class WorkflowBuilder:
         # 模板声明了 "ttp" 变体；未命中时按 enable_upscale 重派生，不得直落
         # active_output（anima_v2 的 default 是 rtx，会让用户关掉高清反而拿
         # 到放大输出）。
+        ttp_requested = bool(getattr(self._settings, "enable_ttp_detail", False))
         if (
             upscale_enabled
-            and getattr(self._settings, "enable_ttp_detail", False)
+            and ttp_requested
             and "ttp" in self._profile.output_variants
         ):
             variant_name = "ttp"
+        elif ttp_requested and not upscale_enabled:
+            # 瓦片输入来自 RTX 预放大；二次放大关了就必然无效。
+            if "upscale_off" not in _TTP_WARNED:
+                _TTP_WARNED.add("upscale_off")
+                logger.warning(
+                    "TTP 开关已打开，但 enable_upscale 已关闭：TTP 依赖 RTX "
+                    "预放大，本开关当前无效。"
+                )
+        elif ttp_requested and "ttp" not in self._profile.output_variants:
+            # 档案未声明 ttp 变体：开着也做不到 TTP，明确告警而非静默无效。
+            if "variant_missing" not in _TTP_WARNED:
+                _TTP_WARNED.add("variant_missing")
+                logger.warning(
+                    "TTP 开关已打开，但当前生成工作流档案未声明 'ttp' 变体"
+                    "（现有变体：%s）：本开关当前无效。请把生成工作流切换到 "
+                    "anima_ttp_api.json，或改用声明了 ttp 变体的档案。",
+                    ",".join(sorted(self._profile.output_variants)) or "none",
+                )
         variant = self._profile.output_variants.get(variant_name)
         if variant is None:
             variant = self._profile.active_output

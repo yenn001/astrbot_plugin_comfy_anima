@@ -968,9 +968,9 @@
     "default": true
   },
   "enable_ttp_detail": {
-    "description": "TTP 瓦片细节增强",
+    "description": "TTP 放大链（全局开关：开→所有生图走 TTP 放大）",
     "type": "bool",
-    "hint": "仅在放大链路生效：RTX 预放大后 2×2 切块、逐块 WD14 反推并以低降噪重绘细节，再拼合（耗时约为纯 RTX 的 3-5 倍）；需要工作流模板声明 ttp 变体",
+    "hint": "【全局开关】打开后所有生图都走 TTP 放大链；关掉则全部回退 RTX 放大。生效需三个条件同时成立：① 本开关打开；② enable_upscale 未被关闭；③ 当前生成工作流档案声明了 ttp 变体 —— 例如把生成工作流切到 anima_ttp_api.json（它同时支持 base / rtx / ttp）。档案未声明 ttp 变体时本开关无效，插件会在日志中明确告警。代价：耗时约为纯 RTX 的 3-5 倍（RTX 预放大后 2×2 切块、逐块 WD14 反推并以低降噪重绘，再拼合）。",
     "default": false
   },
   "global_extra_positive_tags": {
