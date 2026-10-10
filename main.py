@@ -22479,6 +22479,22 @@ QQ快捷指令:
             error_code = str(getattr(exc, "code", "image_task_failed"))[:80]
             if not re.fullmatch(r"[a-z0-9_\-]+", error_code):
                 error_code = "image_task_failed"
+            # 失败必须让用户知道：此前后台出图任务失败完全静默 —— 事件里只写
+            # image_task_failed，用户界面上一片安静（实测含"生成超过 1200 秒"
+            # 那种挂了三小时的情况）。失败时本条回复里不会有图，通知是唯一
+            # 告知渠道，故不受 notify_queue（排队提示）的抑制语义影响。
+            failure_reason = str(
+                getattr(exc, "user_message", "") or type(exc).__name__
+            )[:500]
+            await self._send_job_notice(
+                event,
+                f"{MessageEmoji.WARNING} 出图失败（{job.failed_stage or job.state}）："
+                f"{failure_reason}",
+            )
+            logger.warning(
+                f"[{PLUGIN_NAME}] image task failed: stage="
+                f"{job.failed_stage or job.state} reason={failure_reason[:160]}"
+            )
             if self._task_store is not None and job.task_run_id:
                 safe_message = str(
                     getattr(exc, "user_message", type(exc).__name__)
