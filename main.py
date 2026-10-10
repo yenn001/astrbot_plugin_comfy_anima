@@ -904,6 +904,9 @@ APPEARANCE_UNRESOLVABLE_TTL_SECONDS = 6 * 3600
 # 直连 Danbooru API 取外貌证据的硬超时（方案 §8：宁可少补标签，也不能卡住出图）。
 DANBOORU_EVIDENCE_TIMEOUT_SECONDS = 15.0
 
+# 歧义角色让 LLM 从真候选里挑一个的硬超时（方案 §8：失败即原样报错，不阻断）。
+CHARACTER_PICK_TIMEOUT_SECONDS = 12.0
+
 
 def _describe_failure(exc: BaseException) -> str:
     """Return the most informative short reason for one failure.
@@ -10859,6 +10862,15 @@ QQ快捷指令:
                             details={"error_type": type(exc).__name__},
                         ) from exc
                     if alias_resolution.ambiguous:
+                        picked = await self._pick_character_canonical(
+                            index,
+                            name,
+                            str(user_request or ""),
+                            work_hints=tuple(work_hints or ()),
+                        )
+                        if picked is not None:
+                            alias_resolutions.append(picked)
+                            continue
                         raise CharacterPromptCompileError(
                             f"角色“{name}”的用户别名在本地 Danbooru 中命中多个身份，"
                             "请补充准确作品名",
@@ -15539,6 +15551,109 @@ QQ快捷指令:
                 f"直连未命中：{api_error}"
             )
         return list(posts or [])
+
+    async def _pick_character_canonical(
+        self,
+        index: Any,
+        name: str,
+        user_request: str,
+        *,
+        work_hints: tuple[str, ...] = (),
+    ) -> Any:
+        """Ambiguous name -> let the LLM pick one exact canonical from real candidates.
+
+        实测：娜露梅 被译成 ``Narume``，索引里 ``narume*`` 有两个身份，于是报
+        "请补充准确作品名" —— 可用户给的作品名是中文，Danbooru 不认。把【真实候选 +
+        帖数】连同用户原话一起交给 LLM，它才能把音译误差纠正成
+        ``narmaya_(granblue_fantasy)``（单靠帖数排序做不到：正确名字根本不在 ``narume*``
+        里）。失败/超时/选不出来一律返回 None，调用方维持原有报错（方案 §8）。
+        """
+
+        from .services.danbooru_index import normalize_tag as _normalize
+
+        head = _normalize(name).split("_(", 1)[0] or _normalize(name)
+        if not head:
+            return None
+        try:
+            candidates = await asyncio.to_thread(
+                index.search, head, mode="prefix", category="character", limit=25
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{PLUGIN_NAME}] 歧义角色取候选失败：{type(exc).__name__}")
+            return None
+        if not 2 <= len(candidates) <= 30:
+            return None
+        rows = "\n".join(
+            "- %s （%s posts）" % (getattr(c, "tag", ""), getattr(c, "count", 0))
+            for c in candidates
+            if getattr(c, "tag", "")
+        )
+        if not rows:
+            return None
+        hints = "、".join(str(h) for h in work_hints if str(h).strip())[:120]
+        prompt = (
+            "用户想画的角色（原话）：\n"
+            + str(user_request or "")[:400]
+            + ("\n用户提到的作品：" + hints if hints else "")
+            + "\n\n该名字在 Danbooru 上不唯一。以下是真实存在的候选（完整 tag 与作品数）：\n"
+            + rows
+            + "\n\n请只输出【最符合用户所指】的那一个候选的完整 tag，"
+            "不要解释、不要加引号、不要输出其它内容。若无法判断，只输出 NONE。"
+        )
+        system = (
+            "You pick exactly one Danbooru character tag from the candidates. "
+            "Output only the tag itself, or NONE."
+        )
+        provider_id = str(getattr(self.settings, "prompt_llm_provider_id", "") or "").strip()
+        try:
+            response = await asyncio.wait_for(
+                self._llm_generate_limited(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=system,
+                    temperature=0.0,
+                    max_tokens=48,
+                ),
+                timeout=CHARACTER_PICK_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[{PLUGIN_NAME}] 歧义角色挑选失败（{name}）：{type(exc).__name__}"
+            )
+            return None
+        chosen = self._normalize_picked_tag(response_text(response))
+        if not chosen or chosen.upper() == "NONE":
+            logger.info(
+                f"[{PLUGIN_NAME}] 歧义角色 LLM 未选出唯一身份：{name}"
+                f"（候选 {len(candidates)} 个）"
+            )
+            return None
+        try:
+            confirmed = await asyncio.to_thread(index.lookup, chosen, "character")
+        except Exception:  # noqa: BLE001
+            return None
+        if not bool(getattr(confirmed, "verified", False)):
+            logger.info(
+                f"[{PLUGIN_NAME}] 歧义角色 LLM 选择未通过 exact 校验：{name} -> {chosen}"
+            )
+            return None
+        logger.info(
+            f"[{PLUGIN_NAME}] 歧义角色已由 LLM 从真候选选定并 exact 确认："
+            f"{name} -> {chosen}"
+        )
+        return confirmed
+
+    @staticmethod
+    def _normalize_picked_tag(value: str) -> str:
+        """Accept only a single tag-shaped token from an LLM reply."""
+
+        import re as _re
+
+        first = str(value or "").strip().splitlines()[0].strip() if str(value or "").strip() else ""
+        first = first.strip("`\"'").strip().rstrip(".,;:")
+        if not _re.fullmatch(r"[A-Za-z0-9_().'&+:/-]{1,160}", first):
+            return ""
+        return first
 
     def _log_intent_gate_rejection(self, event: AstrMessageEvent) -> None:
         """Explain why the intent gate produced no DRAW_NOW decision.
