@@ -11004,6 +11004,18 @@ QQ快捷指令:
                 resolution = self._rescue_character_resolution(
                     index, name, resolution
                 )
+                if not resolution.verified:
+                    # 名字可能整个译错（实测 娜露梅 -> Nalumei，索引里一个候选都没有，
+                    # 于是"命中多个"的门根本不触发、角色被降级成原创、图与角色无关）。
+                    # 让 LLM 先给多个英文候选，再逐个验证；成功即用（方案 §8：失败原样继续）。
+                    picked = await self._pick_character_canonical(
+                        index,
+                        name,
+                        str(user_request or ""),
+                        work_hints=tuple(work_hints or ()),
+                    )
+                    if picked is not None:
+                        resolution = picked
                 claim = claims_by_raw.get(raw)
                 if claim is not None and not claim.strict:
                     # ``characters`` is a drawing-director discovery hint. A
@@ -15585,14 +15597,45 @@ QQ快捷指令:
         head = _normalize(name).split("_(", 1)[0] or _normalize(name)
         if not head:
             return None
-        try:
-            candidates = await asyncio.to_thread(
-                index.search, head, mode="prefix", category="character", limit=25
+
+        async def _search(term: str):
+            try:
+                return await asyncio.to_thread(
+                    index.search, term, mode="prefix", category="character", limit=25
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 歧义角色取候选失败（{term}）：{type(exc).__name__}"
+                )
+                return ()
+
+        candidates = await _search(head)
+        if len(candidates) < 2:
+            # 实测：导演会写成 Nalumei / Narume 这种连索引都搜不到的拼法 ✗ ——
+            # 此时"命中多个"的门根本不触发，角色被降级成原创 ✓ 图跟她毫无关系 ✗。
+            # 让 LLM 一次给出多个英文候选，再逐个验证：娜露梅 → narmaya / narume / …
+            variants = await self._suggest_character_name_variants(
+                name, user_request, work_hints=work_hints
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[{PLUGIN_NAME}] 歧义角色取候选失败：{type(exc).__name__}")
-            return None
+            merged: dict[str, Any] = {}
+            for term in variants:
+                for candidate in await _search(term):
+                    key = str(getattr(candidate, "tag", "") or "")
+                    if key and key not in merged:
+                        merged[key] = candidate
+            for candidate in candidates:
+                key = str(getattr(candidate, "tag", "") or "")
+                if key and key not in merged:
+                    merged[key] = candidate
+            candidates = tuple(merged.values())
+            if variants:
+                logger.info(
+                    f"[{PLUGIN_NAME}] 角色名候选补全：{name} -> {list(merged)[:6]}"
+                )
         if not 2 <= len(candidates) <= 30:
+            logger.info(
+                f"[{PLUGIN_NAME}] 角色名仍无法确定候选：{name}（{len(candidates)} 个）"
+            )
             return None
         rows = "\n".join(
             "- %s （%s posts）" % (getattr(c, "tag", ""), getattr(c, "count", 0))
@@ -15671,6 +15714,61 @@ QQ快捷指令:
                 str(getattr(c, "tag", "")) for c in candidates[:12] if getattr(c, "tag", "")
             ),
         )
+
+    async def _suggest_character_name_variants(
+        self,
+        name: str,
+        user_request: str,
+        *,
+        work_hints: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        """Ask the LLM for several English spellings of one Chinese character name.
+
+        实测：导演单次音译不可靠（娜露梅 → Narume / Nalumei 都搜不到），而正确答案
+        ``narmaya`` 与它们并非同一前缀，靠模糊匹配也救不回来。多给几个候选再逐个验证，
+        命中即止 —— 这是"中文名"这条路上唯一可靠的入口（方案 §8：超时即放弃）。
+        """
+
+        hints = "、".join(str(h) for h in work_hints if str(h).strip())[:120]
+        prompt = (
+            "用户想画一个动漫角色，原文：\n"
+            + str(user_request or "")[:300]
+            + ("\n涉及作品：" + hints if hints else "")
+            + "\n\n该角色名（" + str(name) + "）可能是中文或音译。"
+            "请给出它可能的【英文/罗马字】写法，每行一个，最多 5 个，"
+            "只输出名字本身（可用下划线），不要解释、不要编号。"
+        )
+        system = (
+            "You list candidate English spellings of one anime character name. "
+            "Output one per line, names only."
+        )
+        provider_id = str(getattr(self.settings, "prompt_llm_provider_id", "") or "").strip()
+        try:
+            response = await asyncio.wait_for(
+                self._llm_generate_limited(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=system,
+                    temperature=0.2,
+                    max_tokens=64,
+                ),
+                timeout=CHARACTER_PICK_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[{PLUGIN_NAME}] 角色名候选生成失败（{name}）：{type(exc).__name__}"
+            )
+            return ()
+        out: list[str] = []
+        for raw in str(response_text(response) or "").splitlines():
+            value = self._normalize_picked_tag(raw)
+            if value and value.upper() != "NONE" and value.casefold() not in {
+                v.casefold() for v in out
+            }:
+                out.append(value)
+            if len(out) >= 5:
+                break
+        return tuple(out)
 
     @staticmethod
     def _normalize_picked_tag(value: str) -> str:
