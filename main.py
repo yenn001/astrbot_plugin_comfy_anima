@@ -10687,6 +10687,8 @@ QQ快捷指令:
             tuple[str, str, Any, tuple[str, ...], tuple[str, ...], str]
         ] = []
         for raw, name, explicit_work, declared_aliases in resolution_inputs:
+            # 仅当本次挑选真的成功时才跳过“未验证即降级”；其余路径一字不动。
+            picked_from_llm = False
             record_query = f"《{explicit_work}》的{name}" if explicit_work else name
             identity_candidates, work_hints = character_lookup_hints_for_query(
                 records,
@@ -10861,7 +10863,7 @@ QQ快捷指令:
                             code="character_resolution_failed",
                             details={"error_type": type(exc).__name__},
                         ) from exc
-                    if alias_resolution.ambiguous:
+                    if alias_resolution.ambiguous and any(ord(ch) > 127 for ch in str(user_request or "")):
                         picked = await self._pick_character_canonical(
                             index,
                             name,
@@ -10997,7 +10999,7 @@ QQ快捷指令:
                         details={"candidate_count": resolution.candidate_count},
                     )
                 if picked is not None:
-                    resolution = picked
+                    picked_from_llm = True
             if not resolution.verified:
                 # 名字可能被写歪（实测 "rio (bluearchive)"）：先用容错解析确认一次，
                 # 只在索引自己给出了同一 canonical 时才改变结论，不做任何猜测。
@@ -11017,7 +11019,8 @@ QQ快捷指令:
                     if picked is not None:
                         resolution = picked
                 claim = claims_by_raw.get(raw)
-                if claim is not None and not claim.strict:
+                # ① 挑选成功即可信：这里若仍按 claim 降级并 continue，解析结果会被丢弃。
+                if claim is not None and not claim.strict and not picked_from_llm:
                     # ``characters`` is a drawing-director discovery hint. A
                     # bare unknown name can be an original character or an
                     # internet personification, not a failed real identity.
