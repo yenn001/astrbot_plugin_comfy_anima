@@ -15642,6 +15642,7 @@ QQ快捷指令:
                 return ()
 
         candidates = await _search(head)
+        variants: tuple[str, ...] = ()
         if len(candidates) < 2:
             # 实测：导演会写成 Nalumei / Narume 这种连索引都搜不到的拼法 ✗ ——
             # 此时"命中多个"的门根本不触发，角色被降级成原创 ✓ 图跟她毫无关系 ✗。
@@ -15669,6 +15670,12 @@ QQ快捷指令:
                 f"[{PLUGIN_NAME}] 角色名仍无法确定候选：{name}（{len(candidates)} 个）"
             )
             return None
+        # #1 实测两次串行 LLM 调用要 75 秒（35–45 秒 ×2），出图等不起。当候选里已有
+        # "名字部分与某个英文候选完全一致"的唯一项时直接确定，免掉第二次调用
+        # （娜露梅 → 候选 narmaya → narmaya_(granblue_fantasy)）。仍然走 exact 确认。
+        decided = await self._decide_from_candidates(index, candidates, variants, name)
+        if decided is not None:
+            return decided
         rows = "\n".join(
             "- %s （%s posts）" % (getattr(c, "tag", ""), getattr(c, "count", 0))
             for c in candidates
@@ -15692,16 +15699,27 @@ QQ快捷指令:
         )
         provider_id = str(getattr(self.settings, "prompt_llm_provider_id", "") or "").strip()
         try:
-            response = await asyncio.wait_for(
+            # #2 实测：挑选 +76s 成功并写了缓存，编译 +75.2s 已放弃 —— 差 0.8 秒。
+            # shield 之后超时不再取消底层调用，成果经回调落进缓存（下一次必中）。
+            _pick_call = asyncio.ensure_future(
                 self._llm_generate_limited(
                     chat_provider_id=provider_id,
                     prompt=prompt,
                     system_prompt=system,
                     temperature=0.0,
                     max_tokens=48,
-                ),
-                timeout=CHARACTER_PICK_TIMEOUT_SECONDS,
+                )
             )
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.shield(_pick_call),
+                    timeout=CHARACTER_PICK_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _pick_call.add_done_callback(
+                    lambda task, k=_normalize(name), t=name: self._cache_late_pick(task, k, t)
+                )
+                raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[{PLUGIN_NAME}] 歧义角色挑选失败（{name}）：{type(exc).__name__}"
@@ -15748,6 +15766,78 @@ QQ快捷指令:
             candidates=tuple(
                 str(getattr(c, "tag", "")) for c in candidates[:12] if getattr(c, "tag", "")
             ),
+        )
+
+    def _cache_late_pick(self, task: Any, key: str, term: str) -> None:
+        """Cache a late pick so the next draw of the same name resolves instantly.
+
+        实测：挑选在 +76s 成功并写缓存，而编译 +75.2s 已放弃 —— 差 0.8 秒。shield 之后
+        底层调用不会被取消，成果经此回调落进缓存，下一次同角色必然秒级命中。
+        """
+
+        try:
+            response = task.result()
+        except Exception:  # noqa: BLE001 - 迟到的失败无需处理
+            return
+        try:
+            chosen = self._normalize_picked_tag(response_text(response))
+        except Exception:  # noqa: BLE001
+            return
+        if not chosen or chosen.upper() == "NONE":
+            return
+        cache = getattr(self, "_resolved_character_name_cache", None)
+        if isinstance(cache, dict) and not cache.get(key):
+            cache[key] = chosen
+            logger.info(
+                f"[{PLUGIN_NAME}] 迟到成果已入缓存：{term} -> {chosen}（下次直接命中）"
+            )
+
+    async def _decide_from_candidates(
+        self,
+        index: Any,
+        candidates: Any,
+        variants: tuple[str, ...],
+        name: str,
+    ) -> Any:
+        """Decide deterministically when one candidate's name part matches an English variant."""
+
+        from .services.danbooru_index import _squash_identity, normalize_tag as _normalize
+
+        heads = {_squash_identity(v.split("_(", 1)[0]) for v in variants if v}
+        heads.discard("")
+        if not heads:
+            return None
+        matches: list[str] = []
+        for candidate in candidates:
+            tag = str(getattr(candidate, "tag", "") or "")
+            if tag and _squash_identity(tag.split("_(", 1)[0]) in heads:
+                matches.append(tag)
+        if len(matches) != 1:
+            return None
+        try:
+            confirmed = await asyncio.to_thread(index.lookup, matches[0], "character")
+        except Exception:  # noqa: BLE001
+            return None
+        if not bool(getattr(confirmed, "verified", False)):
+            return None
+        canonical = str(getattr(confirmed, "canonical_tag", "") or matches[0])
+        cache = getattr(self, "_resolved_character_name_cache", None)
+        if isinstance(cache, dict):
+            cache[_normalize(name)] = canonical
+        logger.info(
+            f"[{PLUGIN_NAME}] 角色名由候选唯一确定（免二次调用）：{name} -> {canonical}"
+        )
+        from .services.character_identity import CharacterIdentityResolution
+
+        return CharacterIdentityResolution(
+            canonical_tag=canonical,
+            verified=True,
+            ambiguous=False,
+            match_variant="candidate_unique_name_match",
+            match_type="exact",
+            query_count=1,
+            candidate_count=len(matches),
+            candidates=tuple(matches),
         )
 
     async def _suggest_character_name_variants(
