@@ -11038,7 +11038,12 @@ QQ快捷指令:
                         },
                     )
                     continue
-                if bool(
+                # 关键修复（_respect_verified_resolution）：此前这里只看设置就"照画未验证"，
+                # 于是【前一步已经解析出的 verified canonical 被整个绕过】✗ ——
+                # 实测娜露梅：日志里已选定 narmaya_(granblue_fantasy)、缓存也命中了，
+                # 事件却是 llm_character_unverified_drawn、提示词仍是导演写的 narume。
+                # 只有"确实仍未验证"时才允许照画。
+                if not bool(getattr(resolution, "verified", False)) and bool(
                     getattr(
                         getattr(self, "settings", None),
                         "allow_unverified_character_names",
@@ -11061,11 +11066,12 @@ QQ快捷指令:
                         },
                     )
                     continue
-                raise CharacterPromptCompileError(
-                    f"无法通过本地 Danbooru 或当前唯一角色 LoRA + Gallery exact 确认角色“{name}”",
-                    code="character_resolution_unverified",
-                    details={"query_count": resolution.query_count},
-                )
+                if not bool(getattr(resolution, "verified", False)):
+                    raise CharacterPromptCompileError(
+                        f"无法通过本地 Danbooru 或当前唯一角色 LoRA + Gallery exact 确认角色“{name}”",
+                        code="character_resolution_unverified",
+                        details={"query_count": resolution.query_count},
+                    )
             evidence_aliases = " / ".join(adjacent_aliases)
             evidence_name = (
                 f"{name} ({evidence_aliases})" if evidence_aliases else name
