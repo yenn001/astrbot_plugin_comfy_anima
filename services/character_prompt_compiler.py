@@ -307,6 +307,15 @@ def compile_character_prompt(
             # deleted rather than inherited from model memory or another role.
             removed.append(term)
             continue
+        # 导演可能写出"作品名对、角色名却是别人或拼错"的限定 tag，而调用方未必把它
+        # 登记为角色词。实测 narume_(granblue_fantasy) / djeeta_(granblue_fantasy) /
+        # nalume_(granblue_fantasy) 就这样与正确的 narmaya_(granblue_fantasy) 一起留在
+        # 提示词里 —— 两个角色身份同时在场，出图被污染。这里按"限定式角色 tag"兜底：
+        # 作品名与已验证角色的作品一致、名字却不是已验证的那一个 → 删除。
+        qualifier = _work_qualifier(term)
+        if qualifier and qualifier in expected_works and key not in allowed_keys:
+            removed.append(term)
+            continue
         kept.append(term)
 
     dropped_relation: list[str] = []
